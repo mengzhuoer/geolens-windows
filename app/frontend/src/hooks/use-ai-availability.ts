@@ -1,0 +1,116 @@
+import { useQuery } from '@tanstack/react-query';
+import { useAIStatus } from '@/hooks/use-admin';
+import { useAIStatusReader } from '@/hooks/use-ai-status-reader';
+import { useEdition } from '@/hooks/use-edition';
+import { usePermissions } from '@/hooks/use-permissions';
+import { useAuthStore } from '@/stores/auth-store';
+import { getAIAvailability } from '@/api/maps';
+import { queryKeys } from '@/lib/query-keys';
+
+/**
+ * Resolves whether the caller can use builder AI chat, combining AI readiness
+ * with the caller's `use_ai_chat` capability.
+ *
+ * ## Readiness sources
+ *
+ * - **AI-status readers** (the mode-aware capability mirrored by
+ *   `useAIStatusReader()`, not the `isAdmin` flag) read the detailed
+ *   `/api/admin/ai-status/` endpoint so the disabled-state UI can distinguish
+ *   `env_disabled` vs `no_key`.
+ * - **Other editors holding `use_ai_chat`** read the public-safe
+ *   `/api/ai/availability/` endpoint, which returns only a boolean and leaks no
+ *   provider/key detail.
+ * - **Viewers (no `use_ai_chat`)** fire NEITHER endpoint, so there is no 401/403
+ *   console noise; they get `reason = 'permission'`.
+ *
+ * Both endpoints are gated on `!!token` so anonymous sessions never probe them.
+ *
+ * ## reason field
+ *
+ * Gives the disabled-state UI a per-cause taxonomy without re-deriving the gate
+ * logic from raw query data.
+ *
+ * Precedence (first match wins):
+ *   1. `permission`    — caller lacks `use_ai_chat` (no endpoint was queried)
+ *   2. `env_disabled`  — status readers only: AI_ENABLED=false at the instance level
+ *   3. `no_key`        — AI enabled but no provider API key configured (status
+ *                        readers distinguish this; other callers see it for any
+ *                        not-available signal, since the public endpoint
+ *                        intentionally collapses env_disabled/no_key)
+ *   4. `null`          — either `isAIAvailable === true` (AI fully available)
+ *                        OR still loading (UI shows a spinner via `isLoading`)
+ *
+ * The loading state intentionally maps to `null`, not a reason constant, because
+ * the disabled-state UI distinguishes "loading" from "unavailable" via `isLoading`,
+ * and there is no actionable reason to surface while waiting for the API response.
+ */
+export type AIUnavailableReason = 'env_disabled' | 'no_key' | 'permission';
+
+export function useAIAvailability() {
+  const token = useAuthStore((s) => s.token);
+  // Branch on the backend's actual gate (mode-aware capability), not the isAdmin flag.
+  const canReadStatus = useAIStatusReader();
+  // canReadStatus derives from the edition query's tenancy mode, which reads as
+  // single-tenant until that query settles; probing earlier can hit the wrong
+  // endpoint (a 403 in error telemetry). Hold both probes until the edition is known.
+  const editionResolved = !useEdition().isLoading;
+  // can() returns false while the permissions query is loading, which would flash
+  // reason='permission' at permitted editors on a cold mount. Fold its loading
+  // into isLoading so the spinner covers the window.
+  const { can, isLoading: permissionsLoading } = usePermissions();
+  const canUse = can('use_ai_chat');
+
+  // Status readers get the detailed admin status (provider/key info for the reason taxonomy).
+  const adminStatus = useAIStatus({ enabled: !!token && editionResolved && canReadStatus });
+  // Other editors holding use_ai_chat read the public-safe availability signal.
+  // Viewers (!canUse) fire nothing — avoids 403 console noise.
+  const availabilityQuery = useQuery({
+    queryKey: queryKeys.maps.aiAvailability,
+    queryFn: getAIAvailability,
+    enabled: !!token && editionResolved && !canReadStatus && canUse,
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
+  });
+
+  const adminData = adminStatus.data;
+
+  let isAIAvailable: boolean;
+  let reason: AIUnavailableReason | null = null;
+
+  if (permissionsLoading) {
+    // Don't settle reason='permission' before permissions resolve —
+    // loading maps to reason=null (spinner via isLoading), per the taxonomy above.
+    isAIAvailable = false;
+  } else if (!canUse) {
+    isAIAvailable = false;
+    reason = 'permission';
+  } else if (canReadStatus) {
+    isAIAvailable = Boolean(adminData?.enabled && adminData?.configured);
+    if (!isAIAvailable && adminData !== undefined) {
+      reason = !adminData.enabled ? 'env_disabled' : 'no_key';
+    }
+  } else {
+    isAIAvailable = Boolean(availabilityQuery.data?.available);
+    // The public endpoint collapses env_disabled/no_key into a single boolean;
+    // surface the more common "not configured" cause to non-readers (who cannot
+    // act on either, and never see the admin Settings CTA).
+    if (!isAIAvailable && availabilityQuery.data !== undefined) {
+      reason = 'no_key';
+    }
+  }
+
+  // Surface the loading/error state of whichever query is actually active so the
+  // disabled-state UI can show a spinner instead of premature "unavailable" copy.
+  const activeQuery = canReadStatus ? adminStatus : availabilityQuery;
+  const isLoading =
+    permissionsLoading ||
+    (canUse &&
+      (!editionResolved || (activeQuery.fetchStatus !== 'idle' && activeQuery.isLoading)));
+
+  return {
+    ...activeQuery,
+    isLoading,
+    isAIAvailable,
+    reason,
+  };
+}

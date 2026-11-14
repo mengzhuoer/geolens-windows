@@ -1,0 +1,623 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Textarea } from '@/components/ui/textarea';
+import { useTranslation } from 'react-i18next';
+import { Plus, X, Code } from 'lucide-react';
+import type { FilterSpecification } from 'maplibre-gl';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
+import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import {
+  buildNullSafeNumericComparison,
+  parseCanonicalFilter,
+  validateRawFilter,
+  FilterValidationError,
+  NUMERIC_COMPARISON_OPERATORS,
+  utcTimestampText,
+} from '@/lib/maplibre-filter-utils';
+import { randomId } from '@/lib/random-id';
+
+interface FilterCondition {
+  id: string;
+  field: string;
+  operator: string;
+  value: string;
+}
+
+interface LayerFilterEditorProps {
+  columnInfo: { name: string; type: string }[];
+  filter: FilterSpecification | null;
+  onFilterChange: (expression: FilterSpecification | null) => void;
+  layerName?: string | null;
+  /**
+   * Rendered-feature count for this layer. When 0 AND `filter` is non-null, the
+   * empty-state hint and Clear-filter button are shown. `null`/`undefined`
+   * suppresses the hint regardless of filter state.
+   */
+  featureCount?: number | null;
+}
+
+type ColumnType = 'string' | 'number' | 'boolean' | 'other';
+
+interface OperatorDef {
+  label?: string;
+  labelKey?: string;
+  value: string;
+}
+
+// NUMERIC_COMPARISON_OPERATORS comes from maplibre-filter-utils, the single
+// canonical copy.
+// Discriminated union returned by parseFilterExpression
+type ParseResult =
+  | { kind: 'editable'; combinator: 'all' | 'any'; conditions: FilterCondition[] }
+  | { kind: 'opaque'; raw: FilterSpecification };
+
+function classifyColumnType(pgType: string): ColumnType {
+  const t = pgType.toLowerCase();
+  if (/int|float|double|numeric|real|decimal/.test(t)) return 'number';
+  if (/boolean|bool/.test(t)) return 'boolean';
+  if (/text|varchar|char|string/.test(t)) return 'string';
+  return 'other';
+}
+
+const OPERATORS_BY_TYPE: Record<ColumnType, OperatorDef[]> = {
+  string: [
+    { labelKey: 'filters.operators.equals', value: '==' },
+    { labelKey: 'filters.operators.notEquals', value: '!=' },
+    { labelKey: 'filters.operators.contains', value: 'contains' },
+    { labelKey: 'filters.operators.isNull', value: 'is_null' },
+    { value: 'in_list', labelKey: 'filters.operators.inList' },
+    { value: 'not_in_list', labelKey: 'filters.operators.notInList' },
+    { value: 'has', labelKey: 'filters.operators.exists' },
+  ],
+  number: [
+    { label: '=', value: '==' },
+    { label: '!=', value: '!=' },
+    { label: '>', value: '>' },
+    { label: '<', value: '<' },
+    { label: '>=', value: '>=' },
+    { label: '<=', value: '<=' },
+    { labelKey: 'filters.operators.isNull', value: 'is_null' },
+    { value: 'in_list', labelKey: 'filters.operators.inList' },
+    { value: 'not_in_list', labelKey: 'filters.operators.notInList' },
+    { value: 'has', labelKey: 'filters.operators.exists' },
+  ],
+  boolean: [
+    { labelKey: 'filters.operators.equals', value: '==' },
+    { labelKey: 'filters.operators.notEquals', value: '!=' },
+    { labelKey: 'filters.operators.isNull', value: 'is_null' },
+    { value: 'has', labelKey: 'filters.operators.exists' },
+  ],
+  other: [
+    { labelKey: 'filters.operators.equals', value: '==' },
+    { labelKey: 'filters.operators.notEquals', value: '!=' },
+    { labelKey: 'filters.operators.isNull', value: 'is_null' },
+  ],
+};
+
+// Boolean operators whose value renders as the true/false select: a free-text
+// input would coerce anything but "true" to false and silently save e.g.
+// `active != false`.
+const BOOLEAN_VALUE_OPERATORS = new Set(['==', '!=']);
+
+function coerceValue(value: string, pgType: string): string | number | boolean {
+  const colType = classifyColumnType(pgType);
+  if (colType === 'number') {
+    if (value === '') return '';
+    const n = Number(value);
+    return isNaN(n) ? value : n;
+  }
+  if (colType === 'boolean') {
+    return value.toLowerCase() === 'true';
+  }
+  // Tiles carry these as UTC text, which the map compares as a string.
+  if (pgType.toLowerCase() === 'timestamp with time zone') {
+    return utcTimestampText(value) ?? value;
+  }
+  return value;
+}
+
+export function buildFilterExpression(
+  conditions: FilterCondition[],
+  columnInfo: { name: string; type: string }[],
+  combinator: 'all' | 'any' = 'all',
+): FilterSpecification | null {
+  const valid = conditions.filter((c) => {
+    if (!c.field || !c.operator) return false;
+    if (c.operator === 'is_null' || c.operator === 'has') return true;
+    if (c.value === '' || c.value === undefined || c.value === null) return false;
+    // Reject non-numeric values for numeric columns
+    const col = columnInfo.find((ci) => ci.name === c.field);
+    const isNumeric = !!col && classifyColumnType(col.type) === 'number';
+    // List operators validate per entry: the whole-string NaN check below would
+    // reject every numeric list ("1,2" → NaN). The condition stays valid while
+    // at least one entry is numeric; the emit branch drops non-numeric entries.
+    if (isNumeric && (c.operator === 'in_list' || c.operator === 'not_in_list')) {
+      return String(c.value)
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean)
+        .some((v) => !isNaN(Number(v)));
+    }
+    if (isNumeric && isNaN(Number(c.value))) return false;
+    return true;
+  });
+  if (valid.length === 0) return null;
+
+  const expressions: unknown[] = [];
+
+  for (const cond of valid) {
+    const col = columnInfo.find((c) => c.name === cond.field);
+    const pgType = col?.type ?? 'text';
+
+    if (cond.operator === 'is_null') {
+      expressions.push(['any', ['!', ['has', cond.field]], ['==', ['get', cond.field], null]]);
+    } else if (cond.operator === 'has') {
+      expressions.push(['has', cond.field]);
+    } else if (cond.operator === 'in_list' || cond.operator === 'not_in_list') {
+      const values = String(cond.value).split(',').map(v => v.trim()).filter(Boolean);
+      // Per-entry NaN guard for numeric columns: coerceValue leaves non-numeric
+      // entries as strings, so "1,abc,3" would emit a mixed-type literal. Drop
+      // entries that don't coerce.
+      const numericColumn = classifyColumnType(pgType) === 'number';
+      const coerced = values
+        .map(v => coerceValue(v, pgType))
+        .filter(v => !numericColumn || typeof v === 'number');
+      // A list of only separators (",, ,") coerces to an empty literal, an
+      // always-false filter that hides every feature. Drop the condition.
+      if (coerced.length === 0) continue;
+      const inExpr = ['in', ['get', cond.field], ['literal', coerced]];
+      expressions.push(cond.operator === 'in_list' ? inExpr : ['!', inExpr]);
+    } else if (cond.operator === 'contains') {
+      expressions.push(['in', cond.value.trim(), ['get', cond.field]]);
+    } else {
+      const coerced = coerceValue(cond.value, pgType);
+      const isNumericComparison =
+        classifyColumnType(pgType) === 'number' &&
+        typeof coerced === 'number' &&
+        NUMERIC_COMPARISON_OPERATORS.has(cond.operator);
+      expressions.push(
+        isNumericComparison
+          ? buildNullSafeNumericComparison(cond.field, cond.operator, coerced)
+          : [cond.operator, ['get', cond.field], coerced],
+      );
+    }
+  }
+
+  if (expressions.length === 0) return null;
+  // Always wrap to preserve combinator intent on round-trip
+  return [combinator, ...expressions] as FilterSpecification;
+}
+
+export function parseFilterExpression(expr: FilterSpecification | null): ParseResult {
+  // Filter recognition is delegated to the canonical parser in
+  // maplibre-filter-utils so the structured editor and ActiveFilterChips can't
+  // drift; only editor-local row ids are re-attached.
+  const canonical = parseCanonicalFilter(expr);
+  if (canonical.kind === 'opaque') {
+    return { kind: 'opaque', raw: canonical.raw };
+  }
+  return {
+    kind: 'editable',
+    combinator: canonical.combinator,
+    conditions: canonical.conditions.map((c) => ({
+      id: randomId(),
+      field: c.field,
+      operator: c.operator,
+      value: c.value,
+    })),
+  };
+}
+
+export function LayerFilterEditor({
+  columnInfo,
+  filter,
+  onFilterChange,
+  layerName,
+  featureCount,
+}: LayerFilterEditorProps) {
+  const { t } = useTranslation('builder');
+  const lastEmittedFilterRef = useRef<unknown>(null);
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [conditions, setConditions] = useState<FilterCondition[]>([]);
+  const [combinator, setCombinator] = useState<'all' | 'any'>('all');
+  const [rawMode, setRawMode] = useState(false);
+  const [rawText, setRawText] = useState('');
+  const [rawError, setRawError] = useState<string | null>(null);
+  const [opaque, setOpaque] = useState(false);
+
+  function applyParseResult(result: ParseResult) {
+    if (result.kind === 'opaque') {
+      setOpaque(true);
+      setRawMode(true);
+      setRawText(JSON.stringify(result.raw, null, 2));
+      setConditions([]);
+    } else {
+      setOpaque(false);
+      setConditions(result.conditions);
+      setCombinator(result.combinator);
+    }
+  }
+
+  // Sync from filter prop when it changes externally (not from our own emit)
+  useEffect(() => {
+    if (filter === lastEmittedFilterRef.current) return;
+    const result = parseFilterExpression(filter);
+    applyParseResult(result);
+  }, [filter]);
+
+  function getFieldType(fieldName: string): ColumnType {
+    const col = columnInfo.find((c) => c.name === fieldName);
+    return col ? classifyColumnType(col.type) : 'other';
+  }
+
+  // Cleanup debounce timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    };
+  }, []);
+
+  function emitChange(updated: FilterCondition[], combo: 'all' | 'any' = combinator) {
+    // Cancel any pending debounced value emit: a stale 200ms timer firing after
+    // this immediate emit would rebuild the filter from captured (pre-change)
+    // conditions/combinator, overwrite the newer filter, and set
+    // lastEmittedFilterRef to the stale value so the prop-sync effect never
+    // corrects the UI, and the wrong filter would persist on Save.
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    setConditions(updated);
+    const newFilter = buildFilterExpression(updated, columnInfo, combo);
+    lastEmittedFilterRef.current = newFilter;
+    onFilterChange(newFilter);
+  }
+
+  // Debounced version for value input keystrokes.
+  const debouncedEmit = useCallback(
+    (updated: FilterCondition[], combo: 'all' | 'any') => {
+      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+      setConditions(updated);
+      debounceTimerRef.current = setTimeout(() => {
+        const newFilter = buildFilterExpression(updated, columnInfo, combo);
+        lastEmittedFilterRef.current = newFilter;
+        onFilterChange(newFilter);
+      }, 200);
+    },
+    [columnInfo, onFilterChange],
+  );
+
+  function addCondition() {
+    const field = columnInfo[0]?.name ?? '';
+    const operator = OPERATORS_BY_TYPE[getFieldType(field)][0]?.value ?? '==';
+    const newCond: FilterCondition = {
+      id: randomId(),
+      field,
+      operator,
+      value: getFieldType(field) === 'boolean' && BOOLEAN_VALUE_OPERATORS.has(operator) ? 'true' : '',
+    };
+    emitChange([...conditions, newCond]);
+  }
+
+  function removeCondition(id: string) {
+    emitChange(conditions.filter((c) => c.id !== id));
+  }
+
+  function updateCondition(id: string, patch: Partial<FilterCondition>, debounce = false) {
+    const updated = conditions.map((c) => {
+      if (c.id !== id) return c;
+      const merged = { ...c, ...patch };
+
+      // If field changed, reset operator and value
+      if (patch.field && patch.field !== c.field) {
+        const colType = getFieldType(patch.field);
+        const ops = OPERATORS_BY_TYPE[colType];
+        merged.operator = ops[0]?.value ?? '==';
+        merged.value = colType === 'boolean' && BOOLEAN_VALUE_OPERATORS.has(merged.operator) ? 'true' : '';
+      }
+
+      if (patch.operator && patch.operator !== c.operator) {
+        const colType = getFieldType(merged.field);
+        if (colType === 'boolean' && BOOLEAN_VALUE_OPERATORS.has(patch.operator) && !merged.value) {
+          merged.value = 'true';
+        }
+      }
+
+      return merged;
+    });
+    if (debounce) {
+      debouncedEmit(updated, combinator);
+    } else {
+      emitChange(updated);
+    }
+  }
+
+  function handleCombinatorChange(value: string) {
+    const combo = value as 'all' | 'any';
+    // Same stale-timer cancellation as emitChange: an All↔Any toggle within the
+    // debounce window must not be clobbered by the pending value emit (which
+    // captured the previous combinator).
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+    setCombinator(combo);
+    const newFilter = buildFilterExpression(conditions, columnInfo, combo);
+    lastEmittedFilterRef.current = newFilter;
+    onFilterChange(newFilter);
+  }
+
+  function handleRawModeToggle() {
+    if (!rawMode) {
+      // Entering raw mode: serialize current filter
+      const current = buildFilterExpression(conditions, columnInfo, combinator);
+      setRawText(current ? JSON.stringify(current, null, 2) : '');
+      setRawError(null);
+    } else {
+      // Exiting raw mode: re-parse current filter
+      if (!opaque) {
+        setRawError(null);
+      }
+    }
+    setRawMode((prev) => !prev);
+  }
+
+  function handleRawApply() {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch {
+      setRawError(t('filters.rawJsonError'));
+      return;
+    }
+    if (parsed !== null && !Array.isArray(parsed)) {
+      setRawError(t('filters.rawJsonError'));
+      return;
+    }
+
+    // Validate and normalize against the shared filter grammar (mirrors backend
+    // validate_filter) so invalid arity or unsupported legacy forms are rejected
+    // here, not saved and surfaced later as a MapLibre setFilter error.
+    // Opaque-but-valid filters are preserved verbatim.
+    let normalized: FilterSpecification | null;
+    try {
+      normalized = validateRawFilter(parsed);
+    } catch (e) {
+      setRawError(
+        e instanceof FilterValidationError
+          ? t('filters.rawFilterInvalid')
+          : t('filters.rawJsonError'),
+      );
+      return;
+    }
+
+    // Null / empty-array both clear the filter (validateRawFilter maps []
+    // to null) so map.setFilter(id, []) can never be reached. Reset editor state.
+    if (normalized === null) {
+      lastEmittedFilterRef.current = null;
+      onFilterChange(null);
+      applyParseResult(parseFilterExpression(null));
+      setRawError(null);
+      return;
+    }
+
+    lastEmittedFilterRef.current = normalized;
+    onFilterChange(normalized);
+    applyParseResult(parseFilterExpression(normalized));
+    setRawError(null);
+  }
+
+  function handleEnableRawMode() {
+    setRawMode(true);
+    setRawText(filter ? JSON.stringify(filter, null, 2) : '');
+    setRawError(null);
+  }
+
+  // Show empty-state hint when a filter is set but no features rendered.
+  const showEmptyState = filter != null && featureCount === 0;
+
+  return (
+    <div className="space-y-3 rounded-md border bg-muted/30 p-3">
+      {/* Empty-state hint: a filter is active but 0 features rendered. The count
+          is viewport-scoped (queryRenderedFeatures), so the copy says "in view":
+          matches may exist off-screen. */}
+      {showEmptyState && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mb-3 rounded-md border border-destructive/30 bg-destructive/5 p-3"
+        >
+          <p className="text-xs font-semibold text-foreground">
+            {t('layerEditor.emptyResult.title', { defaultValue: '0 features in view — check your filter' })}
+          </p>
+          <p className="mt-1 text-mini text-muted-foreground">
+            {t('layerEditor.emptyResult.help', {
+              defaultValue:
+                'The current filter matches nothing in the visible map area. Matches may exist off-screen — pan or zoom out, adjust a condition, or clear the filter.',
+            })}
+          </p>
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            className="mt-2"
+            onClick={() => onFilterChange(null)}
+          >
+            {t('layerEditor.emptyResult.clear', { defaultValue: 'Clear filter' })}
+          </Button>
+        </div>
+      )}
+      {/* Header row: title + raw toggle */}
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0 space-y-0.5">
+          <div className="text-xs font-medium">{t('filters.layerTitle')}</div>
+          <p className="text-mini leading-snug text-muted-foreground">
+            {t('filters.scopeHelp', { layer: layerName ?? t('filters.thisLayer') })}
+          </p>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 px-1.5 text-xs text-muted-foreground"
+          onClick={handleRawModeToggle}
+          title={t('filters.rawJson')}
+        >
+          <Code className="h-3 w-3 me-1" />
+          {t('filters.rawJson')}
+        </Button>
+      </div>
+
+      {rawMode ? (
+        /* Raw JSON editing mode */
+        <div className="space-y-2">
+          <Textarea
+            aria-label={t('filters.rawJson')}
+            className="text-xs font-mono resize-y min-h-[100px]"
+            value={rawText}
+            onChange={(e) => {
+              setRawText(e.target.value);
+              setRawError(null);
+            }}
+            spellCheck={false}
+          />
+          {rawError && (
+            <div className="text-xs text-destructive">{rawError}</div>
+          )}
+          <Button size="sm" className="h-7 text-xs" onClick={handleRawApply}>
+            {t('filters.rawJsonApply')}
+          </Button>
+        </div>
+      ) : opaque ? (
+        /* Opaque banner — cannot edit visually */
+        <div className="rounded-sm bg-muted p-2 text-xs text-muted-foreground space-y-2">
+          <p>{t('filters.opaqueWarning')}</p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={handleEnableRawMode}
+          >
+            <Code className="h-3 w-3 me-1" />
+            {t('filters.rawJson')}
+          </Button>
+        </div>
+      ) : (
+        /* Visual editing mode */
+        <>
+          {columnInfo.length === 0 && (
+            <p className="rounded-md bg-muted px-2 py-1.5 text-mini leading-snug text-muted-foreground">
+              {t('filters.noColumns')}
+            </p>
+          )}
+          {/* Combinator select */}
+          <Select value={combinator} onValueChange={handleCombinatorChange} aria-label={t('filters.combinator', { defaultValue: 'Match condition' })}>
+            <SelectTrigger className="h-7 text-xs w-44" aria-label={t('filters.combinator', { defaultValue: 'Match condition' })}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all" className="text-xs">
+                {t('filters.matchAll')}
+              </SelectItem>
+              <SelectItem value="any" className="text-xs">
+                {t('filters.matchAny')}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+
+          {conditions.map((cond) => {
+            const colType = getFieldType(cond.field);
+            const ops = OPERATORS_BY_TYPE[colType];
+
+            return (
+              <div key={cond.id} data-testid="filter-condition-row" className="space-y-1.5">
+                {/* Field select */}
+                <div data-testid="filter-field-row" className="min-w-0">
+                  <Select
+                    value={cond.field}
+                    onValueChange={(val) => updateCondition(cond.id, { field: val })}
+                    aria-label={t('filters.field')}
+                  >
+                    <SelectTrigger className="h-7 w-full min-w-0 text-xs" aria-label={t('filters.field')}>
+                      <SelectValue placeholder={t('filters.field')} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {columnInfo.map((col) => (
+                        <SelectItem key={col.name} value={col.name} className="text-xs">
+                          {col.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div data-testid="filter-value-row" className="grid grid-cols-[minmax(5rem,6.5rem)_minmax(0,1fr)_1.75rem] items-center gap-1.5">
+                  {/* Operator select */}
+                  <Select
+                    value={cond.operator}
+                    onValueChange={(val) => updateCondition(cond.id, { operator: val })}
+                    aria-label={t('filters.op')}
+                  >
+                    <SelectTrigger className="h-7 w-full text-xs" aria-label={t('filters.op')}>
+                      <SelectValue placeholder={t('filters.op')} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {ops.map((op) => (
+                        <SelectItem key={op.value} value={op.value} className="text-xs">
+                          {op.labelKey ? t(op.labelKey) : op.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  {/* Value input (hidden for is_null and has) */}
+                  {cond.operator !== 'is_null' && cond.operator !== 'has' ? (
+                    getFieldType(cond.field) === 'boolean' && BOOLEAN_VALUE_OPERATORS.has(cond.operator) ? (
+                      <Select
+                        value={cond.value || 'true'}
+                        onValueChange={(val) => updateCondition(cond.id, { value: val })}
+                      >
+                        <SelectTrigger className="h-7 w-full text-xs" aria-label={t('filters.value')}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="true" className="text-xs">true</SelectItem>
+                          <SelectItem value="false" className="text-xs">false</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <Input
+                        className="h-7 w-full min-w-0 text-xs"
+                        placeholder={t('filters.value')}
+                        aria-label={t('filters.value')}
+                        value={cond.value}
+                        onChange={(e) => updateCondition(cond.id, { value: e.target.value }, true)}
+                      />
+                    )
+                  ) : (
+                    <span aria-hidden="true" />
+                  )}
+
+                  {/* Remove button */}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 shrink-0 justify-self-end"
+                    onClick={() => removeCondition(cond.id)}
+                    aria-label={t('filters.removeCondition', { defaultValue: 'Remove condition' })}
+                  >
+                    <X className="h-3 w-3" />
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+
+          <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={addCondition}>
+            <Plus className="h-3 w-3 me-1" />
+            {t('filters.addFilter')}
+          </Button>
+        </>
+      )}
+    </div>
+  );
+}

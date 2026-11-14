@@ -1,0 +1,30 @@
+type GraphemeSegmenter = {
+  segment(input: string): Iterable<{ segment: string }>;
+};
+
+type SegmenterConstructor = new (
+  locales?: string | string[],
+  options?: { granularity: 'grapheme' },
+) => GraphemeSegmenter;
+
+export function splitGraphemes(value: string): string[] {
+  const Segmenter = (Intl as typeof Intl & { Segmenter?: SegmenterConstructor }).Segmenter;
+  if (!Segmenter) return Array.from(value);
+
+  return Array.from(new Segmenter(undefined, { granularity: 'grapheme' }).segment(value), ({ segment }) => segment);
+}
+
+export function truncateGraphemes(value: string, maxLength: number, ellipsis = '...'): string {
+  if (maxLength < 0) return value;
+
+  const graphemes = splitGraphemes(value);
+  if (graphemes.length <= maxLength) return value;
+
+  return `${graphemes.slice(0, maxLength).join('')}${ellipsis}`;
+}
+
+/** A record's description, or undefined when it is blank or repeats the title. */
+export function distinctDescription(title: string | null | undefined, description: string | null | undefined): string | undefined {
+  const text = description?.trim();
+  return text && text !== title?.trim() ? text : undefined;
+}

@@ -1,0 +1,2628 @@
+"""Integration tests for embed token CRUD and tile middleware.
+
+Covers:
+  - Token creation with SHA-256 hashing
+  - Scoped dataset tile access
+  - Default and max expiration
+  - Tile middleware X-Embed-Token validation before HMAC
+  - Cache-based validation
+  - Token revocation
+  - Token listing
+
+Requirements:
+  - Docker database must be running (docker compose up db)
+  - Alembic migrations must be applied
+"""
+
+import asyncio
+import hashlib
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import func, select, text, update
+
+from app.core.config import settings
+from app.core.db.tenant_session import current_tenant_var
+from app.modules.catalog.datasets.domain.models import Dataset
+from app.modules.catalog.maps.models import Map, MapLayer
+from app.modules.embed_tokens.models import EmbedToken
+from app.modules.embed_tokens.schemas import ADVANCED_SHARING_ERROR
+from app.modules.embed_tokens.service import (
+    create_embed_token,
+    list_admin_embed_tokens,
+    update_embed_token,
+    validate_embed_token_access,
+)
+from app.platform.cache import init_cache, tenant_cache_key
+from app.platform.cache.provider import get_cache
+
+from tests.factories import create_dataset, get_user_id
+
+# The shared conftest fixture is non-autouse; this module-level mark applies
+# it to every test in the file, mirroring the file-scoped autouse=True this
+# module used before the fixture moved to tests/conftest.py.
+pytestmark = pytest.mark.usefixtures("_init_tile_pool_for_tests")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _tenant_context(tenant_id: str | uuid.UUID) -> Iterator[None]:
+    """Install the verified hosted-tenant context used by request services."""
+    context_token = current_tenant_var.set(str(tenant_id))
+    try:
+        yield
+    finally:
+        current_tenant_var.reset(context_token)
+
+
+async def _create_private_dataset(
+    session,
+    *,
+    created_by: uuid.UUID,
+    table_name: str | None = None,
+) -> Dataset:
+    """Insert a Record + Dataset with private visibility."""
+    return await create_dataset(
+        session,
+        created_by=created_by,
+        name="Embed Test DS",
+        table_name=table_name,
+        visibility="private",
+        description="Dataset for embed token tests",
+        geometry_type="Point",
+        feature_count=1,
+        column_info=[
+            {"name": "gid", "type": "integer"},
+            {"name": "geom", "type": "geometry"},
+        ],
+    )
+
+
+async def _create_map_with_layer(
+    session,
+    client: AsyncClient,
+    headers: dict,
+    dataset: Dataset,
+    *,
+    created_by: uuid.UUID,
+) -> tuple[Map, MapLayer]:
+    """Create a map and add a layer pointing to the given dataset."""
+    map_obj = Map(
+        name=f"Embed Test Map {uuid.uuid4().hex[:6]}",
+        description="test",
+        created_by=created_by,
+    )
+    session.add(map_obj)
+    await session.flush()
+
+    layer = MapLayer(
+        map_id=map_obj.id,
+        dataset_id=dataset.id,
+        sort_order=0,
+    )
+    session.add(layer)
+    await session.commit()
+    await session.refresh(map_obj)
+    await session.refresh(layer)
+    return map_obj, layer
+
+
+async def _create_data_table(session, table_name: str) -> None:
+    """Create a PostGIS data table in the 'data' schema for tile serving."""
+    await session.execute(
+        text(
+            f"CREATE TABLE IF NOT EXISTS data.{table_name} ("
+            f"  gid SERIAL PRIMARY KEY,"
+            f"  geom GEOMETRY(Point, 3857),"
+            f"  geom_4326 GEOMETRY(Point, 4326)"
+            f")"
+        )
+    )
+    await session.execute(
+        text(
+            f"INSERT INTO data.{table_name} (geom, geom_4326) VALUES ("
+            f"  ST_Transform(ST_SetSRID(ST_MakePoint(0, 0), 4326), 3857),"
+            f"  ST_SetSRID(ST_MakePoint(0, 0), 4326)"
+            f")"
+        )
+    )
+    await session.commit()
+
+
+async def _cleanup_data_table(session, table_name: str) -> None:
+    await session.execute(text(f"DROP TABLE IF EXISTS data.{table_name}"))
+    await session.commit()
+
+
+@pytest.fixture
+async def cleanup_data_tables(test_db_session):
+    """Fixture that guarantees cleanup of data tables even on test failure.
+
+    Usage: call ``cleanup_data_tables(table_name)`` to register a table for
+    cleanup.  All registered tables are dropped in the ``finally`` block after
+    the test completes (whether it passes or fails).
+    """
+    tables: list[str] = []
+
+    def _register(table_name: str) -> str:
+        tables.append(table_name)
+        return table_name
+
+    yield _register
+
+    for t in tables:
+        await _cleanup_data_table(test_db_session, t)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Token CRUD
+# ---------------------------------------------------------------------------
+
+
+class TestCreateEmbedToken:
+    """Token creation."""
+
+    async def test_create_embed_token(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """POST creates a token with raw_token, token_hint, and scoped_dataset_ids."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "My Token"},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["raw_token"].startswith("et_")
+        assert data["token_hint"].startswith("et_...")
+        assert str(dataset.id) in data["scoped_dataset_ids"]
+        assert data["is_active"] is True
+        assert data["name"] == "My Token"
+
+    async def test_create_embed_token_default_expiration(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Default expiration is ~30 days."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        # Capture the time window around the request to bound the expected
+        # expiration deterministically (no wall-clock comparison after the fact).
+        before = datetime.now(timezone.utc)
+        resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={},
+            headers=admin_auth_header,
+        )
+        after = datetime.now(timezone.utc)
+        assert resp.status_code == 201
+        data = resp.json()
+        expires_at = datetime.fromisoformat(data["expires_at"])
+        # The server generated expires_at at some point t in [before, after].
+        # So expires_at must be in [before + 30d, after + 30d].
+        assert before + timedelta(days=30) <= expires_at <= after + timedelta(days=30)
+
+    async def test_custom_expiration_requires_enterprise(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        community_edition,
+    ):
+        """Community cannot create embed tokens with custom expiration."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"expires_in_days": 90},
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == 422
+        assert ADVANCED_SHARING_ERROR in resp.text
+
+    async def test_allowed_origins_require_enterprise(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        community_edition,
+    ):
+        """Community cannot create embed tokens with origin restrictions."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"allowed_origins": ["https://example.com"]},
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == 422
+        assert ADVANCED_SHARING_ERROR in resp.text
+
+    async def test_create_embed_token_max_expiration(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        enterprise_edition,
+    ):
+        """Expiration is capped at 365 days even if requesting more.
+        The schema enforces le=365 so 400 is expected.
+        """
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"expires_in_days": 400},
+            headers=admin_auth_header,
+        )
+        # Schema enforces le=365, so 422 (validation error) is expected
+        assert resp.status_code == 422
+
+        # Verify max value (365) works
+        before = datetime.now(timezone.utc)
+        resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"expires_in_days": 365},
+            headers=admin_auth_header,
+        )
+        after = datetime.now(timezone.utc)
+        assert resp.status_code == 201
+        data = resp.json()
+        expires_at = datetime.fromisoformat(data["expires_at"])
+        # Bound the expected expiration to [before + 365d, after + 365d].
+        assert before + timedelta(days=365) <= expires_at <= after + timedelta(days=365)
+
+
+class TestEmbedScopeVisibility:
+    """The mint may not outlive the minter's own access.
+
+    Adding a layer is gated and a shared map cannot be dropped to private
+    under one, so the reachable case is a map owner who LOSES access to a
+    layer after the fact. Minting is where that matters, because an embed
+    token is an anonymous tile capability of up to 365 days frozen at the
+    moment it is issued.
+    """
+
+    async def _grant_editor_role(self, session, dataset_id: uuid.UUID) -> uuid.UUID:
+        from app.modules.auth.models import Role
+        from app.modules.catalog.datasets.domain.models import DatasetGrant
+
+        role_id = (
+            await session.execute(select(Role.id).where(Role.name == "editor"))
+        ).scalar_one()
+        session.add(DatasetGrant(dataset_id=dataset_id, role_id=role_id))
+        await session.commit()
+        return role_id
+
+    async def _revoke_grant(self, session, dataset_id, role_id) -> None:
+        await session.execute(
+            text(
+                "DELETE FROM catalog.dataset_grants "
+                "WHERE dataset_id = :dataset_id AND role_id = :role_id"
+            ),
+            {"dataset_id": str(dataset_id), "role_id": str(role_id)},
+        )
+        await session.commit()
+
+    async def test_mint_refused_after_the_minter_loses_access_to_a_layer(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Mints, then loses the grant, then is refused without being told why.
+
+        Both halves matter. The first mint proves the gate is not simply
+        refusing every non-owner of the dataset, which would break the
+        supported case of an editor building a map from data shared with them.
+        """
+        from tests.conftest import _create_test_user
+
+        admin_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        owner_header, owner_id = await _create_test_user(
+            client, admin_auth_header, "editor"
+        )
+
+        # A dataset the map owner reaches only through a role grant.
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Grant Scoped DS",
+            visibility="restricted",
+            geometry_type="Point",
+            feature_count=1,
+        )
+        role_id = await self._grant_editor_role(test_db_session, dataset.id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session,
+            client,
+            owner_header,
+            dataset,
+            created_by=uuid.UUID(owner_id),
+        )
+        still_readable = await create_dataset(
+            test_db_session, created_by=admin_id, name="Public DS", visibility="public"
+        )
+        test_db_session.add(
+            MapLayer(map_id=map_obj.id, dataset_id=still_readable.id, sort_order=1)
+        )
+        await test_db_session.commit()
+
+        first = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "While granted"},
+            headers=owner_header,
+        )
+        assert first.status_code == 201, first.text
+        assert sorted(first.json()["scoped_dataset_ids"]) == sorted(
+            [str(dataset.id), str(still_readable.id)]
+        )
+        first_raw = first.json()["raw_token"]
+
+        await self._revoke_grant(test_db_session, dataset.id, role_id)
+
+        second = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "After revocation"},
+            headers=owner_header,
+        )
+        # 403, matching the maps-router siblings this shape is copied from, and
+        # distinct from the 400 the licensing refusal on this same handler uses.
+        assert second.status_code == 403, second.text
+        detail = second.json()["detail"]
+        assert "cannot access" in detail["message"]
+        assert detail["datasets"] == []
+        # The refusal must not become the disclosure: GET /maps/{id} already
+        # drops layers this caller cannot see, so the id is not something they
+        # have been told.
+        assert str(dataset.id) not in second.text
+
+        # A refused mint changes nothing. The revoke of the existing token runs
+        # after this gate precisely because the cache denial it writes is not
+        # rolled back with the transaction, so a wrong order would leave the
+        # caller's live token dead here while the database said otherwise.
+        # The token still serves what its minter can read, and no longer the
+        # dataset whose grant was revoked.
+        assert (
+            await validate_embed_token_access(
+                first_raw, still_readable.id, test_db_session
+            )
+            is True
+        )
+        assert (
+            await validate_embed_token_access(first_raw, dataset.id, test_db_session)
+            is False
+        )
+        active = (
+            await test_db_session.execute(
+                select(func.count())
+                .select_from(EmbedToken)
+                .where(EmbedToken.map_id == map_obj.id)
+            )
+        ).scalar_one()
+        assert active == 1, "the refused mint must not have inserted a token row"
+
+
+class TestEmbedTokenServiceGuards:
+    """Service-layer guards for schema bypasses."""
+
+    async def test_create_custom_expiration_guard_runs_before_db_lookup(
+        self, community_edition
+    ):
+        with pytest.raises(ValueError, match=ADVANCED_SHARING_ERROR):
+            await create_embed_token(
+                object(),
+                uuid.uuid4(),
+                uuid.uuid4(),
+                expires_in_days=90,
+            )
+
+    async def test_create_allowed_origins_guard_runs_before_db_lookup(
+        self, community_edition
+    ):
+        with pytest.raises(ValueError, match=ADVANCED_SHARING_ERROR):
+            await create_embed_token(
+                object(),
+                uuid.uuid4(),
+                uuid.uuid4(),
+                allowed_origins=["https://example.com"],
+            )
+
+    async def test_update_allowed_origins_guard_runs_before_db_lookup(
+        self, community_edition
+    ):
+        with pytest.raises(ValueError, match=ADVANCED_SHARING_ERROR):
+            await update_embed_token(
+                object(),
+                uuid.uuid4(),
+                uuid.uuid4(),
+                ["https://example.com"],
+            )
+
+
+class TestListEmbedTokens:
+    """Token listing."""
+
+    async def test_list_embed_tokens(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Create 2 tokens, list them, verify both returned."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        # Create 2 tokens
+        for i in range(2):
+            resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={"name": f"Token {i}"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 201
+
+        # List tokens
+        resp = await client.get(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 2
+        assert len(data["tokens"]) == 2
+        # Verify raw_token is NOT in list responses
+        for token in data["tokens"]:
+            assert "raw_token" not in token
+            assert "token_hint" in token
+            assert "scoped_dataset_ids" in token
+
+
+class TestRevokeEmbedToken:
+    """Token revocation."""
+
+    async def test_revoke_embed_token(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Revoke a token; verify is_active=false. Listing shows revoked token."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        # Create a token
+        create_resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "To Revoke"},
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201
+        token_id = create_resp.json()["id"]
+
+        # Revoke it
+        revoke_resp = await client.delete(
+            f"/maps/{map_obj.id}/embed-tokens/{token_id}/",
+            headers=admin_auth_header,
+        )
+        assert revoke_resp.status_code == 200
+        assert revoke_resp.json()["is_active"] is False
+
+        # Verify in list
+        list_resp = await client.get(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            headers=admin_auth_header,
+        )
+        tokens = list_resp.json()["tokens"]
+        revoked = [t for t in tokens if t["id"] == token_id]
+        assert len(revoked) == 1
+        assert revoked[0]["is_active"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: Tile middleware
+# ---------------------------------------------------------------------------
+
+
+class TestTileEmbedTokenAccess:
+    """Tile access with embed tokens."""
+
+    async def test_tile_access_with_valid_embed_token(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Valid embed token grants tile access for scoped dataset."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_tile_{uuid.uuid4().hex[:8]}"
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            # Create embed token
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+
+            # Tile request with embed token header
+            tile_resp = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp.status_code in (200, 204)
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+    async def test_cluster_tile_access_with_valid_embed_token(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Valid embed token grants cluster tile access for scoped point datasets."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_cluster_{uuid.uuid4().hex[:8]}"
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+
+            tile_resp = await client.get(
+                f"/tiles/clusters/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp.status_code in (200, 204)
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+    async def test_tile_access_unscoped_dataset(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Embed token for map A rejects access to unscoped dataset."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+
+        # Create two datasets - token will only scope to dataset_a
+        table_a = f"embed_scope_a_{uuid.uuid4().hex[:8]}"
+        table_b = f"embed_scope_b_{uuid.uuid4().hex[:8]}"
+        dataset_a = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_a
+        )
+        await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_b
+        )
+
+        # Map only has dataset_a as a layer
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset_a, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_b)
+
+        try:
+            # Create embed token (scoped to dataset_a only)
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+
+            # Try accessing dataset_b tiles with this token -- should fail
+            tile_resp = await client.get(
+                f"/tiles/data.{table_b}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp.status_code == 403
+        finally:
+            await _cleanup_data_table(test_db_session, table_b)
+
+    async def test_tile_access_expired_token(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Expired embed token is rejected."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_exp_{uuid.uuid4().hex[:8]}"
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            # Create embed token
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+            token_id = create_resp.json()["id"]
+
+            # Manually expire the token in the DB
+            await test_db_session.execute(
+                update(EmbedToken)
+                .where(EmbedToken.id == uuid.UUID(token_id))
+                .values(expires_at=datetime.now(timezone.utc) - timedelta(hours=1))
+            )
+            await test_db_session.commit()
+
+            # Clear cache so the expired value is picked up from DB
+            from app.platform.cache.provider import get_cache
+            import hashlib
+
+            token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+            cache = get_cache()
+            await cache.delete(f"embed_token:{token_hash}")
+
+            # Tile request should fail
+            tile_resp = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp.status_code == 403
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+    async def test_tile_access_revoked_token(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Revoked embed token is rejected."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_rev_{uuid.uuid4().hex[:8]}"
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            # Create embed token
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+            token_id = create_resp.json()["id"]
+
+            # Revoke via API
+            revoke_resp = await client.delete(
+                f"/maps/{map_obj.id}/embed-tokens/{token_id}/",
+                headers=admin_auth_header,
+            )
+            assert revoke_resp.status_code == 200
+
+            # Tile request should fail
+            tile_resp = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp.status_code == 403
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+    async def test_tile_access_no_embed_token_falls_through(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Without X-Embed-Token or a signature, a non-public tile reads as missing."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_fall_{uuid.uuid4().hex[:8]}"
+        await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            # Request without X-Embed-Token and without HMAC sig
+            tile_resp = await client.get(f"/tiles/data.{table_name}/0/0/0.pbf")
+            assert tile_resp.status_code == 404
+            assert tile_resp.json()["detail"] == "Dataset not found"
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+    async def test_cache_hit_avoids_db_query(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Second tile request succeeds via cache path."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_cache_{uuid.uuid4().hex[:8]}"
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            # Create embed token
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+
+            # First request -- populates cache
+            tile_resp1 = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp1.status_code in (200, 204)
+
+            # Second request -- should use cache
+            tile_resp2 = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp2.status_code in (200, 204)
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Domain locking
+# ---------------------------------------------------------------------------
+
+
+class TestCreateEmbedTokenWithOrigins:
+    """Token creation with allowed_origins."""
+
+    pytestmark = pytest.mark.usefixtures("enterprise_edition")
+
+    async def test_create_with_allowed_origins(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Create token with allowed_origins and verify it is returned."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "Locked", "allowed_origins": ["https://example.com"]},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["allowed_origins"] == ["https://example.com"]
+
+
+class TestTileDomainLocking:
+    """Origin validation on tile requests."""
+
+    pytestmark = pytest.mark.usefixtures("enterprise_edition")
+
+    async def _setup(
+        self,
+        test_db_session,
+        client,
+        admin_auth_header,
+        allowed_origins,
+        cleanup_data_tables,
+    ):
+        """Helper: create dataset, map, data table, and embed token."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = cleanup_data_tables(f"embed_dl_{uuid.uuid4().hex[:8]}")
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        create_resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"allowed_origins": allowed_origins},
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201
+        raw_token = create_resp.json()["raw_token"]
+
+        # Clear cache to ensure fresh validation path
+        import hashlib as _hl
+        from app.platform.cache.provider import get_cache
+
+        token_hash = _hl.sha256(raw_token.encode()).hexdigest()
+        cache = get_cache()
+        await cache.delete(f"embed_token:{token_hash}")
+
+        return table_name, raw_token
+
+    async def test_tile_allowed_origin_passes(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+    ):
+        """Token with allowed_origins, request with matching Origin header -> 200."""
+        table_name, raw_token = await self._setup(
+            test_db_session,
+            client,
+            admin_auth_header,
+            ["https://example.com"],
+            cleanup_data_tables,
+        )
+        resp = await client.get(
+            f"/tiles/data.{table_name}/0/0/0.pbf",
+            headers={"X-Embed-Token": raw_token, "Origin": "https://example.com"},
+        )
+        assert resp.status_code in (200, 204)
+
+    async def test_tile_unlisted_origin_rejected(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+    ):
+        """Token with allowed_origins, request with unlisted Origin -> 403."""
+        table_name, raw_token = await self._setup(
+            test_db_session,
+            client,
+            admin_auth_header,
+            ["https://example.com"],
+            cleanup_data_tables,
+        )
+        resp = await client.get(
+            f"/tiles/data.{table_name}/0/0/0.pbf",
+            headers={"X-Embed-Token": raw_token, "Origin": "https://evil.com"},
+        )
+        assert resp.status_code == 403
+
+    async def test_tile_no_origin_header_rejected(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+    ):
+        """Token with domain-locking, no Origin/Referer -> 403."""
+        table_name, raw_token = await self._setup(
+            test_db_session,
+            client,
+            admin_auth_header,
+            ["https://example.com"],
+            cleanup_data_tables,
+        )
+        resp = await client.get(
+            f"/tiles/data.{table_name}/0/0/0.pbf",
+            headers={"X-Embed-Token": raw_token},
+        )
+        assert resp.status_code == 403
+
+    async def test_tile_null_origins_unrestricted(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+    ):
+        """Token with allowed_origins=None, any origin -> 200."""
+        table_name, raw_token = await self._setup(
+            test_db_session, client, admin_auth_header, None, cleanup_data_tables
+        )
+        resp = await client.get(
+            f"/tiles/data.{table_name}/0/0/0.pbf",
+            headers={"X-Embed-Token": raw_token, "Origin": "https://anything.com"},
+        )
+        assert resp.status_code in (200, 204)
+
+    async def test_tile_localhost_auto_allowed(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+    ):
+        """Token with domain-locking, localhost Origin -> 200 (auto-allowed)."""
+        table_name, raw_token = await self._setup(
+            test_db_session,
+            client,
+            admin_auth_header,
+            ["https://example.com"],
+            cleanup_data_tables,
+        )
+        resp = await client.get(
+            f"/tiles/data.{table_name}/0/0/0.pbf",
+            headers={"X-Embed-Token": raw_token, "Origin": "http://localhost:3000"},
+        )
+        assert resp.status_code in (200, 204)
+
+    async def test_tile_ipv6_loopback_auto_allowed(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+    ):
+        """IPv6 loopback Origin 'http://[::1]:8080' resolves the localhost
+        bypass on a domain-locked token.
+
+        Before the fix, _LOCALHOST_HOSTS held the bracketed '[::1]' but
+        _is_localhost_origin compared urlparse(...).hostname == '::1' (brackets
+        stripped), so the IPv6 entry was a dead branch and this request 403'd.
+        """
+        table_name, raw_token = await self._setup(
+            test_db_session,
+            client,
+            admin_auth_header,
+            ["https://example.com"],
+            cleanup_data_tables,
+        )
+        resp = await client.get(
+            f"/tiles/data.{table_name}/0/0/0.pbf",
+            headers={"X-Embed-Token": raw_token, "Origin": "http://[::1]:8080"},
+        )
+        assert resp.status_code in (200, 204)
+
+    async def test_tile_ipv6_origin_in_allowlist_matches(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+    ):
+        """An IPv6 origin in the allowlist byte-matches the request origin.
+
+        The stored allowed_origins (schema normalizer, bracket-preserving) and the
+        live request origin (service extraction) previously used DIFFERENT
+        normalizers — storage kept '[::1]', extraction produced '::1' — so an
+        IPv6-locked token always denied. Both paths now share one normalizer.
+        """
+        table_name, raw_token = await self._setup(
+            test_db_session,
+            client,
+            admin_auth_header,
+            ["http://[fe80::1]:9000"],
+            cleanup_data_tables,
+        )
+        resp = await client.get(
+            f"/tiles/data.{table_name}/0/0/0.pbf",
+            headers={"X-Embed-Token": raw_token, "Origin": "http://[fe80::1]:9000"},
+        )
+        assert resp.status_code in (200, 204)
+
+    async def test_tile_referer_fallback(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+    ):
+        """Token with domain-locking, no Origin but Referer matches -> 200."""
+        table_name, raw_token = await self._setup(
+            test_db_session,
+            client,
+            admin_auth_header,
+            ["https://example.com"],
+            cleanup_data_tables,
+        )
+        resp = await client.get(
+            f"/tiles/data.{table_name}/0/0/0.pbf",
+            headers={
+                "X-Embed-Token": raw_token,
+                "Referer": "https://example.com/page/1",
+            },
+        )
+        assert resp.status_code in (200, 204)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Usage tracking
+# ---------------------------------------------------------------------------
+
+
+async def _drain_embed_token_usage_bump_tasks() -> None:
+    """Wait for any in-flight fire-and-forget usage-bump tasks to finish.
+
+    ``validate_embed_token_access`` does not await its
+    use_count/last_used_at bump -- it fires it via asyncio.create_task so a
+    slow pool checkout can never delay authorization. A test asserting on the
+    bumped value right after the call would otherwise race that background
+    task; draining app.modules.embed_tokens.service._usage_bump_tasks makes
+    the wait deterministic instead of timing-dependent.
+    """
+    from app.modules.embed_tokens import service as embed_token_service
+
+    pending = list(embed_token_service._usage_bump_tasks)
+    if pending:
+        await asyncio.gather(*pending)
+
+
+class TestUsageTracking:
+    """use_count and last_used_at tracking on cache miss."""
+
+    async def test_usage_tracking_on_cache_miss(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Cache miss triggers atomic use_count increment and last_used_at update."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_usage_{uuid.uuid4().hex[:8]}"
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            # Create embed token
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+            token_id = create_resp.json()["id"]
+
+            # Clear cache to force cache miss
+            token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+            cache = get_cache()
+            await cache.delete(f"embed_token:{token_hash}")
+
+            # Make tile request (cache miss -> DB lookup -> usage tracking)
+            tile_resp = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp.status_code in (200, 204)
+            await _drain_embed_token_usage_bump_tasks()
+
+            # Verify use_count and last_used_at in DB
+            test_db_session.expire_all()
+            result = await test_db_session.execute(
+                select(EmbedToken).where(EmbedToken.id == uuid.UUID(token_id))
+            )
+            token = result.scalar_one()
+            assert token.use_count == 1
+            assert token.last_used_at is not None
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+    async def test_usage_tracking_not_on_cache_hit(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Cache hit does not increment use_count."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_cache_hit_{uuid.uuid4().hex[:8]}"
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            # Create embed token
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+            token_id = create_resp.json()["id"]
+
+            # Clear cache and make first request (cache miss -> use_count=1)
+            token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+            cache = get_cache()
+            await cache.delete(f"embed_token:{token_hash}")
+
+            tile_resp1 = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp1.status_code in (200, 204)
+
+            # Second request (cache hit -> no increment)
+            tile_resp2 = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token},
+            )
+            assert tile_resp2.status_code in (200, 204)
+            await _drain_embed_token_usage_bump_tasks()
+
+            # Expire the session cache to get fresh DB read
+            test_db_session.expire_all()
+            result = await test_db_session.execute(
+                select(EmbedToken).where(EmbedToken.id == uuid.UUID(token_id))
+            )
+            token = result.scalar_one()
+            assert token.use_count == 1  # Only 1 from cache miss, not 2
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+    async def test_bump_does_not_commit_callers_pending_state(self, test_db_session):
+        """The usage bump must not commit the caller's own pending writes.
+
+        ``validate_embed_token_access`` must not bump use_count/
+        last_used_at via ``async with db.begin_nested(): ...`` then
+        ``await db.commit()`` on the CALLER's session. A read-path
+        authorization helper committing the caller's transaction silently
+        flushes whatever else that transaction was carrying -- simulated
+        here as a pending map rename the caller never asked to persist.
+        """
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj = Map(
+            name=f"Embed Bump Test Map {uuid.uuid4().hex[:6]}",
+            description="test",
+            created_by=user_id,
+        )
+        test_db_session.add(map_obj)
+        await test_db_session.flush()
+        test_db_session.add(
+            MapLayer(map_id=map_obj.id, dataset_id=dataset.id, sort_order=0)
+        )
+        await test_db_session.commit()
+
+        _token, raw = await create_embed_token(test_db_session, map_obj.id, user_id)
+        await test_db_session.commit()
+
+        token_hash = hashlib.sha256(raw.encode()).hexdigest()
+        cache = get_cache()
+        await cache.delete(f"embed_token:{token_hash}")  # force the DB cache-miss path
+
+        # Seed pending, uncommitted state on the caller's OWN session -- the
+        # same session a route handler's request-scoped `db` would carry
+        # ahead of its own commit decision.
+        await test_db_session.execute(
+            update(Map)
+            .where(Map.id == map_obj.id)
+            .values(name="PENDING-UNCOMMITTED-RENAME")
+        )
+
+        assert (
+            await validate_embed_token_access(raw, dataset.id, test_db_session) is True
+        )
+
+        # A fresh connection must NOT see the pending rename: if the helper
+        # had committed `db`, this read would come back with the pending name.
+        from app.core.db import async_session
+
+        async with async_session() as fresh:
+            result = await fresh.execute(select(Map.name).where(Map.id == map_obj.id))
+            assert result.scalar_one() != "PENDING-UNCOMMITTED-RENAME"
+
+        # Drain the detached bump task before the test's event loop closes —
+        # not needed for the assertion above, but leaving it in flight would
+        # dangle a task across pytest-asyncio's function-scoped loop boundary.
+        await _drain_embed_token_usage_bump_tasks()
+        await test_db_session.rollback()
+
+    async def test_bump_persists_via_its_own_session(self, test_db_session):
+        """Moving the bump off the caller's session must not lose it."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj = Map(
+            name=f"Embed Bump Test Map {uuid.uuid4().hex[:6]}",
+            description="test",
+            created_by=user_id,
+        )
+        test_db_session.add(map_obj)
+        await test_db_session.flush()
+        test_db_session.add(
+            MapLayer(map_id=map_obj.id, dataset_id=dataset.id, sort_order=0)
+        )
+        await test_db_session.commit()
+
+        token, raw = await create_embed_token(test_db_session, map_obj.id, user_id)
+        await test_db_session.commit()
+
+        token_hash = hashlib.sha256(raw.encode()).hexdigest()
+        cache = get_cache()
+        await cache.delete(f"embed_token:{token_hash}")
+
+        assert (
+            await validate_embed_token_access(raw, dataset.id, test_db_session) is True
+        )
+        await _drain_embed_token_usage_bump_tasks()
+
+        from app.core.db import async_session
+
+        async with async_session() as fresh:
+            result = await fresh.execute(
+                select(EmbedToken.use_count, EmbedToken.last_used_at).where(
+                    EmbedToken.id == token.id
+                )
+            )
+            use_count, last_used_at = result.one()
+            assert use_count == 1
+            assert last_used_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Tests: Admin embed token list
+# ---------------------------------------------------------------------------
+
+
+class TestAdminEmbedTokenList:
+    """Admin list endpoint for all embed tokens."""
+
+    async def test_admin_list_all_tokens(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """GET /admin/embed-tokens/ returns tokens with map_name, creator_username, usage stats."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset1 = await _create_private_dataset(test_db_session, created_by=user_id)
+        dataset2 = await _create_private_dataset(test_db_session, created_by=user_id)
+        map1, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset1, created_by=user_id
+        )
+        map2, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset2, created_by=user_id
+        )
+
+        # Create tokens on different maps
+        for m in [map1, map2]:
+            resp = await client.post(
+                f"/maps/{m.id}/embed-tokens/",
+                json={"name": f"Token for {m.name}"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 201
+
+        # Admin list
+        resp = await client.get(
+            "/admin/embed-tokens/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] >= 2
+        assert len(data["tokens"]) >= 2
+
+        # Check response fields
+        token = data["tokens"][0]
+        assert "map_name" in token
+        assert "creator_username" in token
+        assert "use_count" in token
+        assert "last_used_at" in token
+        assert "allowed_origins" in token
+        assert "token_hint" in token
+
+    async def test_admin_list_filter_by_status(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Filter by status=revoked returns only revoked tokens."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        # Create and revoke a token
+        create_resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "To Revoke Admin"},
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201
+        token_id = create_resp.json()["id"]
+
+        revoke_resp = await client.delete(
+            f"/maps/{map_obj.id}/embed-tokens/{token_id}/",
+            headers=admin_auth_header,
+        )
+        assert revoke_resp.status_code == 200
+
+        # Filter by revoked
+        resp = await client.get(
+            "/admin/embed-tokens/?status=revoked",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # All returned tokens should be revoked
+        for token in data["tokens"]:
+            assert token["is_active"] is False
+
+    async def test_admin_list_requires_admin(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Non-admin user gets 403."""
+        # Create a viewer user
+        viewer_resp = await client.post(
+            "/admin/users/",
+            json={
+                "username": f"viewer_{uuid.uuid4().hex[:6]}",
+                "password": "TestPass1234!",
+                "role": "viewer",
+            },
+            headers=admin_auth_header,
+        )
+        assert viewer_resp.status_code == 201
+        viewer_username = viewer_resp.json()["username"]
+
+        # Login as viewer
+        login_resp = await client.post(
+            "/auth/login",
+            data={"username": viewer_username, "password": "TestPass1234!"},
+        )
+        assert login_resp.status_code == 200
+        viewer_token = login_resp.json()["access_token"]
+        viewer_headers = {"Authorization": f"Bearer {viewer_token}"}
+
+        # Try admin endpoint
+        resp = await client.get(
+            "/admin/embed-tokens/",
+            headers=viewer_headers,
+        )
+        assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Tests: Bulk revoke
+# ---------------------------------------------------------------------------
+
+
+class TestBulkRevokeEmbedTokens:
+    """Bulk revoke endpoint for embed tokens."""
+
+    async def test_bulk_revoke(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Bulk-revoke 2 of 3 tokens; verify revoked_count and remaining active."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        token_ids: list[str] = []
+        map_ids: list[str] = []
+        for i in range(3):
+            dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+            map_obj, _ = await _create_map_with_layer(
+                test_db_session,
+                client,
+                admin_auth_header,
+                dataset,
+                created_by=user_id,
+            )
+            resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={"name": f"Bulk {i}"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 201
+            token_ids.append(resp.json()["id"])
+            map_ids.append(str(map_obj.id))
+
+        # Bulk revoke first 2
+        resp = await client.post(
+            "/admin/embed-tokens/bulk-revoke/",
+            json={"token_ids": token_ids[:2]},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["revoked_count"] == 2
+
+        # Verify third token still active
+        list_resp = await client.get(
+            f"/maps/{map_ids[2]}/embed-tokens/",
+            headers=admin_auth_header,
+        )
+        tokens = list_resp.json()["tokens"]
+        third = [t for t in tokens if t["id"] == token_ids[2]]
+        assert len(third) == 1
+        assert third[0]["is_active"] is True
+
+    async def test_bulk_revoke_skips_already_revoked(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Already-revoked tokens are skipped in bulk revoke count."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        token_ids: list[str] = []
+        map_ids: list[str] = []
+        for i in range(2):
+            dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+            map_obj, _ = await _create_map_with_layer(
+                test_db_session,
+                client,
+                admin_auth_header,
+                dataset,
+                created_by=user_id,
+            )
+            resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={"name": f"Skip {i}"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 201
+            token_ids.append(resp.json()["id"])
+            map_ids.append(str(map_obj.id))
+
+        # Revoke first token individually
+        revoke_resp = await client.delete(
+            f"/maps/{map_ids[0]}/embed-tokens/{token_ids[0]}/",
+            headers=admin_auth_header,
+        )
+        assert revoke_resp.status_code == 200
+
+        # Bulk revoke both (first already revoked)
+        resp = await client.post(
+            "/admin/embed-tokens/bulk-revoke/",
+            json={"token_ids": token_ids},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        # Only the second should count as newly revoked
+        assert resp.json()["revoked_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: Update embed token
+# ---------------------------------------------------------------------------
+
+
+_KEPT_ORIGIN = "https://kept.example.com"
+_REMOVED_ORIGIN = "https://removed.example.com"
+
+
+class TestUpdateEmbedToken:
+    """PATCH endpoint for updating embed token allowed_origins."""
+
+    pytestmark = pytest.mark.usefixtures("enterprise_edition")
+
+    async def test_patch_embed_token_update_origins(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """PATCH with allowed_origins updates domain restrictions."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        # Create token with no origins (unrestricted)
+        create_resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "Update Test"},
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201
+        token_id = create_resp.json()["id"]
+
+        # PATCH with new origins
+        patch_resp = await client.patch(
+            f"/maps/{map_obj.id}/embed-tokens/{token_id}/",
+            json={"allowed_origins": ["https://new.com"]},
+            headers=admin_auth_header,
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+        data = patch_resp.json()
+        assert data["allowed_origins"] == ["https://new.com"]
+        assert data["id"] == token_id
+
+    async def test_patch_embed_token_remove_origins(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """PATCH with allowed_origins=null removes restrictions (unrestricted)."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        # Create token with origins (restricted)
+        create_resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "Remove Test", "allowed_origins": ["https://example.com"]},
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201
+        token_id = create_resp.json()["id"]
+
+        # PATCH with null to remove restrictions
+        patch_resp = await client.patch(
+            f"/maps/{map_obj.id}/embed-tokens/{token_id}/",
+            json={"allowed_origins": None},
+            headers=admin_auth_header,
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+        data = patch_resp.json()
+        assert data["allowed_origins"] is None
+
+    async def test_patch_embed_token_add_origins_to_unrestricted(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """PATCH with origins on an unrestricted token adds restrictions (auto-prepends https://)."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        # Create unrestricted token
+        create_resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "Add Origins"},
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201
+        token_id = create_resp.json()["id"]
+        assert create_resp.json()["allowed_origins"] is None
+
+        # PATCH with bare domain (should auto-prepend https://)
+        patch_resp = await client.patch(
+            f"/maps/{map_obj.id}/embed-tokens/{token_id}/",
+            json={"allowed_origins": ["example.com"]},
+            headers=admin_auth_header,
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+        data = patch_resp.json()
+        assert data["allowed_origins"] == ["https://example.com"]
+
+    async def test_patch_embed_token_not_found(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """PATCH on nonexistent token_id returns 404."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        fake_id = uuid.uuid4()
+        patch_resp = await client.patch(
+            f"/maps/{map_obj.id}/embed-tokens/{fake_id}/",
+            json={"allowed_origins": ["https://example.com"]},
+            headers=admin_auth_header,
+        )
+        assert patch_resp.status_code == 404
+
+    async def test_patch_embed_token_non_owner(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """PATCH by non-owner returns 403."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        dataset = await _create_private_dataset(test_db_session, created_by=user_id)
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+
+        # Create a token
+        create_resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"name": "Non-owner Test"},
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201
+        token_id = create_resp.json()["id"]
+
+        # Create a viewer user
+        viewer_resp = await client.post(
+            "/admin/users/",
+            json={
+                "username": f"viewer_patch_{uuid.uuid4().hex[:6]}",
+                "password": "TestPass1234!",
+                "role": "viewer",
+            },
+            headers=admin_auth_header,
+        )
+        assert viewer_resp.status_code == 201
+        viewer_username = viewer_resp.json()["username"]
+
+        # Login as viewer
+        login_resp = await client.post(
+            "/auth/login",
+            data={"username": viewer_username, "password": "TestPass1234!"},
+        )
+        assert login_resp.status_code == 200
+        viewer_token = login_resp.json()["access_token"]
+        viewer_headers = {"Authorization": f"Bearer {viewer_token}"}
+
+        # PATCH as viewer -> 403
+        patch_resp = await client.patch(
+            f"/maps/{map_obj.id}/embed-tokens/{token_id}/",
+            json={"allowed_origins": ["https://example.com"]},
+            headers=viewer_headers,
+        )
+        assert patch_resp.status_code == 403
+
+    async def test_patch_embed_token_cache_invalidation(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """After PATCH, tile request with new origin succeeds and old origin fails."""
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = f"embed_patch_{uuid.uuid4().hex[:8]}"
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+
+        try:
+            # Create token with old origin
+            create_resp = await client.post(
+                f"/maps/{map_obj.id}/embed-tokens/",
+                json={"allowed_origins": ["https://old.com"]},
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201
+            raw_token = create_resp.json()["raw_token"]
+            token_id = create_resp.json()["id"]
+
+            # Verify old origin works
+            tile_resp = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token, "Origin": "https://old.com"},
+            )
+            assert tile_resp.status_code in (200, 204)
+
+            # PATCH to new origin
+            patch_resp = await client.patch(
+                f"/maps/{map_obj.id}/embed-tokens/{token_id}/",
+                json={"allowed_origins": ["https://new.com"]},
+                headers=admin_auth_header,
+            )
+            assert patch_resp.status_code == 200
+
+            # Old origin should now fail (cache invalidated)
+            tile_resp_old = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token, "Origin": "https://old.com"},
+            )
+            assert tile_resp_old.status_code == 403
+
+            # New origin should work
+            tile_resp_new = await client.get(
+                f"/tiles/data.{table_name}/0/0/0.pbf",
+                headers={"X-Embed-Token": raw_token, "Origin": "https://new.com"},
+            )
+            assert tile_resp_new.status_code in (200, 204)
+        finally:
+            await _cleanup_data_table(test_db_session, table_name)
+
+    async def _token_with_two_origins(
+        self, client, admin_auth_header, test_db_session, cleanup_data_tables
+    ) -> tuple[uuid.UUID, str, str, str]:
+        user_id = await get_user_id(test_db_session, settings.geolens_admin_username)
+        table_name = cleanup_data_tables(f"embed_tighten_{uuid.uuid4().hex[:8]}")
+        dataset = await _create_private_dataset(
+            test_db_session, created_by=user_id, table_name=table_name
+        )
+        map_obj, _ = await _create_map_with_layer(
+            test_db_session, client, admin_auth_header, dataset, created_by=user_id
+        )
+        await _create_data_table(test_db_session, table_name)
+        create_resp = await client.post(
+            f"/maps/{map_obj.id}/embed-tokens/",
+            json={"allowed_origins": [_KEPT_ORIGIN, _REMOVED_ORIGIN]},
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        body = create_resp.json()
+        return map_obj.id, body["id"], body["raw_token"], table_name
+
+    async def test_tightening_outlives_a_request_that_recaches_the_old_policy(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+        monkeypatch,
+    ):
+        """A tile request that lands between the PATCH's cache eviction and its
+        commit reads the still-committed old allowlist and caches it again.
+        The removed origin must still be refused once the PATCH commits."""
+        from app.modules.embed_tokens import router as embed_router
+
+        map_id, token_id, raw_token, table_name = await self._token_with_two_origins(
+            client, admin_auth_header, test_db_session, cleanup_data_tables
+        )
+        tile_url = f"/tiles/data.{table_name}/0/0/0.pbf"
+        token_key = tenant_cache_key(
+            f"embed_token:{hashlib.sha256(raw_token.encode()).hexdigest()}"
+        )
+
+        updated = asyncio.Event()
+        resume = asyncio.Event()
+        update_and_evict = embed_router.update_embed_token
+
+        async def update_then_wait(*args, **kwargs):
+            token = await update_and_evict(*args, **kwargs)
+            updated.set()
+            await resume.wait()
+            return token
+
+        monkeypatch.setattr(embed_router, "update_embed_token", update_then_wait)
+
+        patch_task = asyncio.ensure_future(
+            client.patch(
+                f"/maps/{map_id}/embed-tokens/{token_id}/",
+                json={"allowed_origins": [_KEPT_ORIGIN]},
+                headers=admin_auth_header,
+            )
+        )
+        try:
+            await asyncio.wait_for(updated.wait(), timeout=30)
+
+            racing = await client.get(
+                tile_url,
+                headers={"X-Embed-Token": raw_token, "Origin": _REMOVED_ORIGIN},
+            )
+            assert racing.status_code in (200, 204), racing.text
+            recached = await get_cache().get(token_key)
+            assert recached is not None and recached["is_valid"] is True
+            assert _REMOVED_ORIGIN in recached["allowed_origins"]
+        finally:
+            resume.set()
+            patch_resp = await patch_task
+        assert patch_resp.status_code == 200, patch_resp.text
+
+        after = await client.get(
+            tile_url, headers={"X-Embed-Token": raw_token, "Origin": _REMOVED_ORIGIN}
+        )
+        assert after.status_code == 403, after.text
+        kept = await client.get(
+            tile_url, headers={"X-Embed-Token": raw_token, "Origin": _KEPT_ORIGIN}
+        )
+        assert kept.status_code in (200, 204), kept.text
+        await _drain_embed_token_usage_bump_tasks()
+
+    async def test_tightening_holds_when_the_cache_eviction_fails(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        cleanup_data_tables,
+        monkeypatch,
+    ):
+        """The PATCH logs and ignores a failed eviction, so the entry cached
+        under the old allowlist is still in the store when it commits."""
+        map_id, token_id, raw_token, table_name = await self._token_with_two_origins(
+            client, admin_auth_header, test_db_session, cleanup_data_tables
+        )
+        tile_url = f"/tiles/data.{table_name}/0/0/0.pbf"
+        token_key = tenant_cache_key(
+            f"embed_token:{hashlib.sha256(raw_token.encode()).hexdigest()}"
+        )
+
+        warm = await client.get(
+            tile_url, headers={"X-Embed-Token": raw_token, "Origin": _REMOVED_ORIGIN}
+        )
+        assert warm.status_code in (200, 204), warm.text
+
+        cache = get_cache()
+        working_delete = cache.delete
+
+        async def delete_failing_for_token(key, *args, **kwargs):
+            if key == token_key:
+                raise ConnectionError("cache unavailable")
+            return await working_delete(key, *args, **kwargs)
+
+        with monkeypatch.context() as m:
+            m.setattr(cache, "delete", delete_failing_for_token)
+            patch_resp = await client.patch(
+                f"/maps/{map_id}/embed-tokens/{token_id}/",
+                json={"allowed_origins": [_KEPT_ORIGIN]},
+                headers=admin_auth_header,
+            )
+        assert patch_resp.status_code == 200, patch_resp.text
+        assert _REMOVED_ORIGIN in (await cache.get(token_key))["allowed_origins"]
+
+        after = await client.get(
+            tile_url, headers={"X-Embed-Token": raw_token, "Origin": _REMOVED_ORIGIN}
+        )
+        assert after.status_code == 403, after.text
+        await _drain_embed_token_usage_bump_tasks()
+
+
+# ---------------------------------------------------------------------------
+# Tests: Tenant-pinning
+# ---------------------------------------------------------------------------
+
+
+async def _setup_tenant_map_and_dataset(
+    db_url: str,
+    tenant_id: str,
+    user_id: str,
+    *,
+    extra_dataset_tenant_id: str | None = None,
+):
+    """Create Map + Dataset (+ optional second dataset with a different tenant) for tests.
+
+    Uses ORM via a superuser (AUTOCOMMIT-free) session to avoid raw SQL schema issues.
+    Returns (map_id, primary_ds_id, extra_ds_id_or_none).
+    """
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.modules.catalog.datasets.domain.models import Dataset, Record
+
+    engine = create_async_engine(db_url, poolclass=NullPool)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    map_id = uuid.uuid4()
+    primary_ds_id = None
+    extra_ds_id = None
+    try:
+        async with sm() as session:
+            async with session.begin():
+                # Map for tenant
+                map_obj = Map(
+                    id=map_id,
+                    name=f"tpin-{tenant_id[:8]}",
+                    visibility="private",
+                    created_by=uuid.UUID(user_id),
+                    tenant_id=uuid.UUID(tenant_id),
+                )
+                session.add(map_obj)
+                await session.flush()
+
+                # Primary dataset (same tenant)
+                rec = Record(
+                    title=f"rec-{tenant_id[:8]}",
+                    visibility="private",
+                    record_status="draft",
+                    created_by=uuid.UUID(user_id),
+                    tenant_id=uuid.UUID(tenant_id),
+                )
+                session.add(rec)
+                await session.flush()
+
+                ds = Dataset(
+                    record_id=rec.id,
+                    table_name=f"tpin_{uuid.uuid4().hex[:8]}",
+                    tenant_id=uuid.UUID(tenant_id),
+                )
+                session.add(ds)
+                await session.flush()
+                primary_ds_id = ds.id
+
+                layer = MapLayer(
+                    map_id=map_id,
+                    dataset_id=primary_ds_id,
+                    sort_order=0,
+                )
+                session.add(layer)
+
+                if extra_dataset_tenant_id is not None:
+                    rec2 = Record(
+                        title=f"rec-extra-{extra_dataset_tenant_id[:8]}",
+                        visibility="private",
+                        record_status="draft",
+                        created_by=uuid.UUID(user_id),
+                        tenant_id=uuid.UUID(extra_dataset_tenant_id),
+                    )
+                    session.add(rec2)
+                    await session.flush()
+
+                    ds2 = Dataset(
+                        record_id=rec2.id,
+                        table_name=f"tpin_b_{uuid.uuid4().hex[:8]}",
+                        tenant_id=uuid.UUID(extra_dataset_tenant_id),
+                    )
+                    session.add(ds2)
+                    await session.flush()
+                    extra_ds_id = ds2.id
+
+                    layer2 = MapLayer(
+                        map_id=map_id,
+                        dataset_id=extra_ds_id,
+                        sort_order=1,
+                    )
+                    session.add(layer2)
+    finally:
+        await engine.dispose()
+
+    return map_id, primary_ds_id, extra_ds_id
+
+
+async def _teardown_tenant_map(db_url: str, map_id: uuid.UUID, dataset_ids: list):
+    """Delete test rows via superuser AUTOCOMMIT (RLS-agnostic teardown)."""
+    import sqlalchemy as sa
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    engine = create_async_engine(db_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            await conn.execution_options(isolation_level="AUTOCOMMIT")
+            await conn.execute(
+                sa.text("DELETE FROM catalog.embed_tokens WHERE map_id = :id"),
+                {"id": str(map_id)},
+            )
+            await conn.execute(
+                sa.text("DELETE FROM catalog.map_layers WHERE map_id = :id"),
+                {"id": str(map_id)},
+            )
+            # Delete datasets and their records via CASCADE
+            for did in dataset_ids:
+                await conn.execute(
+                    sa.text(
+                        "DELETE FROM catalog.records WHERE id = "
+                        "(SELECT record_id FROM catalog.datasets WHERE id = :id)"
+                    ),
+                    {"id": str(did)},
+                )
+                await conn.execute(
+                    sa.text("DELETE FROM catalog.datasets WHERE id = :id"),
+                    {"id": str(did)},
+                )
+            await conn.execute(
+                sa.text("DELETE FROM catalog.maps WHERE id = :id"),
+                {"id": str(map_id)},
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.rls
+class TestEmbedTokenTenantPinning:
+    """tenant_id stamped at create; fail-closed cross-tenant equality at validate.
+
+    Invariant: X-Embed-Token INTENTIONALLY serves PRIVATE datasets.
+    The fix adds ONLY a tenant-equality predicate — no public/published recheck.
+    """
+
+    async def test_create_stamps_tenant_id_from_map(self, multi_tenant_rls):
+        """create_embed_token stamps tenant_id from Map.tenant_id (server-side)."""
+        ctx = multi_tenant_rls
+        map_id, primary_ds_id, _ = await _setup_tenant_map_and_dataset(
+            ctx.db_url, ctx.tenant_a, ctx.user_a_id
+        )
+        try:
+            from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+            from sqlalchemy.pool import NullPool
+
+            se_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+            sm = async_sessionmaker(se_engine, expire_on_commit=False)
+            stamped_tenant_id = None
+            try:
+                async with sm() as session:
+                    async with session.begin():
+                        token, _ = await create_embed_token(
+                            session, map_id, uuid.UUID(ctx.user_a_id)
+                        )
+                        await session.flush()
+                        stamped_tenant_id = token.tenant_id
+            finally:
+                await se_engine.dispose()
+        finally:
+            await _teardown_tenant_map(ctx.db_url, map_id, [primary_ds_id])
+
+        assert stamped_tenant_id == uuid.UUID(ctx.tenant_a), (
+            f"EMBED-01 FAIL: token.tenant_id={stamped_tenant_id!r} "
+            f"expected {ctx.tenant_a!r} (from Map.tenant_id)"
+        )
+
+    async def test_create_single_tenant_leaves_tenant_id_null(self, monkeypatch):
+        """In single_tenant mode is_multi_tenant() is False so tenant_id stamp is skipped."""
+        monkeypatch.setenv("GEOLENS_TENANCY_MODE", "single_tenant")
+        import importlib
+
+        import app.core.config as cfg_mod
+        import app.core.tenancy as ten_mod
+
+        cfg_mod.settings = cfg_mod.Settings()  # type: ignore[attr-defined]
+        importlib.reload(ten_mod)
+
+        from app.core.tenancy import is_multi_tenant
+
+        assert not is_multi_tenant(), "Setup error: should be single_tenant"
+        # The tenant stamp is None when is_multi_tenant() is False — confirmed by the
+        # predicate `token_tenant_id = map_tenant_id if is_multi_tenant() else None`.
+        # Restore mode.
+        monkeypatch.setenv("GEOLENS_TENANCY_MODE", "single_tenant")
+        cfg_mod.settings = cfg_mod.Settings()  # type: ignore[attr-defined]
+        importlib.reload(ten_mod)
+
+    async def test_validate_cross_tenant_deny_db_miss_path(self, multi_tenant_rls):
+        """DB-miss path: token for tenant_a denies access to tenant_b dataset."""
+        ctx = multi_tenant_rls
+        init_cache()
+
+        # Map for tenant_a with two layers:
+        # - primary_ds (tenant_a) — in scope
+        # - extra_ds (tenant_b) — in scope but belongs to wrong tenant
+        map_id, primary_ds_id, extra_ds_id = await _setup_tenant_map_and_dataset(
+            ctx.db_url,
+            ctx.tenant_a,
+            ctx.user_a_id,
+            extra_dataset_tenant_id=ctx.tenant_b,
+        )
+        assert extra_ds_id is not None
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.pool import NullPool
+
+        se_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+        sm = async_sessionmaker(se_engine, expire_on_commit=False)
+        raw_token = None
+        try:
+            async with sm() as session:
+                async with session.begin():
+                    _, raw_token = await create_embed_token(
+                        session, map_id, uuid.UUID(ctx.user_a_id)
+                    )
+                    await session.flush()
+        finally:
+            await se_engine.dispose()
+
+        # Flush cache → DB-miss path
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        cache = get_cache()
+        with _tenant_context(ctx.tenant_a):
+            await cache.delete(tenant_cache_key(f"embed_token:{token_hash}"))
+
+            val_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+            val_sm = async_sessionmaker(val_engine, expire_on_commit=False)
+            try:
+                async with val_sm() as session:
+                    result = await validate_embed_token_access(
+                        raw_token, extra_ds_id, session
+                    )
+            finally:
+                await val_engine.dispose()
+
+        await _teardown_tenant_map(ctx.db_url, map_id, [primary_ds_id, extra_ds_id])
+
+        assert result is False, (
+            "EMBED-02 FAIL [cross-tenant/DB-miss]: token for tenant_a allowed access "
+            f"to tenant_b dataset {extra_ds_id}. Expected deny (False)."
+        )
+
+    async def test_validate_same_tenant_private_dataset_allowed(self, multi_tenant_rls):
+        """Token for tenant_a ALLOWS PRIVATE dataset in tenant_a.
+
+        Confirms private-serving is preserved — there is NO public/published recheck.
+        """
+        ctx = multi_tenant_rls
+        init_cache()
+        map_id, primary_ds_id, _ = await _setup_tenant_map_and_dataset(
+            ctx.db_url, ctx.tenant_a, ctx.user_a_id
+        )
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.pool import NullPool
+
+        se_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+        sm = async_sessionmaker(se_engine, expire_on_commit=False)
+        raw_token = None
+        try:
+            async with sm() as session:
+                async with session.begin():
+                    _, raw_token = await create_embed_token(
+                        session, map_id, uuid.UUID(ctx.user_a_id)
+                    )
+                    await session.flush()
+        finally:
+            await se_engine.dispose()
+
+        # Flush cache → DB-miss path
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        cache = get_cache()
+        with _tenant_context(ctx.tenant_a):
+            await cache.delete(tenant_cache_key(f"embed_token:{token_hash}"))
+
+            val_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+            val_sm = async_sessionmaker(val_engine, expire_on_commit=False)
+            try:
+                async with val_sm() as session:
+                    result = await validate_embed_token_access(
+                        raw_token, primary_ds_id, session
+                    )
+            finally:
+                await val_engine.dispose()
+
+        await _teardown_tenant_map(ctx.db_url, map_id, [primary_ds_id])
+
+        assert result is True, (
+            "EMBED-02 + SEC-022 FAIL: token for tenant_a denied access to "
+            f"tenant_a's PRIVATE dataset {primary_ds_id}. Private-serving must be preserved."
+        )
+
+    async def test_validate_cross_tenant_deny_cache_hit_path(self, multi_tenant_rls):
+        """Cache-hit path: cross-tenant deny works even when token is cached."""
+        ctx = multi_tenant_rls
+        init_cache()
+        map_id, primary_ds_id, extra_ds_id = await _setup_tenant_map_and_dataset(
+            ctx.db_url,
+            ctx.tenant_a,
+            ctx.user_a_id,
+            extra_dataset_tenant_id=ctx.tenant_b,
+        )
+        assert extra_ds_id is not None
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.pool import NullPool
+
+        se_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+        sm = async_sessionmaker(se_engine, expire_on_commit=False)
+        raw_token = None
+        try:
+            async with sm() as session:
+                async with session.begin():
+                    _, raw_token = await create_embed_token(
+                        session, map_id, uuid.UUID(ctx.user_a_id)
+                    )
+                    await session.flush()
+        finally:
+            await se_engine.dispose()
+
+        # Flush cache, then do a DB-miss call to populate it
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        cache = get_cache()
+        with _tenant_context(ctx.tenant_a):
+            await cache.delete(tenant_cache_key(f"embed_token:{token_hash}"))
+
+            val_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+            val_sm = async_sessionmaker(val_engine, expire_on_commit=False)
+            try:
+                async with val_sm() as session:
+                    # First call: DB-miss → populates cache with tenant_id payload
+                    _allow = await validate_embed_token_access(
+                        raw_token, primary_ds_id, session
+                    )
+            finally:
+                await val_engine.dispose()
+
+            # Second call: cache-hit path — cross-tenant dataset must still deny
+            val_engine2 = create_async_engine(ctx.db_url, poolclass=NullPool)
+            val_sm2 = async_sessionmaker(val_engine2, expire_on_commit=False)
+            try:
+                async with val_sm2() as session:
+                    result = await validate_embed_token_access(
+                        raw_token, extra_ds_id, session
+                    )
+            finally:
+                await val_engine2.dispose()
+
+        await _teardown_tenant_map(ctx.db_url, map_id, [primary_ds_id, extra_ds_id])
+
+        assert result is False, (
+            "EMBED-02 FAIL [cross-tenant/cache-hit]: token for tenant_a allowed access "
+            f"to tenant_b dataset {extra_ds_id} via cache-hit path. Expected deny (False)."
+        )
+
+
+@pytest.mark.rls
+class TestAdminEmbedTokenTenantFilter:
+    """list_admin_embed_tokens tenant filter closes cross-tenant admin leak."""
+
+    async def test_admin_list_filters_by_tenant(self, multi_tenant_rls):
+        """list_admin_embed_tokens(tenant_id=tenant_a) excludes tenant_b tokens."""
+        ctx = multi_tenant_rls
+
+        # Create one map+dataset for each tenant
+        map_a_id, ds_a_id, _ = await _setup_tenant_map_and_dataset(
+            ctx.db_url, ctx.tenant_a, ctx.user_a_id
+        )
+        map_b_id, ds_b_id, _ = await _setup_tenant_map_and_dataset(
+            ctx.db_url, ctx.tenant_b, ctx.user_b_id
+        )
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.pool import NullPool
+
+        # Create tokens for both maps
+        se_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+        sm = async_sessionmaker(se_engine, expire_on_commit=False)
+        try:
+            async with sm() as session:
+                async with session.begin():
+                    await create_embed_token(
+                        session, map_a_id, uuid.UUID(ctx.user_a_id)
+                    )
+                    await session.flush()
+            async with sm() as session:
+                async with session.begin():
+                    await create_embed_token(
+                        session, map_b_id, uuid.UUID(ctx.user_b_id)
+                    )
+                    await session.flush()
+        finally:
+            await se_engine.dispose()
+
+        # List tokens filtered by tenant_a
+        list_engine = create_async_engine(ctx.db_url, poolclass=NullPool)
+        list_sm = async_sessionmaker(list_engine, expire_on_commit=False)
+        try:
+            async with list_sm() as session:
+                rows, total = await list_admin_embed_tokens(
+                    session, tenant_id=uuid.UUID(ctx.tenant_a)
+                )
+        finally:
+            await list_engine.dispose()
+
+        await _teardown_tenant_map(ctx.db_url, map_a_id, [ds_a_id])
+        await _teardown_tenant_map(ctx.db_url, map_b_id, [ds_b_id])
+
+        # All returned tokens must belong to tenant_a
+        result_tokens = [row[0] for row in rows]
+        assert len(result_tokens) >= 1, "Expected at least 1 tenant_a token"
+        for tok in result_tokens:
+            assert tok.tenant_id == uuid.UUID(ctx.tenant_a), (
+                f"EMBED-03 FAIL: admin list returned token with tenant_id={tok.tenant_id!r} "
+                f"when filtering for tenant_a={ctx.tenant_a!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Tests: NULL tenant_id fail-closed guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.rls
+class TestEmbedTokenNullTenantDeny:
+    """NULL tenant_id tokens are denied in multi_tenant mode.
+
+    Legacy embed tokens created before tenant scoping existed have tenant_id=NULL.
+    Without the guard, `None != None` evaluates to False (i.e. "equal"),
+    so a NULL-tenant token could access any NULL-tenant dataset — fail-OPEN.
+    The guard adds `if token_tenant is None or dataset_tenant is None: return False`
+    to close this gap.
+
+    single_tenant is unaffected — the block is never entered when
+    is_multi_tenant() is False.
+    """
+
+    async def test_null_tenant_token_denied_against_null_tenant_dataset(
+        self, multi_tenant_rls
+    ):
+        """A NULL-tenant token is DENIED against a NULL-tenant dataset
+        in multi_tenant mode (both None must not pass the equality check).
+        """
+        ctx = multi_tenant_rls
+        init_cache()
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.pool import NullPool
+        from app.modules.catalog.datasets.domain.models import Dataset, Record
+
+        db_url = ctx.db_url
+        user_id = uuid.UUID(ctx.user_a_id)
+
+        # Create a dataset with NULL tenant_id (simulates data from before tenant scoping)
+        se_engine = create_async_engine(db_url, poolclass=NullPool)
+        sm = async_sessionmaker(se_engine, expire_on_commit=False)
+        null_ds_id = None
+        map_id = uuid.uuid4()
+        try:
+            async with sm() as session:
+                async with session.begin():
+                    # Map with NULL tenant (legacy)
+                    map_obj = Map(
+                        id=map_id,
+                        name=f"null-tenant-map-{uuid.uuid4().hex[:6]}",
+                        visibility="private",
+                        created_by=user_id,
+                        tenant_id=None,
+                    )
+                    session.add(map_obj)
+                    await session.flush()
+
+                    rec = Record(
+                        title="null-tenant-rec",
+                        visibility="private",
+                        record_status="draft",
+                        created_by=user_id,
+                        tenant_id=None,
+                    )
+                    session.add(rec)
+                    await session.flush()
+
+                    ds = Dataset(
+                        record_id=rec.id,
+                        table_name=f"null_ten_{uuid.uuid4().hex[:8]}",
+                        tenant_id=None,
+                    )
+                    session.add(ds)
+                    await session.flush()
+                    null_ds_id = ds.id
+
+                    layer = MapLayer(
+                        map_id=map_id,
+                        dataset_id=null_ds_id,
+                        sort_order=0,
+                    )
+                    session.add(layer)
+        finally:
+            await se_engine.dispose()
+
+        # Create a token via the service; because map.tenant_id is NULL and
+        # is_multi_tenant() is True, creation stamps NULL — simulating a legacy token.
+        token_engine = create_async_engine(db_url, poolclass=NullPool)
+        token_sm = async_sessionmaker(token_engine, expire_on_commit=False)
+        raw_token = None
+        try:
+            async with token_sm() as session:
+                async with session.begin():
+                    _, raw_token = await create_embed_token(session, map_id, user_id)
+                    await session.flush()
+        finally:
+            await token_engine.dispose()
+
+        # Flush cache to exercise DB-miss path
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        cache = get_cache()
+        with _tenant_context(ctx.tenant_a):
+            await cache.delete(tenant_cache_key(f"embed_token:{token_hash}"))
+
+            # Validate — must deny: both token and dataset tenants are None.
+            val_engine = create_async_engine(db_url, poolclass=NullPool)
+            val_sm = async_sessionmaker(val_engine, expire_on_commit=False)
+            try:
+                async with val_sm() as session:
+                    result = await validate_embed_token_access(
+                        raw_token, null_ds_id, session
+                    )
+            finally:
+                await val_engine.dispose()
+
+        # Teardown
+        import sqlalchemy as sa
+
+        cleanup_engine = create_async_engine(db_url, poolclass=NullPool)
+        try:
+            async with cleanup_engine.connect() as conn:
+                await conn.execution_options(isolation_level="AUTOCOMMIT")
+                await conn.execute(
+                    sa.text("DELETE FROM catalog.embed_tokens WHERE map_id = :id"),
+                    {"id": str(map_id)},
+                )
+                await conn.execute(
+                    sa.text("DELETE FROM catalog.map_layers WHERE map_id = :id"),
+                    {"id": str(map_id)},
+                )
+                await conn.execute(
+                    sa.text(
+                        "DELETE FROM catalog.records WHERE id = "
+                        "(SELECT record_id FROM catalog.datasets WHERE id = :id)"
+                    ),
+                    {"id": str(null_ds_id)},
+                )
+                await conn.execute(
+                    sa.text("DELETE FROM catalog.datasets WHERE id = :id"),
+                    {"id": str(null_ds_id)},
+                )
+                await conn.execute(
+                    sa.text("DELETE FROM catalog.maps WHERE id = :id"),
+                    {"id": str(map_id)},
+                )
+        finally:
+            await cleanup_engine.dispose()
+
+        assert result is False, (
+            "CR-01 FAIL: NULL-tenant token was ALLOWED to access NULL-tenant dataset "
+            f"({null_ds_id}) in multi_tenant mode. Both token.tenant_id=None and "
+            "dataset.tenant_id=None must produce a DENY (fail-closed guard)."
+        )
+
+    async def test_null_tenant_token_denied_against_real_tenant_dataset(
+        self, multi_tenant_rls
+    ):
+        """A NULL-tenant token is DENIED against a real-tenant dataset
+        in multi_tenant mode (NULL on the token side must fail-closed).
+        """
+        ctx = multi_tenant_rls
+        init_cache()
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.pool import NullPool
+
+        db_url = ctx.db_url
+        user_id = uuid.UUID(ctx.user_a_id)
+
+        # A normal tenant_a map+dataset (tenant_id = tenant_a)
+        map_id, ds_id, _ = await _setup_tenant_map_and_dataset(
+            db_url, ctx.tenant_a, ctx.user_a_id
+        )
+
+        # Manually insert an EmbedToken with NULL tenant_id (legacy row from before tenant scoping)
+        # Use the ORM directly to avoid JSONB cast syntax issues with asyncpg.
+        import secrets
+
+        raw_token = "et_" + secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        token_hint = "et_..." + raw_token[-8:]
+
+        insert_engine = create_async_engine(db_url, poolclass=NullPool)
+        from sqlalchemy.ext.asyncio import async_sessionmaker as _asm
+
+        insert_sm = _asm(insert_engine, expire_on_commit=False)
+        try:
+            async with insert_sm() as session:
+                async with session.begin():
+                    legacy_token = EmbedToken(
+                        map_id=map_id,
+                        token_hash=token_hash,
+                        token_hint=token_hint,
+                        scoped_dataset_ids=[str(ds_id)],
+                        is_active=True,
+                        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
+                        created_by=user_id,
+                        tenant_id=None,  # legacy NULL-tenant — simulates a pre-tenant-scoping row
+                    )
+                    session.add(legacy_token)
+        finally:
+            await insert_engine.dispose()
+
+        # Flush cache — DB-miss path
+        cache = get_cache()
+        with _tenant_context(ctx.tenant_a):
+            await cache.delete(tenant_cache_key(f"embed_token:{token_hash}"))
+
+            val_engine = create_async_engine(db_url, poolclass=NullPool)
+            val_sm = async_sessionmaker(val_engine, expire_on_commit=False)
+            try:
+                async with val_sm() as session:
+                    result = await validate_embed_token_access(
+                        raw_token, ds_id, session
+                    )
+            finally:
+                await val_engine.dispose()
+
+        # Teardown: delete the manually-inserted token, then the map/dataset
+        import sqlalchemy as _sa
+
+        cleanup_engine = create_async_engine(db_url, poolclass=NullPool)
+        try:
+            async with cleanup_engine.connect() as conn:
+                await conn.execution_options(isolation_level="AUTOCOMMIT")
+                await conn.execute(
+                    _sa.text("DELETE FROM catalog.embed_tokens WHERE token_hash = :h"),
+                    {"h": token_hash},
+                )
+        finally:
+            await cleanup_engine.dispose()
+
+        await _teardown_tenant_map(db_url, map_id, [ds_id])
+
+        assert result is False, (
+            "CR-01 FAIL: NULL-tenant token (simulated legacy row) was ALLOWED to "
+            f"access tenant_a dataset ({ds_id}) in multi_tenant mode. "
+            "A NULL token.tenant_id must DENY in multi_tenant mode (fail-closed)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: bulk_revoke tenant filter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.rls
+class TestBulkRevokeTenantFilter:
+    """bulk_revoke_embed_tokens must not allow cross-tenant revocation.
+
+    A tenant-A admin who supplies a tenant-B token UUID must see count=0 returned
+    (the token is silently ignored by the WHERE tenant_id = :tenant_id predicate).
+    """
+
+    async def test_bulk_revoke_cannot_revoke_other_tenant_token(self, multi_tenant_rls):
+        """bulk_revoke with tenant_a filter cannot revoke tenant_b token."""
+        ctx = multi_tenant_rls
+
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+        from sqlalchemy.pool import NullPool
+        from app.modules.embed_tokens.service import bulk_revoke_embed_tokens
+
+        db_url = ctx.db_url
+
+        # Create a token for tenant_b
+        map_b_id, ds_b_id, _ = await _setup_tenant_map_and_dataset(
+            db_url, ctx.tenant_b, ctx.user_b_id
+        )
+        se_engine = create_async_engine(db_url, poolclass=NullPool)
+        sm = async_sessionmaker(se_engine, expire_on_commit=False)
+        token_b_id = None
+        try:
+            async with sm() as session:
+                async with session.begin():
+                    tok, _ = await create_embed_token(
+                        session, map_b_id, uuid.UUID(ctx.user_b_id)
+                    )
+                    await session.flush()
+                    token_b_id = tok.id
+        finally:
+            await se_engine.dispose()
+
+        # Attempt bulk_revoke as tenant_a (should be filtered out by tenant_id)
+        rev_engine = create_async_engine(db_url, poolclass=NullPool)
+        rev_sm = async_sessionmaker(rev_engine, expire_on_commit=False)
+        try:
+            async with rev_sm() as session:
+                async with session.begin():
+                    count = await bulk_revoke_embed_tokens(
+                        session,
+                        [token_b_id],
+                        tenant_id=uuid.UUID(ctx.tenant_a),
+                    )
+        finally:
+            await rev_engine.dispose()
+
+        await _teardown_tenant_map(db_url, map_b_id, [ds_b_id])
+
+        assert count == 0, (
+            f"WR-01 FAIL: bulk_revoke with tenant_a filter revoked {count} token(s) "
+            f"belonging to tenant_b (token id={token_b_id}). Expected 0 — "
+            "cross-tenant revocation must be blocked."
+        )
+
+
+@pytest.mark.anyio
+async def test_embed_token_endpoints_require_edit_metadata(
+    client: AsyncClient, admin_auth_header: dict
+):
+    """Embed tokens are anonymous tile capabilities that outrank the share
+    link they accompany, so every CRUD endpoint carries the same
+    edit_metadata gate as share-link creation. A viewer gets 403 from the
+    permission dependency before any map lookup (404 would mean the gate is
+    missing and ownership answered instead)."""
+    from .conftest import _create_test_user
+
+    viewer_headers, _ = await _create_test_user(client, admin_auth_header, "viewer")
+    base = f"/maps/{uuid.uuid4()}/embed-tokens"
+    token_id = uuid.uuid4()
+
+    resp = await client.post(f"{base}/", json={}, headers=viewer_headers)
+    assert resp.status_code == 403, resp.text
+    resp = await client.get(f"{base}/", headers=viewer_headers)
+    assert resp.status_code == 403, resp.text
+    resp = await client.patch(
+        f"{base}/{token_id}/", json={"allowed_origins": None}, headers=viewer_headers
+    )
+    assert resp.status_code == 403, resp.text
+    resp = await client.delete(f"{base}/{token_id}/", headers=viewer_headers)
+    assert resp.status_code == 403, resp.text

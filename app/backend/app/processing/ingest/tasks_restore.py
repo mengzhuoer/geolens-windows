@@ -1,0 +1,293 @@
+"""Procrastinate task: publish one of a dataset's previous versions again.
+
+A previous version is a table a replacement kept. Restoring it is a
+replacement whose candidate is that table, so it runs through the settlement
+seam like any other: the job row, the catalog rows, the run, the follow-ups
+and the tile version are the publish path's own. The data it replaces becomes
+a kept version in turn.
+"""
+
+from __future__ import annotations
+
+import uuid
+from types import SimpleNamespace
+from typing import Any
+
+from sqlalchemy import select
+
+from app.core.db.tenant_session import tenant_task
+from app.core.record_types import capabilities
+from app.platform.catalog_locks import CATALOG_LOCK_CONFLICT_CODE, CatalogLockConflict
+from app.platform.dataset_origin import classify_origin, set_dataset_origin
+from app.platform.jobs.models import EXPECTED_PREVIOUS_VERSION_KEY
+from app.processing.ingest import catalog_projection
+from app.processing.ingest.publication import (
+    PUBLISH,
+    Failure,
+    PublicationCommit,
+    Published,
+    Verdict,
+    settle_replacement,
+)
+from app.processing.ingest.previous_version import (
+    record_live_version,
+    stamp_kept_versions,
+)
+from app.processing.ingest.tasks_common import (
+    _bind_task_log_context,
+    _current_tenant_schema,
+    install_candidate_table,
+    task_app,
+)
+
+# Why a restored dataset refuses scheduled refreshes until the hold is released.
+RESTORED_HOLD = "restored"
+
+_CHANGED = "previous_version_changed"
+_NOT_APPLICABLE = "restore_not_applicable"
+
+
+def _reinstate_source(dataset, source) -> None:
+    """Point the dataset's source fields back at the kept version's.
+
+    The source CRS always follows the kept data. The binding follows it only
+    for an upload or a layer drawn in the app: version fields cannot describe
+    another origin, so that binding is left as it is. A version kept before
+    its row was recorded has none to read, and changes nothing.
+    """
+    if source is None:
+        return
+    dataset.original_srid = source.original_srid
+    kind = classify_origin(source.source_format) if source.source_format else None
+    if kind not in ("upload", "created"):
+        return
+    dataset.source_filename = source.source_filename
+    dataset.source_format = source.source_format
+    if kind == "upload":
+        set_dataset_origin(
+            dataset,
+            "upload",
+            filename=source.source_filename,
+            file_hash=source.file_hash,
+        )
+    else:
+        set_dataset_origin(dataset, "created")
+
+
+class RestoreRefused(Exception):
+    """The kept version the restore was admitted for is not there to publish."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _RestorePreviousVersion:
+    """One of the dataset's kept tables, renamed over its live table."""
+
+    task = "restore_previous_version"
+    staging = False
+    raster_row = False
+    catalog_event = "restore_catalog"
+
+    def __init__(self, *, user_id: str):
+        self.user_id = user_id
+
+    def prepare(self, job, dataset, staging_table: str) -> None:
+        self.expected = (job.user_metadata or {}).get(EXPECTED_PREVIOUS_VERSION_KEY)
+
+    async def fetch(self) -> None:
+        return None
+
+    async def stage(self, session, job, dataset) -> Verdict:
+        if not capabilities(dataset.record.record_type).feature_table:
+            raise RestoreRefused(
+                _NOT_APPLICABLE,
+                "This dataset has no feature table, so it has no previous "
+                "version to restore.",
+            )
+        await self._require_previous(session, dataset)
+        return PUBLISH
+
+    async def install(self, session, dataset) -> None:
+        # Measured here, under the job row, so a delete that takes the job
+        # rows before dropping the table never waits on this read.
+        await self._require_previous(session, dataset)
+        schema = _current_tenant_schema()
+        # An empty or generic kept table falls back to what its own version
+        # recorded, never to the data it replaces.
+        from app.platform.extensions import get_processing_port
+
+        DatasetVersion = get_processing_port().get_dataset_version_orm_class()
+        kept = (
+            await session.execute(
+                select(
+                    DatasetVersion.geometry_type,
+                    DatasetVersion.is_3d,
+                    DatasetVersion.n_dims,
+                ).where(
+                    DatasetVersion.dataset_id == dataset.id,
+                    DatasetVersion.version_number == self.expected,
+                )
+            )
+        ).one_or_none()
+        self.measurement = await catalog_projection.measure(
+            session,
+            dataset,
+            table=self.previous,
+            schema=schema,
+            stored=SimpleNamespace(
+                geometry_type=None if kept is None else kept.geometry_type,
+                is_3d=None if kept is None else kept.is_3d,
+                n_dims=None if kept is None else kept.n_dims,
+            ),
+        )
+        await install_candidate_table(
+            session,
+            dataset=dataset,
+            candidate=self.previous,
+            measurement=self.measurement,
+            restoring=self.expected,
+        )
+
+    async def write(self, session, dataset) -> Published:
+        """Restored columns keep their version's source names and measured metadata."""
+        from app.platform.audit import AuditEvent, audit_emit
+        from app.platform.extensions import get_processing_port
+
+        DatasetVersion = get_processing_port().get_dataset_version_orm_class()
+        actor_id = uuid.UUID(self.user_id)
+        await session.refresh(dataset, ["current_version", "last_refreshed_at"])
+        replaced = dataset.current_version
+        restored = self.expected
+        source = await session.scalar(
+            select(DatasetVersion).where(
+                DatasetVersion.dataset_id == dataset.id,
+                DatasetVersion.version_number == restored,
+            )
+        )
+        # Read before the stamp forgets the restored version as kept.
+        restored_refreshed_at = None if source is None else source.kept_refreshed_at
+
+        await record_live_version(session, dataset)
+        source_columns = None if source is None else source.column_info
+        source_names = {
+            col["name"]: col.get("source_name") for col in source_columns or []
+        }
+        for col in self.measurement.metadata.get("column_info") or []:
+            col["source_name"] = source_names.get(col["name"])
+        # Restore keeps the current attribute metadata, titles and code labels alike.
+        schema_diff = await catalog_projection.project(
+            session, dataset, self.measurement, field_labels=None
+        )
+        await stamp_kept_versions(session, dataset, replaced)
+        dataset.current_version = replaced + 1
+        dataset.scheduled_refresh_hold = RESTORED_HOLD
+        dataset.record.updated_by = actor_id
+        # Freshness describes the data that is live again, as the swap that
+        # kept it recorded.
+        dataset.last_refreshed_at = restored_refreshed_at
+        _reinstate_source(dataset, source)
+
+        version = DatasetVersion(
+            dataset_id=dataset.id,
+            version_number=replaced + 1,
+            source_filename=None if source is None else source.source_filename,
+            source_format=None if source is None else source.source_format,
+            file_hash=None if source is None else source.file_hash,
+            feature_count=self.measurement.metadata.get("feature_count"),
+            srid=self.measurement.metadata.get("srid"),
+            geometry_type=self.measurement.geometry_type,
+            original_srid=None if source is None else source.original_srid,
+            column_info=dataset.column_info,
+            is_3d=self.measurement.three_d.get("is_3d"),
+            n_dims=self.measurement.three_d.get("n_dims"),
+            restored_from_version=restored,
+            uploaded_by=actor_id,
+        )
+        session.add(version)
+        await session.flush()
+        await audit_emit(
+            session,
+            AuditEvent(
+                user_id=actor_id,
+                action="dataset.restore",
+                resource_type="dataset",
+                resource_id=dataset.id,
+                details={
+                    "version_number": replaced + 1,
+                    "restored_from_version": restored,
+                    "replaced_version": replaced,
+                },
+            ),
+        )
+        quicklook = (
+            None if self.measurement.geometry_type is None else dataset.table_name
+        )
+        return Published(
+            dataset_version_id=version.id,
+            feature_count=self.measurement.metadata.get("feature_count"),
+            schema_diff=schema_diff,
+            contacted_origin=False,
+            live_table=dataset.table_name,
+            quicklook_table=quicklook,
+        )
+
+    def classify(self, exc: BaseException) -> Failure:
+        if isinstance(exc, RestoreRefused):
+            return Failure(exc.code)
+        if isinstance(exc, CatalogLockConflict):
+            return Failure(CATALOG_LOCK_CONFLICT_CODE)
+        return Failure("restore_failed")
+
+    async def release(
+        self, *, publication: PublicationCommit | None, failed: bool
+    ) -> None:
+        return None
+
+    async def _require_previous(self, session, dataset) -> None:
+        """Refuse unless the dataset still keeps the version admitted, in a table."""
+        from sqlalchemy import text
+
+        from app.platform.extensions import get_processing_port
+        from app.processing.ingest.metadata import _qtable
+
+        DatasetVersion = get_processing_port().get_dataset_version_orm_class()
+        kept = await session.scalar(
+            select(DatasetVersion.kept_table).where(
+                DatasetVersion.dataset_id == dataset.id,
+                DatasetVersion.version_number == self.expected,
+            )
+        )
+        present = kept is not None and await session.scalar(
+            text("SELECT to_regclass(:kept) IS NOT NULL"),
+            {"kept": _qtable(kept, schema=_current_tenant_schema())},
+        )
+        if not present:
+            raise RestoreRefused(
+                _CHANGED,
+                "The dataset's previous version changed or was deleted before "
+                "it could be restored. Check its version history and try again.",
+            )
+        self.previous = kept
+
+
+@task_app.task(queue="ingest", retry=0)
+@tenant_task
+async def restore_previous_version(
+    job_id: str,
+    dataset_id: str,
+    user_id: str,
+    attempt_id: str | None = None,
+    **kwargs: Any,
+) -> None:
+    """Background task: publish one of the dataset's kept versions as its live data."""
+    _bind_task_log_context(
+        task_name="restore_previous_version", job_id=job_id, dataset_id=dataset_id
+    )
+    await settle_replacement(
+        _RestorePreviousVersion(user_id=user_id),
+        job_id=job_id,
+        dataset_id=dataset_id,
+        attempt_id=attempt_id,
+    )

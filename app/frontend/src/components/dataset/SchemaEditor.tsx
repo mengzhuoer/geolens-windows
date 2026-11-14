@@ -1,0 +1,319 @@
+import { useEffect, useId, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
+import { Trash2, Plus } from 'lucide-react';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { useAddColumn, useColumnReferences, useDropColumn } from '@/hooks/use-features';
+import { useAuthStore } from '@/stores/auth-store';
+import { formatMutationError } from '@/lib/error-map';
+
+const ALLOWED_TYPES = ['text', 'integer', 'real', 'boolean', 'date', 'timestamp'] as const;
+const COLUMN_NAME_RE = /^[a-z][a-z0-9_]{0,62}$/;
+const SYSTEM_COLUMNS = new Set(['gid', 'geom', 'geom_4326']);
+
+interface SchemaEditorProps {
+  datasetId: string;
+  columns: { name: string; type: string }[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}
+
+export function SchemaEditor({ datasetId, columns, open, onOpenChange }: SchemaEditorProps) {
+  const { t } = useTranslation('dataset');
+  const [newName, setNewName] = useState('');
+  const [newType, setNewType] = useState<string>('text');
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const nameInputId = useId();
+  const nameErrorId = useId();
+  const newNameRef = useRef('');
+  const newTypeRef = useRef('text');
+  const addInFlightRef = useRef(false);
+  const authIdentity = useAuthStore((state) => `${state.sessionEpoch}:${state.user?.id ?? ''}`);
+  const requestScopeRef = useRef({ datasetId, authIdentity });
+  if (
+    requestScopeRef.current.datasetId !== datasetId
+    || requestScopeRef.current.authIdentity !== authIdentity
+  ) {
+    requestScopeRef.current = { datasetId, authIdentity };
+  }
+
+  const addColumnMutation = useAddColumn();
+  const dropColumnMutation = useDropColumn();
+  // Warn how many saved maps reference the column under drop confirmation
+  const columnReferences = useColumnReferences(datasetId, confirmDelete);
+
+  const displayColumns = columns.filter((c) => !SYSTEM_COLUMNS.has(c.name));
+
+  useEffect(() => {
+    newNameRef.current = '';
+    newTypeRef.current = 'text';
+    setNewName('');
+    setNewType('text');
+    setNameError(null);
+    setConfirmDelete(null);
+  }, [datasetId]);
+
+  function validateName(name: string): string | null {
+    if (!name) return t('schema.validation.required');
+    if (!COLUMN_NAME_RE.test(name)) {
+      return t('schema.validation.format');
+    }
+    if (SYSTEM_COLUMNS.has(name)) {
+      return t('schema.validation.reserved');
+    }
+    if (columns.some((c) => c.name === name)) {
+      return t('schema.validation.duplicate');
+    }
+    return null;
+  }
+
+  function handleAddColumn() {
+    if (addInFlightRef.current) return;
+    const error = validateName(newName);
+    if (error) {
+      setNameError(error);
+      return;
+    }
+
+    const submittedDatasetId = datasetId;
+    const submittedName = newName;
+    const submittedType = newType;
+    const submittedScope = requestScopeRef.current;
+    addInFlightRef.current = true;
+    addColumnMutation.mutate(
+      { datasetId: submittedDatasetId, column: { name: submittedName, type: submittedType } },
+      {
+        onSuccess: () => {
+          if (requestScopeRef.current !== submittedScope) return;
+          toast.success(t('schema.columnAdded'));
+          if (
+            newNameRef.current === submittedName
+            && newTypeRef.current === submittedType
+          ) {
+            newNameRef.current = '';
+            newTypeRef.current = 'text';
+            setNewName('');
+            setNewType('text');
+            setNameError(null);
+          }
+        },
+        onError: (err) => {
+          if (requestScopeRef.current !== submittedScope) return;
+          toast.error(err instanceof Error ? err.message : t('schema.addFailed'));
+        },
+        onSettled: () => {
+          addInFlightRef.current = false;
+        },
+      },
+    );
+  }
+
+  function handleDropColumn(columnName: string) {
+    const submittedScope = requestScopeRef.current;
+    dropColumnMutation.mutate(
+      { datasetId, columnName },
+      {
+        onSuccess: () => {
+          if (requestScopeRef.current !== submittedScope) return;
+          toast.success(t('schema.columnRemoved'));
+          setConfirmDelete(null);
+        },
+        onError: (err) => {
+          if (requestScopeRef.current !== submittedScope) return;
+          toast.error(formatMutationError('dataset:schema.removeFailed', err));
+          setConfirmDelete(null);
+        },
+      },
+    );
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{t('schema.title')}</DialogTitle>
+          <DialogDescription>
+            {t('schema.description')}
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* Existing columns */}
+        {displayColumns.length > 0 ? (
+          <div className="max-h-60 overflow-y-auto">
+            <Table aria-label={t('schema.title')}>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t('schema.columnName')}</TableHead>
+                  <TableHead>{t('schema.columnType')}</TableHead>
+                  <TableHead className="w-10" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {displayColumns.map((col) => (
+                  <TableRow key={col.name}>
+                    <TableCell className="font-mono text-xs">{col.name}</TableCell>
+                    <TableCell className="text-muted-foreground text-xs">{col.type}</TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 w-7 p-0"
+                        onClick={() => setConfirmDelete(col.name)}
+                        title={t('schema.removeColumn', { name: col.name })}
+                      >
+                        <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground py-4 text-center">
+            {t('schema.noColumns')}
+          </p>
+        )}
+
+        {/* Dropping a column is irreversible — confirm through an AlertDialog
+            so dismissal must be explicit (DESIGN-GUIDE §6). */}
+        <AlertDialog
+          open={confirmDelete != null}
+          onOpenChange={(isOpen) => {
+            if (!isOpen) setConfirmDelete(null);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {t('schema.removeColumn', { name: confirmDelete ?? '' })}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {t('schema.dropWarning', { name: confirmDelete ?? '' })}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            {(columnReferences.data?.map_count ?? 0) > 0 && (
+              <p className="text-xs text-warning">
+                {t('schema.usedByMaps', { count: columnReferences.data!.map_count })}
+              </p>
+            )}
+            <AlertDialogFooter>
+              <AlertDialogCancel disabled={dropColumnMutation.isPending}>
+                {t('common:cancel')}
+              </AlertDialogCancel>
+              <AlertDialogAction
+                variant="destructive"
+                // Also wait for the map-references query: a fast confirm could
+                // drop the column before the "used by N maps" warning rendered.
+                disabled={dropColumnMutation.isPending || columnReferences.isLoading}
+                onClick={() => {
+                  if (confirmDelete) handleDropColumn(confirmDelete);
+                }}
+              >
+                {t('common:confirm')}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        {/* Add column form */}
+        <div className="border-t pt-4 space-y-3">
+          {/* A placeholder is not an accessible name — tie the
+              section label to the name input. */}
+          <Label htmlFor={nameInputId} className="text-sm font-medium">
+            {t('schema.addColumn')}
+          </Label>
+          <div className="flex items-start gap-2">
+            <div className="flex-1 space-y-2">
+              <Input
+                id={nameInputId}
+                placeholder={t('schema.columnNamePlaceholder')}
+                value={newName}
+                onChange={(e) => {
+                  newNameRef.current = e.target.value;
+                  setNewName(e.target.value);
+                  if (nameError) setNameError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') handleAddColumn();
+                }}
+                className="font-mono text-xs h-9"
+                // Announce the validation failure and associate it with the field
+                // instead of a visually-adjacent <p> only.
+                aria-invalid={nameError ? true : undefined}
+                aria-describedby={nameError ? nameErrorId : undefined}
+              />
+              {nameError && (
+                <p id={nameErrorId} role="alert" className="text-xs text-destructive">
+                  {nameError}
+                </p>
+              )}
+            </div>
+            <Select
+              value={newType}
+              onValueChange={(value) => {
+                newTypeRef.current = value;
+                setNewType(value);
+              }}
+            >
+              <SelectTrigger className="w-[130px]" aria-label={t('schema.columnType')}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {ALLOWED_TYPES.map((type) => (
+                  <SelectItem key={type} value={type}>
+                    {type}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              size="sm"
+              className="h-9"
+              onClick={handleAddColumn}
+              disabled={addColumnMutation.isPending || !newName}
+            >
+              <Plus className="h-4 w-4 me-1" />
+              {t('schema.add')}
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}

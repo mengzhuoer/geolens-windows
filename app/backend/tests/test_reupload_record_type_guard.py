@@ -1,0 +1,129 @@
+"""Unit tests for _assert_compatible_record_type on the service-URL preview path.
+
+Pins the fix: `reupload_service_preview` now
+surfaces vector→raster and any→VRT swaps as HTTP 400 before pipeline execution,
+mirroring the multipart and presigned paths.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+from fastapi import HTTPException
+
+from app.modules.catalog.datasets.api.router_reupload import (
+    _assert_compatible_record_type,
+)
+
+
+def _ds(record_type: str):
+    """Build a minimal stand-in for `Dataset` with a `record` attribute."""
+    return SimpleNamespace(record=SimpleNamespace(record_type=record_type))
+
+
+class TestServiceTypeGuard:
+    """Service-URL path (filename=None, service_type provided)."""
+
+    def test_vrt_dataset_rejected_via_service(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(
+                _ds("vrt_dataset"), None, service_type="WFS 2.0.0"
+            )
+        assert exc.value.status_code == 400
+        assert "VRT" in exc.value.detail or "vrt" in exc.value.detail.lower()
+
+    def test_raster_dataset_rejected_for_wfs(self):
+        """All supported service types are vector — reject for raster_dataset.
+
+        Raster reupload is supported now, but only from a file.
+        A service refresh stays refused because nothing fetches a GeoTIFF from
+        a feature service, so the refusal message changed while the status did
+        not.
+        """
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(
+                _ds("raster_dataset"), None, service_type="WFS 2.0.0"
+            )
+        assert exc.value.status_code == 400
+        assert "raster" in exc.value.detail.lower()
+        assert "remote service" in exc.value.detail.lower()
+
+    def test_raster_dataset_rejected_for_arcgis(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(
+                _ds("raster_dataset"), None, service_type="ArcGIS FeatureServer"
+            )
+        assert exc.value.status_code == 400
+        assert "raster" in exc.value.detail.lower()
+
+    def test_raster_dataset_rejected_for_ogc_api(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(
+                _ds("raster_dataset"), None, service_type="OGC API - Features"
+            )
+        assert exc.value.status_code == 400
+        assert "raster" in exc.value.detail.lower()
+
+    def test_vector_dataset_accepted_for_wfs(self):
+        """Vector-record + vector-service is the happy path — no raise."""
+        _assert_compatible_record_type(
+            _ds("vector_dataset"), None, service_type="WFS 2.0.0"
+        )
+
+    def test_table_accepted_for_arcgis(self):
+        """`table` record type accepts vector services (CSV-like uploads)."""
+        _assert_compatible_record_type(
+            _ds("table"), None, service_type="ArcGIS FeatureServer"
+        )
+
+
+class TestFilePathStillWorks:
+    """Make sure the new keyword-only argument doesn't break existing callers
+    that pass only (dataset, filename)."""
+
+    def test_vector_accepts_geojson(self):
+        _assert_compatible_record_type(_ds("vector_dataset"), "places.geojson")
+
+    def test_vector_rejects_tif(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(_ds("vector_dataset"), "landcover.tif")
+        assert exc.value.status_code == 400
+
+    def test_vector_rejects_standalone_vrt(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(_ds("vector_dataset"), "external.vrt")
+        assert exc.value.status_code == 400
+        assert "standalone vrt" in exc.value.detail.lower()
+
+    def test_raster_accepts_tif(self):
+        """The gate admits raster replacement. A raster dataset takes a
+        raster replacement — that is the whole point of the replace path."""
+        _assert_compatible_record_type(_ds("raster_dataset"), "landcover.tif")
+        _assert_compatible_record_type(_ds("raster_dataset"), "landcover.TIFF")
+
+    def test_raster_rejects_geojson(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(_ds("raster_dataset"), "places.geojson")
+        assert exc.value.status_code == 400
+        assert "cross-record-type" in exc.value.detail.lower()
+
+    def test_vrt_rejected_regardless_of_filename(self):
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(_ds("vrt_dataset"), "anything.tif")
+        assert exc.value.status_code == 400
+
+    @pytest.mark.parametrize(
+        "record_type", ["vector_dataset", "table", "raster_dataset"]
+    )
+    def test_a_3tz_replaces_no_dataset(self, record_type):
+        """A .3tz holds only a 3D Tiles tileset, so no reupload takes one."""
+        with pytest.raises(HTTPException) as exc:
+            _assert_compatible_record_type(_ds(record_type), "campus.3TZ")
+        assert exc.value.status_code == 400
+        assert ".3tz archive holds a 3D Tiles tileset" in exc.value.detail
+
+
+def test_raster_worker_rejects_standalone_vrt_jobs():
+    from app.processing.ingest.tasks_raster_common import _reject_raw_vrt_job
+
+    with pytest.raises(ValueError, match="Standalone VRT"):
+        _reject_raw_vrt_job("unsafe.vrt")

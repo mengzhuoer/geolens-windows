@@ -1,0 +1,231 @@
+import { lazy, Suspense, useRef } from 'react';
+import { Link } from 'react-router';
+import { useTranslation } from 'react-i18next';
+import { Badge } from '@/components/ui/badge';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+// Lazy-load DatasetSearchPanel so the ~35 KB chunk only
+// loads when the Add Data dialog opens, not on initial builder mount.
+const DatasetSearchPanel = lazy(() =>
+  import('@/components/builder/DatasetSearchPanel').then((m) => ({ default: m.DatasetSearchPanel }))
+);
+import { ShareDialog } from '@/components/builder/SharePanel';
+import { SceneSpinnerFallback } from '@/components/builder/SceneSpinnerFallback';
+import { VisibilityIcon } from '@/components/maps/VisibilityIcon';
+import { formatRelativeDate } from '@/lib/format';
+import { getVisibilityLabel } from '@/i18n/labels';
+import type { MapLayerResponse, MapResponse } from '@/types/api';
+
+interface BuilderDialogsProps {
+  mapId?: string;
+  mapData: MapResponse;
+  // Add Data
+  showAddData: boolean;
+  onShowAddDataChange: (open: boolean) => void;
+  onAddDataset: (datasetId: string) => void;
+  onDuplicateRendering: (layerId: string) => void;
+  layers: MapLayerResponse[];
+  isAdding: boolean;
+  // Dataset id currently being added (per-row spinner).
+  addingDatasetId?: string | null;
+  addDataInitialQuery?: string;
+  // Fires before a pointer-down outside the dialog closes it.
+  onAddDataPointerDownOutside?: () => void;
+  // Share
+  showShare: boolean;
+  onShowShareChange: (open: boolean) => void;
+  hasUnsavedChanges: boolean;
+  saveStatus: 'saved' | 'unsaved' | 'saving' | 'failed';
+  // Info
+  showInfo: boolean;
+  onShowInfoChange: (open: boolean) => void;
+  // Unsaved changes
+  blockerState: 'blocked' | 'unblocked' | 'proceeding';
+  onBlockerReset?: () => void;
+  onBlockerProceed?: () => void;
+}
+
+export function BuilderDialogs({
+  mapId,
+  mapData,
+  showAddData,
+  onShowAddDataChange,
+  onAddDataset,
+  onDuplicateRendering,
+  layers,
+  isAdding,
+  addingDatasetId,
+  addDataInitialQuery,
+  onAddDataPointerDownOutside,
+  showShare,
+  onShowShareChange,
+  hasUnsavedChanges,
+  saveStatus,
+  showInfo,
+  onShowInfoChange,
+  blockerState,
+  onBlockerReset,
+  onBlockerProceed,
+}: BuilderDialogsProps) {
+  const { t } = useTranslation('builder');
+  const addDataOpenerRef = useRef<HTMLElement | null>(null);
+  const addDataClosedByPointerRef = useRef(false);
+
+  return (
+    <>
+      {/* Add Data dialog. Non-modal and without an overlay so the layer editor
+          stays clickable: an outside click closes the dialog and still reaches
+          its target. */}
+      <Dialog open={showAddData} onOpenChange={onShowAddDataChange} modal={false}>
+        <DialogContent
+          className="sm:max-w-2xl"
+          onOpenAutoFocus={() => {
+            addDataOpenerRef.current = document.activeElement as HTMLElement | null;
+            addDataClosedByPointerRef.current = false;
+          }}
+          onPointerDownOutside={() => {
+            addDataClosedByPointerRef.current = true;
+            onAddDataPointerDownOutside?.();
+          }}
+          // A non-modal dialog has no trigger to hand focus back to, so Escape
+          // and the Close button return it to whatever opened the dialog.
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (!addDataClosedByPointerRef.current) addDataOpenerRef.current?.focus();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>{t('search.title')}</DialogTitle>
+            <DialogDescription>{t('search.dialogDescription')}</DialogDescription>
+          </DialogHeader>
+          <Suspense fallback={<SceneSpinnerFallback />}>
+            <DatasetSearchPanel
+              onAddDataset={onAddDataset}
+              onDuplicateRendering={onDuplicateRendering}
+              layers={layers}
+              isAdding={isAdding}
+              addingDatasetId={addingDatasetId}
+              initialQuery={addDataInitialQuery}
+            />
+          </Suspense>
+        </DialogContent>
+      </Dialog>
+
+      {/* Share dialog */}
+      {mapId && (
+        <ShareDialog
+          // Remounts on a map switch so ShareDialog's own state (including
+          // useShareTokens' held tokens) can't answer for the wrong map
+          // while this dialog stays open across the switch.
+          key={mapId}
+          mapId={mapId}
+          mapName={mapData.name}
+          visibility={mapData.visibility ?? 'private'}
+          groups={mapData.groups}
+          hasDashboard={(mapData.dashboard_config?.widgets?.length ?? 0) > 0}
+          open={showShare}
+          onOpenChange={onShowShareChange}
+          hasUnsavedChanges={hasUnsavedChanges}
+          saveStatus={saveStatus}
+          // Drives the "hidden from viewers" warning listing
+          // layers whose dataset is private/unpublished on this public/shared map.
+          layers={layers}
+        />
+      )}
+
+      {/* Map Info dialog */}
+      <Dialog open={showInfo} onOpenChange={onShowInfoChange}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t('info.title')}</DialogTitle>
+            <DialogDescription>{t('info.dialogDescription')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 text-sm">
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">{t('info.author')}</span>
+              <span className="font-medium">{mapData.created_by_username ?? t('info.unknown')}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">{t('info.created')}</span>
+              <span>{formatRelativeDate(mapData.created_at ?? null)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">{t('info.updated')}</span>
+              <span>{formatRelativeDate(mapData.updated_at ?? null)}</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-muted-foreground">{t('info.visibility')}</span>
+              <Badge variant="outline" className="flex items-center gap-1 text-xs">
+                <VisibilityIcon visibility={mapData.visibility ?? 'private'} withLabel={false} />
+                {getVisibilityLabel(t, mapData.visibility ?? 'private')}
+              </Badge>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">{t('info.layers')}</span>
+              <span>{mapData.layer_count ?? 0}</span>
+            </div>
+            {mapData.forked_from_id && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">{t('info.forkedFrom')}</span>
+                {mapData.forked_from_name ? (
+                  <Link
+                    to={`/maps/${mapData.forked_from_id}`}
+                    className="text-primary underline hover:text-primary/80"
+                    onClick={() => onShowInfoChange(false)}
+                  >
+                    {mapData.forked_from_name}
+                  </Link>
+                ) : (
+                  <span className="text-muted-foreground/60">{t('info.deletedMap')}</span>
+                )}
+              </div>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Unsaved changes leave warning: a modal AlertDialog with the canonical
+          Cancel-then-Action footer, matching the DatasetPage /
+          AdminSettingsPage navigation guards. AlertDialogAction/Cancel ALSO
+          close the dialog, so every click double-invokes: the button's own
+          handler runs, then the close fires onOpenChange, which calls reset
+          again (proceed->reset, or reset->reset). Verified benign with
+          react-router 7.18.1: proceed() re-checks the blocker synchronously, so
+          by the time the trailing reset() runs the blocker is no longer
+          'blocked' and reset() is a no-op that cannot throw. Don't "fix" the
+          double-invoke by dropping onOpenChange: Escape/overlay dismissal needs
+          it to reset the blocker. */}
+      <AlertDialog open={blockerState === 'blocked'} onOpenChange={() => onBlockerReset?.()}>
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('leaveWarning.title')}</AlertDialogTitle>
+            <AlertDialogDescription>{t('leaveWarning.description')}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => onBlockerReset?.()}>
+              {t('leaveWarning.stay')}
+            </AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={() => onBlockerProceed?.()}>
+              {t('leaveWarning.leave')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}

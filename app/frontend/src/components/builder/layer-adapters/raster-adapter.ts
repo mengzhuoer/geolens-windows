@@ -1,0 +1,209 @@
+import type { AdapterLayerInput, LayerAdapter, LayerDrawing } from './types';
+import { normalizeRasterBounds } from './shared';
+import { addDescribedLayer, writeDescribedLayer, writeDescribedVisibility } from '../layer-writer';
+
+/** Default lower percentile bound for the raster stretch. Backend default is 2. */
+const STRETCH_PMIN_DEFAULT = 2;
+/** Default upper percentile bound for the raster stretch. Backend default is 98. */
+const STRETCH_PMAX_DEFAULT = 98;
+/** Default standard-deviation multiplier for stddev stretch. Backend default is 2. */
+const STRETCH_SIGMA_DEFAULT = 2;
+
+export const RASTER_PAINT_DEFAULTS = {
+  'raster-brightness-min': 0,
+  'raster-brightness-max': 1,
+  'raster-contrast': 0,
+  'raster-saturation': 0,
+  'raster-hue-rotate': 0,
+  'raster-resampling': 'linear',
+  'raster-fade-duration': 300,
+} as const;
+
+type RasterPaintProperty = keyof typeof RASTER_PAINT_DEFAULTS;
+
+const RASTER_PAINT_PROPERTIES = Object.keys(RASTER_PAINT_DEFAULTS) as RasterPaintProperty[];
+
+/**
+ * Every paint key a raster layer draws with. A write clears a key the paint
+ * drops, and MapLibre's default for it is the one above.
+ */
+export const RASTER_SPEC_PAINT_PROPERTIES = [...RASTER_PAINT_PROPERTIES, 'raster-opacity'] as const;
+
+/**
+ * The 4 user-facing raster paint properties exposed in RasterLayerControls.
+ * Excludes raster-brightness-max (kept at default 1), raster-resampling,
+ * raster-fade-duration (internal), and raster-opacity (routed separately
+ * via buildRasterPaint). This is the single source of truth for which
+ * properties the editor controls — no hard-coded keys outside this tuple.
+ */
+export const RASTER_OWNED_PAINT_PROPERTIES = [
+  'raster-brightness-min',
+  'raster-contrast',
+  'raster-saturation',
+  'raster-hue-rotate',
+] as const;
+
+/**
+ * Build a raster tile URL with `colormap_name` and/or `stretch` query params.
+ *
+ * Called from syncRasterLayer BEFORE the tile-URL-diff comparison so that a
+ * colormap or stretch change causes the existing source-teardown path to fire
+ * and MapLibre re-fetches tiles with the new params.
+ *
+ * The `_colormap` and `_stretch` keys are builder-private paint keys (never
+ * in RASTER_OWNED_PAINT_PROPERTIES) and mutate the tile URL, not
+ * a MapLibre paint property.
+ *
+ * `colormap_name` is forwarded only for a non-gray colormap (gray is Titiler's
+ * single-band default). `stretch` is forwarded independently of the colormap —
+ * the api raster-proxy computes a stats-based rescale server-side that applies
+ * to the grayscale render too, so `percentile`/`stddev` must work even when the
+ * colormap is left at the default gray.
+ *
+ * Bound params follow the "only forward non-default" discipline:
+ * - `pmin` / `pmax` are forwarded only when `_stretch === 'percentile'` AND the
+ *   value is a finite number differing from its default (2 / 98). Each is
+ *   forwarded independently, so one may be non-default while the other is omitted.
+ * - `sigma` is forwarded only when `_stretch === 'stddev'` AND the value is a
+ *   finite number differing from its default (2).
+ *
+ * `_pmin`, `_pmax`, and `_sigma` are builder-private paint keys —
+ * they must NOT appear in `RASTER_OWNED_PAINT_PROPERTIES`.
+ *
+ * @param baseUrl  Root-relative or absolute tile URL (e.g. `/api/raster-tiles/...`)
+ * @param paint    The layer paint dict; reads `_colormap`, `_stretch`, `_pmin`,
+ *                 `_pmax`, and `_sigma`.
+ * @returns        `baseUrl` unmodified when no non-default params are set;
+ *                 `baseUrl?<params>` otherwise (param order: colormap_name,
+ *                 stretch, pmin, pmax, sigma).
+ */
+export function buildColormapTileUrl(
+  baseUrl: string,
+  paint: Record<string, unknown>,
+): string {
+  const colormap = paint['_colormap'];
+  const stretch = paint['_stretch'];
+  const params = new URLSearchParams();
+  // gray is the Titiler single-band default — only forward a non-gray colormap.
+  if (typeof colormap === 'string' && colormap && colormap !== 'gray') {
+    params.set('colormap_name', colormap);
+  }
+  // minmax is the default (dtype) rescale; percentile/stddev compute a stats-based
+  // rescale server-side that applies regardless of colormap — forward independently.
+  if (typeof stretch === 'string' && stretch !== 'minmax') {
+    params.set('stretch', stretch);
+  }
+  // Percentile bounds — forward each independently only when non-default.
+  if (stretch === 'percentile') {
+    const pmin = Number(paint['_pmin']);
+    if (Number.isFinite(pmin) && pmin !== STRETCH_PMIN_DEFAULT) {
+      params.set('pmin', String(pmin));
+    }
+    const pmax = Number(paint['_pmax']);
+    if (Number.isFinite(pmax) && pmax !== STRETCH_PMAX_DEFAULT) {
+      params.set('pmax', String(pmax));
+    }
+  }
+  // Stddev sigma — forward only when non-default.
+  if (stretch === 'stddev') {
+    const sigma = Number(paint['_sigma']);
+    if (Number.isFinite(sigma) && sigma !== STRETCH_SIGMA_DEFAULT) {
+      params.set('sigma', String(sigma));
+    }
+  }
+  const qs = params.toString();
+  if (!qs) return baseUrl;
+  // The raster template arrives signed, so it already carries
+  // `?sig=&exp=&scope=`; a blind `?` would fold these params into the `scope`
+  // VALUE (a "Scope mismatch" 403 on a private raster, silently dropped styling
+  // on a public one). `new URL()` is unusable here: the base still holds the
+  // `{z}/{x}/{y}` placeholders.
+  const separator = baseUrl.includes('?') ? '&' : '?';
+  return `${baseUrl}${separator}${qs}`;
+}
+
+function buildRasterPaint(input: AdapterLayerInput): Record<string, number | string> {
+  return {
+    ...getSupportedRasterPaint(input.paint),
+    'raster-opacity': input.opacity ?? 1,
+  };
+}
+
+function getSupportedRasterPaint(paint: Record<string, unknown>): Partial<Record<RasterPaintProperty, number | string>> {
+  const nextPaint: Partial<Record<RasterPaintProperty, number | string>> = {};
+  for (const property of RASTER_PAINT_PROPERTIES) {
+    const value = paint[property];
+    if (property === 'raster-resampling') {
+      if (value === 'linear' || value === 'nearest') {
+        nextPaint[property] = value;
+      }
+      continue;
+    }
+    if (typeof value === 'number') {
+      nextPaint[property] = value;
+    }
+  }
+  return nextPaint;
+}
+
+function describeRaster(input: AdapterLayerInput): LayerDrawing {
+  return {
+    specs: [{
+      layer: {
+        id: input.layerId,
+        type: 'raster',
+        source: input.sourceId,
+        layout: { visibility: input.visible ? 'visible' : 'none' },
+        paint: buildRasterPaint(input),
+      },
+      ownedPaint: RASTER_SPEC_PAINT_PROPERTIES,
+      // map-sync's raster path calls syncPaint with no syncVisibility after it.
+      ownedLayout: ['visibility'],
+    }],
+    images: [],
+  };
+}
+
+export const rasterAdapter: LayerAdapter = {
+  type: 'raster',
+  describe: describeRaster,
+
+  addLayers(map, input) {
+    const { layerId, sourceId, tileUrl, tileSize, minzoom, maxzoom, bounds, attribution } = input;
+    // Source construction reads input.tileUrl directly. The colormap/stretch
+    // query params are applied by buildColormapTileUrl (exported here), called
+    // from map-sync.syncRasterLayer, which mutates adapterInput.tileUrl before
+    // handing it over. The source guard is split from the layer guard so that
+    // when a style swap removes layers but retains sources (raster basemap
+    // reload), the layer is re-added without re-adding the existing source.
+    if (!map.getSource(sourceId)) {
+      const normalizedBounds = normalizeRasterBounds(bounds);
+      map.addSource(sourceId, {
+        type: 'raster',
+        tiles: [`${window.location.origin}${tileUrl}`],
+        tileSize: tileSize ?? 256,
+        minzoom: minzoom ?? 0,
+        maxzoom: maxzoom ?? 18,
+        ...(normalizedBounds ? { bounds: normalizedBounds } : {}),
+        // The dataset's required credit line, read by
+        // MapLibre's attribution control off the source it renders from.
+        ...(attribution ? { attribution } : {}),
+      });
+    }
+    if (map.getLayer(layerId)) return;
+    addDescribedLayer(map, describeRaster(input));
+  },
+
+  syncPaint(map, input) {
+    if (!map.getLayer(input.layerId)) return;
+    writeDescribedLayer(map, describeRaster(input));
+  },
+
+  syncVisibility(map, input) {
+    writeDescribedVisibility(map, describeRaster(input));
+  },
+
+  getLayerIds(layerId: string): string[] {
+    return [layerId];
+  },
+};

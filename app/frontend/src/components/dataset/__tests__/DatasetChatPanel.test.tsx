@@ -1,0 +1,454 @@
+import { render, screen } from '@/test/test-utils';
+import userEvent from '@testing-library/user-event';
+import { streamDatasetChatMessage } from '@/api/maps';
+import { useAIAvailability } from '@/hooks/use-ai-availability';
+import { DatasetChatPanel } from '@/components/dataset/DatasetChatPanel';
+import { toast } from 'sonner';
+
+// scrollIntoView is not available in jsdom
+Element.prototype.scrollIntoView = vi.fn();
+
+const mockNavigate = vi.fn();
+vi.mock('react-router', async () => {
+  const actual = await vi.importActual('react-router');
+  return { ...actual, useNavigate: () => mockNavigate };
+});
+
+vi.mock('@/api/maps', () => ({ streamDatasetChatMessage: vi.fn() }));
+vi.mock('@/hooks/use-ai-availability', () => ({ useAIAvailability: vi.fn() }));
+const mockCan = vi.fn();
+vi.mock('@/hooks/use-permissions', () => ({ usePermissions: () => ({ can: mockCan }) }));
+vi.mock('sonner', () => ({ toast: { error: vi.fn() } }));
+
+const mockMutateAsync = vi.fn();
+vi.mock('@/hooks/use-maps', () => ({
+  useCreateMap: () => ({ mutateAsync: mockMutateAsync, isPending: false }),
+}));
+
+const mockStream = vi.mocked(streamDatasetChatMessage);
+const mockAvailability = vi.mocked(useAIAvailability);
+
+function setAvailable(available: boolean) {
+  // Only the isAIAvailable field is read by the component.
+  mockAvailability.mockReturnValue({ isAIAvailable: available } as ReturnType<typeof useAIAvailability>);
+}
+
+function renderPanel(showOpenInBuilder = true) {
+  return render(
+    <DatasetChatPanel datasetId="ds-1" datasetTitle="NY Parks" showOpenInBuilder={showOpenInBuilder} />,
+  );
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockCan.mockReturnValue(true);
+  sessionStorage.clear();
+});
+
+describe('floating dock inset', () => {
+  const readInset = () => document.documentElement.style.getPropertyValue('--floating-dock-inset');
+
+  const readReach = () => document.documentElement.style.getPropertyValue('--floating-dock-reach');
+
+  it('is set only while the launcher shows', async () => {
+    setAvailable(true);
+    const { unmount } = renderPanel();
+    expect(readInset()).toBe('5.5rem');
+    expect(readReach()).toBe('12rem');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    expect(readInset()).toBe('');
+    expect(readReach()).toBe('');
+
+    unmount();
+    expect(readInset()).toBe('');
+    expect(readReach()).toBe('');
+  });
+
+  it('reserves the measured width of the launcher', () => {
+    setAvailable(true);
+    const spy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 176 } as DOMRect);
+    renderPanel();
+    expect(readReach()).toBe('calc(176px + 4.5rem)');
+    spy.mockRestore();
+  });
+
+  it('reserves the lifted launcher position above the pending-edits bar', () => {
+    setAvailable(true);
+    render(
+      <DatasetChatPanel datasetId="ds-1" datasetTitle="NY Parks" showOpenInBuilder abovePendingBar />,
+    );
+    expect(readInset()).toBe('14rem');
+  });
+
+  it('is not set when AI is unavailable', () => {
+    setAvailable(false);
+    renderPanel();
+    expect(readInset()).toBe('');
+  });
+
+  it('is removed on unmount while the launcher shows', () => {
+    setAvailable(true);
+    const { unmount } = renderPanel();
+    unmount();
+    expect(readInset()).toBe('');
+  });
+});
+
+describe('DatasetChatPanel', () => {
+  it('renders nothing when AI is unavailable (anon / no use_ai_chat)', () => {
+    setAvailable(false);
+    renderPanel();
+    expect(screen.queryByRole('button', { name: 'Ask AI' })).toBeNull();
+  });
+
+  it('opens the panel and streams an answer', async () => {
+    setAvailable(true);
+    mockStream.mockImplementation(async function* () {
+      yield { event: 'token', data: { text: 'There are 1,200 parks.' } };
+      yield { event: 'done', data: { explanation: 'There are 1,200 parks.' } };
+    });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+
+    const input = screen.getByPlaceholderText('Ask about this data...');
+    await userEvent.type(input, 'how many parks?');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText('There are 1,200 parks.');
+    expect(mockStream).toHaveBeenCalledWith('ds-1', 'how many parks?', expect.any(String), [], expect.any(AbortSignal));
+  });
+
+  it('explains a model that needs the Responses API', async () => {
+    setAvailable(true);
+    mockStream.mockImplementation(async function* () {
+      yield {
+        event: 'error',
+        data: { message: 'English server text', code: 'model_requires_responses_api' },
+      };
+    });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'how many parks?');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText(
+      "This site's AI model needs the OpenAI Responses API. Ask an administrator to turn it on or choose a different model.",
+    );
+  });
+
+  it('renders a show_query_result table with an open-in-builder action', async () => {
+    setAvailable(true);
+    mockStream.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'show_query_result',
+              rows: [['Central Park', 843]],
+              columns: ['name', 'acres'],
+              row_count: 1,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Found 1 result.' } };
+    });
+    mockMutateAsync.mockResolvedValue({ id: 'map-9' });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'largest park');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText('Found 1 result.');
+    expect(screen.getByText('Central Park')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: /Open in builder/i }));
+    expect(mockMutateAsync).toHaveBeenCalledWith({ name: 'NY Parks Map' });
+    // No spatial payload in the result, so nothing is stashed.
+    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9', { state: { addDatasetId: 'ds-1' } });
+    expect(sessionStorage.getItem('geolens-chat-result')).toBeNull();
+  });
+
+  it('carries a spatial query result into the builder via sessionStorage', async () => {
+    setAvailable(true);
+    // One feature for one matched row — the overlay is
+    // complete, so nothing about truncation rides along. The server never
+    // emits an empty FeatureCollection (_extract_geojson returns None when no
+    // row is mappable), so a features:[] fixture would exercise a state that
+    // cannot reach this code and would now read as a clipped result.
+    const geojson = {
+      type: 'FeatureCollection',
+      features: [{ type: 'Feature', geometry: { type: 'Point', coordinates: [-73.9, 40.8] }, properties: {} }],
+    };
+    const bbox = [-74.5, 40.4, -73.4, 41.1];
+    mockStream.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'show_query_result',
+              rows: [['Central Park', 843]],
+              columns: ['name', 'acres'],
+              row_count: 1,
+              geojson,
+              bbox,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Found 1 result.' } };
+    });
+    mockMutateAsync.mockResolvedValue({ id: 'map-9' });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'largest park');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText('Found 1 result.');
+    await userEvent.click(screen.getByRole('button', { name: /Open in builder/i }));
+
+    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9', {
+      state: { addDatasetId: 'ds-1', chatResult: true },
+    });
+    // The prompt rides along so the builder can suggest a name if
+    // the carried result is saved as a dataset.
+    expect(JSON.parse(sessionStorage.getItem('geolens-chat-result')!)).toEqual({
+      geojson,
+      bbox,
+      prompt: 'largest park',
+    });
+  });
+
+  // The builder can now SAVE a carried result, so the
+  // handoff must say whether it is the whole answer. Geometry alone let a
+  // clipped result arrive looking complete.
+  it('carries the completeness pair when the overlay is clipped', async () => {
+    setAvailable(true);
+    const geojson = {
+      type: 'FeatureCollection',
+      features: [{ type: 'Feature', geometry: { type: 'Point', coordinates: [-73.9, 40.8] }, properties: {} }],
+    };
+    const bbox = [-74.5, 40.4, -73.4, 41.1];
+    mockStream.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'show_query_result',
+              rows: [['Central Park', 843]],
+              columns: ['name', 'acres'],
+              // 300 matched rows behind a 1-feature overlay, and `truncated`
+              // absent — the server's overlay budget, not the SQL row cap.
+              row_count: 300,
+              geojson,
+              bbox,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Found 300 results.' } };
+    });
+    mockMutateAsync.mockResolvedValue({ id: 'map-9' });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'all parks');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText('Found 300 results.');
+    await userEvent.click(screen.getByRole('button', { name: /Open in builder/i }));
+
+    expect(JSON.parse(sessionStorage.getItem('geolens-chat-result')!)).toEqual({
+      geojson,
+      bbox,
+      truncated: true,
+      totalCount: 300,
+      prompt: 'all parks',
+    });
+  });
+
+  it('does not carry a stale spatial payload when a later table result has none (#533)', async () => {
+    setAvailable(true);
+    const geojson = { type: 'FeatureCollection', features: [] };
+    const bbox = [-74.5, 40.4, -73.4, 41.1];
+    mockStream.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            // Spatial result first...
+            {
+              type: 'show_query_result',
+              rows: [['Central Park', 843]],
+              columns: ['name', 'acres'],
+              row_count: 1,
+              geojson,
+              bbox,
+            },
+            // ...then a non-spatial table (e.g. an aggregate) wins the panel.
+            {
+              type: 'show_query_result',
+              rows: [[496]],
+              columns: ['count'],
+              row_count: 1,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Counted.' } };
+    });
+    mockMutateAsync.mockResolvedValue({ id: 'map-9' });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'count parks');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText('Counted.');
+    await userEvent.click(screen.getByRole('button', { name: /Open in builder/i }));
+
+    // The shown table is the count — the earlier geometry must not ride along.
+    expect(mockNavigate).toHaveBeenCalledWith('/maps/map-9', { state: { addDatasetId: 'ds-1' } });
+    expect(sessionStorage.getItem('geolens-chat-result')).toBeNull();
+  });
+
+  it('hides the open-in-builder action for non-spatial tables (fix #531)', async () => {
+    setAvailable(true);
+    mockStream.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'show_query_result', rows: [['a', 1]], columns: ['name', 'n'], row_count: 1 },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Done.' } };
+    });
+
+    renderPanel(false);
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'count rows');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText('Done.');
+    expect(screen.queryByRole('button', { name: /Open in builder/i })).toBeNull();
+  });
+
+  it('keeps chat results available without a map action when edit_metadata is denied', async () => {
+    setAvailable(true);
+    mockCan.mockReturnValue(false);
+    mockStream.mockImplementation(async function* () {
+      yield { event: 'actions', data: { actions: [
+        { type: 'show_query_result', rows: [['Central Park']], columns: ['name'], row_count: 1 },
+      ] } };
+      yield { event: 'done', data: { explanation: 'Found 1 result.' } };
+    });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'find a park');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    expect(await screen.findByText('Central Park')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Open in builder/i })).not.toBeInTheDocument();
+    expect(mockMutateAsync).not.toHaveBeenCalled();
+  });
+
+  it('leaves map creation failures to the shared mutation notification', async () => {
+    setAvailable(true);
+    mockStream.mockImplementation(async function* () {
+      yield { event: 'actions', data: { actions: [
+        { type: 'show_query_result', rows: [['Central Park']], columns: ['name'], row_count: 1 },
+      ] } };
+      yield { event: 'done', data: { explanation: 'Found 1 result.' } };
+    });
+    mockMutateAsync.mockRejectedValue(new Error('Map creation failed'));
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'find a park');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await screen.findByText('Central Park');
+    await userEvent.click(screen.getByRole('button', { name: /Open in builder/i }));
+
+    expect(mockMutateAsync).toHaveBeenCalled();
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('shows a retry-able error bubble when the stream fails', async () => {
+    setAvailable(true);
+    // eslint-disable-next-line require-yield
+    mockStream.mockImplementation(async function* () {
+      throw new Error('boom');
+    });
+
+    renderPanel();
+    await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+    await userEvent.type(screen.getByPlaceholderText('Ask about this data...'), 'hi');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await screen.findByText('Something went wrong. Please try again.');
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+  });
+
+  describe('dock placement', () => {
+    function renderDock(abovePendingBar: boolean) {
+      setAvailable(true);
+      render(
+        <DatasetChatPanel
+          datasetId="ds-1"
+          datasetTitle="NY Parks"
+          showOpenInBuilder
+          abovePendingBar={abovePendingBar}
+        />,
+      );
+      return screen.getByTestId('dataset-chat-dock');
+    }
+
+    it('keeps the default offset without pending edits', async () => {
+      const dock = renderDock(false);
+      expect(dock).toHaveClass('bottom-10');
+      expect(dock.className).not.toContain('--ask-ai-bottom');
+
+      await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+      expect(screen.getByRole('dialog').className).not.toContain('--ask-ai-bottom');
+    });
+
+    it('raises the launcher above the pending-edits bar while edits are pending', () => {
+      const dock = renderDock(true);
+      expect(dock).not.toHaveClass('bottom-10');
+      expect(dock).toHaveClass('bottom-44', 'sm:bottom-32');
+    });
+
+    it('keeps the open dialog above the bar and inside the viewport while edits are pending', async () => {
+      const dock = renderDock(true);
+      await userEvent.click(screen.getByRole('button', { name: 'Ask AI' }));
+
+      expect(dock).not.toHaveClass('bottom-10');
+      expect(dock).not.toHaveClass('bottom-44');
+      expect(dock).toHaveClass('bottom-(--ask-ai-bottom)');
+      expect(screen.getByRole('dialog').className).toContain('max-h-[calc(100dvh-var(--ask-ai-bottom)');
+    });
+
+    it('takes clicks only on the launcher and the dialog, never on the empty dock', async () => {
+      const dock = renderDock(true);
+      expect(dock).toHaveClass('pointer-events-none');
+
+      const launcher = screen.getByRole('button', { name: 'Ask AI' });
+      expect(launcher).toHaveClass('pointer-events-auto');
+
+      await userEvent.click(launcher);
+      expect(screen.getByRole('dialog')).toHaveClass('pointer-events-auto');
+    });
+  });
+});

@@ -1,0 +1,634 @@
+import { apiFetch, ApiError, authenticatedRawFetch } from './client';
+import type {
+  MapResponse,
+  MapVisibility,
+  MapGroupsResponse,
+  MapGroupsConfirm,
+  MapLayerAccessGap,
+  DuplicateMapResponse,
+  MapListResponse,
+  MapCreateRequest,
+  MapUpdateRequest,
+  MapLayerDiffRequest,
+  MapLayerResponse,
+  MapLayerInput,
+  MapHistoryListResponse,
+  SharedMapResponse,
+  ShareTokenResponse,
+  MapGenerateRequest,
+  ColumnValuesResponse,
+  ColumnStatsResponse,
+  ChatMapLayer,
+  ChatHistoryMessage,
+  ChatRequest,
+  ChatResponse,
+  DatasetChatRequest,
+  VisibilityCheckResponse,
+  MapStyleImportResponse,
+  MapIconListResponse,
+  MapIconResponse,
+  MapAccessResponse,
+  MapStoriesResponse,
+  MapLayerBulkDeleteResponse,
+} from '@/types/api';
+import { API_BASE } from '@/lib/constants';
+import { translateApiErrorDetail } from '@/lib/error-map';
+import i18n from '@/i18n/i18n';
+import { normalizeLayerStyleState } from '@/lib/normalize-style-config';
+import { normalizeSavedMap } from '@/lib/normalize-saved-map';
+
+type ShareExpirationPresetDays = 1 | 7 | 30 | 90;
+
+export interface ShareExpirationInput {
+  expiresAt?: string | null;
+  expiresInDays?: ShareExpirationPresetDays;
+}
+
+function serializeShareExpiration(input: ShareExpirationInput): string | undefined {
+  const body: { expires_at?: string | null; expires_in_days?: ShareExpirationPresetDays } = {};
+  if (input.expiresAt !== undefined) body.expires_at = input.expiresAt;
+  if (input.expiresInDays !== undefined) body.expires_in_days = input.expiresInDays;
+  return Object.keys(body).length > 0 ? JSON.stringify(body) : undefined;
+}
+
+export async function listMaps(
+  params: {
+    skip?: number;
+    limit?: number;
+    search?: string;
+    sort_by?: string;
+    sort_dir?: string;
+    visibility?: string;
+    owned_only?: boolean;
+  } = {},
+  options?: RequestInit,
+): Promise<MapListResponse> {
+  const query = new URLSearchParams();
+  if (params.skip !== undefined) query.set('skip', String(params.skip));
+  if (params.limit !== undefined) query.set('limit', String(params.limit));
+  if (params.search) query.set('search', params.search);
+  if (params.sort_by) query.set('sort_by', params.sort_by);
+  if (params.sort_dir) query.set('sort_dir', params.sort_dir);
+  if (params.visibility) query.set('visibility', params.visibility);
+  if (params.owned_only !== undefined) query.set('owned_only', String(params.owned_only));
+  const qs = query.toString();
+  return apiFetch<MapListResponse>(`/maps/${qs ? `?${qs}` : ''}`, options);
+}
+
+export async function getMap(id: string): Promise<MapResponse> {
+  const resp = await apiFetch<MapResponse>(`/maps/${encodeURIComponent(id)}`);
+  if (resp.layers) {
+    for (const l of resp.layers) {
+      const normalized = normalizeLayerStyleState(l.style_config, l.paint, l.dataset_geometry_type, {
+        isDem: l.is_dem,
+      });
+      l.style_config = normalized.style_config;
+      l.paint = normalized.paint;
+    }
+  }
+  // Map-level normalization (basemap_style, show_basemap_labels, plugins). The
+  // per-layer loop above already mutated resp.layers in place.
+  const mapNorm = normalizeSavedMap(resp);
+  resp.basemap_style = mapNorm.basemap_style;
+  resp.show_basemap_labels = mapNorm.show_basemap_labels;
+  resp.basemap_config = mapNorm.basemap_config;
+  resp.terrain_config = mapNorm.terrain_config;
+  resp.plugins = mapNorm.plugins;
+  return resp;
+}
+
+export async function getMapAccess(id: string): Promise<MapAccessResponse> {
+  return apiFetch<MapAccessResponse>(`/maps/${encodeURIComponent(id)}/access/`);
+}
+
+export async function getMapStories(id: string): Promise<MapStoriesResponse> {
+  return apiFetch<MapStoriesResponse>(`/maps/${encodeURIComponent(id)}/stories/`);
+}
+
+export async function getMapHistory(
+  mapId: string,
+  params: { skip?: number; limit?: number } = {},
+): Promise<MapHistoryListResponse> {
+  const query = new URLSearchParams();
+  if (params.skip !== undefined) query.set('skip', String(params.skip));
+  if (params.limit !== undefined) query.set('limit', String(params.limit));
+  const qs = query.toString();
+  return apiFetch<MapHistoryListResponse>(`/maps/${encodeURIComponent(mapId)}/history${qs ? `?${qs}` : ''}`);
+}
+
+export async function createMap(data: MapCreateRequest): Promise<MapResponse> {
+  return apiFetch<MapResponse>('/maps/', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateMap(
+  id: string,
+  data: MapUpdateRequest,
+): Promise<MapResponse> {
+  return apiFetch<MapResponse>(`/maps/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function patchMapLayers(
+  id: string,
+  diff: MapLayerDiffRequest,
+): Promise<MapResponse> {
+  const resp = await apiFetch<MapResponse>(`/maps/${encodeURIComponent(id)}/layers`, {
+    method: 'PATCH',
+    body: JSON.stringify(diff),
+  });
+  if (resp.layers) {
+    for (const l of resp.layers) {
+      const normalized = normalizeLayerStyleState(l.style_config, l.paint, l.dataset_geometry_type, {
+        isDem: l.is_dem,
+      });
+      l.style_config = normalized.style_config;
+      l.paint = normalized.paint;
+    }
+  }
+  return resp;
+}
+
+export async function duplicateMap(mapId: string): Promise<DuplicateMapResponse> {
+  return apiFetch<DuplicateMapResponse>(`/maps/${encodeURIComponent(mapId)}/duplicate/`, {
+    method: 'POST',
+  });
+}
+
+export async function deleteMap(id: string): Promise<void> {
+  await apiFetch(`/maps/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function addLayerToMapApi(
+  mapId: string,
+  data: MapLayerInput,
+): Promise<MapLayerResponse> {
+  const layer = await apiFetch<MapLayerResponse>(`/maps/${encodeURIComponent(mapId)}/layers`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+  const normalized = normalizeLayerStyleState(layer.style_config, layer.paint, layer.dataset_geometry_type, {
+    isDem: layer.is_dem,
+  });
+  layer.style_config = normalized.style_config;
+  layer.paint = normalized.paint;
+  return layer;
+}
+
+export async function removeLayerFromMapApi(
+  mapId: string,
+  layerId: string,
+): Promise<void> {
+  await apiFetch(`/maps/${encodeURIComponent(mapId)}/layers/${encodeURIComponent(layerId)}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
+ * Batch-delete multiple layers from a map in a single HTTP call.
+ *
+ * One POST regardless of how many layers are selected. The backend returns
+ * partial-failure details inline so the caller can surface them without
+ * treating the whole operation as failed.
+ */
+export async function bulkDeleteLayersApi(
+  mapId: string,
+  layerIds: string[],
+): Promise<MapLayerBulkDeleteResponse> {
+  return apiFetch(`/maps/${encodeURIComponent(mapId)}/layers/bulk-delete`, {
+    method: 'POST',
+    body: JSON.stringify({ layer_ids: layerIds }),
+  });
+}
+
+/**
+ * Fetch a shared map by its share token.
+ *
+ * Returns `null` when the token does not exist (404), an expected quiet outcome
+ * the caller renders as "Map not found". Other statuses (403, 410 expired, 500)
+ * still throw ApiError so they surface correctly (e.g. "Link expired" for 410).
+ */
+export async function getSharedMap(token: string, embedToken?: string): Promise<SharedMapResponse | null> {
+  const extraHeaders: Record<string, string> = {};
+  // Embed viewers present their token so the metadata payload includes the
+  // token's scoped (possibly non-public) dataset layers, as the tile path does.
+  if (embedToken) {
+    extraHeaders['X-Embed-Token'] = embedToken;
+  }
+  const resp = await apiFetch<SharedMapResponse | null>(`/maps/shared/${encodeURIComponent(token)}`, {
+    headers: extraHeaders,
+    expected404: true,
+  });
+  if (resp === null) {
+    return null;
+  }
+  if (resp.layers) {
+    for (const l of resp.layers) {
+      const normalized = normalizeLayerStyleState(l.style_config, l.paint, l.geometry_type, {
+        isDem: l.is_dem,
+      });
+      l.style_config = normalized.style_config;
+      l.paint = normalized.paint;
+    }
+  }
+  // SharedMapResponse.show_basemap_labels is optional; older payloads omit it and
+  // normalizeSavedMap defaults it to true. resp.layers is already normalized above.
+  const mapNorm = normalizeSavedMap(resp);
+  resp.basemap_style = mapNorm.basemap_style;
+  resp.show_basemap_labels = mapNorm.show_basemap_labels;
+  resp.basemap_config = mapNorm.basemap_config;
+  resp.terrain_config = mapNorm.terrain_config;
+  // SharedMapResponse has no plugins field, so the normalized plugins are discarded.
+  return resp;
+}
+
+export async function checkMapVisibility(mapId: string): Promise<VisibilityCheckResponse> {
+  return apiFetch<VisibilityCheckResponse>(`/maps/${encodeURIComponent(mapId)}/visibility-check/`);
+}
+
+export async function exportMapStyleJson(mapId: string): Promise<Record<string, unknown>> {
+  return apiFetch<Record<string, unknown>>(`/maps/${encodeURIComponent(mapId)}/style.json`);
+}
+
+export async function importMapStyleJson(style: Record<string, unknown>): Promise<MapStyleImportResponse> {
+  return apiFetch<MapStyleImportResponse>('/maps/import', {
+    method: 'POST',
+    body: JSON.stringify(style),
+  });
+}
+
+export async function listMapIcons(): Promise<MapIconListResponse> {
+  return apiFetch<MapIconListResponse>('/maps/icons');
+}
+
+export async function uploadMapIcon(file: File): Promise<MapIconResponse> {
+  const formData = new FormData();
+  formData.append('file', file);
+  return apiFetch<MapIconResponse>('/maps/icons', {
+    method: 'POST',
+    body: formData,
+  });
+}
+
+/**
+ * Share a map with exactly these groups; an empty list unshares it. Without
+ * `confirm`, the server answers 409 when some layer is unreadable by a group
+ * that would newly reach the map (see `layersHiddenFromGroups`).
+ */
+export async function setMapGroups(
+  id: string,
+  groupIds: string[],
+  confirm?: MapGroupsConfirm,
+): Promise<MapGroupsResponse> {
+  return apiFetch<MapGroupsResponse>(`/maps/${encodeURIComponent(id)}/groups/`, {
+    method: 'PUT',
+    body: JSON.stringify({ group_ids: groupIds, ...(confirm && { confirm }) }),
+  });
+}
+
+/** The layers a 409 from `setMapGroups` lists, or undefined for any other failure. */
+export function layersHiddenFromGroups(err: unknown): MapLayerAccessGap[] | undefined {
+  if (!(err instanceof ApiError) || err.status !== 409 || !err.body || typeof err.body !== 'object') {
+    return undefined;
+  }
+  const detail = err.body as { code?: unknown; layers?: unknown };
+  return detail.code === 'layers_hidden_from_groups' && Array.isArray(detail.layers)
+    ? (detail.layers as MapLayerAccessGap[])
+    : undefined;
+}
+
+export async function publishMap(id: string, visibility: MapVisibility): Promise<MapResponse> {
+  return apiFetch<MapResponse>(`/maps/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ visibility }),
+  });
+}
+
+/**
+ * Distinguishes the one 400 `publishMap` can return that has its own UI
+ * (SharePanel's inline "can't go public" message) from every other failure,
+ * which gets the generic toast. Reads the raw `err.body` the backend sent
+ * (`{ message, datasets }` from `validate_public_visibility` in
+ * `maps/router.py`), not `err.message`, which is a translated fallback string.
+ *
+ * Shared by `usePublishMap` and `SharePanel` so the two can't drift.
+ */
+export function nonPublicDatasetsFromError(err: unknown): string | undefined {
+  if (!(err instanceof ApiError) || err.status !== 400 || !err.body || typeof err.body !== 'object') {
+    return undefined;
+  }
+  const detail = err.body as { message?: unknown; datasets?: unknown };
+  if (
+    typeof detail.message === 'string' &&
+    detail.message.includes('non-public datasets') &&
+    typeof detail.datasets === 'string' &&
+    detail.datasets.length > 0
+  ) {
+    return detail.datasets;
+  }
+  return undefined;
+}
+
+export async function createShareToken(
+  mapId: string,
+  expiration: ShareExpirationInput = {},
+): Promise<ShareTokenResponse> {
+  const body = serializeShareExpiration(expiration);
+  return apiFetch<ShareTokenResponse>(`/maps/${encodeURIComponent(mapId)}/share/`, {
+    method: 'POST',
+    ...(body && { body }),
+  });
+}
+
+export async function revokeShareToken(mapId: string): Promise<void> {
+  await apiFetch(`/maps/${encodeURIComponent(mapId)}/share/`, { method: 'DELETE' });
+}
+
+export async function updateShareTokenExpiration(
+  mapId: string,
+  expiration: ShareExpirationInput,
+): Promise<ShareTokenResponse> {
+  return apiFetch<ShareTokenResponse>(`/maps/${encodeURIComponent(mapId)}/share/`, {
+    method: 'PATCH',
+    body: serializeShareExpiration(expiration),
+  });
+}
+
+export async function getMapShareToken(mapId: string): Promise<ShareTokenResponse | null> {
+  return apiFetch<ShareTokenResponse | null>(`/maps/${encodeURIComponent(mapId)}/share/`);
+}
+
+export async function uploadThumbnail(mapId: string, dataUri: string): Promise<void> {
+  await apiFetch(`/maps/${encodeURIComponent(mapId)}/thumbnail/`, {
+    method: 'PUT',
+    body: JSON.stringify({ data_uri: dataUri }),
+  });
+}
+
+export async function uploadOgImage(mapId: string, dataUri: string): Promise<void> {
+  await apiFetch(`/maps/${encodeURIComponent(mapId)}/og-image/`, {
+    method: 'PUT',
+    body: JSON.stringify({ data_uri: dataUri }),
+  });
+}
+
+export async function fetchDatasetMaps(datasetId: string): Promise<MapListResponse> {
+  return apiFetch<MapListResponse>(`/datasets/${encodeURIComponent(datasetId)}/maps/`);
+}
+
+export interface StreamEvent {
+  event: string;
+  data: Record<string, unknown>;
+}
+
+/**
+ * Parse an SSE response body into StreamEvents.
+ *
+ * SSE spec allows \r\n, \n, or \r as line terminators. sse-starlette uses
+ * \r\n, so after splitting on \n every line carries a trailing \r that must
+ * be stripped before the empty-line frame boundary check. Blank line = SSE
+ * frame boundary; accumulated data lines are joined and JSON-parsed
+ * (malformed frames are skipped).
+ */
+async function* parseSSEBody(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamEvent> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let eventType = 'message';
+  let dataLines: string[] = [];
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const rawLines = buffer.split('\n');
+      buffer = rawLines.pop() ?? '';
+
+      for (const rawLine of rawLines) {
+        const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+        if (line.startsWith('event: ')) {
+          eventType = line.slice(7);
+        } else if (line.startsWith('data: ')) {
+          dataLines.push(line.slice(6));
+        } else if (line === '' && dataLines.length > 0) {
+          try {
+            const data = JSON.parse(dataLines.join('\n'));
+            yield { event: eventType, data };
+          } catch {
+            // Skip malformed JSON
+          }
+          dataLines = [];
+          eventType = 'message';
+        }
+      }
+    }
+    // Flush any remaining data lines at end of stream
+    if (dataLines.length > 0) {
+      try {
+        const data = JSON.parse(dataLines.join('\n'));
+        yield { event: eventType, data };
+      } catch { /* skip */ }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export async function* streamGenerateMap(
+  data: MapGenerateRequest,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  // Route through the refresh-aware raw fetch so a stream issued as the first
+  // request after a long idle refreshes the JWT instead of failing with a 401.
+  const response = await authenticatedRawFetch(
+    `${API_BASE}/ai/generate-map/stream/`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+      signal,
+    },
+  );
+
+  if (!response.ok) {
+    let detail: unknown;
+    try {
+      const body = await response.json();
+      detail = body.detail;
+    } catch { /* not JSON */ }
+    throw new Error(translateApiErrorDetail(detail, response.status));
+  }
+
+  if (!response.body) {
+    throw new Error(i18n.t('common:errors.emptyResponse'));
+  }
+  yield* parseSSEBody(response.body);
+}
+
+export async function fetchColumnValues(
+  datasetId: string,
+  columnName: string,
+  limit?: number,
+): Promise<ColumnValuesResponse> {
+  const params = limit ? `?limit=${limit}` : '';
+  return apiFetch<ColumnValuesResponse>(
+    `/datasets/${encodeURIComponent(datasetId)}/columns/${encodeURIComponent(columnName)}/values/${params}`,
+  );
+}
+
+export async function fetchColumnStats(
+  datasetId: string,
+  columnName: string,
+): Promise<ColumnStatsResponse> {
+  return apiFetch<ColumnStatsResponse>(
+    `/datasets/${encodeURIComponent(datasetId)}/columns/${encodeURIComponent(columnName)}/stats/`,
+  );
+}
+
+function toChatLayers(layers: MapLayerResponse[]): ChatMapLayer[] {
+  return layers.map((l) => ({
+    id: l.id,
+    name: l.display_name ?? l.dataset_name,
+    dataset_id: l.dataset_id,
+    dataset_table_name: l.dataset_table_name,
+    geometry_type: l.dataset_geometry_type,
+    layer_type: l.layer_type ?? null,
+    column_info: l.dataset_column_info ?? null,
+    visible: l.visible,
+    filter: l.filter ?? null,
+    label_config: l.label_config ?? null,
+    popup_config: l.popup_config ?? null,
+    style_config: l.style_config ?? null,
+    paint: l.paint ?? null,
+    dataset_title: l.dataset_name,
+    feature_count: l.dataset_feature_count ?? null,
+    sample_values: l.dataset_sample_values ?? null,
+  }));
+}
+
+/**
+ * Public-safe AI readiness signal.
+ *
+ * Permission-gated on `use_ai_chat` server-side, so a non-admin editor (who
+ * cannot read `/admin/ai-status/`) can learn whether builder chat is usable
+ * without leaking provider/key detail. Returns `available=false` (not a 503)
+ * when provider keys are missing. A viewer without `use_ai_chat` gets 403.
+ */
+interface AIAvailabilityResponse {
+  available: boolean;
+}
+
+export async function getAIAvailability(): Promise<AIAvailabilityResponse> {
+  return apiFetch<AIAvailabilityResponse>('/ai/availability/');
+}
+
+export async function sendChatMessage(
+  mapId: string,
+  message: string,
+  layers: MapLayerResponse[],
+  language?: string,
+  history?: ChatHistoryMessage[],
+  signal?: AbortSignal,
+): Promise<ChatResponse> {
+  return apiFetch<ChatResponse>('/ai/chat/', {
+    method: 'POST',
+    signal,
+    body: JSON.stringify({
+      message,
+      map_id: mapId,
+      layers: toChatLayers(layers),
+      language,
+      history,
+    } satisfies ChatRequest),
+  });
+}
+
+/**
+ * POST an AI chat SSE request and yield its parsed events.
+ *
+ * Shared by the map-scoped and dataset-scoped chat streams: refresh-aware raw
+ * fetch, ApiError classification on non-OK pre-flight responses,
+ * then SSE frame parsing via parseSSEBody.
+ */
+async function* streamChatSSE(
+  path: string,
+  payload: unknown,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  const response = await authenticatedRawFetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  if (!response.ok) {
+    let detail: unknown;
+    try {
+      const body = await response.json();
+      detail = body.detail;
+    } catch { /* not JSON */ }
+    throw new ApiError(
+      translateApiErrorDetail(detail, response.status),
+      response.status,
+      detail,
+    );
+  }
+
+  if (!response.body) {
+    throw new Error(i18n.t('common:errors.emptyResponse'));
+  }
+  yield* parseSSEBody(response.body);
+}
+
+export async function* streamChatMessage(
+  mapId: string,
+  message: string,
+  layers: MapLayerResponse[],
+  language?: string,
+  history?: ChatHistoryMessage[],
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  yield* streamChatSSE(
+    '/ai/chat/stream/',
+    {
+      message,
+      map_id: mapId,
+      layers: toChatLayers(layers),
+      language,
+      history,
+    },
+    signal,
+  );
+}
+
+/**
+ * Dataset-scoped AI chat stream (read-only query_data over one dataset).
+ * The server resolves all dataset context authoritatively from the DB.
+ */
+export async function* streamDatasetChatMessage(
+  datasetId: string,
+  message: string,
+  language?: string,
+  history?: ChatHistoryMessage[],
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  yield* streamChatSSE(
+    '/ai/chat/dataset/stream/',
+    {
+      message,
+      dataset_id: datasetId,
+      language,
+      history,
+    } satisfies DatasetChatRequest,
+    signal,
+  );
+}

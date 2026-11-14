@@ -1,0 +1,1860 @@
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Globe, Lock, Copy, Loader2, Code, Link as LinkIcon, Info, Trash2, Shield, ExternalLink, ChevronRight, Users, AlertTriangle, AlertCircle, RotateCcw, X, Plus } from 'lucide-react';
+import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { ApiError } from '@/api/client';
+import { classifyApiError } from '@/lib/error-map';
+import {
+  getLockedPreviewBaseUrl,
+  getPublicAppBaseUrl,
+  getShareableBaseUrl,
+} from '@/lib/public-urls';
+import { formatDate } from '@/lib/format';
+import { cn } from '@/lib/utils';
+import { useEdition } from '@/hooks/use-edition';
+import { useCanSetPublicVisibility, useTileConfig } from '@/hooks/use-settings';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { usePublishMap, useMapAudienceBusy, useCreateShareToken, useRevokeShareToken, useMapShareToken, useUpdateShareToken, useLayersHiddenFromMapGroups } from '@/hooks/use-maps';
+import { checkMapVisibility, nonPublicDatasetsFromError } from '@/api/maps';
+import { useCreateEmbedToken, useMapEmbedTokens, useUpdateEmbedToken, useRevokeEmbedToken } from '@/components/builder/hooks/use-embed-tokens';
+import { normalizeOrigin, WildcardOriginError } from '@/lib/builder/url-normalize';
+// Reuse the same audience-visibility check as the layer-stack badge.
+import { isLayerHiddenFromMapAudience } from '@/components/builder/map-stack';
+import { LiveAnnouncement } from '@/components/ui/live-announcement';
+import { MapGroupShare } from '@/components/builder/MapGroupShare';
+import type { GroupRef, MapLayerResponse, MapVisibility } from '@/types/api';
+import { Textarea } from '@/components/ui/textarea';
+
+/**
+ * True for the backend's "this deployment cannot enforce a domain lock" refusal
+ * (`assert_domain_lock_is_enforceable`). Matched through `classifyApiError`
+ * rather than by re-testing the prose, so error-map.ts stays the one place that
+ * knows the server's wording.
+ */
+function isDomainLockUnenforceable(err: unknown): err is ApiError {
+  return (
+    err instanceof ApiError &&
+    err.status === 422 &&
+    classifyApiError(err.body, err.status).key === 'errors.embedDomainLockUnenforceable'
+  );
+}
+
+/**
+ * Build the embedded-viewer iframe `src` URL for a shared map. Single source of
+ * truth for generateEmbedCode (full iframe snippet) and EmbedPreviewPane (live
+ * preview), so the viewer URL shape (path, `embed` flag, `et` token param)
+ * cannot drift between them.
+ */
+export function buildEmbedSrc({
+  shareToken,
+  embedTokenRaw,
+  origin,
+  dashboardCollapsed = false,
+}: {
+  shareToken: string;
+  embedTokenRaw: string;
+  origin: string;
+  dashboardCollapsed?: boolean;
+}): string {
+  const params = new URLSearchParams({ embed: 'true' });
+  if (embedTokenRaw) {
+    params.set('et', embedTokenRaw);
+  }
+  if (dashboardCollapsed) {
+    params.set('dashboard', 'collapsed');
+  }
+  return `${origin}/m/${shareToken}?${params.toString()}`;
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
+ * Generate the iframe embed snippet for a shared map.
+ *
+ * Emits `sandbox="allow-scripts allow-same-origin"`. Without
+ * `allow-same-origin` the frame gets an OPAQUE origin, so the shell's `<script
+ * type="module" crossorigin>` fetch and every later `/api/` call are
+ * cross-origin with `Origin: null`: the viewer renders "Map not found" while
+ * the api answers the same request 200 and the browser discards it for want
+ * of a CORS header.
+ *
+ * The escape hatch the restriction guards against does not reach here. A frame
+ * strips its own sandbox by reaching `parent.document`, which requires being
+ * same-origin with its EMBEDDER. A third-party page embedding a GeoLens map
+ * never is, so the pair cannot be used to escape from there; the warning
+ * belongs to a FIRST-PARTY frame of your own origin. An iframe with no
+ * `sandbox` attribute, which most embed snippets ship, additionally permits
+ * forms, popups, top-level navigation, downloads and pointer lock.
+ *
+ * The cost: the frame regains the GeoLens origin, and with it the viewer's
+ * persisted session. So embed mode is deliberately anonymous: `isEmbedViewer`
+ * in lib/embed-context.ts, read by `authenticatedRawFetch`, withholds the
+ * bearer token, skips the proactive refresh, and returns a 401 untouched
+ * instead of refreshing or logging out. The share token is the capability and
+ * authorizes the map on its own; an embed on someone else's page has no
+ * business spending, refreshing or destroying a viewer's login.
+ *
+ * Exported so SharePanel.test.tsx can pin the rendered snippet shape without
+ * mounting ShareDialog.
+ */
+export function generateEmbedCode({
+  shareToken,
+  embedTokenRaw,
+  origin,
+  title,
+  dashboardCollapsed,
+}: {
+  shareToken: string;
+  embedTokenRaw: string;
+  origin: string;
+  /** Accessible name for the frame (WCAG 4.1.2); escaped for the attribute. */
+  title: string;
+  dashboardCollapsed?: boolean;
+}): string {
+  if (!shareToken) return '';
+  const url = buildEmbedSrc({ shareToken, embedTokenRaw, origin, dashboardCollapsed });
+  return `<iframe src="${url}" title="${escapeHtmlAttribute(title)}" width="100%" height="600" sandbox="allow-scripts allow-same-origin" style="border:none;"></iframe>`;
+}
+
+const VISIBILITY_OPTIONS: Array<{
+  value: MapVisibility;
+  icon: typeof Lock;
+  iconClass: string;
+  titleKey: string;
+  descKey: string;
+}> = [
+  {
+    value: 'private',
+    icon: Lock,
+    iconClass: 'text-muted-foreground',
+    titleKey: 'share.privateTitle',
+    descKey: 'share.privateDescription',
+  },
+  {
+    value: 'restricted',
+    icon: Users,
+    iconClass: 'text-primary',
+    titleKey: 'share.restrictedTitle',
+    descKey: 'share.restrictedDescription',
+  },
+  {
+    value: 'internal',
+    icon: Users,
+    iconClass: 'text-warning',
+    titleKey: 'share.internalTitle',
+    descKey: 'share.internalDescription',
+  },
+  {
+    value: 'public',
+    icon: Globe,
+    iconClass: 'text-success',
+    titleKey: 'share.publicTitle',
+    descKey: 'share.publicDescription',
+  },
+];
+
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Single source of truth for the share-link expiration presets: the Select
+ * options, detectPreset matching windows and apply math all derive from this
+ * table.
+ */
+const EXPIRATION_PRESETS = [
+  { key: '1d', days: 1, i18nKey: 'share.expiration1Day', defaultValue: '1 day' },
+  { key: '7d', days: 7, i18nKey: 'share.expiration7Days', defaultValue: '7 days' },
+  { key: '30d', days: 30, i18nKey: 'share.expiration30Days', defaultValue: '30 days' },
+  { key: '90d', days: 90, i18nKey: 'share.expiration90Days', defaultValue: '90 days' },
+] as const;
+
+interface ShareLinkSettingsProps {
+  mapId: string;
+  shareExpires: string | null;
+  configOrigins: string[];
+  resolvedEmbedTokenId: string | null;
+  canUseAdvancedSharing: boolean;
+  onRevoked: () => void;
+}
+
+function ShareLinkSettings({
+  mapId,
+  shareExpires,
+  configOrigins,
+  resolvedEmbedTokenId,
+  canUseAdvancedSharing,
+  onRevoked,
+}: ShareLinkSettingsProps) {
+  const { t } = useTranslation('builder');
+  const revokeShareToken = useRevokeShareToken();
+  const updateShareToken = useUpdateShareToken();
+  const updateEmbedToken = useUpdateEmbedToken();
+
+  const [showSettings, setShowSettings] = useState(false);
+  const [expiresValue, setExpiresValue] = useState('');
+  const [showDomainRestrict, setShowDomainRestrict] = useState(false);
+
+  // Expiration preset Select state
+  type ExpirationPreset = 'never' | (typeof EXPIRATION_PRESETS)[number]['key'] | 'custom';
+  const [expirationPreset, setExpirationPreset] = useState<ExpirationPreset>('never');
+
+  /**
+   * Detect which preset bucket a given shareExpires ISO string falls into.
+   * Uses ±1 day tolerance for matching preset windows (presets target T23:59:59Z).
+   * Returns 'never' for null, the matching preset key if within tolerance, or 'custom'.
+   */
+  function detectPreset(shareExpiresIso: string | null): ExpirationPreset {
+    if (!shareExpiresIso) return 'never';
+    const target = new Date(shareExpiresIso);
+    const now = new Date();
+    for (const { key, days } of EXPIRATION_PRESETS) {
+      const presetDate = new Date(now.getTime() + days * ONE_DAY_MS);
+      if (Math.abs(target.getTime() - presetDate.getTime()) < ONE_DAY_MS) {
+        return key;
+      }
+    }
+    return 'custom';
+  }
+
+  // Chip-based allowed-origins state
+  const [origins, setOrigins] = useState<string[]>(configOrigins);
+  const [originInput, setOriginInput] = useState('');
+  const [originError, setOriginError] = useState<string | null>(null);
+
+  // Sync origins when configOrigins prop changes (e.g. after PATCH resolves)
+  useEffect(() => {
+    setOrigins(configOrigins);
+  }, [configOrigins]);
+
+  /**
+   * Save the expiration value typed into the Custom date Input.
+   *
+   * Contract: does NOT modify rawShareToken or embedTokenRaw state. Expiration
+   * is updated on the share token only via useUpdateShareToken; the raw tokens
+   * survive dialog open/close cycles and expiration changes.
+   * SharePanel.test.tsx pins this: after a preset Select change the Copy Link /
+   * embed textarea remain visible.
+   */
+  async function handleSaveExpiration() {
+    try {
+      const newExpires = expiresValue ? new Date(expiresValue + 'T23:59:59Z').toISOString() : null;
+      await updateShareToken.mutateAsync({ mapId, expiresAt: newExpires });
+      // Distinct message when expiration is cleared vs. updated.
+      if (newExpires) {
+        toast.success(t('share.expirationUpdated'));
+      } else {
+        toast.success(t('share.expirationCleared', { defaultValue: 'Link expiration removed. The link never expires.' }));
+      }
+    } catch {
+      toast.error(t('share.updateFailed'));
+    }
+  }
+
+  /**
+   * Apply an expiration preset and let the server calculate the deadline. Same
+   * contract as above: rawShareToken and embedTokenRaw are untouched
+   * (SharePanel.test.tsx asserts Copy Link and the embed textarea stay
+   * visible).
+   */
+  async function handleApplyPreset(preset: Exclude<ExpirationPreset, 'custom'>) {
+    try {
+      if (preset === 'never') {
+        await updateShareToken.mutateAsync({ mapId, expiresAt: null });
+      } else {
+        const expiresInDays = EXPIRATION_PRESETS.find((item) => item.key === preset)?.days;
+        if (!expiresInDays) return;
+        await updateShareToken.mutateAsync({ mapId, expiresInDays });
+      }
+      if (preset !== 'never') {
+        toast.success(t('share.expirationUpdated', { defaultValue: 'Expiration updated' }));
+      } else {
+        toast.success(t('share.expirationCleared', { defaultValue: 'Link expiration removed. The link never expires.' }));
+      }
+    } catch {
+      toast.error(t('share.updateFailed'));
+    }
+  }
+
+  async function handleAddOrigin(input: string) {
+    if (!resolvedEmbedTokenId) return;
+    const trimmed = input.trim().replace(/,$/, '');
+    if (!trimmed) return;
+
+    let canonical: string;
+    try {
+      canonical = normalizeOrigin(trimmed);
+    } catch (err) {
+      if (err instanceof WildcardOriginError) {
+        setOriginError(t('share.originWildcardError', { defaultValue: 'Wildcard origin not allowed' }));
+      } else {
+        setOriginError(t('share.originInvalid', { defaultValue: 'Invalid URL' }));
+      }
+      return;
+    }
+
+    // Silently dedupe — canonical form already in list
+    if (origins.includes(canonical)) return;
+
+    const newOrigins = [...origins, canonical];
+    // Optimistic update
+    setOrigins(newOrigins);
+    setOriginInput('');
+    setOriginError(null);
+
+    const addedCanonical = canonical; // capture what was added for functional rollback
+    try {
+      await updateEmbedToken.mutateAsync({
+        mapId,
+        tokenId: resolvedEmbedTokenId,
+        allowedOrigins: newOrigins,
+      });
+    } catch (err) {
+      // Rollback optimistic update using functional setState so concurrent adds
+      // are not discarded (stale-closure rollback race).
+      setOrigins((current) => current.filter((o) => o !== addedCanonical));
+      if (err instanceof ApiError && err.status === 422 && /Wildcard/i.test(err.message)) {
+        setOriginError(t('share.originWildcardError', { defaultValue: 'Wildcard origin not allowed' }));
+      } else if (isDomainLockUnenforceable(err)) {
+        // The server's remediation IS the message here: it names PUBLIC_APP_URL
+        // and the value to set. Collapsing it into the generic "update failed"
+        // toast would leave a domain lock that quietly delivers nothing.
+        // err.message is already localized by apiFetch.
+        setOriginError((err as ApiError).message);
+      } else {
+        toast.error(t('share.updateFailed'));
+      }
+    }
+  }
+
+  async function handleRemoveOrigin(target: string) {
+    if (!resolvedEmbedTokenId) return;
+    const removedOrigin = target; // capture for functional rollback
+    const newOrigins = origins.filter((o) => o !== target);
+    // Optimistic update
+    setOrigins(newOrigins);
+
+    try {
+      await updateEmbedToken.mutateAsync({
+        mapId,
+        tokenId: resolvedEmbedTokenId,
+        allowedOrigins: newOrigins.length > 0 ? newOrigins : null,
+      });
+    } catch (err) {
+      // Rollback using functional setState — re-insert what was removed so
+      // concurrent removes are not discarded (stale-closure race).
+      setOrigins((current) =>
+        current.includes(removedOrigin) ? current : [...current, removedOrigin],
+      );
+      // Removing one of several origins still writes a non-empty lock, so an
+      // unenforceable deployment refuses it and the operator needs the same
+      // remediation as on add. Clearing the LAST origin sends null and is never
+      // refused, which stays their way out.
+      if (isDomainLockUnenforceable(err)) {
+        setOriginError((err as ApiError).message);
+      } else {
+        toast.error(t('share.updateFailed'));
+      }
+    }
+  }
+
+  async function handleRevokeShareLink() {
+    try {
+      await revokeShareToken.mutateAsync(mapId);
+      setExpiresValue('');
+      setOrigins([]);
+      setOriginInput('');
+      setOriginError(null);
+      setShowDomainRestrict(false);
+      setShowSettings(false);
+      onRevoked();
+      toast.success(t('toasts.shareLinkRevoked'));
+    } catch {
+      toast.error(t('toasts.revokeFailed'));
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <button
+        type="button"
+        className="flex cursor-pointer items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+        onClick={() => {
+          const next = !showSettings;
+          setShowSettings(next);
+          if (next) {
+            const detected = detectPreset(shareExpires);
+            setExpirationPreset(detected);
+            setExpiresValue(shareExpires ? shareExpires.split('T')[0] : '');
+            setShowDomainRestrict(configOrigins.length > 0);
+          }
+        }}
+      >
+        <ChevronRight className={cn('h-3 w-3 transition-transform', showSettings ? 'rotate-90' : 'rtl-mirror')} />
+        {t('share.linkSettings')}
+      </button>
+
+      {showSettings && (
+        <div className="space-y-4 ps-4 border-s-2 border-border">
+          {/* Expiration */}
+          <div className="space-y-2">
+            <label className="text-xs font-medium">{t('share.expirationLabel')}</label>
+            <Select
+              value={expirationPreset}
+              onValueChange={(v) => {
+                const next = v as ExpirationPreset;
+                setExpirationPreset(next);
+                if (next !== 'custom') {
+                  void handleApplyPreset(next as Exclude<ExpirationPreset, 'custom'>);
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-full h-8">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="never">{t('share.expirationNever', { defaultValue: 'Never' })}</SelectItem>
+                {EXPIRATION_PRESETS.map((p) => (
+                  <SelectItem key={p.key} value={p.key}>{t(p.i18nKey, { defaultValue: p.defaultValue })}</SelectItem>
+                ))}
+                {canUseAdvancedSharing && (
+                  <SelectItem value="custom">{t('share.expirationCustom', { defaultValue: 'Custom date…' })}</SelectItem>
+                )}
+              </SelectContent>
+            </Select>
+            {expirationPreset === 'custom' && canUseAdvancedSharing && (
+              <div className="flex gap-2">
+                <Input
+                  type="date"
+                  value={expiresValue}
+                  onChange={(e) => setExpiresValue(e.target.value)}
+                  min={new Date().toISOString().split('T')[0]}
+                  className="h-8 text-sm flex-1"
+                  placeholder={t('share.expirationPlaceholder')}
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleSaveExpiration}
+                  disabled={updateShareToken.isPending}
+                >
+                  {updateShareToken.isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : t('share.save')}
+                </Button>
+              </div>
+            )}
+            <p className="text-xs text-muted-foreground">{t('share.expirationHint')}</p>
+          </div>
+
+          {/* Domain restriction */}
+          {canUseAdvancedSharing && resolvedEmbedTokenId && (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <Shield className="h-3 w-3 text-muted-foreground" />
+                  <label className="text-xs font-medium">{t('share.restrictToDomains')}</label>
+                </div>
+                <Switch
+                  checked={showDomainRestrict}
+                  onCheckedChange={(checked) => {
+                    setShowDomainRestrict(checked);
+                    if (!checked && configOrigins.length > 0) {
+                      // Clear all origins when switch is turned off
+                      setOrigins([]);
+                      setOriginInput('');
+                      setOriginError(null);
+                      if (resolvedEmbedTokenId) {
+                        updateEmbedToken.mutateAsync({
+                          mapId,
+                          tokenId: resolvedEmbedTokenId,
+                          allowedOrigins: null,
+                        }).catch(() => {
+                          toast.error(t('toasts.domainClearFailed', { defaultValue: 'Failed to clear domain restrictions' }));
+                        });
+                      }
+                    }
+                  }}
+                  aria-label={t('share.restrictToDomains')}
+                />
+              </div>
+              {showDomainRestrict && (
+                <div className="space-y-2">
+                  {/* Chip list */}
+                  {origins.length > 0 && (
+                    <div role="list" className="flex flex-wrap gap-2">
+                      {origins.map((o) => (
+                        <span
+                          key={o}
+                          role="listitem"
+                          className="inline-flex items-center gap-1 rounded-md border border-border bg-muted px-3 py-1 text-xs"
+                        >
+                          <span className="font-mono truncate max-w-[16rem]" title={o}>{o}</span>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveOrigin(o)}
+                            aria-label={t('share.removeOrigin', { origin: o, defaultValue: 'Remove {{origin}}' })}
+                            className="h-4 w-4 rounded-full -me-1 hover:bg-destructive/10 hover:text-destructive inline-flex items-center justify-center"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {/* Input row */}
+                  <div className="flex gap-2">
+                    <Input
+                      value={originInput}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (v.endsWith(',')) {
+                          void handleAddOrigin(v.slice(0, -1));
+                        } else {
+                          setOriginInput(v);
+                          setOriginError(null);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          void handleAddOrigin(originInput);
+                        }
+                      }}
+                      placeholder={t('share.originsInputPlaceholder', { defaultValue: 'Paste a URL like https://example.com' })}
+                      className="h-8 text-sm font-mono flex-1"
+                      aria-label={t('share.originsInputLabel', { defaultValue: 'Allowed origin URL' })}
+                      aria-describedby="origins-hint"
+                    />
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="outline"
+                      className="h-8 w-8 shrink-0"
+                      onClick={() => void handleAddOrigin(originInput)}
+                      aria-label={t('share.addOrigin', { defaultValue: 'Add origin' })}
+                    >
+                      <Plus className="h-3 w-3" />
+                    </Button>
+                  </div>
+                  {/* Inline error */}
+                  {originError && (
+                    <p className="text-xs text-destructive">{originError}</p>
+                  )}
+                  {/* Hint */}
+                  <p id="origins-hint" className="text-xs text-muted-foreground">
+                    {origins.length === 0
+                      ? t('share.originsEmptyHint', { defaultValue: 'No origins yet — paste a URL like https://example.com to allow embedding.' })
+                      : t('share.originsNormHint', { defaultValue: 'Each origin is normalized to scheme + host + port before saving.' })}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Revoke is destructive (kills the link AND every embed token), so
+              it gets the same AlertDialog confirm as the admin revoke actions. */}
+          <div className="pt-2 border-t">
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full text-destructive hover:text-destructive hover:bg-destructive/5"
+                  disabled={revokeShareToken.isPending}
+                >
+                  {revokeShareToken.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin me-1.5" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5 me-1.5" />
+                  )}
+                  {t('share.revokeShareLink')}
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>{t('share.revokeConfirmTitle')}</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {t('share.revokeConfirmDescription')}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>{t('share.revokeConfirmCancel')}</AlertDialogCancel>
+                  <AlertDialogAction variant="destructive" onClick={handleRevokeShareLink}>
+                    {t('share.revokeConfirmAction')}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface EmbedPreviewPaneProps {
+  shareToken: string;
+  embedTokenRaw: string;
+  origin: string;
+  dashboardCollapsed: boolean;
+}
+
+function EmbedPreviewPane({ shareToken, embedTokenRaw, origin, dashboardCollapsed }: EmbedPreviewPaneProps) {
+  const { t } = useTranslation('builder');
+  const [expanded, setExpanded] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [errored, setErrored] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  // Share URL construction with generateEmbedCode via buildEmbedSrc so the
+  // preview and the copyable snippet can't diverge on path or query params. The
+  // ORIGIN is the one thing they may differ on, and the caller decides: the
+  // snippet is opened by a customer and names the public host; the preview is
+  // opened by this browser and names the host this browser reached. Path,
+  // params and sandbox stay identical.
+  const src = buildEmbedSrc({ shareToken, embedTokenRaw, origin, dashboardCollapsed });
+  // A new URL navigates the iframe again, so it waits on a fresh load and timeout.
+  const [shownSrc, setShownSrc] = useState(src);
+  if (shownSrc !== src) {
+    setShownSrc(src);
+    setLoaded(false);
+    setErrored(false);
+  }
+
+  // 8-second onLoad timeout fallback — if the iframe never fires onLoad
+  // (e.g. viewer error page), transition to error state with Reload affordance.
+  useEffect(() => {
+    if (!expanded || loaded || errored) return;
+    const timer = setTimeout(() => setErrored(true), 8000);
+    return () => clearTimeout(timer);
+  }, [expanded, loaded, errored, reloadKey, src]);
+
+  return (
+    <div className="space-y-2 border-t pt-3">
+      <button
+        type="button"
+        onClick={() => setExpanded(!expanded)}
+        className="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
+        aria-expanded={expanded}
+        aria-label={t('share.iframePreviewToggle', { defaultValue: 'Preview' })}
+      >
+        <ChevronRight className={cn('h-3 w-3 transition-transform', expanded ? 'rotate-90' : 'rtl-mirror')} />
+        {t('share.iframePreviewToggle', { defaultValue: 'Preview' })}
+      </button>
+      {expanded && (
+        <div className="rounded-lg border border-border overflow-hidden">
+          {!errored ? (
+            <div className="relative h-[300px] bg-muted">
+              {!loaded && (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" aria-hidden="true" />
+                </div>
+              )}
+              {/* Must stay byte-identical to the sandbox generateEmbedCode
+                  emits: a preview under a different sandbox is a preview of a
+                  different page. See the generateEmbedCode docstring for why
+                  the pair is safe for a third-party embed. */}
+              <iframe
+                key={reloadKey}
+                data-testid="share-preview-iframe"
+                src={src}
+                sandbox="allow-scripts allow-same-origin"
+                title={t('share.iframePreviewTitle', { defaultValue: 'Map embed preview' })}
+                loading="lazy"
+                style={{ border: 'none' }}
+                className={cn('w-full h-[300px] transition-opacity', loaded ? 'opacity-100' : 'opacity-0')}
+                onLoad={() => setLoaded(true)}
+              />
+            </div>
+          ) : (
+            <div className="h-[300px] bg-muted flex flex-col items-center justify-center gap-2 px-4">
+              <AlertCircle className="h-5 w-5 text-muted-foreground" aria-hidden="true" />
+              <p className="text-sm text-muted-foreground text-center">
+                {t('share.iframeErrorTitle', { defaultValue: 'Preview unavailable' })}
+              </p>
+              <p className="text-xs text-muted-foreground text-center">
+                {t('share.iframeErrorBody', { defaultValue: 'Check that the embed token is valid and the share link is active. Reload to retry.' })}
+              </p>
+              <button
+                type="button"
+                onClick={() => { setErrored(false); setLoaded(false); setReloadKey((k) => k + 1); }}
+                className="text-xs text-primary underline"
+              >
+                {t('share.iframeReload', { defaultValue: 'Reload' })}
+              </button>
+            </div>
+          )}
+          <div className="flex items-center gap-1 px-3 py-2 text-xs text-muted-foreground border-t border-border">
+            <Shield className="h-3 w-3" aria-hidden="true" />
+            {/* Worded generally: the sandbox allows scripts and same-origin. */}
+            {t('share.iframeSandboxNote', {
+              defaultValue: 'The embed preview runs in the same restricted sandbox as the snippet you copy.',
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface ShareDialogProps {
+  mapId: string;
+  visibility: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  hasUnsavedChanges?: boolean;
+  saveStatus?: 'saved' | 'unsaved' | 'saving' | 'failed';
+  /**
+   * The map's current layers, used to warn about layers whose dataset would be
+   * silently filtered out for this map's audience (a private/unpublished
+   * dataset on a public/shared map).
+   */
+  layers?: MapLayerResponse[];
+  /** Names the embed snippet's iframe; a generic label is used when absent. */
+  mapName?: string;
+  /** The groups the map is shared with. The server sends them to the owner and admins only. */
+  groups?: GroupRef[] | null;
+  /** Whether the saved map has a dashboard; only then can an embed start with it collapsed. */
+  hasDashboard?: boolean;
+}
+
+/**
+ * Owns the full share-token + embed-token lifecycle for a single map, so the
+ * "create an embed token when the map has non-public layers" sequence lives in
+ * ONE place instead of being copied across the get/regenerate handlers.
+ * ShareDialog consumes it for presentation only.
+ */
+function useShareTokens({
+  mapId,
+  open,
+  probeEmbedTokens = false,
+}: {
+  mapId: string;
+  open: boolean;
+  /** Loads the embed tokens although no share link exists. */
+  probeEmbedTokens?: boolean;
+}) {
+  const { t } = useTranslation('builder');
+  const createShareToken = useCreateShareToken();
+  const revokeShareToken = useRevokeShareToken();
+  const createEmbedToken = useCreateEmbedToken();
+  const revokeEmbedToken = useRevokeEmbedToken();
+
+  const [hasNonPublic, setHasNonPublic] = useState(false);
+  const [embedTokenRaw, setEmbedTokenRaw] = useState<string | null>(null);
+  const [rawShareToken, setRawShareToken] = useState<string | null>(null);
+
+  // Single-flight guard for concurrent createEmbedToken invocations (the
+  // ChatPanel.tsx inflightRef pattern).
+  const inflightEmbedCreate = useRef<Promise<{ raw_token: string }> | null>(null);
+
+  // Queries as source of truth — only fetch when dialog is open
+  const shareTokenQuery = useMapShareToken(open ? mapId : undefined);
+  const persistedShareTokenHint = shareTokenQuery.data?.token ?? null;
+  const hasShareToken = Boolean(rawShareToken || persistedShareTokenHint);
+  const shareExpires = shareTokenQuery.data?.expires_at ?? null;
+  const isExpired = shareExpires ? new Date(shareExpires) < new Date() : false;
+
+  const embedTokensQuery = useMapEmbedTokens(open && (hasShareToken || probeEmbedTokens) ? mapId : undefined);
+  const activeEmbedToken = embedTokensQuery.data?.tokens?.find(
+    token => token.is_active && new Date(token.expires_at) > new Date()
+  );
+  const resolvedEmbedTokenId = activeEmbedToken?.id ?? null;
+  // Memoized so the array reference only changes when the data does: `?? []`
+  // would produce a new [] each render, firing the sync useEffect in
+  // ShareLinkSettings every render and wiping in-flight optimistic chip state.
+  const configOrigins = useMemo(
+    () => activeEmbedToken?.allowed_origins ?? [],
+    [activeEmbedToken?.allowed_origins],
+  );
+
+  async function runVisibilityCheck() {
+    try {
+      const check = await checkMapVisibility(mapId);
+      setHasNonPublic(check.has_non_public);
+      return check;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Create an embed token if one does not already exist.
+   *
+   * Contract: concurrent invocations are deduplicated via the
+   * inflightEmbedCreate ref. Two callers racing through here (React StrictMode
+   * double-mount, rapid double-click on Generate Share Link) share one
+   * in-flight promise instead of firing parallel createEmbedToken mutations
+   * that would both succeed and orphan one token in the DB. This is also the
+   * explicit create path that lets a fully-public map (no non-public layers)
+   * mint a token so the owner can configure allowed domains.
+   * SharePanel.test.tsx asserts one call under two concurrent clicks.
+   */
+  async function createEmbed() {
+    if (embedTokenRaw) return;
+    if (activeEmbedToken) return;
+    if (inflightEmbedCreate.current) {
+      try {
+        await inflightEmbedCreate.current;
+      } catch {
+        // primary call already toasted; secondary callers stay silent
+      }
+      return;
+    }
+    try {
+      // Allowed origins are managed via the chip input in ShareLinkSettings;
+      // none at creation time.
+      const promise = createEmbedToken.mutateAsync({ mapId });
+      inflightEmbedCreate.current = promise;
+      const tokenResult = await promise;
+      setEmbedTokenRaw(tokenResult.raw_token);
+    } catch {
+      toast.error(t('share.embedTokenFailed'));
+    } finally {
+      inflightEmbedCreate.current = null;
+    }
+  }
+
+  async function getLink() {
+    if (hasShareToken) {
+      const check = await runVisibilityCheck();
+      if (check?.has_non_public) await createEmbed();
+      return;
+    }
+    try {
+      const created = await createShareToken.mutateAsync({ mapId });
+      setRawShareToken(created.share_url ? created.token : null);
+      const check = await runVisibilityCheck();
+      if (check?.has_non_public) await createEmbed();
+    } catch {
+      toast.error(t('toasts.shareLinkFailed'));
+    }
+  }
+
+  async function regenerateLink() {
+    try {
+      await revokeShareToken.mutateAsync(mapId);
+      setEmbedTokenRaw(null);
+      const created = await createShareToken.mutateAsync({ mapId });
+      setRawShareToken(created.share_url ? created.token : null);
+      const check = await runVisibilityCheck();
+      if (check?.has_non_public) {
+        // Allowed origins are managed via the chip input in ShareLinkSettings;
+        // none at creation time.
+        const tokenResult = await createEmbedToken.mutateAsync({ mapId });
+        setEmbedTokenRaw(tokenResult.raw_token);
+      }
+      toast.success(t('toasts.shareLinkCreated', { defaultValue: 'Share link created' }));
+    } catch {
+      toast.error(t('toasts.shareLinkFailed'));
+    }
+  }
+
+  function onRevoked() {
+    setRawShareToken(null);
+    setEmbedTokenRaw(null);
+    setHasNonPublic(false);
+  }
+
+  /** Clear all locally-held token state — used when a map leaves public visibility. */
+  function clearSharedState() {
+    setHasNonPublic(false);
+    setEmbedTokenRaw(null);
+    setRawShareToken(null);
+  }
+
+  // Regenerate embed token when the raw value was lost.
+  async function regenerateEmbed() {
+    if (!activeEmbedToken) return;
+    try {
+      await revokeEmbedToken.mutateAsync({ mapId, tokenId: activeEmbedToken.id });
+      // Allowed origins are managed via the chip input in ShareLinkSettings;
+      // none at creation time.
+      const tokenResult = await createEmbedToken.mutateAsync({ mapId });
+      setEmbedTokenRaw(tokenResult.raw_token);
+      toast.success(t('share.embedTokenRegenerated', { defaultValue: 'Embed token regenerated' }));
+    } catch {
+      toast.error(t('share.embedTokenFailed'));
+    }
+  }
+
+  return {
+    state: {
+      hasNonPublic,
+      embedTokenRaw,
+      rawShareToken,
+      hasShareToken,
+      shareExpires,
+      isExpired,
+      activeEmbedToken,
+      resolvedEmbedTokenId,
+      configOrigins,
+    },
+    getLink,
+    regenerateLink,
+    regenerateEmbed,
+    createEmbed,
+    onRevoked,
+    clearSharedState,
+    // Mutation objects exposed so the presentation layer can read isPending.
+    shareMutation: createShareToken,
+    revokeShareMutation: revokeShareToken,
+    embedMutation: createEmbedToken,
+    revokeEmbedMutation: revokeEmbedToken,
+  };
+}
+
+export function ShareDialog({
+  mapId,
+  visibility,
+  open,
+  onOpenChange,
+  hasUnsavedChanges = false,
+  saveStatus = hasUnsavedChanges ? 'unsaved' : 'saved',
+  layers = [],
+  mapName,
+  groups = null,
+  hasDashboard = false,
+}: ShareDialogProps) {
+  const { t } = useTranslation('builder');
+  const [collapseRequested, setCollapseRequested] = useState(false);
+  const dashboardCollapsed = hasDashboard && collapseRequested;
+  const { isEnterprise } = useEdition();
+  const publishMap = usePublishMap(mapId);
+  const audienceBusy = useMapAudienceBusy();
+  // While the group picker's list is open, Escape closes the list, not the dialog.
+  const [groupPickerOpen, setGroupPickerOpen] = useState(false);
+  // The restrict_public_visibility instance setting caps
+  // non-admins at non-public; the server enforces it with a 403, this only
+  // disables the Public choice.
+  const canSetPublic = useCanSetPublicVisibility();
+
+  // Three origins live here, picked by WHO OPENS THE URL, not by whether it is
+  // "a share".
+  //
+  // 1. HANDED TO SOMEONE ELSE (the copied link, its /card twin, the iframe
+  // snippet): the recipient is not on this network, so these name the address
+  // people use to reach GeoLens (shareBaseUrl / embedBaseUrl).
+  //
+  // 2. OPENED BY THIS BROWSER (the "Open" button and an UNLOCKED preview):
+  // these use currentOrigin directly. This browser demonstrably reaches this
+  // host and may not reach the public one at all (an externally routed hostname
+  // unreachable from the internal admin network is a normal split-horizon
+  // deployment), and pointing a local affordance at it would leave an admin
+  // able to use GeoLens yet unable to open the share they just created.
+  //
+  // 3. OPENED BY THIS BROWSER AND SUBJECT TO THE LOCK (a DOMAIN-LOCKED
+  // preview): its API calls must carry the CONFIGURED origin, while
+  // `frame-ancestors` judges this dialog as the PARENT and accepts only that
+  // same configured origin. So it is offered only when the two coincide (see
+  // getLockedPreviewBaseUrl).
+  //
+  // The domain-lock decision for the SNIPPET is a further split within (1). See
+  // lib/public-urls.ts for why "configured" is not the same question as
+  // "correct".
+  const { data: tileConfig } = useTileConfig();
+  const currentOrigin = typeof window === 'undefined' ? '' : window.location.origin;
+  // Non-null only when the configured value is one a viewer could actually
+  // open. Null covers unset AND the shipped localhost default.
+  const trustedAppBaseUrl = getPublicAppBaseUrl(tileConfig, currentOrigin);
+  // Ordinary shares degrade gracefully: a serving origin still opens.
+  const shareBaseUrl = getShareableBaseUrl(tileConfig, currentOrigin);
+
+  // Names of layers that would be silently hidden from this map's
+  // audience — e.g. a private/unpublished dataset added to a public/shared
+  // map. Empty for a private map (no audience beyond the owner/grantees).
+  const audienceHiddenLayers = useMemo(
+    () =>
+      layers
+        .filter((layer) => isLayerHiddenFromMapAudience(layer, visibility as MapVisibility))
+        .map((layer) => layer.display_name ?? layer.dataset_name),
+    [layers, visibility],
+  );
+
+  // Only the owner and admins receive the group list, and only they may change it.
+  const canManageGroups = groups !== null;
+  // Layers the predicate above already lists are left to its stronger warning.
+  const groupHiddenIds = useLayersHiddenFromMapGroups(mapId, visibility as MapVisibility, groups);
+  const groupHiddenLayers = useMemo(
+    () =>
+      layers
+        .filter((layer) => groupHiddenIds.has(layer.id) && !isLayerHiddenFromMapAudience(layer, visibility as MapVisibility))
+        .map((layer) => layer.display_name ?? layer.dataset_name),
+    [layers, groupHiddenIds, visibility],
+  );
+  const groupCount = groups?.length ?? 0;
+  // The level the owner picked but the server has not confirmed. "Specific
+  // groups" on a private map stays here until groups are saved; any change of
+  // the visibility prop discards it.
+  const [choice, setChoice] = useState<{ from: MapVisibility; level: MapVisibility } | null>(null);
+  // A visibility change settles the pending choice, so it cannot come back
+  // if the map later returns to the level it was picked from.
+  if (choice && choice.from !== visibility) setChoice(null);
+  const selectedLevel = choice?.from === visibility ? choice.level : (visibility as MapVisibility);
+  const radioGroupRef = useRef<HTMLDivElement>(null);
+  const [savedNote, setSavedNote] = useState({ text: '', n: 0 });
+  // The level to focus once the audience controls are enabled again: they are
+  // still disabled while the save that cleared the last group settles.
+  const [levelToFocus, setLevelToFocus] = useState<MapVisibility | null>(null);
+  useEffect(() => {
+    if (!levelToFocus || audienceBusy) return;
+    radioGroupRef.current?.querySelector<HTMLElement>(`[data-level="${levelToFocus}"]`)?.focus();
+    setLevelToFocus(null);
+  }, [levelToFocus, audienceBusy]);
+  const groupEditorOpen = canManageGroups && (visibility !== 'private' || selectedLevel === 'restricted');
+  const openedFromChoice = choice?.from === visibility && choice.level === 'restricted';
+
+  // Sharing with groups revokes share links and embed tokens, so the warning
+  // needs the token list even when the map has no share link yet.
+  const tokens = useShareTokens({
+    mapId,
+    open,
+    probeEmbedTokens: groupEditorOpen && visibility === 'private',
+  });
+  const {
+    hasNonPublic,
+    embedTokenRaw,
+    rawShareToken,
+    hasShareToken,
+    shareExpires,
+    isExpired,
+    activeEmbedToken,
+    resolvedEmbedTokenId,
+    configOrigins,
+  } = tokens.state;
+  const handleGetShareLink = tokens.getLink;
+  const handleRegenerateShareLink = tokens.regenerateLink;
+  const handleRegenerateEmbedToken = tokens.regenerateEmbed;
+  const handleRevoked = tokens.onRevoked;
+  const createShareToken = tokens.shareMutation;
+  const revokeShareToken = tokens.revokeShareMutation;
+  // The embed snippet splits from the share link here, on what a wrong origin
+  // COSTS. An unrestricted embed degrades: from a non-canonical but real origin
+  // it still loads and draws. A DOMAIN-LOCKED one does not: the shell's own API
+  // calls would carry an origin the backend doesn't recognize as first-party,
+  // so the map comes up empty with nothing said. So when the lock is on we
+  // require a trustworthy configured origin and withhold the snippet otherwise.
+  // `assert_domain_lock_is_enforceable` refuses to mint such a lock, so this is
+  // reachable only for a token that predates the guard or a deployment whose
+  // URL changed under it.
+  const isDomainLocked = configOrigins.length > 0;
+  const embedBaseUrl = isDomainLocked ? trustedAppBaseUrl : shareBaseUrl;
+
+  // Category (3). Null means the preview is genuinely impossible, not merely
+  // unconfigured: you cannot preview a domain-locked embed from a hostname the
+  // lock does not permit, and the browser would just block the frame. Copying
+  // the snippet, which is what the admin came for, is unaffected.
+  const previewBaseUrl = isDomainLocked
+    ? getLockedPreviewBaseUrl(tileConfig, currentOrigin)
+    : currentOrigin;
+  // Which of the two refusals to print: no usable public origin at all, or one
+  // that exists but is not this hostname.
+  const lockedPreviewBlockedByOrigin = isDomainLocked && trustedAppBaseUrl !== null;
+
+  const createEmbedToken = tokens.embedMutation;
+  const revokeEmbedToken = tokens.revokeEmbedMutation;
+
+  const isPublic = visibility === 'public';
+  const canUseAdvancedSharing = isEnterprise;
+
+  // Visibility change awaiting user confirmation. Non-null only while
+  // the confirm AlertDialog is open; the radio's checked state stays on the
+  // current `visibility` prop until the mutation actually succeeds, so
+  // cancelling leaves the old selection intact.
+  const [pendingVisibility, setPendingVisibility] = useState<MapVisibility | null>(null);
+
+  // The backend refuses PUT /maps/{id} with 400 when a map is switched to
+  // public while it still holds non-public dataset layers
+  // (validate_public_visibility in maps/router.py). The dataset names come from
+  // the raw `err.body` the backend sent, not the translated `err.message`. This
+  // holds the refusal so it renders as a persistent inline message under the
+  // visibility control, since the confirm dialog is already closed when the
+  // response arrives.
+  const [publishBlocked, setPublishBlocked] = useState<string | null>(null);
+
+  // The dialog stays mounted across open/close (BuilderDialogs.tsx keeps it
+  // alive while a map is loaded), so a refusal from one visit would otherwise
+  // still be showing the next time it opens.
+  useEffect(() => {
+    if (!open) setPublishBlocked(null);
+  }, [open]);
+
+  // Layers hidden from the audience of the visibility being confirmed
+  // (not the current one — before a private→public change the current-visibility
+  // list is always empty). Same predicate as the post-change warning below.
+  const pendingAudienceHiddenLayers = useMemo(
+    () =>
+      pendingVisibility
+        ? layers
+            .filter((layer) => isLayerHiddenFromMapAudience(layer, pendingVisibility))
+            .map((layer) => layer.display_name ?? layer.dataset_name)
+        : [],
+    [layers, pendingVisibility],
+  );
+
+  // validate_public_visibility (server) decides whether the map can go
+  // public; isLayerHiddenFromMapAudience above only guesses from cached
+  // layer fields and can disagree with it. 'error' must stay distinct from
+  // an eligible result — a request that never got an answer is not the
+  // server saying yes.
+  type PublicEligibility =
+    | { status: 'checking' }
+    | { status: 'error' }
+    | { status: 'resolved'; nonPublicDatasets: string[] };
+  const [publicEligibility, setPublicEligibility] = useState<PublicEligibility>({ status: 'checking' });
+  const publicEligibilityRequestId = useRef(0);
+  const isCheckingPublicEligibility = publicEligibility.status === 'checking';
+  const publicEligibilityFailed = publicEligibility.status === 'error';
+  const isPublicBlocked =
+    publicEligibility.status === 'resolved' && publicEligibility.nonPublicDatasets.length > 0;
+  const isPublicEligible =
+    publicEligibility.status === 'resolved' && publicEligibility.nonPublicDatasets.length === 0;
+  // Deduplicated — the server names one dataset per non-public layer, so two
+  // layers on the same dataset, or a shared title, would otherwise repeat.
+  const blockedDatasets =
+    publicEligibility.status === 'resolved'
+      ? [...new Set(publicEligibility.nonPublicDatasets)]
+      : [];
+
+  // BuilderDialogs.tsx keys ShareDialog on mapId, so a map switch remounts
+  // this component and resets its state; publishRequestId only has to
+  // arbitrate same-map races (a retry, a rapid re-click) below.
+  const publishRequestId = useRef(0);
+
+  // A remount discards this instance's state, not an already-running PUT's
+  // toast — that isn't state a remount resets. Lets the orphaned call
+  // notice it should skip it.
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    // StrictMode runs setup, cleanup, then setup again on mount; without
+    // this line the cleanup's false is never undone by the second setup.
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // Guards a stale response — including a retry's — from landing after a newer request.
+  function checkPublicEligibility() {
+    const requestId = ++publicEligibilityRequestId.current;
+    setPublicEligibility({ status: 'checking' });
+    checkMapVisibility(mapId)
+      .then((check) => {
+        if (publicEligibilityRequestId.current === requestId) {
+          setPublicEligibility({ status: 'resolved', nonPublicDatasets: check.non_public_datasets });
+        }
+      })
+      .catch(() => {
+        if (publicEligibilityRequestId.current === requestId) {
+          setPublicEligibility({ status: 'error' });
+        }
+      });
+  }
+
+  // Restricted is reached by saving groups; from internal or public it needs
+  // groups already on file, and only the owner or an admin can change them.
+  const restrictedBlocked = !canManageGroups || (visibility !== 'private' && groupCount === 0);
+
+  function optionDescription(opt: (typeof VISIBILITY_OPTIONS)[number], publicBlocked: boolean): string {
+    if (publicBlocked) return t('common:visibilityPublicAdminOnly');
+    if (opt.value === 'restricted' && restrictedBlocked && canManageGroups) {
+      return t('share.restrictedNeedsGroups');
+    }
+    if (opt.value === 'private' && visibility === 'restricted') {
+      return t('share.privateDescriptionRestricted');
+    }
+    return t(opt.descKey);
+  }
+
+  // Clearing the last group leaves the map private and closes the editor, so
+  // the result is read out here and focus moves to the level that is now checked.
+  function handleGroupsSaved(saved: string) {
+    if (saved !== 'private') return;
+    setChoice(null);
+    setSavedNote((prev) => ({ text: t('share.groups.savedPrivate'), n: prev.n + 1 }));
+    setLevelToFocus('private');
+  }
+
+  function handleVisibilitySelect(newVisibility: MapVisibility) {
+    setChoice(newVisibility === 'restricted' && visibility === 'private' ? { from: 'private', level: 'restricted' } : null);
+    if (newVisibility === visibility) return;
+    // A fresh attempt clears any stale refusal from a previous one.
+    setPublishBlocked(null);
+    // Transitions that cross the public boundary need explicit confirmation:
+    // going public exposes the map to anyone with a link, and leaving public
+    // kills existing share links (clearSharedState below). Private<->internal
+    // stays one click.
+    if (newVisibility === 'public' || visibility === 'public') {
+      setPendingVisibility(newVisibility);
+      if (newVisibility === 'public') checkPublicEligibility();
+      return;
+    }
+    // From private, the group editor does the work: saving groups restricts the map.
+    if (newVisibility === 'restricted' && visibility === 'private') return;
+    void handleVisibilityChange(newVisibility);
+  }
+
+  async function handleConfirmVisibilityChange() {
+    const next = pendingVisibility;
+    setPendingVisibility(null);
+    if (next) await handleVisibilityChange(next);
+  }
+
+  async function handleVisibilityChange(newVisibility: MapVisibility) {
+    if (newVisibility === visibility) return;
+    setPublishBlocked(null);
+    // A newer attempt on this same map makes an earlier PUT's response
+    // stale once it lands (a mapId change instead remounts the dialog).
+    const requestId = ++publishRequestId.current;
+    try {
+      const { clearedGroups, visibility: effective } = await publishMap.mutateAsync({ id: mapId, visibility: newVisibility });
+      if (!isMountedRef.current || publishRequestId.current !== requestId) return;
+      if (effective === 'public') {
+        toast.success(t('toasts.mapNowPublic'));
+      } else if (effective === 'internal') {
+        toast.success(t('toasts.mapNowInternal'));
+      } else if (effective === 'restricted' && newVisibility === 'restricted') {
+        toast.success(t('toasts.mapNowRestricted'));
+      } else if (effective === 'restricted') {
+        // A map still shared with groups stays restricted when Private is picked.
+        toast.warning(t('toasts.mapStillRestricted'));
+      } else {
+        toast.success(t(clearedGroups ? 'toasts.mapNowPrivateGroupsCleared' : 'toasts.mapNowPrivate'));
+      }
+      if (effective !== 'public') {
+        tokens.clearSharedState();
+      }
+    } catch (err) {
+      if (!isMountedRef.current || publishRequestId.current !== requestId) return;
+      // The mutation never touched `visibility` on failure (the toggle only
+      // follows the server response above), so the previous value is already on
+      // screen. The raw error detail (`err.body`) carries `{ message, datasets
+      // }` for this refusal, extracted via the same helper `usePublishMap` uses
+      // to skip its generic "failed to update" toast for this one case (see
+      // use-maps.ts).
+      const datasets = nonPublicDatasetsFromError(err);
+      if (datasets) setPublishBlocked(datasets);
+    }
+  }
+
+  /**
+   * Category (2) above: the "Open" button navigates THIS admin's browser and
+   * hands the URL to nobody, so it uses the origin this browser is known to
+   * reach rather than the public one, which a split-horizon deployment may
+   * route only externally.
+   */
+  function getShareUrl() {
+    if (!rawShareToken) return '';
+    return `${currentOrigin}/m/${rawShareToken}`;
+  }
+
+  /**
+   * Returns the crawler-unfurlable /card URL so the copied link emits
+   * OG/Twitter meta tags when pasted into Slack, Twitter etc. Human visitors
+   * are redirected to the SPA viewer via the card route's <meta
+   * http-equiv="refresh">. The /m/{token} viewer URL stays in getShareUrl() for
+   * "Open in new tab" (direct, redirect-free load); the embed iframe src is
+   * separate (see generateEmbedCode).
+   */
+  function getShareCardUrl() {
+    if (!rawShareToken) return '';
+    return `${shareBaseUrl}/api/maps/shared/${rawShareToken}/card`;
+  }
+
+  function getEmbedCode() {
+    if (!embedBaseUrl) return '';
+    return generateEmbedCode({
+      shareToken: rawShareToken || '',
+      embedTokenRaw: embedTokenRaw || '',
+      origin: embedBaseUrl,
+      title: mapName || t('share.embedTitleFallback'),
+      dashboardCollapsed,
+    });
+  }
+
+  async function handleCopyShareLink() {
+    // Copy the /card URL so the pasted link unfurls in social clients.
+    const url = getShareCardUrl();
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.success(t('toasts.shareLinkCopied'));
+    } catch {
+      toast.error(t('toasts.copyFailed'));
+    }
+  }
+
+  async function handleCopyEmbedCode() {
+    const code = getEmbedCode();
+    if (!code) {
+      // Only reachable with a domain lock on and no trustworthy public origin:
+      // a snippet that would load and stay empty.
+      if (!embedBaseUrl) toast.error(t('share.publicAppUrlNotConfigured'));
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(code);
+      toast.success(t('toasts.embedCodeCopied'));
+    } catch {
+      toast.error(t('toasts.copyFailed'));
+    }
+  }
+
+  const visibilityDialog = (() => {
+    if (pendingVisibility !== 'public') {
+      return {
+        title: t('share.leavePublicConfirmTitle'),
+        description: t('share.leavePublicConfirmDescription'),
+        confirm: {
+          label: t('share.leavePublicConfirmAction'),
+          onClick: handleConfirmVisibilityChange,
+          variant: 'destructive' as const,
+        },
+      };
+    }
+    if (isPublicBlocked) {
+      return {
+        title: t('share.makePublicBlockedTitle'),
+        description: t('share.makePublicBlockedIntro'),
+        body: (
+          <div className="space-y-2">
+            {/* Up to 200 titles of up to 500 characters each — bounded
+                independently of the dialog's own height. */}
+            <ul
+              data-testid="share-blocked-datasets-list"
+              aria-label={t('share.makePublicBlockedIntro')}
+              className="max-h-40 list-disc space-y-1 overflow-y-auto rounded-md border border-border bg-muted/20 py-2 ps-8 pe-3 text-xs text-foreground"
+            >
+              {blockedDatasets.map((name) => (
+                <li key={name} className="break-words">
+                  {name}
+                </li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">
+              {t('share.makePublicBlockedRemedy')}
+            </p>
+          </div>
+        ),
+      };
+    }
+    if (publicEligibilityFailed) {
+      return {
+        title: t('share.makePublicConfirmTitle'),
+        description: t('share.makePublicCheckFailed'),
+        footerExtra: (
+          <Button type="button" variant="outline" onClick={checkPublicEligibility}>
+            {t('share.makePublicCheckRetry')}
+          </Button>
+        ),
+      };
+    }
+    return {
+      title: t('share.makePublicConfirmTitle'),
+      description: t('share.makePublicConfirmDescription'),
+      body:
+        isPublicEligible && pendingAudienceHiddenLayers.length > 0 ? (
+          <div
+            data-testid="share-confirm-audience-hidden-warning"
+            className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2 text-xs text-foreground"
+          >
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+            <p>
+              {t('share.audienceHiddenWarning', {
+                count: pendingAudienceHiddenLayers.length,
+                layers: pendingAudienceHiddenLayers.join(', '),
+              })}
+            </p>
+          </div>
+        ) : undefined,
+      confirm: {
+        label: t('share.makePublicConfirmAction'),
+        onClick: handleConfirmVisibilityChange,
+        pending: isCheckingPublicEligibility,
+      },
+    };
+  })();
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="sm:max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto"
+        onEscapeKeyDown={(event) => {
+          if (groupPickerOpen) event.preventDefault();
+        }}
+      >
+        <DialogHeader>
+          <DialogTitle>{t('share.title')}</DialogTitle>
+          <DialogDescription>{t('share.dialogDescription')}</DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-5">
+          {(hasUnsavedChanges || saveStatus === 'failed' || saveStatus === 'saving') && (
+            <div
+              data-testid="share-output-save-state"
+              className={cn(
+                'flex items-start gap-2 rounded-md border px-3 py-2 text-xs',
+                saveStatus === 'failed'
+                  ? 'border-destructive/30 bg-destructive/5 text-foreground'
+                  : 'border-warning/30 bg-warning/5 text-foreground',
+              )}
+            >
+              {saveStatus === 'saving' ? (
+                <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" aria-hidden="true" />
+              ) : (
+                <AlertTriangle
+                  className={cn(
+                    'mt-0.5 h-3.5 w-3.5 shrink-0',
+                    saveStatus === 'failed' ? 'text-destructive' : 'text-warning',
+                  )}
+                  aria-hidden="true"
+                />
+              )}
+              <p>
+                {saveStatus === 'failed'
+                  ? t('share.saveFailedWarning', { defaultValue: 'Save failed. Share links and embeds still show the last saved map until you retry successfully.' })
+                  : saveStatus === 'saving'
+                    ? t('share.savingWarning', { defaultValue: 'Saving changes. Share links and embeds update after this save finishes.' })
+                    : t('share.unsavedWarning', { defaultValue: 'Unsaved changes are only in the builder preview. Save before copying links or embeds.' })}
+              </p>
+            </div>
+          )}
+
+          {/* Warn about layers whose dataset is private/unpublished on a
+              public/shared map: those viewers silently never see them (filtered
+              server-side by filter_layer_rows_by_dataset_visibility). */}
+          {audienceHiddenLayers.length > 0 && (
+            <div
+              data-testid="share-audience-hidden-warning"
+              className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2 text-xs text-foreground"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+              <p>
+                {t('share.audienceHiddenWarning', {
+                  count: audienceHiddenLayers.length,
+                  layers: audienceHiddenLayers.join(', '),
+                  defaultValue: 'Hidden from viewers: {{layers}}. These layers\' datasets are private or unpublished, so they will not appear for anyone but you.',
+                })}
+              </p>
+            </div>
+          )}
+          {groupHiddenLayers.length > 0 && (
+            <div
+              data-testid="share-group-hidden-warning"
+              className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2 text-xs text-foreground"
+            >
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+              <p>{t('share.groupHiddenWarning', { layers: groupHiddenLayers.join(', ') })}</p>
+            </div>
+          )}
+
+          {/* Visibility selector */}
+          <div className="space-y-2">
+            <p className="text-sm font-semibold">{t('share.visibilityTitle')}</p>
+            <div
+              ref={radioGroupRef}
+              className="space-y-1.5"
+              role="radiogroup"
+              aria-label={t('share.visibilityTitle')}
+            >
+              {VISIBILITY_OPTIONS.filter(
+                (opt) => opt.value !== 'restricted' || canManageGroups || visibility === 'restricted',
+              ).map((opt) => {
+                const Icon = opt.icon;
+                const isActive = selectedLevel === opt.value;
+                // A non-admin cannot move a map TO public while
+                // the instance restricts public visibility to admins.
+                const publicBlocked = opt.value === 'public' && !canSetPublic;
+                const blocked = publicBlocked || (opt.value === 'restricted' && !isActive && restrictedBlocked);
+                return (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    role="radio"
+                    data-level={opt.value}
+                    aria-checked={isActive}
+                    className={cn(
+                      'cursor-pointer w-full flex items-start gap-3 rounded-lg border px-3 py-2.5 text-start transition-colors',
+                      isActive
+                        ? 'ring-2 ring-ring border-primary bg-primary/5'
+                        : 'border-border hover:border-muted-foreground/30 hover:bg-accent/50',
+                      blocked && 'cursor-not-allowed opacity-60',
+                    )}
+                    onClick={() => handleVisibilitySelect(opt.value)}
+                    disabled={audienceBusy || blocked}
+                  >
+                    <Icon className={cn('h-4 w-4 mt-0.5 shrink-0', opt.iconClass)} />
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold">{t(opt.titleKey)}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {optionDescription(opt, publicBlocked)}
+                      </p>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            {!isPublic && (
+              <p className="text-xs text-muted-foreground mt-2">{t('share.makePublicHint', { defaultValue: 'Make this map public to generate a share link' })}</p>
+            )}
+            {/* The server-side refusal to publish a map that still holds
+                non-public dataset layers, shown inline (see
+                handleVisibilityChange above). */}
+            {publishBlocked && (
+              <div
+                data-testid="share-publish-blocked-error"
+                role="alert"
+                className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-foreground mt-2"
+              >
+                <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" aria-hidden="true" />
+                <p>{t('share.cannotPublish', { datasets: publishBlocked })}</p>
+              </div>
+            )}
+          </div>
+
+          {/* Crossing the public boundary is confirmed before the mutation
+              runs: going public exposes the map and leaving public kills
+              existing share links. */}
+          <ConfirmDialog
+            open={pendingVisibility !== null}
+            onOpenChange={(dialogOpen) => {
+              if (!dialogOpen) setPendingVisibility(null);
+            }}
+            title={visibilityDialog.title}
+            description={visibilityDialog.description}
+            footerExtra={visibilityDialog.footerExtra}
+            confirm={visibilityDialog.confirm}
+          >
+            {visibilityDialog.body}
+          </ConfirmDialog>
+
+          {publishMap.isPending && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {t('share.updatingVisibility')}
+            </div>
+          )}
+
+          <LiveAnnouncement text={savedNote.text} trigger={String(savedNote.n)} />
+
+          {groups && groupEditorOpen && (
+            <MapGroupShare
+              mapId={mapId}
+              visibility={visibility}
+              groups={groups}
+              hasLinks={hasShareToken || Boolean(activeEmbedToken)}
+              focusOnOpen={openedFromChoice}
+              onSaved={handleGroupsSaved}
+              onPickerOpenChange={setGroupPickerOpen}
+            />
+          )}
+
+          {/* Share link section (only for public maps) */}
+          {isPublic && (
+            <>
+              <div className="border-t pt-4 space-y-3">
+                <div className="flex items-center gap-1.5">
+                  <LinkIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="text-sm font-semibold">{t('share.shareLink')}</span>
+                </div>
+
+                {hasShareToken ? (
+                  <div className="space-y-3">
+                    {rawShareToken ? (
+                      <div className="flex gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="flex-1"
+                          onClick={handleCopyShareLink}
+                          disabled={isExpired}
+                        >
+                          <Copy className="h-3.5 w-3.5 me-1.5" />
+                          {t('share.copyLink')}
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            const url = getShareUrl();
+                            if (url) window.open(url, '_blank');
+                          }}
+                          disabled={isExpired}
+                        >
+                          <ExternalLink className="h-3.5 w-3.5 me-1.5" />
+                          {t('share.open')}
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="space-y-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2">
+                        <div className="flex items-start gap-2">
+                          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+                          <p className="text-xs text-foreground">
+                            {t('share.rawTokenUnavailable', {
+                              defaultValue: 'For security, the full share link is only shown when it is created. Regenerate the link to copy it again.',
+                            })}
+                          </p>
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          onClick={handleRegenerateShareLink}
+                          disabled={revokeShareToken.isPending || createShareToken.isPending}
+                        >
+                          {(revokeShareToken.isPending || createShareToken.isPending) ? (
+                            <Loader2 className="h-3 w-3 animate-spin me-1.5" />
+                          ) : (
+                            <RotateCcw className="h-3 w-3 me-1.5" />
+                          )}
+                          {t('share.regenerateLink', { defaultValue: 'Regenerate link' })}
+                        </Button>
+                      </div>
+                    )}
+
+                    {/* Status summary */}
+                    {isExpired && (
+                      <div className="flex items-center gap-1.5 text-xs text-destructive">
+                        <AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>{t('share.expired')}</span>
+                      </div>
+                    )}
+                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                      <span className={isExpired ? 'text-destructive' : undefined}>
+                        {t('share.summaryExpires')}: {shareExpires ? formatDate(shareExpires) : t('share.summaryNever')}
+                      </span>
+                      {configOrigins.length > 0 && (
+                        <>
+                          <span className="text-border">|</span>
+                          <span className="truncate">{t('share.summaryDomains')}: {configOrigins.join(', ')}</span>
+                        </>
+                      )}
+                    </div>
+
+                    {/* Link Settings -- collapsible */}
+                    <ShareLinkSettings
+                      mapId={mapId}
+                      shareExpires={shareExpires}
+                      configOrigins={configOrigins}
+                      resolvedEmbedTokenId={resolvedEmbedTokenId}
+                      canUseAdvancedSharing={canUseAdvancedSharing}
+                      onRevoked={handleRevoked}
+                    />
+                  </div>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
+                    onClick={handleGetShareLink}
+                    disabled={createShareToken.isPending}
+                  >
+                    {createShareToken.isPending ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin me-1.5" />
+                    ) : (
+                      <LinkIcon className="h-3.5 w-3.5 me-1.5" />
+                    )}
+                    {t('share.generateShareLink')}
+                  </Button>
+                )}
+              </div>
+
+              {/* Embed code section (only when share token exists) */}
+              {hasShareToken && rawShareToken && (
+                <div className="border-t pt-4 space-y-3">
+                  <div className="flex items-center gap-1.5">
+                    <Code className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span className="text-sm font-semibold">{t('share.embedCode')}</span>
+                  </div>
+                  {/* A domain-locked embed with no trustworthy public origin
+                      would load and stay empty, so say that instead of emitting
+                      a snippet that looks fine. An unrestricted embed always
+                      has a usable origin and never reaches this branch. */}
+                  {!embedBaseUrl ? (
+                    <div
+                      role="status"
+                      className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2"
+                    >
+                      <AlertTriangle className="h-3.5 w-3.5 text-warning mt-0.5 flex-shrink-0" />
+                      <p className="text-xs text-muted-foreground">
+                        {t('share.publicAppUrlNotConfigured')}
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="relative">
+                      <Textarea
+                        readOnly
+                        value={getEmbedCode()}
+                        rows={3}
+                        className="bg-muted/30 text-xs font-mono resize-none"
+                      />
+                      <Button
+                        variant="outline"
+                        size="icon-xs"
+                        className="absolute top-1.5 end-1.5"
+                        onClick={handleCopyEmbedCode}
+                        title={t('share.copyEmbedCode')}
+                      >
+                        <Copy className="h-3 w-3" />
+                      </Button>
+                    </div>
+                  )}
+                  {hasDashboard && (
+                    <div className="flex items-center justify-between gap-2">
+                      <label htmlFor="embed-dashboard-collapsed" className="text-xs font-medium">
+                        {t('share.dashboardCollapsed')}
+                      </label>
+                      <Switch
+                        id="embed-dashboard-collapsed"
+                        checked={collapseRequested}
+                        onCheckedChange={setCollapseRequested}
+                      />
+                    </div>
+                  )}
+                  {hasNonPublic && (
+                    <div className="flex items-start gap-2 rounded-md border border-info/30 bg-info/5 px-3 py-2">
+                      <Info className="h-3.5 w-3.5 text-info mt-0.5 flex-shrink-0" />
+                      <p className="text-xs text-foreground">
+                        {t('share.embedTokenInfo')}
+                      </p>
+                    </div>
+                  )}
+                  {hasNonPublic && !embedTokenRaw && (
+                    <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2">
+                      <AlertTriangle className="h-3.5 w-3.5 text-warning mt-0.5 flex-shrink-0" />
+                      <p className="text-xs text-foreground">
+                        {t('share.embedTokenMissing', { defaultValue: 'This map contains non-public layers. Viewers may not be able to see all layers without an embed token.' })}
+                      </p>
+                    </div>
+                  )}
+                  {/* Warn when embed token was created in a previous session. */}
+                  {!embedTokenRaw && activeEmbedToken && (
+                    <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 px-3 py-2">
+                      <AlertTriangle className="h-3.5 w-3.5 text-warning mt-0.5 flex-shrink-0" />
+                      <div className="flex-1 space-y-1.5">
+                        <p className="text-xs text-foreground">
+                          {t('share.embedTokenNotAvailable', {
+                            defaultValue: 'The embed token was created in a previous session. Regenerate to get the embed code.',
+                          })}
+                        </p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          onClick={handleRegenerateEmbedToken}
+                          disabled={revokeEmbedToken.isPending || createEmbedToken.isPending}
+                        >
+                          {(revokeEmbedToken.isPending || createEmbedToken.isPending) ? (
+                            <Loader2 className="h-3 w-3 animate-spin me-1.5" />
+                          ) : (
+                            <RotateCcw className="h-3 w-3 me-1.5" />
+                          )}
+                          {t('share.regenerate', { defaultValue: 'Regenerate' })}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                  <div className="space-y-1">
+                    <p className="text-xs font-medium text-muted-foreground">{t('share.customizeTitle')}</p>
+                    <ul className="text-xs text-muted-foreground space-y-0.5 ms-3">
+                      <li><code className="bg-muted px-1 rounded-sm text-mini">zoom=N</code> {t('share.customizeZoom')}</li>
+                      <li><code className="bg-muted px-1 rounded-sm text-mini">center=lng,lat</code> {t('share.customizeCenter')}</li>
+                      <li><code className="bg-muted px-1 rounded-sm text-mini">legend=true|false</code> {t('share.customizeLegend')}</li>
+                    </ul>
+                  </div>
+                  {/* A fully-public map has no embed token (none was forced by
+                      non-public layers), so the domain controls in Link
+                      Settings never appear. Offer an explicit
+                      create-embed-token path so the owner can restrict
+                      embedding to specific domains. */}
+                  {canUseAdvancedSharing && !hasNonPublic && !embedTokenRaw && !resolvedEmbedTokenId && (
+                    <div className="flex items-start gap-2 rounded-md border border-border bg-muted/20 px-3 py-2">
+                      <Shield className="h-3.5 w-3.5 text-muted-foreground mt-0.5 flex-shrink-0" />
+                      <div className="flex-1 space-y-1.5">
+                        <p className="text-xs text-foreground">
+                          {t('share.embedTokenForDomains', {
+                            defaultValue: 'Create an embed token to restrict this embed to specific domains.',
+                          })}
+                        </p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-xs"
+                          onClick={() => void tokens.createEmbed()}
+                          disabled={createEmbedToken.isPending}
+                        >
+                          {createEmbedToken.isPending ? (
+                            <Loader2 className="h-3 w-3 animate-spin me-1.5" />
+                          ) : (
+                            <Shield className="h-3 w-3 me-1.5" />
+                          )}
+                          {t('share.createEmbedToken', { defaultValue: 'Create embed token' })}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                  {/* Embed preview pane — gated on embedTokenRaw to ensure et= param is available */}
+                  {/* An UNLOCKED preview loads in THIS browser and uses the
+                      origin this browser reached; pointed at a public host
+                      routed only externally it would render nothing. A
+                      DOMAIN-LOCKED preview must come from the configured
+                      origin, the only one its API calls may present, so with no
+                      such origin it is suppressed rather than shown empty. */}
+                  {embedTokenRaw && previewBaseUrl && (
+                    <EmbedPreviewPane
+                      shareToken={rawShareToken}
+                      embedTokenRaw={embedTokenRaw}
+                      origin={previewBaseUrl}
+                      dashboardCollapsed={dashboardCollapsed}
+                    />
+                  )}
+                  {embedTokenRaw && !previewBaseUrl && (
+                    <p
+                      role="status"
+                      className="text-xs text-muted-foreground border-t pt-3"
+                    >
+                      {lockedPreviewBlockedByOrigin
+                        ? t('share.lockedPreviewCrossOrigin')
+                        : t('share.lockedPreviewNeedsPublicUrl')}
+                    </p>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -1,0 +1,287 @@
+import { act } from 'react';
+import { renderHook } from '@/test/test-utils';
+import { useEphemeralLayers } from '@/components/builder/hooks/use-ephemeral-layers';
+import type { Map as MaplibreMap } from 'maplibre-gl';
+
+interface MockMap {
+  layers: Set<string>;
+  sources: Set<string>;
+  styleLoaded: boolean;
+  fitBoundsCalls: Array<{ bounds: unknown; options: unknown }>;
+  getLayer: (id: string) => string | undefined;
+  getSource: (id: string) => string | undefined;
+  addLayer: (layer: { id: string }) => void;
+  addSource: (id: string, _source: unknown) => void;
+  removeLayer: (id: string) => void;
+  removeSource: (id: string) => void;
+  isStyleLoaded: () => boolean;
+  once: (event: string, cb: () => void) => void;
+  on: (event: string, cb: () => void) => void;
+  off: (event: string, cb: () => void) => void;
+  /** Registered style.load handlers — call to simulate a basemap/style reload. */
+  styleLoadHandlers: Array<() => void>;
+  /** One-shot idle handlers — call to simulate the map settling. */
+  idleHandlers: Array<() => void>;
+  fitBounds: (bounds: unknown, options: unknown) => void;
+}
+
+function createMockMap(): MockMap {
+  const layers = new Set<string>();
+  const sources = new Set<string>();
+  const fitBoundsCalls: MockMap['fitBoundsCalls'] = [];
+  const styleLoadHandlers: Array<() => void> = [];
+  const idleHandlers: Array<() => void> = [];
+
+  const mock: MockMap = {
+    styleLoadHandlers,
+    idleHandlers,
+    layers,
+    sources,
+    styleLoaded: true,
+    fitBoundsCalls,
+    getLayer: (id: string) => (layers.has(id) ? id : undefined),
+    getSource: (id: string) => (sources.has(id) ? id : undefined),
+    addLayer: (layer) => {
+      layers.add(layer.id);
+    },
+    addSource: (id) => {
+      sources.add(id);
+    },
+    removeLayer: (id) => {
+      layers.delete(id);
+    },
+    removeSource: (id) => {
+      sources.delete(id);
+    },
+    isStyleLoaded: () => mock.styleLoaded,
+    once: (event, cb) => {
+      if (event === 'idle') idleHandlers.push(cb);
+      else cb();
+    },
+    on: (event, cb) => {
+      if (event === 'style.load') styleLoadHandlers.push(cb);
+    },
+    off: (event, cb) => {
+      const pool = event === 'style.load' ? styleLoadHandlers : event === 'idle' ? idleHandlers : null;
+      if (pool) {
+        const idx = pool.indexOf(cb);
+        if (idx >= 0) pool.splice(idx, 1);
+      }
+    },
+    fitBounds: (bounds, options) => {
+      fitBoundsCalls.push({ bounds, options });
+    },
+  };
+  return mock;
+}
+
+function sampleGeoJSON(): GeoJSON.FeatureCollection {
+  return {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [0, 0] },
+        properties: {},
+      },
+    ],
+  };
+}
+
+describe('useEphemeralLayers', () => {
+  it('starts with no ephemeral result', () => {
+    const map = createMockMap();
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    expect(result.current.ephemeralResult).toBeNull();
+    expect(map.sources.size).toBe(0);
+    expect(map.layers.size).toBe(0);
+  });
+
+  it('handleQueryResult adds source, layers, and fits bounds', () => {
+    const map = createMockMap();
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [-1, -1, 1, 1]);
+    });
+
+    expect(result.current.ephemeralResult).not.toBeNull();
+    expect(map.sources.has('ephemeral-result')).toBe(true);
+    // All 4 layer types should have been added
+    expect(map.layers.has('ephemeral-result-fill')).toBe(true);
+    expect(map.layers.has('ephemeral-result-outline')).toBe(true);
+    expect(map.layers.has('ephemeral-result-line')).toBe(true);
+    expect(map.layers.has('ephemeral-result-circle')).toBe(true);
+    // Bounds should have been auto-zoomed
+    expect(map.fitBoundsCalls).toHaveLength(1);
+    expect(map.fitBoundsCalls[0].bounds).toEqual([[-1, -1], [1, 1]]);
+  });
+
+  // MapLibre's globe fit returns no camera for a zero-size box.
+  it('fits a single-point result with a box that has width and height', () => {
+    const map = createMockMap();
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [12.5, 48.1, 12.5, 48.1]);
+    });
+
+    expect(map.fitBoundsCalls).toHaveLength(1);
+    const [[west, south], [east, north]] = map.fitBoundsCalls[0].bounds as [[number, number], [number, number]];
+    expect(east - west).toBeGreaterThan(0);
+    expect(north - south).toBeGreaterThan(0);
+  });
+
+  it('handleDismissEphemeral removes all ephemeral layers and source', () => {
+    const map = createMockMap();
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [0, 0, 1, 1]);
+    });
+    expect(map.layers.size).toBeGreaterThan(0);
+
+    act(() => {
+      result.current.handleDismissEphemeral();
+    });
+
+    expect(result.current.ephemeralResult).toBeNull();
+    expect(map.sources.has('ephemeral-result')).toBe(false);
+    expect(map.layers.has('ephemeral-result-fill')).toBe(false);
+    expect(map.layers.has('ephemeral-result-outline')).toBe(false);
+    expect(map.layers.has('ephemeral-result-line')).toBe(false);
+    expect(map.layers.has('ephemeral-result-circle')).toBe(false);
+  });
+
+  it('dismissing when map ref is null does not throw', () => {
+    const ref = { current: null };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [0, 0, 1, 1]);
+    });
+    // Should not throw even though map is null
+    expect(() => {
+      act(() => {
+        result.current.handleDismissEphemeral();
+      });
+    }).not.toThrow();
+    expect(result.current.ephemeralResult).toBeNull();
+  });
+
+  it('replacing a query result tears down prior layers before adding new ones', () => {
+    const map = createMockMap();
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [0, 0, 1, 1]);
+    });
+    expect(map.layers.has('ephemeral-result-fill')).toBe(true);
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [2, 2, 3, 3]);
+    });
+    // Still present (re-added)
+    expect(map.layers.has('ephemeral-result-fill')).toBe(true);
+    // Second fitBounds call
+    expect(map.fitBoundsCalls.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('overlay survives style reloads', () => {
+  it('re-adds the overlay on style.load without re-zooming', () => {
+    const map = createMockMap();
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [-1, -1, 1, 1]);
+    });
+    expect(map.layers.has('ephemeral-result-fill')).toBe(true);
+    expect(map.fitBoundsCalls).toHaveLength(1);
+    expect(map.styleLoadHandlers.length).toBeGreaterThan(0);
+
+    // Simulate a basemap switch wiping the style: MapLibre drops all layers
+    // and sources, then fires style.load.
+    map.layers.clear();
+    map.sources.clear();
+    act(() => {
+      map.styleLoadHandlers.forEach((cb) => cb());
+    });
+
+    expect(map.sources.has('ephemeral-result')).toBe(true);
+    expect(map.layers.has('ephemeral-result-fill')).toBe(true);
+    expect(map.layers.has('ephemeral-result-circle')).toBe(true);
+    // No second auto-zoom — the viewport belongs to the user after first show.
+    expect(map.fitBoundsCalls).toHaveLength(1);
+  });
+
+  it('retries on idle when the style is transiently not loaded', () => {
+    const map = createMockMap();
+    // Reproduce the cold-load pickup race: style transiently reports
+    // not-loaded and the initial style.load has already fired (so the
+    // style.load subscription alone would never run).
+    map.styleLoaded = false;
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [-1, -1, 1, 1]);
+    });
+
+    // Nothing applied yet — the overlay must wait for the map to settle.
+    expect(map.sources.has('ephemeral-result')).toBe(false);
+    expect(map.fitBoundsCalls).toHaveLength(0);
+    expect(map.idleHandlers).toHaveLength(1);
+
+    // Map settles.
+    map.styleLoaded = true;
+    act(() => {
+      map.idleHandlers.forEach((cb) => cb());
+    });
+
+    expect(map.sources.has('ephemeral-result')).toBe(true);
+    expect(map.layers.has('ephemeral-result-circle')).toBe(true);
+    expect(map.fitBoundsCalls).toHaveLength(1);
+    expect(map.fitBoundsCalls[0].bounds).toEqual([[-1, -1], [1, 1]]);
+  });
+
+  it('unsubscribes the idle handler on dismiss', () => {
+    const map = createMockMap();
+    map.styleLoaded = false;
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [0, 0, 1, 1]);
+    });
+    expect(map.idleHandlers).toHaveLength(1);
+
+    act(() => {
+      result.current.handleDismissEphemeral();
+    });
+    expect(map.idleHandlers).toHaveLength(0);
+  });
+
+  it('unsubscribes the style.load handler on dismiss', () => {
+    const map = createMockMap();
+    const ref = { current: map as unknown as MaplibreMap };
+    const { result } = renderHook(() => useEphemeralLayers(ref));
+
+    act(() => {
+      result.current.handleQueryResult(sampleGeoJSON(), [0, 0, 1, 1]);
+    });
+    expect(map.styleLoadHandlers.length).toBeGreaterThan(0);
+
+    act(() => {
+      result.current.handleDismissEphemeral();
+    });
+    expect(map.styleLoadHandlers).toHaveLength(0);
+  });
+});

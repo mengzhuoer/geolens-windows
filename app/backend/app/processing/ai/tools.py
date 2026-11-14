@@ -1,0 +1,452 @@
+"""Tool definitions for chat-based map editing LLM interactions.
+
+The JSON-schema contract the LLM sees for each tool (search the catalog,
+add/remove a layer, set a filter, change a paint property, generate a
+data-driven style, etc.); execution lives in `app.processing.ai.service` and
+`app.processing.ai.chat_service`. Malformed JSON Schema fails silently: the
+request succeeds with no tool calls.
+"""
+
+_SEARCH_DATASETS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "q": {
+            "type": "string",
+            "description": "Full-text search query",
+        },
+        "geometry_type": {
+            "type": "string",
+            "description": (
+                "Filter by geometry type: POINT, LINESTRING, POLYGON, "
+                "MULTIPOINT, MULTILINESTRING, MULTIPOLYGON"
+            ),
+        },
+        "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Filter by keywords",
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Max results to return (default 10, max 25)",
+            "default": 10,
+        },
+        "bbox": {
+            "type": "array",
+            "items": {"type": "number"},
+            "description": (
+                "Spatial bounding box filter [west, south, east, north] in "
+                "WGS84 coordinates. Use this to find datasets in a specific area."
+            ),
+        },
+    },
+}
+
+_SEARCH_DATASETS_DESC = (
+    "Search the dataset catalog. Returns matching datasets with id, "
+    "title, summary, geometry_type, keywords, extent_bbox, feature_count, "
+    "column_info (up to 20 columns with name/type), and sample_values "
+    "(up to 5 columns). Use this to find datasets before adding them as layers."
+)
+
+
+_GET_DATASET_DETAILS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "dataset_id": {
+            "type": "string",
+            "description": "Dataset UUID to get details for",
+        },
+    },
+    "required": ["dataset_id"],
+}
+
+_GET_DATASET_DETAILS_DESC = (
+    "Get full column info, sample values, and feature count for a specific "
+    "dataset. Use after search_datasets to understand a dataset's columns "
+    "before applying data-driven styling."
+)
+
+
+CHAT_TOOLS_ANTHROPIC = [
+    {
+        "name": "search_datasets",
+        "description": _SEARCH_DATASETS_DESC,
+        "input_schema": _SEARCH_DATASETS_SCHEMA,
+    },
+    {
+        "name": "set_filter",
+        "description": (
+            # A pointer to the system prompt's routing rule, not a second copy
+            # of it; without one, "show me the ..." can land on a persistent
+            # layer filter instead of a query result.
+            "Set or clear a filter on a map layer. This is the map-edit path: "
+            "it changes what the map shows and persists on save. The system "
+            "prompt's verb classes decide when a request routes here. "
+            "Pass a MapLibre filter "
+            "expression array to filter features, or null to clear the filter. "
+            "Always reference columns with the expression form "
+            '["get", "column"] -- never bare field names. '
+            'Example: ["all", [">", ["get", "population"], 1000000], '
+            '["==", ["get", "state"], "CA"]]'
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID)",
+                },
+                "expression": {
+                    "description": (
+                        "MapLibre filter expression array, or null to clear"
+                    ),
+                    "oneOf": [{"type": "array"}, {"type": "null"}],
+                },
+            },
+            "required": ["layer_id"],
+        },
+    },
+    {
+        "name": "set_style",
+        "description": (
+            "Patch paint properties of a layer (e.g., color, opacity, width). "
+            "Unspecified paint properties are preserved. Use clear_paint to "
+            "remove stale properties such as line-gradient or line-dasharray. "
+            "Set replace_paint=true only when paint contains the complete "
+            "desired paint object. Use the correct paint property for the "
+            "geometry type: fill-color for polygons, line-color for lines, "
+            "circle-color for points. Data-driven coloring (a colour that "
+            # Capability pointer only: request-classification prose here is
+            # what the routing guard rejects.
+            "varies by column value) belongs to set_data_driven_style."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID)",
+                },
+                "paint": {
+                    "type": "object",
+                    "description": (
+                        "MapLibre paint properties to patch into the current "
+                        "layer style. Omitted properties are preserved."
+                    ),
+                },
+                "clear_paint": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "MapLibre paint property names to clear/unset. Use for "
+                        "transitions like gradient to solid color."
+                    ),
+                },
+                "replace_paint": {
+                    "type": "boolean",
+                    "description": (
+                        "When true, replace the whole paint object with paint "
+                        "after applying clear_paint. Defaults to false."
+                    ),
+                },
+            },
+            "required": ["layer_id"],
+        },
+    },
+    {
+        "name": "set_render_as",
+        "description": (
+            "Change how a vector layer is drawn. Point layers: point, symbol, "
+            "heatmap, cluster. Line layers: line, arrow. Polygon layers: fill, "
+            "stroke, fill-stroke, extrusion-3d. Switching resets paint to the "
+            "new type's defaults, so call it before set_style when the same "
+            "turn tunes the new type (for example heatmap-radius). Raster "
+            "layers have one render type and cannot be switched."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID)",
+                },
+                "render_as": {
+                    "type": "string",
+                    "enum": [
+                        "point",
+                        "symbol",
+                        "heatmap",
+                        "cluster",
+                        "line",
+                        "arrow",
+                        "fill",
+                        "stroke",
+                        "fill-stroke",
+                        "extrusion-3d",
+                    ],
+                    "description": "Render type for the layer",
+                },
+                "height_column": {
+                    "type": "string",
+                    "description": (
+                        "Numeric column that sets extrusion-3d heights. "
+                        "Omit to use the layer's first numeric column."
+                    ),
+                },
+            },
+            "required": ["layer_id", "render_as"],
+        },
+    },
+    {
+        "name": "set_data_driven_style",
+        "description": (
+            "Apply data-driven coloring (categorical or graduated) to a layer "
+            "based on a column. Use 'categorical' for text/string columns "
+            "(e.g., land use type) and 'graduated' for numeric columns "
+            "(e.g., population). The server fetches actual column values/stats "
+            "and builds the full paint expression."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID)",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["categorical", "graduated"],
+                    "description": "Styling mode",
+                },
+                "column": {
+                    "type": "string",
+                    "description": "Column name to style by",
+                },
+                "ramp": {
+                    "type": "string",
+                    "description": (
+                        "Color ramp name from the style editor, such as YlOrRd, "
+                        "Viridis, Blues, Greens, RdYlBu or Set2. "
+                        "Default: YlOrRd"
+                    ),
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["equal_interval", "quantile"],
+                    "description": (
+                        "Classification method for graduated mode (default: quantile)"
+                    ),
+                },
+                "class_count": {
+                    "type": "integer",
+                    "description": "Number of classes (default 5)",
+                },
+            },
+            "required": ["layer_id", "mode", "column"],
+        },
+    },
+    {
+        "name": "set_label",
+        "description": (
+            "Enable or configure labels on a layer. Set column to null to "
+            "disable labels. Choose a text or name column for best results."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID)",
+                },
+                "column": {
+                    "type": ["string", "null"],
+                    "description": "Column to label by, or null to disable",
+                },
+                "font_size": {
+                    "type": "number",
+                    "description": "Font size in pixels (default 12)",
+                },
+                "text_color": {
+                    "type": "string",
+                    "description": "Text color hex string (default #333333)",
+                },
+            },
+            "required": ["layer_id", "column"],
+        },
+    },
+    {
+        "name": "toggle_visibility",
+        "description": "Show or hide a layer on the map.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID)",
+                },
+                "visible": {
+                    "type": "boolean",
+                    "description": "True to show, false to hide",
+                },
+            },
+            "required": ["layer_id", "visible"],
+        },
+    },
+    {
+        "name": "set_opacity",
+        "description": (
+            "Set the opacity of a layer. Works for both vector and raster layers. "
+            "Use values from 0.0 (fully transparent) to 1.0 (fully opaque)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID)",
+                },
+                "opacity": {
+                    "type": "number",
+                    "description": "Opacity value from 0.0 (transparent) to 1.0 (opaque)",
+                },
+            },
+            "required": ["layer_id", "opacity"],
+        },
+    },
+    {
+        "name": "remove_layer",
+        "description": "Remove a layer from the map entirely.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID)",
+                },
+            },
+            "required": ["layer_id"],
+        },
+    },
+    {
+        "name": "add_layer",
+        "description": (
+            "Add a new layer to the map from a dataset. Use search_datasets "
+            "first to find the dataset_id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dataset_id": {
+                    "type": "string",
+                    "description": "Dataset ID (UUID) to add as a layer",
+                },
+            },
+            "required": ["dataset_id"],
+        },
+    },
+    {
+        "name": "query_data",
+        "description": (
+            # Behavioural only: classifying user phrasing here would compete
+            # with the system prompt's verb classes (build_chat_system_prompt).
+            "Query the user's map data using SQL. The server generates the "
+            "SQL from a natural language question and executes it safely, so "
+            "the result is a table of values plus an optional highlight "
+            "overlay -- never a persistent map change."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The user's natural language question about their data",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "run_analysis",
+        "description": (
+            # Behavioural only: the system prompt alone owns verb
+            # classification.
+            "Run a parameterized PostGIS geometry operation on a layer and "
+            "draw the result on the map as a temporary preview. buffer grows "
+            "each feature by a distance; centroid replaces each feature with "
+            "its centre point. The preview is temporary and is not saved. "
+            "Do NOT tell the user where to save it -- the tool result says "
+            "what they need to know, and the surfaces differ."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "layer_id": {
+                    "type": "string",
+                    "description": "Layer ID (UUID) to run the operation on",
+                },
+                "operation": {
+                    "type": "string",
+                    # `dissolve` stays out: it is materialize-only, an
+                    # aggregate with no preview shape.
+                    "enum": ["buffer", "centroid", "clip"],
+                    "description": (
+                        "buffer = grow each feature by a distance; "
+                        "centroid = replace each feature with its centre "
+                        "point; clip = keep only the parts of each feature "
+                        "that fall inside another layer"
+                    ),
+                },
+                "distance_meters": {
+                    "type": "number",
+                    "description": (
+                        "Buffer distance in metres, 0 < d <= 100000 "
+                        "(required for buffer, ignored otherwise)"
+                    ),
+                },
+                "mask_layer_id": {
+                    "type": "string",
+                    "description": (
+                        "Layer ID (UUID) of the POLYGON layer to clip against "
+                        "(required for clip, ignored otherwise). Must be a "
+                        "different layer from layer_id."
+                    ),
+                },
+            },
+            "required": ["layer_id", "operation"],
+        },
+    },
+]
+
+
+# Read-only chat tools: a view-only user (non-owner/non-admin) may ask
+# questions but not change the map, so every mutating tool is withheld. The set
+# can answer questions (sandboxed, RBAC-scoped SELECTs) and draw a temporary
+# analysis preview. ``run_analysis`` qualifies: it only SELECTs and its result
+# is an ephemeral overlay, never a persisted change. Edit persistence is
+# separately owner-gated at Save, so this is defense in depth.
+_READONLY_TOOL_NAMES = {"query_data", "run_analysis"}
+CHAT_TOOLS_READONLY = [
+    t for t in CHAT_TOOLS_ANTHROPIC if t["name"] in _READONLY_TOOL_NAMES
+]
+
+# Tools whose entire output is a map overlay — withheld from map-less surfaces
+# (dataset-scoped chat) by select_chat_tools(has_map=False).
+_MAP_ONLY_TOOL_NAMES = {"run_analysis"}
+
+
+def select_chat_tools(can_edit: bool, has_map: bool = True) -> list:
+    """Return the chat tool set for a caller.
+
+    Full tool set when the caller may edit the map; read-only (``query_data``
+    + ``run_analysis``) when they may only view it.
+
+    has_map=False drops the map-only tools for surfaces with no map to draw on
+    (dataset-scoped chat): ``run_analysis``'s whole output is an ephemeral map
+    overlay, so offering it there would let the model promise a preview the
+    surface cannot render.
+    """
+    tools = CHAT_TOOLS_ANTHROPIC if can_edit else CHAT_TOOLS_READONLY
+    if not has_map:
+        tools = [t for t in tools if t["name"] not in _MAP_ONLY_TOOL_NAMES]
+    return tools

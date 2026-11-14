@@ -1,0 +1,304 @@
+"""Shared alembic subprocess runner for migration tests.
+
+Some migrations refuse to downgrade while rows would violate the older schema.
+A test that commits such a row breaks every migration test that later
+downgrades past it in the same xdist worker, and the failure shows up in an
+unrelated file only when both tests share a worker, since each worker owns its
+own database.
+
+This module is the one place that knows about refuse-to-coerce downgrades:
+
+- ``0030``: normalized automatically before every downgrade (see below).
+- ``0029_api_key_hardening``: refuses while any API key carries an expiry or
+  any user's ``key_epoch`` has been bumped. Also normalized
+  automatically — see ``_API_KEY_STATE_NORMALIZATION`` for why this one is
+  auto-cleaned while the two below are not.
+- ``0010_oauth_github_provider_type``: refuses while GitHub OAuth providers
+  exist. Not auto-cleaned — deleting provider rows is semantic test state,
+  and the only test that creates them (test_oauth_github_migration) manages
+  its own cleanup.
+- ``0005_dormant_tenancy``: refuses while tenant-scoped data exists. Same
+  reasoning; no current test trips it.
+- ``0065_tiles3d_record_type``: refuses while any record uses
+  ``tiles3d_dataset`` or any dataset uses ``3dtiles``, and
+  ``0066_tileset_asset_key`` while any ``tileset`` asset row exists. Not
+  auto-cleaned; the tests that commit such rows (test_tiles3d_record_type,
+  test_tiles3d_branches, test_tiles3d_record_type_migration,
+  test_catalog_projection, test_tileset_upload and test_tileset_quality_score)
+  remove them themselves.
+- ``0070_pointcloud_record_type``: refuses while any record uses
+  ``pointcloud_dataset`` or any dataset uses ``copc``, and
+  ``0071_pointcloud_asset_and_facts`` while any ``pointcloud`` asset row
+  exists. Not auto-cleaned; the tests that commit such rows
+  (test_pointcloud_record_type, test_pointcloud_record_type_migration,
+  test_pointcloud_branches and test_pointcloud_record_type_refusals) remove
+  them themselves.
+
+- ``0077_dataset_previous_version``: refuses while any refresh run has
+  ``origin_kind = 'restore'``. Normalized automatically, since ordinary
+  restore tests leave such runs behind.
+- ``0088_dataset_kept_versions``: refuses while any dataset keeps more than
+  one previous version. Normalized automatically by forgetting all but each
+  dataset's newest, since ordinary replacement tests keep several.
+
+If a future migration gains a refuse-to-coerce downgrade, teach this module
+about it rather than adding cleanup to individual test files.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from importlib.metadata import entry_points
+from pathlib import Path
+
+import sqlalchemy
+
+_BACKEND_DIR = Path(__file__).parent.parent.resolve()
+_ALEMBIC_INI = _BACKEND_DIR / "alembic.ini"
+
+
+def enterprise_migrations_present() -> bool:
+    """True when an enterprise/overlay migrations entry-point is installed.
+
+    conftest then migrates the per-worker test DB to the enterprise head (e.g.
+    e002_add_saml_columns), making the alembic environment MULTI-HEAD. The
+    core-only ``alembic`` subprocess these OSS-drift-gate roundtrip/check tests
+    shell out to can neither locate the enterprise revision nor disambiguate
+    ``head`` / ``-1`` across branches — so they are skipped under the overlay.
+    They still run (and gate drift) in the no-overlay Pytest Parallel Isolation
+    job. Core registers no ``geolens.migrations`` entry-point, so this is False
+    for community/OSS runs.
+    """
+    for ep in entry_points(group="geolens.migrations"):
+        try:
+            fn = ep.load()
+            if callable(fn) and any(Path(p).is_dir() for p in fn()):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# The remediation SQL that 0030's own error message prescribes. Collapsing a
+# two-ring seam extent to its envelope LOSES the antimeridian-crossing shape
+# (the envelope is -180..180) — that loss is acceptable ONLY in a test
+# database, where extents are fixture noise. Never lift this into
+# application code: in production the refusal is the feature (#892/#901).
+#
+# Guarded so it is a no-op when the schema is already below the revisions
+# that shaped catalog.records (e.g. a second downgrade step from an already
+# downgraded state).
+_SEAM_EXTENT_NORMALIZATION = """
+DO $$
+BEGIN
+    IF to_regclass('catalog.records') IS NOT NULL AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'catalog'
+          AND table_name = 'records'
+          AND column_name = 'spatial_extent'
+    ) THEN
+        UPDATE catalog.records
+        SET spatial_extent = ST_Envelope(spatial_extent)
+        WHERE GeometryType(spatial_extent) = 'MULTIPOLYGON';
+    END IF;
+END
+$$;
+"""
+
+
+# The remediation 0029's own error message prescribes, minus the
+# DELETE — a test database's keys are fixture noise, so clearing the state is
+# enough and there is no need to destroy rows a sibling test may still read.
+#
+# WHY this one is auto-cleaned while 0010 and 0005 are documented-only. Those
+# two are semantic test state, created by the single test that cares about
+# them. Expiring keys and epoch bumps are not: they are created by ordinary
+# auth tests with no relationship to migrations
+# (``test_api_key_with_future_expiry_accepted_and_surfaced`` and
+# ``test_stale_key_epoch_api_key_rejected`` in test_api_key_auth.py, both of
+# which commit and neither of which cleans up), while more than twenty
+# downgrade call sites across six files cross 0029 on their way to 0004/0005/
+# 0009. Leaving it documented would reproduce #933 exactly: whichever
+# migration test happened to share an xdist worker with the auth suite would
+# fail, in a file that has nothing to do with API keys.
+#
+# The same "never lift this into application code" caveat as above applies —
+# in production the refusal is the feature.
+# Each column is guarded independently so this stays a no-op at any schema
+# revision, including a second downgrade step from an already-downgraded state.
+_API_KEY_STATE_NORMALIZATION = """
+DO $$
+BEGIN
+    IF to_regclass('catalog.api_keys') IS NOT NULL AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'catalog' AND table_name = 'api_keys'
+          AND column_name = 'expires_at'
+    ) THEN
+        UPDATE catalog.api_keys SET expires_at = NULL WHERE expires_at IS NOT NULL;
+    END IF;
+    IF to_regclass('catalog.users') IS NOT NULL AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'catalog' AND table_name = 'users'
+          AND column_name = 'key_epoch'
+    ) THEN
+        UPDATE catalog.users SET key_epoch = 1 WHERE key_epoch <> 1;
+    END IF;
+    -- api_keys.key_epoch is a mint-time snapshot of the owner's value; realign
+    -- it so the two stay mutually consistent for any test that reads them
+    -- after a downgrade/re-upgrade roundtrip.
+    IF to_regclass('catalog.api_keys') IS NOT NULL AND EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'catalog' AND table_name = 'api_keys'
+          AND column_name = 'key_epoch'
+    ) THEN
+        UPDATE catalog.api_keys SET key_epoch = 1 WHERE key_epoch <> 1;
+    END IF;
+END
+$$;
+"""
+
+
+# Restore runs are fixture noise in a test database; 0077's downgrade refuses
+# them because the earlier CHECK has no 'restore'.
+_RESTORE_RUN_NORMALIZATION = """
+DO $$
+BEGIN
+    IF to_regclass('catalog.dataset_refresh_runs') IS NOT NULL THEN
+        DELETE FROM catalog.dataset_refresh_runs WHERE origin_kind = 'restore';
+    END IF;
+END
+$$;
+"""
+
+
+# Several kept versions are fixture noise in a test database; 0088's downgrade
+# refuses them because the earlier schema keeps one.
+_KEPT_VERSION_NORMALIZATION = """
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'catalog'
+          AND table_name = 'dataset_versions'
+          AND column_name = 'kept_table'
+    ) THEN
+        UPDATE catalog.dataset_versions v SET kept_table = NULL, kept_at = NULL,
+            kept_bytes = NULL, kept_refreshed_at = NULL
+        WHERE v.kept_table IS NOT NULL AND EXISTS (
+            SELECT 1 FROM catalog.dataset_versions n
+            WHERE n.dataset_id = v.dataset_id AND n.kept_table IS NOT NULL
+              AND n.version_number > v.version_number
+        );
+    END IF;
+END
+$$;
+"""
+
+
+def _execute_normalization(sql: str) -> None:
+    from app.core.config import settings
+
+    engine = sqlalchemy.create_engine(
+        settings.test_database_url_sync, isolation_level="AUTOCOMMIT"
+    )
+    try:
+        with engine.connect() as conn:
+            conn.execute(sqlalchemy.text(sql))
+    finally:
+        engine.dispose()
+
+
+def normalize_seam_extents() -> None:
+    """Collapse MULTIPOLYGON spatial_extents so downgrades can cross 0030."""
+    _execute_normalization(_SEAM_EXTENT_NORMALIZATION)
+
+
+def normalize_api_key_state() -> None:
+    """Clear key expiry and epoch bumps so downgrades can cross 0029."""
+    _execute_normalization(_API_KEY_STATE_NORMALIZATION)
+
+
+def normalize_restore_runs() -> None:
+    """Delete restore refresh runs so downgrades can cross 0077."""
+    _execute_normalization(_RESTORE_RUN_NORMALIZATION)
+
+
+def normalize_kept_versions() -> None:
+    """Forget all but each dataset's newest kept version so downgrades can cross 0088."""
+    _execute_normalization(_KEPT_VERSION_NORMALIZATION)
+
+
+def run_alembic(
+    *args: str, extra_env: dict | None = None, normalize: bool = True
+) -> subprocess.CompletedProcess:
+    """Run an alembic command via subprocess against the per-worker TEST DB.
+
+    Uses the backend .venv python so the env matches what pytest runs with.
+    PYTHONPATH is set so env.py can ``from app.core.config import settings``.
+    POSTGRES_DB targets the per-worker test DB (isolated + conftest-migrated
+    to head) so destructive downgrade/upgrade roundtrips never mutate the
+    SHARED main DB (``postgres`` on CI), which would corrupt sibling workers
+    and the drift check.
+
+    Every ``downgrade`` is preceded by ``normalize_seam_extents()`` and
+    ``normalize_api_key_state()`` — with the current head at/above 0030, even a
+    plain ``downgrade -1`` crosses a refuse-to-coerce guard on its first step,
+    so the normalizations run unconditionally rather than parsing the revision
+    graph (both are idempotent and free when the state they clear is absent).
+
+    ``normalize=False`` skips them. It exists for the tests that assert a guard
+    actually FIRES; nothing else should pass it, because skipping the
+    normalization is how the cross-file failures in #933 happened.
+    """
+    from app.core.config import settings
+
+    if normalize and args and args[0] == "downgrade":
+        normalize_seam_extents()
+        normalize_api_key_state()
+        normalize_restore_runs()
+        normalize_kept_versions()
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_BACKEND_DIR)
+    env["POSTGRES_DB"] = settings.postgres_db_test
+    # Stripped for determinism — migration 0012's dims fallback
+    # reads these from the subprocess env, and every caller should see exactly
+    # what its test injects via extra_env, never ambient shell state.
+    env.pop("EMBEDDING_DIMS", None)
+    env.pop("ENV_ONLY_CONFIG", None)
+    if extra_env:
+        env.update(extra_env)
+
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", "-c", str(_ALEMBIC_INI), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(_BACKEND_DIR),
+    )
+
+
+async def fresh_query(query: str, params: dict | None = None):
+    """Run a query on a fresh AUTOCOMMIT connection, bypassing the test transaction.
+
+    The ``test_db_session`` fixture holds an open transaction around each
+    test. DDL/DML committed by subprocess alembic (which commits outside that
+    transaction) is invisible to the session due to transaction snapshot
+    isolation. A separate connection with AUTOCOMMIT isolation is needed to
+    observe committed changes.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.config import settings
+
+    engine = create_async_engine(
+        settings.test_database_url, isolation_level="AUTOCOMMIT"
+    )
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(sqlalchemy.text(query), params or {})
+            return result.fetchall() if result.returns_rows else None
+    finally:
+        await engine.dispose()

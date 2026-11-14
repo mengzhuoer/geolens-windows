@@ -1,0 +1,111 @@
+import { render, screen } from '@testing-library/react';
+import { QualityScoreCard } from '@/components/dataset/QualityScoreCard';
+
+describe('QualityScoreCard', () => {
+  const baseQualityScore = {
+    overall: 87,
+    metadata_completeness: 90,
+    geometry_validity: 92,
+    attribute_completeness: 81,
+    crs_defined: 100,
+    computed_at: '2026-03-01T12:00:00Z',
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-03-05T12:00:00Z'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('renders fresh quality state with timestamp, relative age, and cadence guidance', () => {
+    render(<QualityScoreCard qualityScore={baseQualityScore} updateFrequency="annually" />);
+
+    expect(screen.getByRole('heading', { level: 2, name: 'Quality Score' })).toBeInTheDocument();
+    expect(screen.getByText('87').closest('[data-slot="card-action"]')).toBeInTheDocument();
+    expect(screen.getByTestId('quality-freshness-time')).toHaveTextContent('Quality assessed Mar 1, 2026');
+    expect(screen.getByTestId('quality-freshness-time')).toHaveTextContent('4 days ago');
+    expect(screen.getByTestId('quality-freshness-badge')).toHaveTextContent('Assessment recent');
+    expect(screen.getByText(/See Source for when the dataset was updated/)).toBeInTheDocument();
+    expect(screen.getByText(/optional record fields \(10 total\)/)).toBeInTheDocument();
+    expect(screen.getByTestId('quality-cadence-guidance')).toHaveTextContent('Assessment recency uses the stated annual update cadence.');
+    expect(screen.queryByTestId('quality-remediation-hint')).not.toBeInTheDocument();
+  });
+
+  it('renders a metadata-only score, as a 3D Tiles tileset gets, with the other dimensions unscored', () => {
+    render(
+      <QualityScoreCard
+        qualityScore={{
+          ...baseQualityScore,
+          overall: 64,
+          metadata_completeness: 64,
+          geometry_validity: null,
+          attribute_completeness: null,
+          crs_defined: null,
+        }}
+      />,
+    );
+
+    expect(screen.getByText('64 (100%)')).toBeInTheDocument();
+    expect(screen.getAllByText('—')).toHaveLength(3);
+  });
+
+  it('marks stale freshness and shows remediation guidance when score age exceeds cadence threshold', () => {
+    render(
+      <QualityScoreCard
+        qualityScore={{ ...baseQualityScore, computed_at: '2025-12-01T12:00:00Z' }}
+        updateFrequency="monthly"
+      />,
+    );
+
+    expect(screen.getByTestId('quality-freshness-badge')).toHaveTextContent('Assessment due');
+    expect(screen.getByTestId('quality-cadence-guidance')).toHaveTextContent('Assessment recency uses the stated monthly update cadence.');
+    expect(screen.getByTestId('quality-remediation-hint')).toBeInTheDocument();
+  });
+
+  it('shows missing freshness state and unknown cadence guidance when computed time is absent', () => {
+    render(
+      <QualityScoreCard
+        qualityScore={{ ...baseQualityScore, computed_at: null as unknown as string }}
+        updateFrequency="unmapped-frequency"
+      />,
+    );
+
+    expect(screen.getByTestId('quality-freshness-badge')).toHaveTextContent('No assessment date');
+    expect(screen.getByTestId('quality-freshness-time')).toHaveTextContent('Not available');
+    expect(screen.getByTestId('quality-freshness-time')).toHaveTextContent('Unknown age');
+    expect(screen.getByTestId('quality-cadence-guidance')).toHaveTextContent(
+      'No periodic cadence is set; assessment recency uses a 45-day reference.',
+    );
+    expect(screen.getByTestId('quality-remediation-hint')).toBeInTheDocument();
+  });
+
+  it('keeps assessment action appropriate to edit rights', () => {
+    const score = { ...baseQualityScore, computed_at: '2025-12-01T12:00:00Z' };
+    const { rerender } = render(<QualityScoreCard qualityScore={score} updateFrequency="monthly" />);
+    expect(screen.getByTestId('quality-remediation-hint')).toHaveTextContent('Ask the dataset owner');
+
+    rerender(<QualityScoreCard qualityScore={score} updateFrequency="monthly" canEdit />);
+    expect(screen.getByTestId('quality-remediation-hint')).toHaveTextContent('Recompute the quality assessment');
+  });
+
+  it('maps cadence guidance for daily, monthly, annually, and unknown frequencies', () => {
+    const { rerender } = render(
+      <QualityScoreCard qualityScore={baseQualityScore} updateFrequency="daily" />,
+    );
+    expect(screen.getByTestId('quality-cadence-guidance')).toHaveTextContent('Assessment recency uses the stated daily update cadence.');
+
+    rerender(<QualityScoreCard qualityScore={baseQualityScore} updateFrequency="monthly" />);
+    expect(screen.getByTestId('quality-cadence-guidance')).toHaveTextContent('Assessment recency uses the stated monthly update cadence.');
+
+    rerender(<QualityScoreCard qualityScore={baseQualityScore} updateFrequency="annually" />);
+    expect(screen.getByTestId('quality-cadence-guidance')).toHaveTextContent('Assessment recency uses the stated annual update cadence.');
+
+    rerender(<QualityScoreCard qualityScore={baseQualityScore} updateFrequency="unknown" />);
+    expect(screen.getByTestId('quality-cadence-guidance')).toHaveTextContent(
+      'No periodic cadence is set; assessment recency uses a 45-day reference.',
+    );
+  });
+});

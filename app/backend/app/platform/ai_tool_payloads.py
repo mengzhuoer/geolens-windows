@@ -1,0 +1,57 @@
+"""Trim AI tool results before they are echoed back into the model's context.
+
+A chat tool result serves two consumers: the **action collector**, which
+forwards map payload (GeoJSON overlays) to the browser, and the **model**,
+re-fed the result as conversation context to narrate the outcome.
+
+Geometry is exclusively the collector's business — the model narrates from
+``feature_count``/``row_count``/``rows``, never raw coordinates. Left in,
+one ``run_analysis`` preview can exceed ``MAX_REQUEST_TOKEN_BUDGET`` in a
+single round.
+
+Call this at every point where a result is serialized *for the provider*;
+the action collector must keep receiving the untrimmed dict.
+"""
+
+from __future__ import annotations
+
+import json
+
+from app.platform.prompt_fence import (
+    TOOL_RESULT_PREAMBLE,
+    fence_untrusted_content,
+)
+
+# Keys whose whole purpose is client-side map rendering. `bbox` deliberately
+# stays: it is four numbers and gives the model useful spatial context.
+_MAP_ONLY_KEYS = frozenset({"geojson"})
+
+
+def model_safe_tool_result(result: dict) -> dict:
+    """Return ``result`` without map-only payload, for provider serialization.
+
+    Returns the original object when there is nothing to strip, so the common
+    path allocates nothing.
+    """
+    if not any(key in result for key in _MAP_ONLY_KEYS):
+        return result
+    return {k: v for k, v in result.items() if k not in _MAP_ONLY_KEYS}
+
+
+def tool_result_content(result: dict) -> str:
+    """Serialize one tool result for the provider, inside the trust fence.
+
+    Catalog tool results carry text nobody on this side wrote: other users'
+    public titles and summaries, raw query rows, catalog dataset names. The
+    phrase blacklist is only a mitigation. The boundary is that the model is
+    told at the point of use that what follows is output, and a forged
+    closing marker is stripped so the text cannot leave the region.
+
+    Every result is fenced, not an enumerated subset: ``add_layer`` looks
+    like a pure echo of the model's input but already carries catalog text.
+
+    ``default=str``: query_data rows can carry Decimal/datetime values from
+    PostGIS.
+    """
+    payload = json.dumps(model_safe_tool_result(result), default=str)
+    return fence_untrusted_content(payload, preamble=TOOL_RESULT_PREAMBLE)

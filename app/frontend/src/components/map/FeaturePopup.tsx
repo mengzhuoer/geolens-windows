@@ -1,0 +1,564 @@
+import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import i18n from '@/i18n/i18n';
+import { Popup } from '@vis.gl/react-maplibre';
+import { toast } from 'sonner';
+import { ChevronLeft, ChevronRight, Copy, Check, X } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { truncateGraphemes } from '@/lib/text';
+import { splitTextWithUrls, classifyUrl } from '@/lib/popup-rich-text';
+import { formatFeaturePropertyValue, groupsDigits } from '@/lib/feature-property-value';
+import { useAttributes } from '@/components/dataset/hooks/use-dataset';
+import { valueLabelFor, valueLabelsByField, type ValueLabels } from '@/lib/value-labels';
+import { useFeatureRow } from '@/components/map/hooks/use-feature-row';
+
+export interface FeatureInfo {
+  properties: Record<string, unknown>;
+  layerName: string;
+  columnInfo?:
+    | {
+        name: string;
+        type: string;
+        title?: string;
+        value_labels?: Record<string, string>;
+        semantic_role?: string | null;
+      }[]
+    | null;
+  /** Dataset whose attribute metadata supplies the row labels; without it
+   *  every key is humanized. */
+  datasetId?: string;
+  /** Already-substituted popup expression output. Rendered as a heading
+   *  above the property table when present. */
+  title?: string | null;
+  /** Ordered allowlist of property keys to display; null/undefined → fall
+   *  back to columnInfo legacy default; [] → render zero rows. */
+  visibleFields?: string[] | null;
+  /** Map zoom when the feature was clicked — distinguishes low-zoom
+   *  attribute stripping ("zoom in" hint) from a feature whose values are
+   *  genuinely all null ("no attributes"). */
+  zoomAtClick?: number;
+  /** The map layer the feature was clicked on. */
+  layerId?: string;
+  /** The vector tile feature id, which is the row's `gid`. */
+  featureId?: number;
+  /** The tile carries only the columns the map draws with; read the other fields from the rows endpoint. */
+  fetchRow?: boolean;
+  /** Sent with the rows request, for an embedded map's reader. */
+  embedToken?: string;
+}
+
+/** MVT attribute budget: below this zoom the tile
+ *  server strips attribute columns unless opted in via `cols=`. */
+const ATTRIBUTE_BUDGET_MINZOOM = 10;
+
+interface FeaturePopupProps {
+  longitude: number;
+  latitude: number;
+  features: FeatureInfo[];
+  onClose: () => void;
+}
+
+const EXCLUDED_KEYS = new Set(['geom', 'geometry']);
+const MAX_VALUE_LENGTH = 100;
+
+function humanizeKey(key: string): string {
+  return key
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function isUrl(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  return value.startsWith('http://') || value.startsWith('https://');
+}
+
+export function FeaturePopup({
+  longitude,
+  latitude,
+  features,
+  onClose,
+}: FeaturePopupProps) {
+  const { t } = useTranslation('builder');
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => () => clearTimeout(timerRef.current), []);
+
+  // On open, soft-move focus to the close button so keyboard users land inside
+  // the popup; on close/unmount, restore focus to the map canvas (or container)
+  // so the map stays keyboard-operable. A soft move + restore, NOT a focus
+  // trap: map interaction is preserved.
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    closeButtonRef.current?.focus();
+    return () => {
+      // Restore focus to the map so the keyboard context returns to the map
+      // (canvas carries tabindex=0); fall back to the map container, then to
+      // wherever focus was before the popup opened.
+      const restoreTarget =
+        document.querySelector<HTMLElement>('.maplibregl-canvas') ??
+        document.querySelector<HTMLElement>('.maplibregl-map') ??
+        previouslyFocused;
+      restoreTarget?.focus?.();
+    };
+  }, []);
+
+  // Escape closes the popup (focus is restored by the unmount effect above).
+  // Document-level listener so it fires wherever focus is inside the popup,
+  // without a keyboard handler on the non-interactive dialog container.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !e.defaultPrevented) {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+
+  // Clamp activeIndex if features shrinks while popup is open (e.g. layer toggle race).
+  useEffect(() => {
+    if (activeIndex >= features.length) setActiveIndex(0);
+  }, [features.length, activeIndex]);
+
+  const feature = features[activeIndex] ?? features[0];
+
+  const { data: attributeList } = useAttributes(feature?.datasetId);
+  const columnInfoForTitles = feature?.columnInfo;
+  const fieldTitles = useMemo(() => {
+    // The attributes route is not readable with an embed token or API key, so
+    // a shared map's column_info carries the titles as the fallback.
+    const titles = new Map<string, string>();
+    for (const column of columnInfoForTitles ?? []) {
+      if (column.title) titles.set(column.name, column.title);
+    }
+    for (const attribute of attributeList?.attributes ?? []) {
+      if (attribute.is_current && attribute.title) {
+        titles.set(attribute.field_name, attribute.title);
+      }
+    }
+    return titles;
+  }, [attributeList, columnInfoForTitles]);
+
+  const valueLabels = useMemo(() => {
+    // The attributes route is the live source. A capability-authorized viewer
+    // cannot read it, so column_info carries the labels for that case only.
+    if (attributeList) return valueLabelsByField(attributeList.attributes);
+    const labels = new Map<string, ValueLabels>();
+    for (const column of columnInfoForTitles ?? []) {
+      if (column.value_labels) labels.set(column.name, column.value_labels);
+    }
+    return labels;
+  }, [attributeList, columnInfoForTitles]);
+
+  const semanticRoles = useMemo(() => {
+    const roles = new Map<string, string>();
+    if (attributeList) {
+      for (const attribute of attributeList.attributes) {
+        if (attribute.is_current && attribute.semantic_role) {
+          roles.set(attribute.field_name, attribute.semantic_role);
+        }
+      }
+      return roles;
+    }
+    for (const column of columnInfoForTitles ?? []) {
+      if (column.semantic_role) roles.set(column.name, column.semantic_role);
+    }
+    return roles;
+  }, [attributeList, columnInfoForTitles]);
+
+  const formatValue = useCallback(
+    (value: unknown, key: string): string =>
+      formatFeaturePropertyValue(
+        value,
+        i18n.language,
+        t('featurePopup.booleanTrue'),
+        t('featurePopup.booleanFalse'),
+        4,
+        groupsDigits(semanticRoles.get(key)),
+      ) ?? '--',
+    [t, semanticRoles],
+  );
+
+  const featureRow = useFeatureRow(
+    feature?.datasetId,
+    feature?.featureId,
+    feature?.fetchRow === true,
+    feature?.embedToken,
+  );
+  // The tile's values stay; the row adds the fields the tile left out.
+  const properties = useMemo(
+    () => (featureRow.status === 'ready'
+      ? { ...feature?.properties, ...featureRow.row }
+      : feature?.properties),
+    [feature?.properties, featureRow],
+  );
+  const awaitingRow = feature?.fetchRow === true && (featureRow.status === 'loading' || featureRow.status === 'error');
+  const columnInfo = feature?.columnInfo;
+  const visibleFields = feature?.visibleFields;
+
+  const baseEntries = useMemo(() => {
+    if (!properties) return [] as [string, unknown][];
+    return Object.entries(properties).filter(([key]) => {
+      if (key.startsWith('_')) return false;
+      if (EXCLUDED_KEYS.has(key)) return false;
+      return true;
+    });
+  }, [properties]);
+
+  // Visible-fields resolution:
+  //   visibleFields is an ordered allowlist when defined → preserve user order
+  //   null/undefined → fall back to legacy columnInfo allowlist
+  //   [] → render zero rows (intentional "title only" mode)
+  const visibleEntries = useMemo<[string, unknown][]>(() => {
+    if (visibleFields !== undefined && visibleFields !== null) {
+      const propMap = new Map(baseEntries);
+      // Render configured fields even when absent from the tile properties:
+      // ST_AsMVT omits null-valued properties, so intersecting with the present
+      // keys hid configured fields that are null on the clicked feature
+      // (formatValue's '--' placeholder was unreachable). A name absent from
+      // BOTH the tile and the known schema is a stale config leftover (e.g.
+      // reupload/rename) and stays hidden; with no schema to consult, favor
+      // showing.
+      const known = columnInfo ? new Set(columnInfo.map((c) => c.name)) : null;
+      return visibleFields
+        .filter((k) => propMap.has(k) || known === null || known.has(k))
+        .map((k) => [k, propMap.get(k)] as [string, unknown]);
+    }
+    if (columnInfo) {
+      const columnNames = new Set(columnInfo.map((c) => c.name));
+      return baseEntries.filter(([key]) => columnNames.has(key));
+    }
+    return baseEntries;
+  }, [visibleFields, columnInfo, baseEntries]);
+
+  if (!feature) return null;
+
+  const { layerName, title } = feature;
+
+  const handleCopy = async (key: string, value: unknown) => {
+    const text = formatValue(value, key);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => setCopiedKey(null), 1500);
+    } catch {
+      toast.error(t('featurePopup.copyFailed'));
+    }
+  };
+
+  const handlePrev = () => setActiveIndex((i) => Math.max(0, i - 1));
+  const handleNext = () => setActiveIndex((i) => Math.min(features.length - 1, i + 1));
+
+  const isMulti = features.length > 1;
+
+  return (
+    <Popup
+      longitude={longitude}
+      latitude={latitude}
+      onClose={onClose}
+      closeButton={false}
+      closeOnClick={false}
+      maxWidth="360px"
+    >
+      {/* Labelled dialog container with focus management.
+          aria-label uses the feature title when present, else the layer name. */}
+      <div
+        role="dialog"
+        aria-label={
+          title ||
+          layerName ||
+          t('featurePopup.dialogLabel', { defaultValue: 'Feature details' })
+        }
+        className="text-xs"
+      >
+        {/* Header: layer name (left) + pager + close (right) */}
+        <div className="flex items-center justify-between gap-2 mb-2 pb-2 border-b border-border">
+          <span className="font-semibold font-mono text-xs uppercase tracking-wide text-muted-foreground truncate">
+            {layerName || '\u00A0'}
+          </span>
+          <div className="flex items-center gap-0.5 shrink-0">
+            {isMulti && (
+              <>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={handlePrev}
+                  disabled={activeIndex === 0}
+                  aria-label={t('featurePopup.prev')}
+                >
+                  <ChevronLeft className="rtl-mirror" />
+                </Button>
+                <span className="text-xs text-muted-foreground tabular-nums px-1">
+                  {activeIndex + 1}/{features.length}
+                </span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={handleNext}
+                  disabled={activeIndex === features.length - 1}
+                  aria-label={t('featurePopup.next')}
+                >
+                  <ChevronRight className="rtl-mirror" />
+                </Button>
+                <span className="w-px h-4 bg-border mx-1" aria-hidden="true" />
+              </>
+            )}
+            <Button
+              ref={closeButtonRef}
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              onClick={onClose}
+              aria-label={t('featurePopup.close')}
+            >
+              <X />
+            </Button>
+          </div>
+        </div>
+
+        {/* Title (custom expression output) */}
+        {title && (
+          <div
+            className="font-semibold text-sm text-foreground mb-2 break-words"
+            style={{ whiteSpace: 'pre-wrap' }}
+          >
+            {title}
+          </div>
+        )}
+
+        {/* Properties */}
+        <div className="max-h-48 overflow-y-auto">
+          {featureRow.status === 'loading' && (
+            <p role="status" className="text-xs text-muted-foreground py-1">
+              {t('featurePopup.loadingFields')}
+            </p>
+          )}
+          {featureRow.status === 'error' && (
+            <p role="alert" className="text-xs text-destructive py-1">
+              {t('featurePopup.fieldsFailed')}
+            </p>
+          )}
+          {featureRow.status === 'missing' && (
+            <p className="text-xs text-muted-foreground py-1">{t('featurePopup.rowGone')}</p>
+          )}
+          {visibleEntries.length === 0 ? (
+            awaitingRow || featureRow.status === 'missing' ? null : <p className="text-xs text-muted-foreground py-1">
+              {/* Below the attribute budget, the tile server strips attribute columns
+                  unless opted in via cols=; in all-fields mode nothing is
+                  opted in, so a dataset WITH columns arriving property-less
+                  at low zoom means "zoom in", not "no attributes". Gated to
+                  the all-fields case (visibleFields == null — an explicit []
+                  is the intentional title-only mode) AND to a click below
+                  the attribute budget — at higher zooms an empty property
+                  set means the values really are all null. */}
+              {visibleFields == null
+                && (columnInfo?.length ?? 0) > 0
+                && feature.zoomAtClick !== undefined
+                && feature.zoomAtClick < ATTRIBUTE_BUDGET_MINZOOM
+                ? t('featurePopup.zoomForAttributes')
+                : t('featurePopup.noAttributes')}
+            </p>
+          ) : (
+            <table className="w-full">
+              <tbody>
+                {visibleEntries.map(([key, value]) => (
+                  <tr
+                    key={key}
+                    role="button"
+                    tabIndex={0}
+                    className="group cursor-pointer hover:bg-accent/50 rounded-sm transition-[color,background-color,box-shadow,border-color,opacity] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                    onClick={() => handleCopy(key, value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        handleCopy(key, value);
+                      }
+                    }}
+                    title={t('featurePopup.clickToCopy')}
+                  >
+                    <td className="pe-3 py-1 font-medium font-mono text-xs text-muted-foreground whitespace-nowrap align-top">
+                      {fieldTitles.get(key) ?? humanizeKey(key)}
+                    </td>
+                    <td className="py-1 text-xs text-foreground">
+                      <span className="flex items-start gap-1">
+                        <ValueDisplay
+                          value={value}
+                          formatValue={(v) => formatValue(v, key)}
+                          labels={valueLabels.get(key)}
+                        />
+                        <span className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0 mt-0.5">
+                          {copiedKey === key ? (
+                            <Check className="h-3 w-3 text-success" />
+                          ) : (
+                            <Copy className="h-3 w-3 text-muted-foreground" />
+                          )}
+                        </span>
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </Popup>
+  );
+}
+
+function ValueDisplay({
+  value,
+  formatValue,
+  labels,
+}: {
+  value: unknown;
+  formatValue: (v: unknown) => string;
+  labels?: ValueLabels;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const { t } = useTranslation('builder');
+
+  const codeLabel = valueLabelFor(labels, value);
+  if (codeLabel !== undefined) {
+    return (
+      <span className="break-words">
+        {codeLabel}{' '}
+        {/* The code stays in the accessibility tree and shows on hover and row focus. */}
+        <span className="text-muted-foreground opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100">
+          ({formatValue(value)})
+        </span>
+      </span>
+    );
+  }
+
+  if (isUrl(value)) {
+    const { kind, srcUrl } = classifyUrl(value);
+
+    if (kind === 'image') {
+      return (
+        <span className="block space-y-1">
+          {/* A plain image avoids requiring CORS from hosts whose pixels are never
+              read through a canvas. The thumbnail has no derivable caption, so
+              an empty alt keeps screen readers from announcing its raw URL. */}
+          <img
+            src={srcUrl}
+            alt=""
+            loading="lazy"
+            decoding="async"
+            className="max-h-32 max-w-full rounded-sm object-contain"
+          />
+          <a
+            href={srcUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-primary underline break-all text-2xs"
+            onClick={(e) => e.stopPropagation()}
+            // Preserve native link activation inside the copyable property row.
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+            }}
+          >
+            {truncateGraphemes(srcUrl, MAX_VALUE_LENGTH)}
+          </a>
+        </span>
+      );
+    }
+
+    if (kind === 'video') {
+      return (
+        <span className="block">
+          {/* eslint-disable-next-line jsx-a11y/media-has-caption -- user-supplied popup media has no caption track */}
+          <video
+            src={srcUrl}
+            controls
+            preload="metadata"
+            className="max-h-32 max-w-full rounded-sm"
+          />
+        </span>
+      );
+    }
+
+    return (
+      <a
+        href={value}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-primary underline break-all"
+        onClick={(e) => e.stopPropagation()}
+        // Preserve native link activation inside the copyable property row.
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+        }}
+      >
+        {!expanded ? truncateGraphemes(value, MAX_VALUE_LENGTH) : value}
+      </a>
+    );
+  }
+
+  if (typeof value === 'string') {
+    const segments = splitTextWithUrls(value);
+    const hasUrls = segments.some((s) => s.kind === 'url');
+    if (hasUrls) {
+      return (
+        <span className="break-words">
+          {segments.map((seg, i) =>
+            seg.kind === 'url' ? (
+              <a
+                key={i}
+                href={seg.value}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-primary underline break-all"
+                onClick={(e) => e.stopPropagation()}
+                // Preserve native link activation inside the copyable property row.
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+                }}
+              >
+                {seg.value}
+              </a>
+            ) : (
+              <span key={i}>{seg.value}</span>
+            ),
+          )}
+        </span>
+      );
+    }
+  }
+
+  const formatted = formatValue(value);
+  const truncated = truncateGraphemes(formatted, MAX_VALUE_LENGTH, '');
+  if (truncated !== formatted && !expanded) {
+    return (
+      <span className="break-words">
+        {truncated}
+        <button
+          type="button"
+          className="text-primary ms-0.5 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label={t('popup.showFullValue', { defaultValue: 'Show full value' })}
+          onClick={(e) => {
+            e.stopPropagation();
+            setExpanded(true);
+          }}
+          // Keep Enter/Space on this button from bubbling to the surrounding
+          // property row, whose keydown handler copies the value + preventDefaults
+          // which would otherwise hijack the button's own activation.
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') e.stopPropagation();
+          }}
+        >
+          ...
+        </button>
+      </span>
+    );
+  }
+
+  return <span className="break-words">{formatted}</span>;
+}

@@ -1,0 +1,450 @@
+import { queryKeys } from '@/lib/query-keys';
+
+describe('queryKeys factory', () => {
+  // -------------------------------------------------------------------------
+  // Auth
+  // -------------------------------------------------------------------------
+  describe('auth', () => {
+    it('me returns expected key', () => {
+      expect(queryKeys.auth.me).toEqual(['auth', 'me']);
+    });
+
+    it('permissions returns expected key', () => {
+      expect(queryKeys.auth.permissions).toEqual(['auth', 'permissions']);
+    });
+
+    it('all is a prefix of me', () => {
+      const all = queryKeys.auth.all;
+      expect(queryKeys.auth.me.slice(0, all.length)).toEqual([...all]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Datasets
+  // -------------------------------------------------------------------------
+  describe('datasets', () => {
+    it('all returns base key', () => {
+      expect(queryKeys.datasets.all).toEqual(['datasets']);
+    });
+
+    it('detail includes id', () => {
+      expect(queryKeys.datasets.detail('abc')).toEqual(['dataset', 'abc']);
+    });
+
+    it('rows includes all params', () => {
+      expect(queryKeys.datasets.rows('abc', 50, 0)).toEqual(['dataset-rows', 'abc', 50, 0, undefined, undefined, undefined]);
+      const filters = { name: 'x' };
+      const sort = { column: 'name', desc: true };
+      expect(queryKeys.datasets.rows('abc', 50, 0, filters, sort)).toEqual(['dataset-rows', 'abc', 50, 0, filters, sort, undefined]);
+      // The CQL2 filter is part of the cache identity: a drawer sending the
+      // layer's filter must never hit an unfiltered cached page.
+      expect(queryKeys.datasets.rows('abc', 50, 0, filters, sort, 'cql2')).toEqual(['dataset-rows', 'abc', 50, 0, filters, sort, 'cql2']);
+    });
+
+    it('history includes skip and limit', () => {
+      expect(queryKeys.datasets.history('abc', 0, 50)).toEqual(['dataset-history', 'abc', 0, 50]);
+    });
+
+    it('versions includes skip and limit', () => {
+      expect(queryKeys.datasets.versions('abc', 0, 50)).toEqual(['dataset-versions', 'abc', 0, 50]);
+    });
+
+    it('attributes includes datasetId', () => {
+      expect(queryKeys.datasets.attributes('abc')).toEqual(['attributes', 'abc']);
+    });
+
+    it('validation includes datasetId', () => {
+      expect(queryKeys.datasets.validation('abc')).toEqual(['validation', 'abc']);
+    });
+
+    it('related is a superset of all', () => {
+      const key = queryKeys.datasets.related('abc');
+      expect(key[0]).toBe('datasets');
+    });
+
+    it('maps is a superset of all', () => {
+      const key = queryKeys.datasets.maps('abc');
+      expect(key[0]).toBe('datasets');
+    });
+
+    it('rowsPrefix is a prefix of rows', () => {
+      const prefix = queryKeys.datasets.rowsPrefix('abc');
+      const full = queryKeys.datasets.rows('abc', 50, 0);
+      expect(full.slice(0, prefix.length)).toEqual([...prefix]);
+    });
+
+    it('versionsPrefix is a prefix of versions', () => {
+      const prefix = queryKeys.datasets.versionsPrefix('abc');
+      const full = queryKeys.datasets.versions('abc', 0, 50);
+      expect(full.slice(0, prefix.length)).toEqual([...prefix]);
+    });
+
+    it('keeps sync configuration and credential metadata dataset-scoped', () => {
+      expect(queryKeys.datasets.sync('abc')).toEqual(['dataset-sync', 'abc']);
+      expect(queryKeys.datasets.syncCredentials('abc')).toEqual(['sync-credentials', 'abc']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Maps
+  // -------------------------------------------------------------------------
+  describe('maps', () => {
+    it('all returns base key', () => {
+      expect(queryKeys.maps.all).toEqual(['maps']);
+    });
+
+    it('list is a superset of all', () => {
+      const params = { skip: 0, limit: 20 };
+      const key = queryKeys.maps.list(params);
+      expect(key[0]).toBe('maps');
+    });
+
+    it('detail includes id', () => {
+      expect(queryKeys.maps.detail('abc')).toEqual(['map', 'abc']);
+    });
+
+    it('shareToken includes mapId', () => {
+      expect(queryKeys.maps.shareToken('abc')).toEqual(['map-share-token', 'abc']);
+    });
+
+    it('embedTokens includes mapId', () => {
+      expect(queryKeys.maps.embedTokens('abc')).toEqual(['map-embed-tokens', 'abc']);
+    });
+
+    it('sharedMap includes token', () => {
+      // Embed viewers don't share cache entries with the anonymous payload.
+      expect(queryKeys.maps.sharedMap('tok123')).toEqual(['shared-map', 'tok123', undefined]);
+      expect(queryKeys.maps.sharedMap('tok123', 'et_x')).toEqual(['shared-map', 'tok123', 'et_x']);
+    });
+
+    it('columnValues includes datasetId and col', () => {
+      expect(queryKeys.maps.columnValues('abc', 'name')).toEqual(['column-values', 'abc', 'name']);
+    });
+
+    it('columnStats includes datasetId and col', () => {
+      expect(queryKeys.maps.columnStats('abc', 'name')).toEqual(['column-stats', 'abc', 'name']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Collections
+  // -------------------------------------------------------------------------
+  describe('collections', () => {
+    it('all returns base key', () => {
+      expect(queryKeys.collections.all).toEqual(['collections']);
+    });
+
+    it('list is a superset of all', () => {
+      const key = queryKeys.collections.list(0, 50);
+      expect(key[0]).toBe('collections');
+    });
+
+    it('detail includes id', () => {
+      expect(queryKeys.collections.detail('abc')).toEqual(['collection', 'abc']);
+    });
+
+    it('datasets includes collectionId', () => {
+      expect(queryKeys.collections.datasets('abc', 0, 20)).toEqual(['collection-datasets', 'abc', 0, 20]);
+    });
+
+    it('datasetsPrefix is a prefix of datasets', () => {
+      const prefix = queryKeys.collections.datasetsPrefix('abc');
+      const full = queryKeys.collections.datasets('abc', 0, 20);
+      expect(full.slice(0, prefix.length)).toEqual([...prefix]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Search
+  // -------------------------------------------------------------------------
+  describe('search', () => {
+    it('results includes params', () => {
+      const params = { q: 'test' };
+      expect(queryKeys.search.results(params)).toEqual(['search', params]);
+    });
+
+    it('facets includes params', () => {
+      const params = { q: 'test' };
+      expect(queryKeys.search.facets(params)).toEqual(['facets', params]);
+    });
+
+    it('summary returns expected key', () => {
+      expect(queryKeys.search.summary).toEqual(['catalog-summary']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Admin
+  // -------------------------------------------------------------------------
+  describe('admin', () => {
+    it('all returns base key', () => {
+      expect(queryKeys.admin.all).toEqual(['admin']);
+    });
+
+    it('stats is a superset of all', () => {
+      expect(queryKeys.admin.stats[0]).toBe('admin');
+    });
+
+    it('users includes skip, limit, status, search, sort, order, role', () => {
+      expect(queryKeys.admin.users(0, 50)).toEqual([
+        'admin', 'users', 0, 50, undefined, undefined, undefined, undefined, undefined,
+      ]);
+      expect(queryKeys.admin.users(0, 50, 'active', 'bob')).toEqual([
+        'admin', 'users', 0, 50, 'active', 'bob', undefined, undefined, undefined,
+      ]);
+      // Two orderings of the same page must not share a cache entry.
+      expect(queryKeys.admin.users(0, 50, undefined, undefined, 'username', 'asc')).not.toEqual(
+        queryKeys.admin.users(0, 50, undefined, undefined, 'username', 'desc'),
+      );
+      expect(queryKeys.admin.users(0, 50, undefined, undefined, undefined, undefined, 'viewer')).not.toEqual(
+        queryKeys.admin.users(0, 50, undefined, undefined, undefined, undefined, 'editor'),
+      );
+    });
+
+    it('shareTokens includes skip, limit, search, status, sort, order', () => {
+      expect(queryKeys.admin.shareTokens(0, 50)).toEqual([
+        'admin', 'share-tokens', 0, 50, undefined, undefined, undefined, undefined,
+      ]);
+      expect(queryKeys.admin.shareTokens(0, 50, 'parcels', 'active')).toEqual([
+        'admin', 'share-tokens', 0, 50, 'parcels', 'active', undefined, undefined,
+      ]);
+      // Two orderings of the same page must not share a cache entry.
+      expect(
+        queryKeys.admin.shareTokens(0, 50, undefined, undefined, 'map_name', 'asc'),
+      ).not.toEqual(
+        queryKeys.admin.shareTokens(0, 50, undefined, undefined, 'map_name', 'desc'),
+      );
+    });
+
+    it('jobs and auditLogs separate two orderings of the same page', () => {
+      // Both take the whole params object, so sort/order ride along without a
+      // signature change — but only if the caller actually passes them.
+      expect(queryKeys.admin.jobs({ skip: 0, sort: 'status', order: 'asc' })).not.toEqual(
+        queryKeys.admin.jobs({ skip: 0, sort: 'status', order: 'desc' }),
+      );
+      expect(
+        queryKeys.admin.auditLogs({ skip: 0, sort: 'action', order: 'asc' }),
+      ).not.toEqual(queryKeys.admin.auditLogs({ skip: 0, sort: 'action', order: 'desc' }));
+    });
+
+    it('aiStatus returns expected key', () => {
+      expect(queryKeys.admin.aiStatus).toEqual(['admin', 'ai-status']);
+    });
+
+    it('embeddingStats returns expected key', () => {
+      expect(queryKeys.admin.embeddingStats).toEqual(['admin', 'embedding-stats']);
+    });
+
+    it('infrastructure returns expected key', () => {
+      expect(queryKeys.admin.infrastructure).toEqual(['admin', 'infrastructure']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Settings
+  // -------------------------------------------------------------------------
+  describe('settings', () => {
+    it('all returns base key', () => {
+      expect(queryKeys.settings.all).toEqual(['settings']);
+    });
+
+    it('basemaps is a superset of all', () => {
+      expect(queryKeys.settings.basemaps[0]).toBe('settings');
+    });
+
+    it('branding returns expected key', () => {
+      expect(queryKeys.settings.branding).toEqual(['settings', 'branding']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Ingest
+  // -------------------------------------------------------------------------
+  describe('ingest', () => {
+    it('jobStatus includes jobId', () => {
+      expect(queryKeys.ingest.jobStatus('job123')).toEqual(['job-status', 'job123']);
+    });
+
+    it('discoverTables returns expected key', () => {
+      expect(queryKeys.ingest.discoverTables).toEqual(['discover-tables']);
+    });
+
+    it('uploadConfig returns expected key', () => {
+      expect(queryKeys.ingest.uploadConfig).toEqual(['upload-config']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Saved searches
+  // -------------------------------------------------------------------------
+  describe('savedSearches', () => {
+    it('all returns expected key', () => {
+      expect(queryKeys.savedSearches.all).toEqual(['saved-searches']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // API keys
+  // -------------------------------------------------------------------------
+  describe('apiKeys', () => {
+    it('mine returns expected key', () => {
+      expect(queryKeys.apiKeys.mine).toEqual(['my-api-keys']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Tile tokens
+  // -------------------------------------------------------------------------
+  describe('tileTokens', () => {
+    it('token includes datasetId', () => {
+      expect(queryKeys.tileTokens.token('abc')).toEqual(['tile-token', 'abc']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // VRT
+  // -------------------------------------------------------------------------
+  describe('vrt', () => {
+    it('sources includes datasetId', () => {
+      expect(queryKeys.vrt.sources('abc')).toEqual(['vrt-sources', 'abc']);
+    });
+
+    it('status includes datasetId', () => {
+      expect(queryKeys.vrt.status('abc')).toEqual(['vrt-status', 'abc']);
+    });
+
+    it('generations includes datasetId and optional params', () => {
+      expect(queryKeys.vrt.generations('abc')).toEqual(['vrt-generations', 'abc', undefined]);
+      expect(queryKeys.vrt.generations('abc', { limit: 10 })).toEqual(['vrt-generations', 'abc', { limit: 10 }]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Edition
+  // -------------------------------------------------------------------------
+  describe('edition', () => {
+    it('info returns expected key', () => {
+      expect(queryKeys.edition.info).toEqual(['edition']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Auth config & OAuth
+  // -------------------------------------------------------------------------
+  describe('authConfig', () => {
+    it('config returns expected key', () => {
+      expect(queryKeys.authConfig.config).toEqual(['auth', 'config']);
+    });
+
+    it('oauthProviders returns expected key', () => {
+      expect(queryKeys.authConfig.oauthProviders).toEqual(['auth', 'oauth-providers']);
+    });
+
+    it('config is a superset of auth.all', () => {
+      expect(queryKeys.authConfig.config[0]).toBe('auth');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Settings OAuth
+  // -------------------------------------------------------------------------
+  describe('settingsOAuth', () => {
+    it('providers returns expected key', () => {
+      expect(queryKeys.settingsOAuth.providers).toEqual(['settings', 'oauth-providers']);
+    });
+
+    it('is a superset of settings.all', () => {
+      expect(queryKeys.settingsOAuth.providers[0]).toBe('settings');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // SAML providers
+  // -------------------------------------------------------------------------
+  describe('saml', () => {
+    it('providers returns expected key', () => {
+      // Pins the string the admin SAML list caches under, so a typo cannot
+      // silently turn an invalidation into a no-op.
+      expect(queryKeys.saml.providers).toEqual(['saml', 'providers']);
+    });
+
+    it('does not prefix-match the OAuth provider families', () => {
+      // SamlProvidersSection invalidates this key AND both OAuth families on every
+      // mutation (via hooks/use-auth-providers.ts). Those are three separate calls
+      // because none of the keys covers another — TanStack matches by prefix, so
+      // re-rooting this one under 'settings' would silently make one of them
+      // redundant and the other over-broad.
+      const saml = queryKeys.saml.providers;
+      for (const other of [
+        queryKeys.settingsOAuth.providers,
+        queryKeys.authConfig.oauthProviders,
+      ]) {
+        expect(other.slice(0, saml.length)).not.toEqual([...saml]);
+        expect(saml.slice(0, other.length)).not.toEqual([...other]);
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Relationships
+  // -------------------------------------------------------------------------
+  describe('relationships', () => {
+    it('list includes datasetId', () => {
+      expect(queryKeys.relationships.list('abc')).toEqual(['dataset-relationships', 'abc']);
+    });
+
+    it('records includes all params', () => {
+      expect(queryKeys.relationships.records('abc', 42, 'rel1')).toEqual([
+        'related-records', 'abc', 42, 'rel1',
+      ]);
+    });
+
+    it('recordsPrefix is a prefix of records for any featureGid/relationshipId', () => {
+      expect(queryKeys.relationships.recordsPrefix('abc')).toEqual(['related-records', 'abc']);
+      const full = queryKeys.relationships.records('abc', 42, 'rel1');
+      expect(full.slice(0, 2)).toEqual(queryKeys.relationships.recordsPrefix('abc'));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // OGC records
+  // -------------------------------------------------------------------------
+  describe('ogcRecords', () => {
+    it('detail includes id', () => {
+      expect(queryKeys.ogcRecords.detail('abc')).toEqual(['ogc-record', 'abc']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // COG search
+  // -------------------------------------------------------------------------
+  describe('cogSearch', () => {
+    it('results includes query', () => {
+      expect(queryKeys.cogSearch.results('test')).toEqual(['cog-search', 'test']);
+    });
+
+    it('addSource includes query', () => {
+      expect(queryKeys.cogSearch.addSource('test')).toEqual(['cog-search-add-source', 'test']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Dataset search
+  // -------------------------------------------------------------------------
+  describe('datasetSearch', () => {
+    it('results includes query and recordType', () => {
+      expect(queryKeys.datasetSearch.results('test', 'vector_dataset')).toEqual([
+        'dataset-search', 'test', 'vector_dataset',
+      ]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Typeahead
+  // -------------------------------------------------------------------------
+  describe('typeahead', () => {
+    it('results includes query', () => {
+      expect(queryKeys.typeahead.results('test')).toEqual(['typeahead', 'test']);
+    });
+  });
+});

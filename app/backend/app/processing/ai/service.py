@@ -1,0 +1,984 @@
+"""AI map generation service: LLM orchestration with tool calling."""
+
+import asyncio
+import json
+import re
+import uuid
+
+import structlog
+from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+from collections.abc import AsyncGenerator, Awaitable, Callable
+
+from app.processing.ai.chat_constants import (
+    TOOL_RESULT_PROTOCOL,
+    ramp_prompt_lines,
+    sanitize_column_info,
+    sanitize_dataset_value,
+    sanitize_sample_values,
+)
+from app.processing.ai.constants import tool_label
+from app.platform.extensions import get_ai_provider
+from app.processing.ai.llm_loop import (
+    ToolLoopExhaustedError,
+    ToolLoopResult,
+    UserFacingAIError,
+    stream_error_event,
+    noop_tool_executor,
+    resolve_provider,
+)
+from app.processing.ai.schemas import LLMMapSpec, validate_paint_for_geometry
+from app.processing.ai.tools import (
+    _GET_DATASET_DETAILS_DESC,
+    _GET_DATASET_DETAILS_SCHEMA,
+    _SEARCH_DATASETS_DESC,
+    _SEARCH_DATASETS_SCHEMA,
+)
+from typing import TYPE_CHECKING
+
+from app.core.db import release_connection
+from app.core.geo import extent_to_bbox, merge_bboxes, wrap_longitude
+from app.core.identity import Identity
+from app.processing.ai.token_usage import (
+    record_token_usage,
+    usage_accounting,
+)
+
+if TYPE_CHECKING:
+    from app.core.processing_port import ProcessingPort
+
+logger = structlog.stdlib.get_logger(__name__)
+
+SYSTEM_PROMPT = """\
+You are a GIS map designer. The user will describe what map they want, and you \
+must search the dataset catalog, select appropriate datasets, and design a map.
+
+## Workflow
+1. Search the catalog using the search_datasets tool. Try multiple search \
+   strategies if the first doesn't find what you need:
+   - Start with short, broad terms (e.g. "preserved lands" instead of \
+     "New Jersey Highlands Preserved Lands")
+   - Drop geographic qualifiers — dataset titles often omit region names
+   - Try synonyms (e.g. "conservation" for "preserved", "parcels" for "lands")
+   - Search for each major concept separately if a combined query fails
+2. Select the best-matching datasets. If you plan data-driven styling, call \
+   get_dataset_details to see column info and sample values.
+3. Design the map with proper layer ordering, distinct styling, and an \
+   appropriate viewport.
+
+## Layer ordering
+- Polygons/fills at the bottom (lowest sort_order)
+- Lines in the middle
+- Points on top (highest sort_order)
+
+## Styling
+Use distinct colors for each layer. Suggested palette:
+- #3b82f6 (blue), #ef4444 (red), #22c55e (green), #f59e0b (amber),
+  #8b5cf6 (purple), #ec4899 (pink), #06b6d4 (cyan), #f97316 (orange)
+
+For polygons: use fill-opacity 0.2-0.4 with a darker _outline-color.
+For lines: use line-width 1.5-3.
+For points: use circle-radius 4-6 with a stroke.
+
+IMPORTANT: Use the correct paint properties for each geometry type:
+- Polygon/MultiPolygon: fill-color, fill-opacity, _outline-color
+- LineString/MultiLineString: line-color, line-width, line-opacity
+- Point/MultiPoint: circle-color, circle-radius, circle-stroke-color, circle-stroke-width
+Do NOT mix properties across geometry types (e.g. no fill-color on a point layer).
+
+## Data-Driven Styling
+When a dataset has a column that is well-suited for thematic visualization, use data-driven paint expressions:
+
+- **Categorical** (text/string columns like land_use, type, status):
+  Use a "match" expression: ["match", ["get", "column_name"], "value1", "#color1", "value2", "#color2", ..., "#cccccc"]
+  First call get_dataset_details to see sample values for the column.
+
+- **Graduated** (numeric columns like population, area, elevation):
+  Use a "step" expression: ["step", ["get", "column_name"], "#color1", break1, "#color2", break2, "#color3", ...]
+  First call get_dataset_details to understand the value range.
+
+- **Continuous** (numeric columns where smooth transitions make sense):
+  Use an "interpolate" expression: ["interpolate", ["linear"], ["get", "column_name"], min, "#startColor", max, "#endColor"]
+
+Available color ramps (use these hex values):
+__RAMP_LIST__
+
+Apply data-driven styling ONLY if:
+- The user explicitly asks for a thematic, choropleth, or "color by X" map, OR
+- The user mentions a specific attribute to color by.
+
+Default to flat color styling for all other requests, even if a thematic
+column is present. Do not apply data-driven styling unless the user's request
+clearly calls for it.
+
+## Viewport
+Set center_lng, center_lat, and zoom based on dataset extents. If datasets \
+cover a whole country, zoom 4-6. If they cover a city, zoom 10-13.
+
+## Basemap
+{basemap_instruction}
+
+## Output
+After gathering datasets, output your map specification as JSON inside \
+<map_spec> tags. Here is a complete example with multiple layers:
+
+<map_spec>
+{{
+  "name": "Parks and Trails",
+  "description": "National parks with nearby hiking trails",
+  "center_lng": -105.3,
+  "center_lat": 39.7,
+  "zoom": 8,
+  "basemap_style": "openfreemap-positron",
+  "layers": [
+    {{
+      "dataset_id": "<id from search_datasets>",
+      "sort_order": 0,
+      "visible": true,
+      "opacity": 1.0,
+      "paint": {{"fill-color": "#22c55e", "fill-opacity": 0.3, "_outline-color": "#15803d"}},
+      "layout": {{}}
+    }},
+    {{
+      "dataset_id": "<id from search_datasets>",
+      "sort_order": 1,
+      "visible": true,
+      "opacity": 1.0,
+      "paint": {{"line-color": "#f59e0b", "line-width": 2}},
+      "layout": {{}}
+    }}
+  ],
+  "explanation": "I found national parks (polygons) and hiking trails (lines). Parks are shown in green with trails overlaid in amber."
+}}
+</map_spec>
+
+All fields shown above are required. Use `dataset_id` values returned by search_datasets.
+
+If no matching datasets exist after trying multiple search strategies, output an error:
+
+<map_spec>
+{{"error": "No matching datasets found. The catalog does not contain datasets related to 'subway ridership'. Try searching for 'transit', 'public transportation', or 'ridership' instead."}}
+</map_spec>
+
+## Important
+- Do NOT invent or hallucinate dataset IDs. Only use IDs returned by search_datasets.
+- If you are unsure which dataset best matches, explain your reasoning in the explanation field.
+- If no datasets match, suggest alternative search terms the user could try in the error message.
+
+""".replace("__RAMP_LIST__", ramp_prompt_lines(("YlOrRd", "Viridis", "Blues")))
+
+_DEFAULT_BASEMAP_INSTRUCTION = (
+    "Choose from: positron (light, default), dark_matter (dark), voyager (colorful)."
+)
+
+
+def _build_basemap_instruction(basemap_ids: list[str] | None) -> str:
+    if basemap_ids:
+        choices = ", ".join(basemap_ids)
+        return f"Choose from: {choices}. Use 'positron' if unsure."
+    return _DEFAULT_BASEMAP_INSTRUCTION
+
+
+async def _should_send_sample_values(session: AsyncSession) -> bool:
+    """Check admin toggle for sending sample values to the LLM."""
+    try:
+        from app.core.persistent_config import AI_SEND_SAMPLE_VALUES
+
+        return await AI_SEND_SAMPLE_VALUES.get(session)
+    except Exception:  # broad: withhold samples when the setting is unreadable
+        logger.warning("AI_SEND_SAMPLE_VALUES unreadable; withholding", exc_info=True)
+        return False
+
+
+async def _get_available_basemaps(session: AsyncSession) -> list[str] | None:
+    """Fetch available basemap IDs from admin settings."""
+    try:
+        from app.core.persistent_config import BASEMAPS
+
+        basemaps = await BASEMAPS.get(session)
+        if basemaps and isinstance(basemaps, list):
+            return [
+                b.get("id") or b.get("key", "") for b in basemaps if isinstance(b, dict)
+            ]
+    except Exception:  # broad: persistent_config lookup is non-fatal; degrade to None on any DB/cache error
+        logger.warning("Failed to fetch basemap config, using defaults", exc_info=True)
+    return None
+
+
+def _build_map_system_prompt(
+    language: str | None = None,
+    basemap_ids: list[str] | None = None,
+) -> str:
+    """Build map generation system prompt with language directive and dynamic basemaps."""
+    from app.processing.ai.chat_service import lang_name
+
+    basemap_instruction = _build_basemap_instruction(basemap_ids)
+    prompt = SYSTEM_PROMPT.format(basemap_instruction=basemap_instruction)
+
+    # This path has no layer block, so a catalog tool result is the only
+    # untrusted text it ever sees.
+    prompt += "\n" + TOOL_RESULT_PROTOCOL
+
+    lang = lang_name(language)
+    prompt += f"""
+## Language
+Always respond in {lang}. The explanation field and any text must be in {lang}. Never switch to another language.
+"""
+    return prompt
+
+
+# Anthropic tool format (schema sourced from tools.py)
+ANTHROPIC_TOOLS = [
+    {
+        "name": "search_datasets",
+        "description": _SEARCH_DATASETS_DESC,
+        "input_schema": _SEARCH_DATASETS_SCHEMA,
+    },
+    {
+        "name": "get_dataset_details",
+        "description": _GET_DATASET_DETAILS_DESC,
+        "input_schema": _GET_DATASET_DETAILS_SCHEMA,
+    },
+]
+
+
+async def _execute_search_tool(
+    session: AsyncSession,
+    user: Identity,
+    user_roles: set[str],
+    tool_input: dict,
+    *,
+    send_sample_values: bool = True,
+    port: "ProcessingPort",
+) -> list[dict]:
+    """Execute the search_datasets tool and return results as dicts."""
+    from app.modules.catalog.search.service import SearchFilters
+
+    q = tool_input.get("q")
+    geometry_type = tool_input.get("geometry_type")
+    keywords = tool_input.get("keywords")
+    limit = min(tool_input.get("limit", 10), 25)
+    bbox = tool_input.get("bbox")
+
+    datasets, _total = await port.search_datasets(
+        session,
+        user,
+        user_roles,
+        SearchFilters(
+            q=q,
+            geometry_type=geometry_type,
+            keywords=keywords,
+            bbox=bbox,
+            limit=limit,
+        ),
+    )
+
+    results = []
+    for ds in datasets:
+        sample = None
+        if send_sample_values and ds.sample_values:
+            sample = {}
+            for k, v in list(ds.sample_values.items())[:5]:
+                sample[k] = v[:5] if isinstance(v, list) else v
+            sample = sample or None
+
+        # Search includes other users' PUBLIC datasets, so an attacker's text
+        # here lands in a victim's model context, where the model holds
+        # query_data and every editing tool. Scrub it like content.
+        results.append(
+            {
+                "id": str(ds.id),
+                "title": sanitize_dataset_value(ds.record.title),
+                "summary": sanitize_dataset_value(ds.record.summary),
+                "geometry_type": ds.geometry_type,
+                "keywords": [
+                    sanitize_dataset_value(kw.keyword) for kw in ds.record.keywords
+                ]
+                if ds.record.keywords
+                else None,
+                # A VRT's stored extent covers members the user may not read.
+                "extent_bbox": None
+                if ds.record.record_type == "vrt_dataset"
+                else port.extract_bbox(ds),
+                "feature_count": ds.feature_count,
+                "column_info": sanitize_column_info(
+                    ds.column_info[:20] if ds.column_info else None
+                ),
+                "sample_values": sanitize_sample_values(sample),
+            }
+        )
+
+    return results
+
+
+async def _execute_get_dataset_details(
+    session: AsyncSession,
+    user: Identity,
+    user_roles: set[str],
+    tool_input: dict,
+    *,
+    send_sample_values: bool = True,
+    port: "ProcessingPort",
+) -> dict:
+    """Return full column info, sample values, and feature count for a dataset."""
+    from app.modules.catalog.datasets.domain.models import Dataset as DatasetORM
+
+    dataset_id = tool_input.get("dataset_id")
+
+    try:
+        uuid.UUID(str(dataset_id))
+    except (ValueError, AttributeError):
+        return {"error": "Invalid dataset_id format"}
+
+    Record_orm = port.get_record_orm_class()
+    DatasetGrant_orm = port.get_grant_orm_class()
+    stmt = (
+        select(DatasetORM)
+        .options(joinedload(DatasetORM.record))
+        .join(Record_orm, DatasetORM.record_id == Record_orm.id)
+        .where(DatasetORM.id == dataset_id)
+    )
+    stmt = port.apply_visibility_filter(
+        stmt, user, user_roles, Record_orm, DatasetGrant_orm
+    )
+    result = await session.execute(stmt)
+    ds = result.unique().scalar_one_or_none()
+    if ds is None:
+        return {"error": "Dataset not found"}
+
+    # Bounds token usage.
+    column_info = ds.column_info[:50] if ds.column_info else None
+
+    sample = None
+    if send_sample_values and ds.sample_values:
+        sample = {}
+        for k, v in ds.sample_values.items():
+            sample[k] = v[:5] if isinstance(v, list) else v
+        sample = sample or None
+
+    # Same trust boundary as _execute_search_tool: this tool reads any dataset
+    # the caller can see, including other users' public ones.
+    return {
+        "id": str(ds.id),
+        "title": sanitize_dataset_value(ds.record.title),
+        "geometry_type": ds.geometry_type,
+        "feature_count": ds.feature_count,
+        "column_info": sanitize_column_info(column_info),
+        "sample_values": sanitize_sample_values(sample),
+    }
+
+
+def _finished_text(result: ToolLoopResult) -> str:
+    """The reply's text, refusing a reply that stopped before it finished."""
+    if result.truncated:
+        raise UserFacingAIError("The AI's reply was cut off. Try a shorter prompt.")
+    return result.text
+
+
+def _parse_map_spec(text: str) -> dict:
+    """Extract JSON from <map_spec> tags in LLM response."""
+    match = re.search(r"<map_spec>\s*(.*?)\s*</map_spec>", text, re.DOTALL)
+    if not match:
+        raise ValueError("No <map_spec> block found in LLM response")
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Malformed JSON in LLM map spec: {e}") from e
+
+
+async def _retry_parse_map_spec(
+    raw_text: str,
+    provider: str,
+    model: str,
+    runtime_config: dict[str, object],
+    *,
+    session: AsyncSession,
+    user_id: uuid.UUID | None,
+) -> dict:
+    """Lightweight retry: ask the LLM to fix its JSON output without re-running tools."""
+    extraction_prompt = (
+        "The following text should contain a JSON map specification inside "
+        "<map_spec> tags, but parsing failed. Output ONLY the corrected JSON "
+        "inside <map_spec>...</map_spec> tags. Do not call any tools.\n\n"
+        f"{raw_text}"
+    )
+
+    provider_ext = get_ai_provider(provider)
+
+    await release_connection(session)
+    async with usage_accounting(
+        session, user_id=user_id, subsystem="map_generation", model=model
+    ):
+        result = await provider_ext.complete(
+            model=model,
+            system_prompt="",
+            user_message=extraction_prompt,
+            tools=[],
+            tool_executor=noop_tool_executor,
+            max_rounds=1,
+            max_tokens=1024,
+            base_url=runtime_config.get("base_url"),
+        )
+    # Retry rounds spend real tokens; unrecorded they bypass the daily budget.
+    await record_token_usage(
+        user_id=user_id,
+        subsystem="map_generation",
+        model=model,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+    retry_text = _finished_text(result)
+
+    return _parse_map_spec(retry_text)
+
+
+async def _repair_map_spec(
+    spec_dict: dict,
+    validation_error: ValidationError,
+    provider: str,
+    model: str,
+    runtime_config: dict[str, object],
+    *,
+    session: AsyncSession,
+    user_id: uuid.UUID | None,
+) -> LLMMapSpec:
+    """Run one repair round for schema-invalid specs.
+
+    Sibling of _retry_parse_map_spec for valid-JSON-wrong-shape output. Feeds
+    the pydantic errors back to the model, bounded to a single attempt, then
+    fails with a user-friendly message instead of a raw ValidationError.
+    """
+    missing = [".".join(str(p) for p in e["loc"]) for e in validation_error.errors()]
+    logger.warning(
+        "Map spec failed validation, attempting one repair round",
+        fields=missing,
+    )
+    repair_prompt = (
+        "The following JSON map specification failed schema validation. "
+        "Fix ONLY the listed problems, keeping everything else unchanged, "
+        "and output the corrected JSON inside <map_spec>...</map_spec> "
+        "tags. Do not call any tools.\n\n"
+        f"Validation errors:\n{validation_error}\n\n"
+        f"Specification:\n{json.dumps(spec_dict)}"
+    )
+    provider_ext = get_ai_provider(provider)
+
+    await release_connection(session)
+    async with usage_accounting(
+        session, user_id=user_id, subsystem="map_generation", model=model
+    ):
+        result = await provider_ext.complete(
+            model=model,
+            system_prompt="",
+            user_message=repair_prompt,
+            tools=[],
+            tool_executor=noop_tool_executor,
+            max_rounds=1,
+            max_tokens=1024,
+            base_url=runtime_config.get("base_url"),
+        )
+    # Repair-round tokens count toward the daily cap.
+    await record_token_usage(
+        user_id=user_id,
+        subsystem="map_generation",
+        model=model,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+    try:
+        return LLMMapSpec(**_parse_map_spec(_finished_text(result)))
+    except (ValueError, ValidationError) as e:
+        raise UserFacingAIError(
+            "The AI couldn't produce a valid map for this prompt — try rephrasing it."
+        ) from e
+
+
+def _snap_viewport_to_extent(spec: LLMMapSpec, extents: list[object]) -> None:
+    """Pull an LLM viewport back to the layer data when it points elsewhere.
+
+    ``merge_bboxes`` folds per-dataset bboxes on the circle, so datasets split
+    across the antimeridian (e.g. Fiji at lon 179/-179) don't union to
+    -180..180 and snap the centre to lon 0, far from the data. The margin and
+    centroid arithmetic needs a monotonic width, so a crossing east is lifted
+    past +180 before comparison. Mutates ``spec``.
+    """
+    merged = merge_bboxes(extent_to_bbox(ext) for ext in extents)
+    if merged is None:
+        return
+    min_x, min_y, max_x, max_y = merged
+    center_lng = spec.center_lng
+    if min_x > max_x:
+        max_x += 360.0
+        if center_lng < min_x:
+            center_lng += 360.0
+    # Margin: 50% of the extent in each direction.
+    dx = (max_x - min_x) * 0.5 or 1.0
+    dy = (max_y - min_y) * 0.5 or 1.0
+    if (
+        center_lng < min_x - dx
+        or center_lng > max_x + dx
+        or spec.center_lat < min_y - dy
+        or spec.center_lat > max_y + dy
+    ):
+        centroid_lng = wrap_longitude((min_x + max_x) / 2)
+        centroid_lat = (min_y + max_y) / 2
+        logger.warning(
+            "LLM viewport outside dataset extent, snapping to centroid",
+            llm_center=(spec.center_lng, spec.center_lat),
+            snapped_center=(centroid_lng, centroid_lat),
+        )
+        spec.center_lng = centroid_lng
+        spec.center_lat = centroid_lat
+
+
+async def _validate_and_persist_map(
+    session: AsyncSession,
+    user: Identity,
+    user_roles: set[str],
+    spec: LLMMapSpec,
+    basemap_ids: list[str] | None = None,
+    *,
+    port: "ProcessingPort",
+) -> dict:
+    """Validate dataset visibility, create map, and persist layers atomically.
+
+    Returns dict with map_id, map_name, explanation, datasets_used.
+    Raises ValueError if any referenced dataset is not visible to the user.
+    """
+    from app.modules.catalog.datasets.domain.models import Dataset as DatasetORM
+
+    if basemap_ids and spec.basemap_style not in basemap_ids:
+        logger.warning(
+            "LLM chose invalid basemap, falling back",
+            chosen=spec.basemap_style,
+            available=basemap_ids,
+        )
+        spec.basemap_style = basemap_ids[0]
+
+    dataset_ids = [uuid.UUID(layer.dataset_id) for layer in spec.layers]
+    Record_orm = port.get_record_orm_class()
+    DatasetGrant_orm = port.get_grant_orm_class()
+    stmt = (
+        select(
+            DatasetORM.id,
+            DatasetORM.geometry_type,
+            Record_orm.title,
+            Record_orm.spatial_extent,
+            DatasetORM.table_name,
+            Record_orm.record_type,
+        )
+        .join(Record_orm, DatasetORM.record_id == Record_orm.id)
+        .where(DatasetORM.id.in_(dataset_ids))
+    )
+    stmt = port.apply_visibility_filter(
+        stmt, user, user_roles, Record_orm, DatasetGrant_orm
+    )
+    ds_result = await session.execute(stmt)
+    ds_info = {
+        str(row[0]): {
+            "geometry_type": row[1],
+            "title": row[2],
+            # A VRT's stored extent covers members the user may not read.
+            "spatial_extent": None if row[5] == "vrt_dataset" else row[3],
+            "table_name": row[4],
+        }
+        for row in ds_result.all()
+    }
+
+    requested_ids = [layer.dataset_id for layer in spec.layers]
+    missing = [did for did in requested_ids if did not in ds_info]
+    if missing:
+        raise UserFacingAIError(
+            f"Datasets not found or not accessible: {', '.join(missing)}"
+        )
+
+    # A center far outside the union of dataset bboxes snaps to the centroid.
+    try:
+        _snap_viewport_to_extent(
+            spec, [info.get("spatial_extent") for info in ds_info.values()]
+        )
+    except Exception:  # broad: viewport validation is non-fatal context-builder; skip on any geometry/DB error
+        logger.debug("Viewport validation skipped", exc_info=True)
+
+    # The LLM may guess break values in step expressions; replace them with
+    # DB-computed quantiles.
+    allowed_tables = {info["table_name"] for info in ds_info.values()}
+    for layer in spec.layers:
+        if not layer.paint:
+            continue
+        info = ds_info.get(layer.dataset_id)
+        if not info or not info.get("table_name"):
+            continue
+        for prop, value in list(layer.paint.items()):
+            if (
+                isinstance(value, list)
+                and len(value) >= 4
+                and value[0] == "step"
+                and isinstance(value[1], list)
+                and len(value[1]) == 2
+                and value[1][0] == "get"
+            ):
+                column = value[1][1]
+                # ["step", ["get", col], default_color, break1, color1, ...]
+                n_breaks = (len(value) - 3) // 2
+                if n_breaks < 1:
+                    continue
+                try:
+                    stats = await port.get_column_stats(
+                        session,
+                        info["table_name"],
+                        column,
+                        class_count=n_breaks + 1,
+                        allowed_tables=allowed_tables,
+                    )
+                    quantiles = stats.get("quantiles", [])
+                    if quantiles and len(quantiles) >= n_breaks:
+                        # Break values sit at positions 3, 5, 7...
+                        for i, brk in enumerate(quantiles[:n_breaks]):
+                            layer.paint[prop][3 + i * 2] = brk
+                        logger.info(
+                            "Replaced LLM choropleth breaks with DB quantiles",
+                            column=column,
+                            breaks=quantiles[:n_breaks],
+                        )
+                except Exception:  # broad: per-layer quantile lookup is non-fatal; LLM-generated breaks remain on failure
+                    logger.warning(
+                        "Choropleth break replacement skipped", exc_info=True
+                    )
+
+    layer_dicts = []
+    for layer in spec.layers:
+        info = ds_info[layer.dataset_id]
+        validated_paint = validate_paint_for_geometry(
+            layer.paint, info.get("geometry_type")
+        )
+        layer_dicts.append(
+            {
+                "dataset_id": uuid.UUID(layer.dataset_id),
+                "sort_order": layer.sort_order,
+                "visible": layer.visible,
+                "opacity": layer.opacity,
+                "paint": validated_paint,
+                "layout": layer.layout,
+            }
+        )
+
+    # Map and layers persist atomically in a savepoint.
+    async with session.begin_nested():
+        map_obj = await port.create_map(
+            session,
+            name=spec.name,
+            description=spec.description,
+            created_by=user.id,
+        )
+        await port.update_map(
+            session,
+            map_obj.id,
+            center_lng=spec.center_lng,
+            center_lat=spec.center_lat,
+            zoom=spec.zoom,
+            basemap_style=spec.basemap_style,
+            layers=layer_dicts,
+        )
+
+    # In spec.layers order, duplicates preserved.
+    dataset_names = [ds_info[layer.dataset_id]["title"] for layer in spec.layers]
+
+    return {
+        "map_id": str(map_obj.id),
+        "map_name": spec.name,
+        "explanation": spec.explanation,
+        "datasets_used": dataset_names,
+    }
+
+
+def _build_tool_executor(
+    session: AsyncSession,
+    user: Identity,
+    user_roles: set[str],
+    send_sample_values: bool,
+    port: "ProcessingPort",
+) -> "Callable[[str, dict], Awaitable[dict]]":
+    async def tool_executor(tool_name: str, tool_input: dict) -> dict:
+        if tool_name == "search_datasets":
+            result: dict = {
+                "results": await _execute_search_tool(
+                    session,
+                    user,
+                    user_roles,
+                    tool_input,
+                    send_sample_values=send_sample_values,
+                    port=port,
+                )
+            }
+        elif tool_name == "get_dataset_details":
+            result = await _execute_get_dataset_details(
+                session,
+                user,
+                user_roles,
+                tool_input,
+                send_sample_values=send_sample_values,
+                port=port,
+            )
+        else:
+            result = {"error": f"Unknown tool: {tool_name}"}
+        await release_connection(session)
+        return result
+
+    return tool_executor
+
+
+async def generate_map_from_prompt(
+    session: AsyncSession,
+    user: Identity,
+    user_roles: set[str],
+    prompt: str,
+    language: str | None = None,
+    *,
+    port: "ProcessingPort",
+) -> dict:
+    """Orchestrate LLM tool-calling loop to generate a map from a prompt.
+
+    Provider and model are resolved from PersistentConfig (admin-overridable).
+    Returns dict with map_id, map_name, explanation, datasets_used.
+    """
+    provider, model, runtime_config = await resolve_provider(session)
+    provider_ext = get_ai_provider(provider)
+    basemap_ids = await _get_available_basemaps(session)
+    send_samples = await _should_send_sample_values(session)
+
+    system_prompt = _build_map_system_prompt(language, basemap_ids=basemap_ids)
+    tool_executor = _build_tool_executor(session, user, user_roles, send_samples, port)
+
+    await release_connection(session)
+    try:
+        async with usage_accounting(
+            session, user_id=user.id, subsystem="map_generation", model=model
+        ):
+            result = await provider_ext.complete(
+                model=model,
+                system_prompt=system_prompt,
+                user_message=prompt,
+                tools=ANTHROPIC_TOOLS,
+                tool_executor=tool_executor,
+                base_url=runtime_config.get("base_url"),
+                temperature=0.3,
+                max_tokens=1024,
+                max_rounds=8,
+            )
+    except ToolLoopExhaustedError as exc:
+        # usage_accounting has already recorded the spend.
+        raise UserFacingAIError(
+            "Map generation required too many steps. Try a simpler prompt."
+        ) from exc
+
+    logger.info(
+        "Map generation complete",
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+    await record_token_usage(
+        user_id=user.id,
+        subsystem="map_generation",
+        model=model,
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+    )
+
+    text = _finished_text(result)
+    try:
+        spec_dict = _parse_map_spec(text)
+    except ValueError:
+        logger.warning("Map spec parse failed, retrying extraction only")
+        spec_dict = await _retry_parse_map_spec(
+            text,
+            provider,
+            model,
+            runtime_config,
+            session=session,
+            user_id=user.id,
+        )
+
+    if "error" in spec_dict:
+        raise UserFacingAIError(spec_dict["error"])
+
+    # Validate with Pydantic, with one LLM repair round.
+    try:
+        spec = LLMMapSpec(**spec_dict)
+    except ValidationError as ve:
+        spec = await _repair_map_spec(
+            spec_dict,
+            ve,
+            provider,
+            model,
+            runtime_config,
+            session=session,
+            user_id=user.id,
+        )
+
+    if not spec.layers:
+        raise UserFacingAIError("LLM produced a map with no layers")
+
+    return await _validate_and_persist_map(
+        session, user, user_roles, spec, basemap_ids=basemap_ids, port=port
+    )
+
+
+async def stream_generate_map(
+    session: AsyncSession,
+    user: Identity,
+    user_roles: set[str],
+    prompt: str,
+    language: str | None = None,
+    *,
+    port: "ProcessingPort",
+) -> AsyncGenerator[dict, None]:
+    """Semi-streaming variant of generate_map_from_prompt.
+
+    Tool progress events are collected during the LLM tool loop and replayed
+    before the final result. True incremental streaming would require callback
+    support in provider_ext.complete.
+
+    Yields progress events, then the final result or error as a done/error event.
+    """
+    try:
+        provider, model, runtime_config = await resolve_provider(session)
+        provider_ext = get_ai_provider(provider)
+        basemap_ids = await _get_available_basemaps(session)
+        send_samples = await _should_send_sample_values(session)
+        system_prompt = _build_map_system_prompt(language, basemap_ids=basemap_ids)
+        tool_executor = _build_tool_executor(
+            session, user, user_roles, send_samples, port
+        )
+
+        tool_events: list[dict] = []
+
+        async def tracking_executor(tool_name: str, tool_input: dict) -> dict:
+            """Wrap tool_executor to emit SSE progress events for each tool call."""
+            tool_events.append(
+                {
+                    "type": "tool_start",
+                    "tool": tool_name,
+                    "label": tool_label(tool_name),
+                }
+            )
+            result = await tool_executor(tool_name, tool_input)
+            tool_events.append(
+                {
+                    "type": "tool_result",
+                    "tool": tool_name,
+                    "success": "error" not in result,
+                }
+            )
+            return result
+
+        await release_connection(session)
+        # usage_accounting records the spend of an exhaustion, a timeout or a
+        # client disconnect, which would otherwise bill the provider but never
+        # reach catalog.ai_token_usage. Timeout counts arrive on __cause__;
+        # a disconnect arrives as CancelledError, which `except Exception`
+        # would miss.
+        async with usage_accounting(
+            session, user_id=user.id, subsystem="map_generation", model=model
+        ):
+            result = await asyncio.wait_for(
+                provider_ext.complete(
+                    model=model,
+                    system_prompt=system_prompt,
+                    user_message=prompt,
+                    tools=ANTHROPIC_TOOLS,
+                    tool_executor=tracking_executor,
+                    base_url=runtime_config.get("base_url"),
+                    temperature=0.3,
+                    max_tokens=1024,
+                    max_rounds=8,
+                ),
+                timeout=300.0,  # hard cap on the whole tool loop
+            )
+
+        logger.info(
+            "Map generation complete (streaming)",
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+        )
+
+        # Record BEFORE any post-LLM yield, so a client disconnect during the
+        # tool-event replay can't skip accounting: the tokens are already spent
+        # once provider_ext.complete returns.
+        await record_token_usage(
+            user_id=user.id,
+            subsystem="map_generation",
+            model=model,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+        )
+
+        for evt in tool_events:
+            yield evt
+
+        yield {"type": "tool_start", "tool": "create_map", "label": "Building map..."}
+
+        text = _finished_text(result)
+        try:
+            spec_dict = _parse_map_spec(text)
+        except ValueError:
+            logger.warning("Map spec parse failed, retrying extraction only")
+            spec_dict = await _retry_parse_map_spec(
+                text,
+                provider,
+                model,
+                runtime_config,
+                session=session,
+                user_id=user.id,
+            )
+
+        if "error" in spec_dict:
+            yield {"type": "error", "message": spec_dict["error"]}
+            return
+
+        try:
+            spec = LLMMapSpec(**spec_dict)
+        except ValidationError as ve:
+            spec = await _repair_map_spec(
+                spec_dict,
+                ve,
+                provider,
+                model,
+                runtime_config,
+                session=session,
+                user_id=user.id,
+            )
+        if not spec.layers:
+            yield {"type": "error", "message": "LLM produced a map with no layers"}
+            return
+
+        map_result = await _validate_and_persist_map(
+            session, user, user_roles, spec, basemap_ids=basemap_ids, port=port
+        )
+        await session.commit()
+        yield {"type": "done", **map_result}
+
+    except ToolLoopExhaustedError:
+        yield {
+            "type": "error",
+            "message": "Map generation required too many steps. Try a simpler prompt.",
+        }
+    except TimeoutError:
+        logger.warning("Streaming map generation timed out")
+        yield {
+            "type": "error",
+            "message": "Map generation timed out. Try a simpler prompt.",
+        }
+    except Exception as e:  # broad: SSE generator must yield error event for any unhandled SDK/runtime exception
+        # A SQLAlchemy ProgrammingError carries the statement and bound params,
+        # an APIStatusError the provider response body and URL, and
+        # OpenAICredentialDestinationError names the configured endpoint, so
+        # str(e) must never reach the browser. Only UserFacingAIError passes
+        # through, not "any ValueError": that class is open, and a ValueError
+        # naming the endpoint belongs to it too.
+        logger.exception("Streaming map generation failed")
+        yield stream_error_event(e)

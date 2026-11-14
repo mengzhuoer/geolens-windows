@@ -1,0 +1,296 @@
+import { render, screen } from '@/test/test-utils';
+import userEvent from '@testing-library/user-event';
+import { useDistributions } from '@/components/dataset/hooks/use-records';
+import { useTileConfig } from '@/hooks/use-settings';
+import { ConnectDropdown } from '../ConnectDropdown';
+import type { DatasetResponse, RecordType } from '@/types/api';
+
+vi.mock('@/stores/auth-store', () => ({
+  useAuthStore: (selector: (s: Record<string, unknown>) => unknown) =>
+    selector({ user: { roles: ['admin'] }, token: 'test' }),
+}));
+
+vi.mock('@/components/dataset/hooks/use-records', () => ({
+  useDistributions: vi.fn(),
+}));
+
+vi.mock('@/hooks/use-settings', () => ({
+  useTileConfig: vi.fn(),
+}));
+
+const mockUseDistributions = vi.mocked(useDistributions);
+const mockUseTileConfig = vi.mocked(useTileConfig);
+
+function makeDataset(overrides: Partial<DatasetResponse> = {}): DatasetResponse {
+  return {
+    id: 'ds-1',
+    record_id: 'rec-1',
+    table_name: 'public_parks',
+    source_health: 'unknown',
+    schema_drift_status: 'unknown',
+    source_freshness: 'unknown',
+    has_generic_geometry: false,
+    title: 'Parks',
+    summary: null,
+    srid: 4326,
+    geometry_type: 'Polygon',
+    feature_count: 100,
+    extent_bbox: null,
+    column_info: null,
+    license: null,
+    attribution: null,
+    source_organization: null,
+    data_vintage_start: null,
+    data_vintage_end: null,
+    source_format: null,
+    source_filename: null,
+    original_srid: null,
+    visibility: 'public',
+    created_by: null,
+    created_by_display: 'admin',
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    last_edited_by_display: null,
+    last_edited_at: null,
+    record_status: 'published',
+    lineage_summary: null,
+    update_frequency: null,
+    usage_constraints: null,
+    access_constraints: null,
+    sensitivity_classification: null,
+    theme_category: null,
+    owner_org: null,
+    published_at: null,
+    updated_by: null,
+    current_version: 1,
+    source_url: null,
+    quality_statement: null,
+    collections: null,
+    record_type: 'vector_dataset',
+    raster: null,
+    ...overrides,
+    tile_columns: overrides.tile_columns ?? null,
+  };
+}
+
+describe('ConnectDropdown', () => {
+  beforeEach(() => {
+    mockUseDistributions.mockReturnValue({
+      data: {
+        distributions: [
+          {
+            id: 'dist-ogc',
+            record_id: 'rec-1',
+            distribution_type: 'ogc_features',
+            format: 'geojson',
+            url: '/collections/ds-1/items',
+            title: 'OGC API Features',
+            description: null,
+            protocol: 'OGC:OAFeat',
+            media_type: 'application/geo+json',
+            is_primary: true,
+            auto_generated: true,
+          },
+          {
+            id: 'dist-csv',
+            record_id: 'rec-1',
+            distribution_type: 'download',
+            format: 'csv',
+            url: '/datasets/ds-1/export?format=csv',
+            title: 'CSV Download',
+            description: null,
+            protocol: 'HTTP',
+            media_type: 'text/csv',
+            is_primary: false,
+            auto_generated: true,
+          },
+          {
+            id: 'dist-tiles',
+            record_id: 'rec-1',
+            distribution_type: 'vector_tiles',
+            format: 'pbf',
+            url: '/tiles/data.public_parks/{z}/{x}/{y}.pbf',
+            title: 'Vector Tiles',
+            description: null,
+            protocol: 'XYZ',
+            media_type: 'application/vnd.mapbox-vector-tile',
+            is_primary: false,
+            auto_generated: true,
+          },
+        ],
+        total: 3,
+      },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useDistributions>);
+    mockUseTileConfig.mockReturnValue({
+      data: {
+        public_api_url: 'https://catalog.example.com/api',
+        public_base_url: 'https://catalog.example.com',
+      },
+    } as ReturnType<typeof useTileConfig>);
+  });
+
+  it('renders OGC features and vector tiles actions for spatial datasets', async () => {
+    const user = userEvent.setup();
+    render(<ConnectDropdown dataset={makeDataset()} />);
+
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+
+    expect(screen.getByText('Copy OGC Features URL')).toBeInTheDocument();
+    expect(screen.getByText('Copy Vector Tiles URL')).toBeInTheDocument();
+    expect(screen.queryByText('Copy CSV Export URL')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['public', 'https://catalog.example.com/api/tiles/data.public_parks/{z}/{x}/{y}.pbf'],
+    ['private', 'https://catalog.example.com/api/tiles/data.public_parks/{z}/{x}/{y}.pbf?api_key={your_key}'],
+  ] as const)('copies the %s vector tile URL for desktop clients', async (visibility, expected) => {
+    const user = userEvent.setup();
+    render(<ConnectDropdown dataset={makeDataset({ visibility })} />);
+
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+    await user.click(screen.getByText('Copy Vector Tiles URL'));
+
+    await expect(navigator.clipboard.readText()).resolves.toBe(expected);
+  });
+
+  it('keeps copy shortcuts and opens the available QGIS, Python, and curl instructions', async () => {
+    const user = userEvent.setup();
+    const onShowInstructions = vi.fn();
+    render(<ConnectDropdown dataset={makeDataset()} onShowInstructions={onShowInstructions} />);
+
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+
+    expect(screen.getByText('Copy OGC Features URL')).toBeInTheDocument();
+    expect(screen.getByText('Copy Vector Tiles URL')).toBeInTheDocument();
+    expect(screen.getByText('QGIS, Python, and curl')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('menuitem', { name: /open connection instructions/i }));
+
+    expect(onShowInstructions).toHaveBeenCalledOnce();
+  });
+
+  it('renders OGC features and CSV actions for table datasets', async () => {
+    const user = userEvent.setup();
+    render(<ConnectDropdown dataset={makeDataset({ record_type: 'table' })} />);
+
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+
+    expect(screen.getByText('Copy OGC Features URL')).toBeInTheDocument();
+    expect(screen.getByText('Copy CSV Export URL')).toBeInTheDocument();
+    expect(screen.queryByText('Copy Vector Tiles URL')).not.toBeInTheDocument();
+  });
+
+  it('renders raster-specific items for raster datasets', async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectDropdown
+        dataset={makeDataset({
+          record_type: 'raster_dataset',
+          raster: {
+            tile_url: 'http://tiles/xyz',
+            connect: {
+              download_url: '/api/datasets/ds-1/download/cog',
+              tile_url: 'http://tiles/{z}/{x}/{y}.png',
+              s3_uri: 's3://bucket/key.tif',
+            },
+          } as DatasetResponse['raster'],
+        })}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+
+    expect(screen.getByText('Copy COG URL')).toBeInTheDocument();
+    expect(screen.getByText('Copy XYZ Tile URL')).toBeInTheDocument();
+    expect(screen.getByText('Copy S3 URI')).toBeInTheDocument();
+    expect(screen.queryByText('Copy OGC Features URL')).not.toBeInTheDocument();
+    expect(screen.queryByText('Copy Vector Tiles URL')).not.toBeInTheDocument();
+  });
+
+  it('does not imply QGIS, Python, or curl instructions for raster connections', async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectDropdown
+        dataset={makeDataset({
+          record_type: 'raster_dataset',
+          raster: { connect: { tile_url: 'http://tiles/{z}/{x}/{y}.png' } } as DatasetResponse['raster'],
+        })}
+        onShowInstructions={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+
+    expect(screen.queryByRole('menuitem', { name: /connection instructions/i })).not.toBeInTheDocument();
+  });
+
+  it('copies the absolute tileset URL and points a tileset to CesiumJS instructions', async () => {
+    const user = userEvent.setup();
+    render(
+      <ConnectDropdown
+        dataset={makeDataset({
+          record_type: 'tiles3d_dataset',
+          tileset: {
+            url: '/api/datasets/ds-1/tiles3d/tileset.json',
+            size_bytes: 1024,
+            version: '1.1',
+            geometric_error: 12,
+            bounding_volume: 'region',
+          },
+        })}
+        onShowInstructions={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+    expect(screen.getByText('CesiumJS')).toBeInTheDocument();
+    expect(screen.queryByText('Copy OGC Features URL')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('menuitem', { name: 'Copy tileset URL' }));
+
+    await expect(navigator.clipboard.readText()).resolves.toBe(
+      `${window.location.origin}/api/datasets/ds-1/tiles3d/tileset.json`,
+    );
+  });
+
+  it('copies the COPC URL and opens point cloud client instructions', async () => {
+    const user = userEvent.setup();
+    const onShowInstructions = vi.fn();
+    render(
+      <ConnectDropdown
+        dataset={makeDataset({
+          record_type: 'pointcloud_dataset',
+          pointcloud: {
+            url: '/api/datasets/ds-1/copc/attempt-1/data.copc.laz',
+            size_bytes: 1024,
+            point_count: 100,
+            point_format: 7,
+            vertical_crs: null,
+          },
+        })}
+        onShowInstructions={onShowInstructions}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+    expect(screen.getByText('QGIS, Potree, and copc.js')).toBeInTheDocument();
+    await user.click(screen.getByRole('menuitem', { name: 'Copy COPC URL' }));
+    await expect(navigator.clipboard.readText()).resolves.toBe(
+      `${window.location.origin}/api/datasets/ds-1/copc/attempt-1/data.copc.laz`,
+    );
+    await user.click(screen.getByRole('button', { name: /connect/i }));
+    await user.click(screen.getByRole('menuitem', { name: /open connection instructions/i }));
+    expect(onShowInstructions).toHaveBeenCalledOnce();
+  });
+
+  it('offers no connection for an unknown record type', () => {
+    render(
+      <ConnectDropdown
+        dataset={makeDataset({ record_type: 'hologram_dataset' as RecordType })}
+        onShowInstructions={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /connect/i })).not.toBeInTheDocument();
+  });
+});

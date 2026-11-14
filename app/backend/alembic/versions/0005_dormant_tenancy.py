@@ -1,0 +1,322 @@
+"""Add dormant tenant substrate: tenant_id columns + tenancy tables + partial-unique indexes.
+
+Adds the inert multi-tenant substrate to the core schema. All changes are
+**dormant** — tenant_id defaults to NULL, no FK enforcement, no RLS, no behavior change for single_tenant (Community /
+Enterprise) deployments.
+
+What this migration adds
+------------------------
+1. Nullable ``tenant_id UUID`` column to every tenant-shared control-plane
+   table: ``users``, ``records``, ``datasets``, ``maps``, ``collections``,
+   ``embed_tokens``.
+
+2. New tables in the ``catalog`` schema:
+   - ``organizations`` — top-level billing/ownership entity.
+   - ``tenants`` — logical tenant (subdomain-shaped slug) within an org.
+   - ``org_memberships`` — user ↔ org membership join table (composite PK,
+     no FK constraints yet).
+
+3. Two-partial-index uniqueness pattern on ``users``:
+   Drops the existing global UNIQUE constraints (``users_username_key``,
+   ``users_email_key``) and replaces them with four partial unique indexes:
+   - ``uq_users_username_global``  UNIQUE(username) WHERE tenant_id IS NULL
+   - ``uq_users_username_tenant``  UNIQUE(tenant_id, username) WHERE tenant_id IS NOT NULL
+   - ``uq_users_email_global``     UNIQUE(email) WHERE tenant_id IS NULL
+   - ``uq_users_email_tenant``     UNIQUE(tenant_id, email) WHERE tenant_id IS NOT NULL
+
+   Rationale: Postgres treats NULLs as DISTINCT in a unique index, so a naive
+   composite UNIQUE(tenant_id, username) would allow duplicate usernames when
+   tenant_id IS NULL — breaking single_tenant global uniqueness.  The partial
+   indexes are the correct solution.
+
+Downgrade reverses every operation in the exact inverse order only while the
+tenant substrate is empty.  Once tenant-scoped data exists, removing the
+columns and tables would silently discard ownership metadata and can make the
+restored global user constraints impossible to create.  The downgrade therefore
+locks the affected tables and fails with an operator-facing consolidation
+contract before changing the schema.
+
+Revision ID: 0005_dormant_tenancy
+Revises:     0004_add_maps_legend_title
+Create Date: 2026-06-14
+"""
+
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+revision: str = "0005_dormant_tenancy"
+down_revision: Union[str, None] = "0004_add_maps_legend_title"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+_SHARED_TABLES = (
+    "users",
+    "records",
+    "datasets",
+    "maps",
+    "collections",
+    "embed_tokens",
+)
+
+
+def _assert_downgrade_has_no_tenant_data() -> None:
+    """Refuse to erase tenant ownership or restore impossible constraints.
+
+    The lock prevents a write from racing the preflight and committing tenant
+    data before the destructive DDL acquires its stronger table locks.  It is
+    retained until Alembic's surrounding transaction commits or rolls back.
+    """
+    bind = op.get_bind()
+    bind.execute(
+        sa.text(
+            """
+            LOCK TABLE
+                catalog.users,
+                catalog.records,
+                catalog.datasets,
+                catalog.maps,
+                catalog.collections,
+                catalog.embed_tokens,
+                catalog.organizations,
+                catalog.tenants,
+                catalog.org_memberships
+            IN SHARE ROW EXCLUSIVE MODE
+            """
+        )
+    )
+    blockers = (
+        bind.execute(
+            sa.text(
+                """
+            SELECT blocker
+            FROM (
+                SELECT 'catalog.users.tenant_id' AS blocker
+                WHERE EXISTS (
+                    SELECT 1 FROM catalog.users WHERE tenant_id IS NOT NULL
+                )
+                UNION ALL
+                SELECT 'catalog.records.tenant_id'
+                WHERE EXISTS (
+                    SELECT 1 FROM catalog.records WHERE tenant_id IS NOT NULL
+                )
+                UNION ALL
+                SELECT 'catalog.datasets.tenant_id'
+                WHERE EXISTS (
+                    SELECT 1 FROM catalog.datasets WHERE tenant_id IS NOT NULL
+                )
+                UNION ALL
+                SELECT 'catalog.maps.tenant_id'
+                WHERE EXISTS (
+                    SELECT 1 FROM catalog.maps WHERE tenant_id IS NOT NULL
+                )
+                UNION ALL
+                SELECT 'catalog.collections.tenant_id'
+                WHERE EXISTS (
+                    SELECT 1 FROM catalog.collections WHERE tenant_id IS NOT NULL
+                )
+                UNION ALL
+                SELECT 'catalog.embed_tokens.tenant_id'
+                WHERE EXISTS (
+                    SELECT 1 FROM catalog.embed_tokens WHERE tenant_id IS NOT NULL
+                )
+                UNION ALL
+                SELECT 'catalog.organizations'
+                WHERE EXISTS (SELECT 1 FROM catalog.organizations)
+                UNION ALL
+                SELECT 'catalog.tenants'
+                WHERE EXISTS (SELECT 1 FROM catalog.tenants)
+                UNION ALL
+                SELECT 'catalog.org_memberships'
+                WHERE EXISTS (SELECT 1 FROM catalog.org_memberships)
+            ) AS present
+            ORDER BY blocker
+            """
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if blockers:
+        raise RuntimeError(
+            "Cannot downgrade 0005_dormant_tenancy while tenant-scoped data "
+            f"exists in: {', '.join(blockers)}. This downgrade removes tenant "
+            "associations and tenancy tables. Back up and consolidate tenant "
+            "data, resolve global username/email collisions, clear tenant_id "
+            "values, and empty the tenancy tables before retrying."
+        )
+
+
+def upgrade() -> None:
+    # ------------------------------------------------------------------
+    # 1. Add nullable tenant_id to the six shared control-plane tables.
+    # ------------------------------------------------------------------
+    for table in _SHARED_TABLES:
+        op.add_column(
+            table,
+            sa.Column(
+                "tenant_id",
+                postgresql.UUID(as_uuid=True),
+                nullable=True,
+            ),
+            schema="catalog",
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Create the tenancy tables.
+    # ------------------------------------------------------------------
+    op.create_table(
+        "organizations",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column("name", sa.Text(), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        schema="catalog",
+    )
+
+    op.create_table(
+        "tenants",
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
+        sa.Column("slug", sa.String(63), nullable=False),
+        # Dormant link to organizations — no FK constraint yet.
+        sa.Column("organization_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("name", sa.Text(), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        schema="catalog",
+    )
+    # Non-unique index on slug (unique-per-org enforcement is not yet in place).
+    op.create_index(
+        "ix_tenants_slug",
+        "tenants",
+        ["slug"],
+        unique=False,
+        schema="catalog",
+    )
+
+    op.create_table(
+        "org_memberships",
+        sa.Column("user_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("organization_id", postgresql.UUID(as_uuid=True), nullable=False),
+        # Nullable until roles are wired.
+        sa.Column("role", sa.String(50), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("user_id", "organization_id"),
+        schema="catalog",
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Replace global UNIQUE constraints on users with the
+    #    two-partial-index pattern (per field).
+    # ------------------------------------------------------------------
+    # Drop the existing global unique constraints that were created in
+    # 0001_baseline as sa.UniqueConstraint("username") / ("email").
+    # Postgres generates names "users_username_key" and "users_email_key".
+    op.drop_constraint("users_username_key", "users", schema="catalog", type_="unique")
+    op.drop_constraint("users_email_key", "users", schema="catalog", type_="unique")
+
+    # username: global (tenant_id IS NULL) — preserves single_tenant uniqueness.
+    op.create_index(
+        "uq_users_username_global",
+        "users",
+        ["username"],
+        unique=True,
+        schema="catalog",
+        postgresql_where=sa.text("tenant_id IS NULL"),
+    )
+    # username: per-tenant (tenant_id IS NOT NULL) — multi_tenant uniqueness.
+    op.create_index(
+        "uq_users_username_tenant",
+        "users",
+        ["tenant_id", "username"],
+        unique=True,
+        schema="catalog",
+        postgresql_where=sa.text("tenant_id IS NOT NULL"),
+    )
+    # email: global.
+    op.create_index(
+        "uq_users_email_global",
+        "users",
+        ["email"],
+        unique=True,
+        schema="catalog",
+        postgresql_where=sa.text("tenant_id IS NULL"),
+    )
+    # email: per-tenant.
+    op.create_index(
+        "uq_users_email_tenant",
+        "users",
+        ["tenant_id", "email"],
+        unique=True,
+        schema="catalog",
+        postgresql_where=sa.text("tenant_id IS NOT NULL"),
+    )
+
+
+def downgrade() -> None:
+    # ------------------------------------------------------------------
+    # Reverse in exact inverse order of upgrade().
+    # ------------------------------------------------------------------
+
+    _assert_downgrade_has_no_tenant_data()
+
+    # 3. Restore the global unique constraints and drop the partial indexes.
+    op.drop_index("uq_users_email_tenant", table_name="users", schema="catalog")
+    op.drop_index("uq_users_email_global", table_name="users", schema="catalog")
+    op.drop_index("uq_users_username_tenant", table_name="users", schema="catalog")
+    op.drop_index("uq_users_username_global", table_name="users", schema="catalog")
+
+    op.create_unique_constraint("users_email_key", "users", ["email"], schema="catalog")
+    op.create_unique_constraint(
+        "users_username_key", "users", ["username"], schema="catalog"
+    )
+
+    # 2. Drop the tenancy tables.
+    op.drop_table("org_memberships", schema="catalog")
+    op.drop_index("ix_tenants_slug", table_name="tenants", schema="catalog")
+    op.drop_table("tenants", schema="catalog")
+    op.drop_table("organizations", schema="catalog")
+
+    # 1. Drop the tenant_id columns from the six shared tables.
+    for table in reversed(_SHARED_TABLES):
+        op.drop_column(table, "tenant_id", schema="catalog")

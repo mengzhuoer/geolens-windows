@@ -1,0 +1,707 @@
+"""Pydantic models for site-wide settings: basemaps, map defaults, unified settings API."""
+
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+from pydantic import BaseModel, Field, field_validator
+
+from app.core.config import validate_privacy_url_shape
+from app.core.config_ai import ClaudePlatform
+from app.core.public_urls import (
+    canonical_host_error,
+    is_api_base_path,
+    is_usable_public_origin,
+)
+from app.modules.auth.schemas import validate_role_name
+
+
+class BasemapEntry(BaseModel):
+    id: str = Field(
+        max_length=30,
+        description="Unique identifier for the basemap (e.g. 'osm', 'satellite').",
+    )
+    label: str = Field(
+        max_length=200, description="Human-readable label shown in the basemap picker."
+    )
+    url: str = Field(
+        max_length=2000,
+        description=(
+            "Style JSON URL (ending in .json), /styles/ path, tile URL with "
+            "{z}/{x}/{y} placeholders, or a PMTiles archive URL "
+            "(https://....pmtiles, optionally pmtiles://-prefixed)."
+        ),
+    )
+    enabled: bool = Field(
+        default=True, description="Whether the basemap is selectable in the picker."
+    )
+    is_preset: bool = Field(
+        default=False,
+        description="Whether this is a built-in preset (cannot be deleted, only disabled).",
+    )
+    attribution: str | None = Field(
+        default=None,
+        description="Optional attribution string shown on the map. May include HTML.",
+    )
+    api_key: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Optional API key for authenticated tile providers. Substituted into the URL via {api_key} placeholder.",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_tile_url(cls, v: str) -> str:
+        """Allow style JSON URLs (.json), /styles/ paths, tile URLs with
+        {z}/{x}/{y} placeholders, or a PMTiles archive URL."""
+        base_path = v.split("?")[0].rstrip("/")
+        if base_path.endswith(".json"):
+            return v
+        if "{z}" in v and "{x}" in v and "{y}" in v:
+            return v
+        # Accept style endpoints that serve JSON without .json extension
+        # (e.g. https://tiles.openfreemap.org/styles/bright)
+        if "/styles/" in v:
+            return v
+        # A single static PMTiles archive (no style JSON, no tile server),
+        # bare (https://....pmtiles) or scheme-prefixed
+        # (pmtiles://https://....pmtiles), matching MapLibre's `pmtiles://`
+        # protocol and frontend/src/lib/basemap-utils.ts. The inner URL must
+        # still be a well-formed http(s) URL.
+        inner = v.removeprefix("pmtiles://")
+        inner_base_path = inner.split("?")[0].rstrip("/")
+        if inner_base_path.lower().endswith(".pmtiles"):
+            parsed = urlsplit(inner)
+            if parsed.scheme in ("http", "https") and parsed.netloc:
+                return v
+        raise ValueError(
+            "Tile URL must end with .json (style), contain /styles/, contain "
+            "{z}, {x}, {y} placeholders, or be a PMTiles archive URL "
+            "(https://....pmtiles, optionally pmtiles://-prefixed)"
+        )
+
+
+class BasemapPublicResponse(BaseModel):
+    """Public basemap response — excludes api_key."""
+
+    id: str = Field(description="Unique basemap identifier.")
+    label: str = Field(description="Display label.")
+    url: str = Field(
+        description="Tile URL or style JSON URL with API key already substituted (or omitted) for client use."
+    )
+    enabled: bool = Field(description="Whether the basemap is currently selectable.")
+    is_preset: bool = Field(description="Whether this is a built-in preset.")
+    attribution: str | None = Field(
+        default=None, description="Attribution string for the basemap source."
+    )
+
+
+class MapDefaultsUpdate(BaseModel):
+    center_lat: float = Field(
+        description="Initial map center latitude in WGS84. Clamped to [-90, 90]."
+    )
+    center_lng: float = Field(
+        description="Initial map center longitude in WGS84. Clamped to [-180, 180]."
+    )
+    zoom: float = Field(description="Initial zoom level. Clamped to [0, 22].")
+
+    @field_validator("center_lat")
+    @classmethod
+    def clamp_lat(cls, v: float) -> float:
+        return max(-90.0, min(90.0, v))
+
+    @field_validator("center_lng")
+    @classmethod
+    def clamp_lng(cls, v: float) -> float:
+        return max(-180.0, min(180.0, v))
+
+    @field_validator("zoom")
+    @classmethod
+    def clamp_zoom(cls, v: float) -> float:
+        return max(0.0, min(22.0, v))
+
+
+class MapDefaultsResponse(BaseModel):
+    center_lat: float = Field(
+        ge=-90.0, le=90.0, description="Currently configured initial center latitude."
+    )
+    center_lng: float = Field(
+        ge=-180.0,
+        le=180.0,
+        description="Currently configured initial center longitude.",
+    )
+    zoom: float = Field(
+        ge=0.0,
+        le=22.0,
+        description="Currently configured initial zoom level.",
+    )
+
+
+class TileConfigResponse(BaseModel):
+    cdn_base_url: str | None = Field(
+        default=None, description="CDN origin URL for tile delivery, if configured."
+    )
+    public_app_url: str | None = Field(
+        default=None,
+        description=(
+            "Explicitly configured PUBLIC_APP_URL, or null when unset. Never "
+            "derived from PUBLIC_API_URL or from the request, because a share "
+            "or embed URL built on a derived value points at a host that does "
+            "not serve the app."
+        ),
+    )
+    public_api_url: str | None = Field(
+        default=None,
+        description="Externally-reachable API base URL used in OGC self-links.",
+    )
+    public_base_url: str | None = Field(
+        default=None,
+        description="Deprecated alias for public_api_url. Will be removed in a future release.",
+    )
+    mvt_source_layer_prefix: str | None = Field(
+        default="data",
+        description=(
+            "Schema prefix emitted inside vector-tile source-layer names. "
+            "Null when a multi-tenant request has no resolved tenant context."
+        ),
+    )
+
+
+class SettingItem(BaseModel):
+    """A single setting in the unified response."""
+
+    key: str = Field(description="Setting key (e.g. 'login_rate_limit', 'basemaps').")
+    value: Any = Field(description="Current value. Type depends on the setting.")
+    source: str = Field(
+        description="Where the value came from: 'default' (built-in default), 'overridden' (admin set via UI), or 'env_only' (configured via environment variable, read-only)."
+    )
+    label: str = Field(description="Human-readable label for display in the admin UI.")
+    default_value: Any = Field(
+        default=None,
+        description="Runtime default the setting resets to. Reported only for embedding_dims, so the UI can tell whether a reset changes the live width.",
+    )
+
+
+class FeatureFlagsResponse(BaseModel):
+    """Public feature flags readable by any authenticated user."""
+
+    enable_dataset_editing: bool = False
+    require_metadata_for_publish: bool = False
+    # When true, only admins may set `visibility: public`; the
+    # frontend uses it to hide/disable the Public option for non-admins.
+    restrict_public_visibility: bool = False
+
+
+class SettingsAllResponse(BaseModel):
+    """Response for GET /settings/all/."""
+
+    env_only: bool = Field(
+        description="Whether the instance is in env-only mode (settings are read-only and managed via environment variables)."
+    )
+    tabs: dict[str, list[SettingItem]] = Field(
+        description="Settings grouped by admin UI tab (general, auth, ai, etc.)."
+    )
+
+
+class SettingsUpdateRequest(BaseModel):
+    """Request for PUT /settings/."""
+
+    settings: dict[str, Any] = Field(
+        description="Map of setting keys to new values. Maximum 50 settings per request."
+    )
+
+    @field_validator("settings")
+    @classmethod
+    def limit_settings_count(cls, v: dict) -> dict:
+        if len(v) > 50:
+            raise ValueError("Too many settings in single request (max 50)")
+        return v
+
+
+class SettingsResetRequest(BaseModel):
+    """Request for POST /settings/reset/."""
+
+    keys: list[str] = Field(
+        max_length=100,
+        description="List of setting keys to reset to their default values. Maximum 100 keys per request.",
+    )
+
+
+class EditionInfoResponse(BaseModel):
+    """Response for runtime capability metadata."""
+
+    edition: str = Field(description="Runtime capability channel.")
+    features: list[str] = Field(description="List of enabled runtime feature flags.")
+    tenancy_mode: str = Field(
+        default="single_tenant",
+        description="Deployment tenancy mode.",
+    )
+
+
+class EnterpriseTabsResponse(BaseModel):
+    """Response for restricted Settings tab keys."""
+
+    tabs: list[str] = Field(
+        description=(
+            "Tab keys (e.g. 'branding', 'appearance') restricted by the current "
+            "runtime. Sorted alphabetically for stable client-side comparison."
+        )
+    )
+
+
+class BrandingResponse(BaseModel):
+    """Response for GET /settings/branding/."""
+
+    show_badge: bool = Field(
+        description=(
+            "Whether to show the 'Powered by GeoLens' label in public and shared "
+            "footers. Badge-removal writes are restricted controls."
+        )
+    )
+    privacy_url: str | None = Field(
+        default=None,
+        description=(
+            "Operator-configured privacy-policy URL shown on the login and "
+            "register pages, or null when unset (no link is shown). Must be "
+            "an absolute http(s) URL with no embedded credentials; a query "
+            "string or fragment is allowed and preserved as-is."
+        ),
+    )
+
+
+class ConfigModeResponse(BaseModel):
+    """Response for GET /settings/config-mode/."""
+
+    env_only: bool = Field(
+        description="True if the instance is configured via environment variables only (admin UI is read-only)."
+    )
+
+
+class ApiKeyStatusResponse(BaseModel):
+    """Response for GET /settings/api-key-status/."""
+
+    anthropic_configured: bool = Field(
+        description=(
+            "Whether Claude's credentials are set for the selected platform: "
+            "ANTHROPIC_API_KEY on Anthropic's API, or that platform's settings on "
+            "Foundry, Bedrock or Vertex. The model is checked separately."
+        )
+    )
+    anthropic_platform: ClaudePlatform = Field(
+        description="Where Claude requests go, from ANTHROPIC_PLATFORM."
+    )
+    openai_configured: bool = Field(
+        description="Whether OPENAI_API_KEY is set in the environment."
+    )
+
+
+class DetectEmbeddingDimsResponse(BaseModel):
+    """Response for POST /settings/detect-embedding-dims/."""
+
+    dimensions: int = Field(
+        description="Number of dimensions in the embedding vector returned by the configured embedding provider."
+    )
+
+
+class NotificationStatusResponse(BaseModel):
+    """Response for GET /settings/notifications/status/.
+
+    Returns only boolean presence flags — never a secret value (SMTP password,
+    webhook URL, or webhook secret).
+    """
+
+    notifications_enabled: bool = Field(
+        description="Whether the NOTIFICATIONS_ENABLED master toggle is set to true."
+    )
+    smtp_configured: bool = Field(
+        description="Whether an SMTP host is configured (SMTP_HOST is set). Does not echo the host value."
+    )
+    webhook_configured: bool = Field(
+        description="Whether a notification webhook URL is configured (NOTIFICATION_WEBHOOK_URL is set). Does not echo the URL."
+    )
+
+
+class NotificationTestChannelResult(BaseModel):
+    """Per-channel result from POST /settings/notifications/test/.
+
+    The ``error`` field contains only the exception type name and a short
+    safe message — never the SMTP password, webhook URL, or webhook secret.
+    """
+
+    channel: str = Field(description="Channel name, e.g. 'smtp' or 'webhook'.")
+    ok: bool = Field(
+        description="True if the channel delivered the test notification without error."
+    )
+    error: str | None = Field(
+        default=None,
+        description="Safe error string (exception type name + short message) if ok=False, else null. Never contains secrets.",
+    )
+
+
+class NotificationTestResponse(BaseModel):
+    """Response for POST /settings/notifications/test/.
+
+    Always returns HTTP 200 — a channel delivery failure is captured in the
+    per-channel ``channels`` list rather than as a 5xx. Never contains secret
+    values.
+    """
+
+    sent: bool = Field(
+        description="True if at least one channel successfully delivered the test notification."
+    )
+    channels: list[NotificationTestChannelResult] = Field(
+        description="Per-channel delivery results. Empty when no channel is configured."
+    )
+    message: str = Field(description="Human-readable summary of the test result.")
+
+
+def validate_login_rate_limit(v: Any) -> int:
+    v = int(v)
+    if v < 1 or v > 1000:
+        raise ValueError("login_rate_limit must be between 1 and 1000")
+    return v
+
+
+def validate_global_rate_limit(v: Any) -> int:
+    v = int(v)
+    if v < 1 or v > 1000:
+        raise ValueError("global_rate_limit must be between 1 and 1000")
+    return v
+
+
+def validate_ogc_items_max_page_size(v: Any) -> int:
+    # Upper bound guards against a mis-set value that would let an anonymous
+    # request build an unbounded FeatureCollection in memory.
+    v = int(v)
+    if v < 1 or v > 100_000:
+        raise ValueError("ogc_items_max_page_size must be between 1 and 100000")
+    return v
+
+
+def validate_semantic_search_rate_limit(v: Any) -> int:
+    v = int(v)
+    if v < 1 or v > 1000:
+        raise ValueError("semantic_search_rate_limit must be between 1 and 1000")
+    return v
+
+
+def validate_basemap_proxy_rate_limit(v: Any) -> int:
+    v = int(v)
+    if v < 1 or v > 1000:
+        raise ValueError("basemap_proxy_rate_limit must be between 1 and 1000")
+    return v
+
+
+def validate_upload_max_size(v: Any) -> int:
+    v = int(v)
+    if v < 1 or v > 10000:
+        raise ValueError("max_size_mb must be between 1 and 10000")
+    return v
+
+
+def validate_upload_extensions(v: Any) -> str:
+    if not isinstance(v, str):
+        raise ValueError("allowed_extensions must be a string")
+    exts = [e.strip() for e in v.split(",") if e.strip()]
+    for ext in exts:
+        if not ext.startswith("."):
+            raise ValueError(f"Extension must start with '.': {ext}")
+    if not exts:
+        raise ValueError("At least one extension is required")
+    return ",".join(exts)
+
+
+def validate_basemaps(v: Any) -> list[dict]:
+    if not isinstance(v, list):
+        raise ValueError("basemaps must be a list")
+    return [BasemapEntry(**entry).model_dump() for entry in v]
+
+
+def validate_map_defaults(v: Any) -> dict:
+    if not isinstance(v, dict):
+        raise ValueError("map_defaults must be a dict")
+    validated = MapDefaultsUpdate(**v)
+    return validated.model_dump()
+
+
+def validate_strip_string(v: Any) -> str:
+    if not isinstance(v, str):
+        raise ValueError("Value must be a string")
+    return v.strip()
+
+
+def validate_openai_base_url(v: Any) -> str:
+    """Keep the environment API key bound to the operator's chat endpoint."""
+    from app.core.ai_credentials import validate_persistent_openai_base_url
+
+    return validate_persistent_openai_base_url(v, purpose="chat")
+
+
+def validate_embedding_base_url(v: Any) -> str:
+    """Keep the environment API key bound to the operator's embedding endpoint."""
+    from app.core.ai_credentials import validate_persistent_openai_base_url
+
+    return validate_persistent_openai_base_url(v, purpose="embedding")
+
+
+def _normalize_absolute_url(v: Any) -> str:
+    if not isinstance(v, str):
+        raise ValueError("Value must be a string")
+    stripped = v.strip()
+    if not stripped:
+        raise ValueError("Value must not be empty")
+
+    parsed = urlsplit(stripped)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Value must be an absolute http(s) URL")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Value must not include a query string or fragment")
+
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def validate_public_app_url(v: Any) -> str:
+    """One rule, both entry points.
+
+    This validator and ``is_usable_public_origin`` each cover half of what
+    makes a public app URL usable, so an env ``PUBLIC_APP_URL`` (which skips
+    this function) could accept ``https://maps.example.com/api``, while a
+    persisted value (which skips the shape rule) could store
+    ``https://192.168.1`` and have every reader silently ignore it. The
+    ``/api`` clause is checked first only to keep its specific message.
+    """
+    # `v is None`, not `not v`: JSON null is a legitimate clear, but a falsy
+    # non-string (False, 0, [], {}) is a type error, not a clear.
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return ""
+    if not isinstance(v, str):
+        raise ValueError("Value must be a string")
+    normalized = _normalize_absolute_url(v)
+    if is_api_base_path(urlsplit(normalized).path):
+        raise ValueError("public_app_url must point to the app, not the /api base")
+    if not is_usable_public_origin(normalized):
+        problem = canonical_host_error(urlsplit(normalized).hostname or "")
+        raise ValueError(
+            "public_app_url must be spelled the way a browser would send it, "
+            "because it is compared against the origin an embed shell presents. "
+            + (problem or "Remove any percent-encoding, backslash or non-ASCII.")
+        )
+    return normalized
+
+
+def validate_public_api_url(v: Any) -> str:
+    # `v is None`, not `not v`: see validate_public_app_url above.
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return ""
+    if not isinstance(v, str):
+        raise ValueError("Value must be a string")
+    return _normalize_absolute_url(v)
+
+
+def validate_privacy_url(v: Any) -> str:
+    """The login/register privacy-policy link. Unset clears it.
+
+    Deliberately NOT ``_normalize_absolute_url`` (above): that helper rejects
+    a query string or fragment, but a real policy page (Google Docs, Notion,
+    SharePoint) routinely carries one. Uses the shared shape check in
+    ``app.core.config.validate_privacy_url_shape`` instead, so this
+    admin-write path agrees with the boot validator and router_public.py's
+    read-path defense on what "safe" means for a raw ``<a href>``.
+    """
+    # `v is None`, not `not v`: see validate_public_app_url above.
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return ""
+    if not isinstance(v, str):
+        raise ValueError("Value must be a string")
+    # No local re-wrap: router.py's _canonicalize_setting_value already
+    # prefixes the ValueError with "Validation error for 'privacy_url': ...".
+    return validate_privacy_url_shape(v)
+
+
+def validate_enabled_plugins(v: Any) -> list[str] | None:
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        raise ValueError("enabled_plugins must be a list or null")
+    for item in v:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("Each plugin ID must be a non-empty string")
+    return [item.strip() for item in v]
+
+
+def _validate_bounded_int(v: Any, name: str, min_val: int, max_val: int) -> int:
+    if isinstance(v, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(v, float) and not v.is_integer():
+        # Reject fractional numbers up front; int(0.5) would otherwise truncate to
+        # 0 and pass the range check. For quotas 0 means "unlimited", so a typo'd
+        # 0.5 would silently disable the cap instead of returning 422.
+        raise ValueError(f"{name} must be an integer")
+    try:
+        result = int(v)
+    except (ValueError, TypeError):
+        raise ValueError(f"{name} must be a valid integer")
+    if result < min_val or result > max_val:
+        raise ValueError(f"{name} must be between {min_val} and {max_val}")
+    return result
+
+
+def validate_access_token_expire(v: Any) -> int:
+    return _validate_bounded_int(v, "access_token_expire_minutes", 1, 1440)
+
+
+def validate_refresh_token_expire(v: Any) -> int:
+    return _validate_bounded_int(v, "refresh_token_expire_days", 1, 365)
+
+
+AUDIT_RETENTION_MIN_DAYS = 90
+
+
+def validate_audit_retention_days(v: Any) -> int | None:
+    if v is None:
+        return None
+    return _validate_bounded_int(
+        v, "audit_retention_days", AUDIT_RETENTION_MIN_DAYS, 36500
+    )
+
+
+def validate_embedding_dims(v: Any) -> int:
+    return _validate_bounded_int(v, "embedding_dims", 1, 4096)
+
+
+def validate_tile_cache_ttl(v: Any) -> int:
+    return _validate_bounded_int(v, "tile_cache_ttl", 0, 86400)
+
+
+def validate_max_storage_bytes_per_user(v: Any) -> int:
+    # 0 = unlimited; reject negatives (which would otherwise persist and show as
+    # "overridden" yet behave as unlimited via the cap>0 guard). Ceiling is the
+    # JS safe-integer max so the admin number input round-trips losslessly.
+    return _validate_bounded_int(v, "max_storage_bytes_per_user", 0, 9007199254740991)
+
+
+def validate_max_datasets_per_user(v: Any) -> int:
+    # 0 = unlimited; reject negatives. Generous ceiling for a per-user count.
+    return _validate_bounded_int(v, "max_datasets_per_user", 0, 10_000_000)
+
+
+def validate_max_story_image_mb_per_user(v: Any) -> int:
+    return _validate_bounded_int(v, "max_story_image_mb_per_user", 0, 10_000_000)
+
+
+def validate_previous_versions_kept(v: Any) -> int:
+    return _validate_bounded_int(v, "previous_versions_kept", 1, 50)
+
+
+def validate_max_ai_tokens_per_user_per_day(v: Any) -> int:
+    # 0 = unlimited; reject negatives, which would otherwise persist as
+    # "overridden" yet behave as unlimited via the cap>0 guard in
+    # _check_ai_budget — silently disabling the cost cap.
+    return _validate_bounded_int(
+        v, "max_ai_tokens_per_user_per_day", 0, 9007199254740991
+    )
+
+
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
+def validate_log_level(v: Any) -> str:
+    """Accept only standard Python logging level names (case-insensitive)."""
+    if not isinstance(v, str):
+        raise ValueError("log_level must be a string")
+    upper = v.strip().upper()
+    if upper not in _VALID_LOG_LEVELS:
+        raise ValueError(
+            f"Invalid log_level {v!r}. Must be one of: {', '.join(sorted(_VALID_LOG_LEVELS))}"
+        )
+    return upper
+
+
+def validate_allowed_email_domains(v: Any) -> list[str]:
+    """Validate and normalize the allowed_email_domains setting.
+
+    - Raises ValueError if v is not a list, or if any entry is invalid
+      (offending pattern named in the message).
+    - Normalizes each entry (strip, lower-case, drop empties, de-dup).
+    - Empty input returns [] (unrestricted — valid).
+
+    Imports domain helpers inline to avoid a circular-import risk at module load.
+    """
+    from app.platform.domain_validation import (
+        is_domain_pattern_valid,
+        normalize_domains,
+    )
+
+    if not isinstance(v, list):
+        raise ValueError("allowed_email_domains must be a list")
+    # Reject non-string entries here (ValueError -> 422) before
+    # normalize_domains calls .strip(), which would raise AttributeError and
+    # surface as a 500 (update_settings only catches ValueError/TypeError).
+    for entry in v:
+        if not isinstance(entry, str):
+            raise ValueError(
+                "allowed_email_domains entries must be strings, got "
+                f"{type(entry).__name__}: {entry!r}"
+            )
+    normalized = normalize_domains(v)
+    for pattern in normalized:
+        if not is_domain_pattern_valid(pattern):
+            raise ValueError(f"Invalid email domain pattern: {pattern!r}")
+    return normalized
+
+
+def validate_cors_allowed_origins(v: Any) -> str:
+    """Reject a wildcard origin, which the CORS middleware cannot honour.
+
+    Responses carry `Access-Control-Allow-Credentials: true`, so the spec
+    forbids `*` as the allow-origin value. DynamicCORSMiddleware therefore
+    treats a list containing `*` as "deny everything" — including any explicit
+    origins listed alongside it. Catching it here turns a silent, 30s-delayed
+    outage (the middleware caches the empty set) into an immediate 422.
+    """
+    if not isinstance(v, str):
+        raise ValueError("cors_allowed_origins must be a string")
+    origins = [o.strip() for o in v.split(",") if o.strip()]
+    if "*" in origins:
+        raise ValueError(
+            "Wildcard '*' is not accepted because credentialed CORS requires "
+            "explicit origins. List each origin in full, e.g. "
+            "https://example.com, https://app.example.com"
+        )
+    return ", ".join(origins)
+
+
+SETTING_VALIDATORS: dict[str, Any] = {
+    "log_level": validate_log_level,
+    "cors_allowed_origins": validate_cors_allowed_origins,
+    "login_rate_limit": validate_login_rate_limit,
+    "global_rate_limit": validate_global_rate_limit,
+    "ogc_items_max_page_size": validate_ogc_items_max_page_size,
+    "semantic_search_rate_limit": validate_semantic_search_rate_limit,
+    "basemap_proxy_rate_limit": validate_basemap_proxy_rate_limit,
+    "upload_max_size_mb": validate_upload_max_size,
+    "upload_allowed_extensions": validate_upload_extensions,
+    "basemaps": validate_basemaps,
+    "map_defaults": validate_map_defaults,
+    "embedding_model": validate_strip_string,
+    "embedding_base_url": validate_embedding_base_url,
+    "openai_base_url": validate_openai_base_url,
+    "llm_model": validate_strip_string,
+    "public_app_url": validate_public_app_url,
+    "public_api_url": validate_public_api_url,
+    "public_base_url": validate_public_api_url,
+    "privacy_url": validate_privacy_url,
+    "enabled_plugins": validate_enabled_plugins,
+    "access_token_expire_minutes": validate_access_token_expire,
+    "refresh_token_expire_days": validate_refresh_token_expire,
+    "audit_retention_days": validate_audit_retention_days,
+    "embedding_dims": validate_embedding_dims,
+    "tile_cache_ttl": validate_tile_cache_ttl,
+    "max_storage_bytes_per_user": validate_max_storage_bytes_per_user,
+    "max_datasets_per_user": validate_max_datasets_per_user,
+    "max_story_image_mb_per_user": validate_max_story_image_mb_per_user,
+    "previous_versions_kept": validate_previous_versions_kept,
+    "max_ai_tokens_per_user_per_day": validate_max_ai_tokens_per_user_per_day,
+    "allowed_email_domains": validate_allowed_email_domains,
+    "registration_default_role": validate_role_name,
+}

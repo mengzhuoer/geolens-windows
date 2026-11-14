@@ -1,0 +1,651 @@
+"""Staging acquisition and cleanup for ingest tasks.
+
+Holds the half of the ingest task helpers that gets a source into a staging
+table and tears the attempt down when it dies: the ``StagingResult`` bundle,
+the two staging-object reapers, the upload-safety gauntlet, the original-file
+archive, the post-ogr2ogr staging pipeline, and the shared terminal-failure
+handler. ``tasks_common`` keeps the job lifecycle, metadata extraction, and
+the finalize pipeline.
+"""
+
+import uuid
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import structlog
+from sqlalchemy import Text, func, literal, text, true, update
+from sqlalchemy.orm.attributes import set_committed_value
+
+from app.core.async_io import await_draining, run_in_thread_draining
+from app.core.failure_reason import redact_failure_reason
+from app.platform.jobs.models import ARCHIVE_PENDING_METADATA_KEY, IngestJob
+from app.platform.storage import get_storage
+from app.processing.ingest.source_format import derive_source_format
+from app.processing.ingest.tasks_common import (
+    _append_job_warning,
+    _current_tenant_role,
+    _current_tenant_schema,
+    _detect_3d_and_promote_elev,
+    _detect_and_override_geometry,
+)
+
+
+@dataclass
+class StagingResult:
+    """Intermediate staging outputs before dataset creation."""
+
+    metadata: dict
+    sample_values: dict
+    three_d: dict
+    has_geometry: bool
+    geometry_type: str | None
+    # clip_to_mercator_bounds accounting, so the caller (which owns the job
+    # row) can warn the user about geometry the clamp destroyed.
+    mercator_clip: dict | None = None
+
+
+async def reap_downloaded_staging_source(
+    job_id: str,
+    *,
+    original_file_path: str,
+    final_status: str,
+    failed_source_replayable: bool,
+    is_fan_out_child: bool = False,
+) -> bool:
+    """Delete the storage object this task downloaded its source from.
+
+    Without it the ``staging/{job_id}/`` key a task downloaded from outlives a
+    run that fails before creating a dataset. After a presigned completion
+    ``original_file_path`` is the frozen copy, not the client-writable
+    original: this reaps the frozen object and ``reap_presigned_staging_object``
+    reaps the client's key, so every terminal tail calls both.
+
+    The reap signal is the ``staging/`` prefix on ``original_file_path``, not
+    a difference from ``file_path``: a download that raises never rewrites the
+    path, and only a presigned completion (S3-only) produces a ``staging/``
+    path. Fan-out children are skipped, since siblings share the original and
+    retention reaps it.
+
+    ``failed_source_replayable`` is required so each caller states whether a
+    failed job may be reaped. Ordinary imports pass True and keep the object
+    on failure, since ``_retry_capability`` in ``platform/jobs/router.py`` can
+    retry them while it exists. The reupload caller passes False because
+    reupload jobs can't be retried, so nothing else would reap them.
+
+    Returns False only when a delete it attempted failed. Never raises: a
+    failed delete leaves an orphan, which beats failing a job whose work is
+    already committed.
+    """
+    if final_status not in ("complete", "failed"):
+        return True
+    if final_status == "failed" and failed_source_replayable:
+        return True
+    if is_fan_out_child or not original_file_path.startswith("staging/"):
+        return True
+    try:
+        from app.platform.storage import get_storage
+        from app.platform.storage.titiler_url import resolve_current_storage_key
+
+        await await_draining(
+            get_storage().delete(resolve_current_storage_key(original_file_path))
+        )
+    except BaseException:  # broad: terminal cleanup must complete through cancellation
+        structlog.get_logger().warning(
+            "Failed to delete staging source object",
+            job_id=job_id,
+            storage_key=original_file_path,
+        )
+        return False
+    return True
+
+
+async def reap_presigned_staging_object(
+    job_id: str, owned_staging_key: str | None, *, final_status: str
+) -> bool:
+    """Delete a job's own presigned staging object.
+
+    A completed presigned upload points ``file_path`` at the frozen copy, so a
+    reaper keyed off ``file_path`` misses the staging key the client's PUT URL
+    can still recreate outside size and quota accounting. Called by every
+    terminal task tail.
+
+    Pass the result of ``owned_presigned_staging_key``, which declines a
+    fan-out child's inherited parent key so a child can't reap the original
+    its siblings still read.
+
+    Returns False only when the delete failed. Never raises: a failed delete
+    leaves an orphan, better than failing a job whose work is already
+    committed.
+    """
+    # A non-terminal exit (missing job/dataset, lost heartbeat claim) must not
+    # sweep, since the attempt may be re-claimed and still need these bytes.
+    if final_status not in ("complete", "failed") or not owned_staging_key:
+        return True
+    try:
+        from app.platform.storage import get_storage
+        from app.platform.storage.titiler_url import resolve_current_storage_key
+
+        await await_draining(
+            get_storage().delete(resolve_current_storage_key(owned_staging_key))
+        )
+    except BaseException:  # broad: terminal cleanup must complete through cancellation
+        structlog.get_logger().warning(
+            "Failed to delete presigned staging object",
+            job_id=job_id,
+            storage_key=owned_staging_key,
+        )
+        return False
+    return True
+
+
+async def _validate_upload_file_safety(
+    session,
+    *,
+    file_path: str,
+    source_filename: str | None,
+) -> None:
+    """Run the upload-safety checks before GDAL touches a file.
+
+    - content validation (magic bytes, extension match, CSV parse)
+    - size validation (against the persistent_config max)
+    - ZIP-container bomb / path-traversal validation
+    - content directives (SQLite virtual tables, VRT members)
+
+    Raises ``ValueError`` on any check so each caller can map it to its own
+    job-failure handling.
+    """
+    from app.processing.ingest.validation import (
+        validate_file_content,
+        validate_file_size,
+        validate_archive_safety,
+        validate_content_directives,
+    )
+    from app.core.persistent_config import UPLOAD_MAX_SIZE_MB
+
+    max_size_mb = await UPLOAD_MAX_SIZE_MB.get(session)
+
+    # validate_file_content wants a non-None filename for extension parsing;
+    # fall back to the file's own basename so the content-check still runs.
+    effective_filename = source_filename or Path(file_path).name
+    validate_file_content(file_path, effective_filename)
+    validate_file_size(file_path, max_size_mb * 1024 * 1024)
+    validate_archive_safety(file_path, effective_filename)
+    # Off the event loop: the linear schema walk is still real work.
+    await run_in_thread_draining(
+        validate_content_directives, file_path, effective_filename
+    )
+
+
+def original_archive_key(
+    dataset_id, file_path: str, archive_name: str | None = None
+) -> str:
+    """The logical key an upload's original is archived under.
+
+    ``file_path`` is a temp download on any object-store deployment, so a
+    caller that knows the name the user uploaded passes it as ``archive_name``.
+    """
+    return f"originals/{dataset_id}/{archive_name or Path(file_path).name}"
+
+
+async def _archive_original_file(
+    session,
+    *,
+    job,
+    dataset_id,
+    file_path: str,
+    log_message: str = "Failed to archive original file to storage",
+    commit: bool = True,
+    archive_name: str | None = None,
+) -> bool:
+    """Upload the original source file to the storage provider (best-effort).
+
+    Returns True when the archive landed, the one fact that lets a caller
+    delete the staged upload; a lossy raster may publish only once it holds.
+    With ``commit`` True a landed archive also removes the job's
+    archive-pending mark.
+
+    A failure never fails the ingest, since the dataset is already committed.
+    It is merged into the stored metadata as ``archive_failed`` and
+    ``archive_error`` for the operator, only while ``job``'s attempt owns the
+    row and, for a job marked pending, the mark is still there: another run
+    may have made this archive meanwhile. ``commit=False`` leaves that write
+    to the caller's own commit; otherwise a failed commit of it is logged, not
+    raised, so a transient DB error can't turn a published ingest into a
+    failed job.
+    """
+
+    logger = structlog.get_logger()
+    archive_key = original_archive_key(dataset_id, file_path, archive_name)
+    try:
+        from app.core.db.tenant_session import current_tenant_var
+        from app.platform.storage.titiler_url import resolve_storage_key
+
+        storage = get_storage()
+        physical_archive_key = resolve_storage_key(
+            archive_key, tenant_id=current_tenant_var.get()
+        )
+        with open(file_path, "rb") as fobj:
+            await storage.put(physical_archive_key, fobj)
+    except Exception as archive_exc:  # broad: archive is best-effort; S3/local I/O can fail for any reason
+        logger.warning(
+            log_message,
+            archive_key=archive_key,
+            dataset_id=str(dataset_id),
+            error=str(archive_exc)[:500],
+        )
+        flag = func.jsonb_build_object(
+            "archive_failed", true(), "archive_error", str(archive_exc)[:500]
+        )
+        owned = [IngestJob.id == job.id, IngestJob.attempt_id == job.attempt_id]
+        if ARCHIVE_PENDING_METADATA_KEY in (job.user_metadata or {}):
+            owned.append(IngestJob.user_metadata.has_key(ARCHIVE_PENDING_METADATA_KEY))
+        stamp = (
+            update(IngestJob)
+            .where(*owned)
+            # A job created without metadata can hold JSON null, which ``||``
+            # would turn into an array.
+            .values(
+                user_metadata=func.coalesce(
+                    func.nullif(IngestJob.user_metadata, text("'null'::jsonb")),
+                    text("'{}'::jsonb"),
+                ).op("||")(flag)
+            )
+            .returning(IngestJob.user_metadata)
+            .execution_options(synchronize_session=False)
+        )
+        if not commit:
+            stamped = await session.scalar(stamp)
+        else:
+            try:
+                stamped = await session.scalar(stamp)
+                await session.commit()
+            except Exception as commit_exc:  # broad: transient DB errors (deadlock, pooler drop) during flag persistence
+                await session.rollback()
+                logger.warning(
+                    "Failed to persist archive_failed flag on job",
+                    archive_key=archive_key,
+                    dataset_id=str(dataset_id),
+                    error=str(commit_exc)[:500],
+                )
+                return False
+        if stamped is not None:
+            set_committed_value(job, "user_metadata", stamped)
+        return False
+    if commit and ARCHIVE_PENDING_METADATA_KEY in (job.user_metadata or {}):
+        await _clear_archive_pending(session, job)
+    return True
+
+
+async def _clear_archive_pending(session, job) -> None:
+    """Remove ``job``'s archive-pending mark now that its archive exists; never raises.
+
+    Edits the stored metadata in place and shows ``job`` the result. A mark
+    that stays only keeps the job and its upload through retention.
+    """
+    try:
+        remaining = await session.scalar(
+            update(IngestJob)
+            .where(IngestJob.id == job.id)
+            .values(
+                user_metadata=IngestJob.user_metadata.op("-")(
+                    literal(ARCHIVE_PENDING_METADATA_KEY, Text)
+                )
+            )
+            .returning(IngestJob.user_metadata)
+            .execution_options(synchronize_session=False)
+        )
+        await session.commit()
+    except Exception:  # broad: the archive exists, so a mark left behind loses nothing
+        with suppress(Exception):  # broad: a dead connection can't roll back
+            await session.rollback()
+        structlog.get_logger().warning(
+            "archive_pending_not_cleared", job_id=str(job.id)
+        )
+        return
+    set_committed_value(job, "user_metadata", remaining)
+
+
+def source_columns_for(info: dict, layer_name: str | None) -> list[dict] | None:
+    """The ogrinfo field list, unless it may describe a layer other than the one loaded.
+
+    With no layer chosen for a multi-layer source, ogrinfo reads the first layer
+    and the loader may keep another.
+    """
+    if info.get("all_layers") and not layer_name:
+        return None
+    return info.get("columns")
+
+
+def layer_to_load(info: dict, layer_name: str | None) -> str | None:
+    """The layer to load: ogr2ogr copies every source layer into the one table
+    unless one is named, so a geodatabase whose attachment tables were left out
+    of the preview names the layer that remains."""
+    if not layer_name and info.get("attachments_omitted"):
+        return info["layer_name"]
+    return layer_name
+
+
+def _stored_to_source_names(
+    column_info: list[dict], source_columns: list[dict] | None
+) -> dict[str, str]:
+    """Stored column name to source field name, matched by position.
+
+    GDAL creates columns in source field order and a rename keeps the position.
+    A source field named ``gid`` in any case becomes the table's own ``gid`` column, which
+    ``column_info`` leaves out. When the counts still differ a field was
+    dropped or added, so position proves nothing and no column is mapped.
+    """
+    names = [col["name"] for col in source_columns or []]
+    if len(column_info) != len(names):
+        names = [name for name in names if name.lower() != "gid"]
+    if len(column_info) != len(names):
+        return {}
+    return {col["name"]: name for col, name in zip(column_info, names)}
+
+
+async def _run_staging_pipeline(
+    session,
+    *,
+    table_name: str,
+    has_geometry: bool | None,
+    effective_srid: int | None,
+    source_columns: list[dict] | None = None,
+) -> StagingResult:
+    """Post-process a table ogr2ogr just loaded.
+
+    ``has_geometry`` is what the caller knows: None detects it, True
+    requires a geometry column and False skips the geometry steps.
+    ``effective_srid`` is the SRID ``geom`` is in. ``source_columns`` is the
+    source layer's ogrinfo field list. Normalizes the geometry column, clips it to Web Mercator bounds and adds ``geom_4326``, then
+    grants the reader and reads the metadata, the 3D facts (a 3D point
+    table gains ``elev``) and the samples. Returns the clip accounting for
+    the caller to warn with. Does not commit.
+    """
+    from app.processing.ingest.metadata import (
+        add_4326_column,
+        clip_to_mercator_bounds,
+        ensure_geom_column,
+        extract_metadata,
+        get_sample_values,
+        grant_reader_access,
+    )
+    from app.processing.ingest.ogr import IngestionError
+
+    _schema = _current_tenant_schema()
+    mercator_clip = None
+    if has_geometry is not False:
+        found = await ensure_geom_column(session, table_name, schema=_schema)
+        if has_geometry and not found:
+            raise IngestionError(
+                "The source has geometry, but the imported table has no geometry "
+                "column. Check the file and upload it again."
+            )
+        has_geometry = found
+    if has_geometry:
+        assert effective_srid is not None, "a spatial table needs its source SRID"
+        mercator_clip = await clip_to_mercator_bounds(
+            session, table_name, schema=_schema
+        )
+        await add_4326_column(session, table_name, effective_srid, schema=_schema)
+
+    await grant_reader_access(
+        session,
+        table_name,
+        schema=_schema,
+        role=_current_tenant_role(),
+    )
+
+    metadata = await extract_metadata(session, table_name, schema=_schema)
+    # Matched before the elev promotion re-reads the columns and appends one.
+    source_names = _stored_to_source_names(metadata["column_info"], source_columns)
+    three_d = await _detect_3d_and_promote_elev(
+        session, table_name, metadata, schema=_schema
+    )
+    for col in metadata["column_info"]:
+        col["source_name"] = source_names.get(col["name"])
+
+    sample_values = await get_sample_values(
+        session, table_name, metadata.get("column_info", []), schema=_schema
+    )
+
+    return StagingResult(
+        metadata=metadata,
+        sample_values=sample_values,
+        three_d=three_d,
+        has_geometry=has_geometry,
+        geometry_type=metadata.get("geometry_type"),
+        mercator_clip=mercator_clip,
+    )
+
+
+async def _cleanup_staging_on_failure(
+    session,
+    *,
+    staging_table: str,
+    job,
+    exc: Exception,
+    task_name: str,
+    attempt_id: uuid.UUID,
+) -> None:
+    """Mark the job failed, then drop the staging table, in that order.
+
+    The terminal-write site for the import tasks: applies the
+    ``redact_failure_reason`` backstop, the ``pending``-inclusive attempt
+    fence (a worker-time refusal that raises before the claim must still
+    finalize the job it owns rather than leave it for the stale sweep), and
+    the ``ingest_failed`` notification.
+
+    ``staging_table`` is "" for paths with none (the VRT tail reaps its
+    object keys in its own ``finally``); an empty name skips the DROP.
+
+    The failure row is committed before the drop, because a statement error
+    aborts the whole transaction: a drop that hit a lock or statement timeout
+    first would leave the job ``running`` with no reason recorded. Anything
+    here that can fail goes after the commit, in its own guarded block with
+    its own rollback.
+
+    The failure UPDATE runs under ``JOB_ERROR_WRITE_TIMEOUT_MS``; on a
+    contended row it logs ``job_error_write_timeout`` and returns rather than
+    waiting. The job stays ``running`` and the caller re-raises the failure
+    it was already handling.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+
+    from app.platform.jobs import ledger
+    from app.platform.jobs.models import ACTIVE_STATUSES
+    from app.platform.jobs.heartbeat import (
+        arm_job_error_write_budget,
+        log_job_error_write_failure,
+    )
+    from app.processing.ingest.metadata import _qtable
+
+    job_id = job.id
+    # Last boundary before this text becomes durable: it feeds the persisted
+    # error_message, the log record and the notification reason. The
+    # exception, not its text, crosses, so a library exception becomes a code
+    # instead of its statement-and-parameters dump.
+    error_message = redact_failure_reason(exc)
+    await session.rollback()
+
+    # An expired budget must not become the task's outcome. Swallowed and
+    # logged as its own event, so the caller re-raises the ingest failure and
+    # the report below still runs; `written` gates what the write earned.
+    written = landed = False
+    try:
+        # Armed after the rollback that would discard it and before the
+        # UPDATE, the statement that blocks on a contended job row; inside the
+        # guard because arming can fail on a lost connection too.
+        await arm_job_error_write_budget(session)
+        # `pending` too: a failure before the claim, such as the worker-time
+        # SSRF refusal, must still end the job this attempt owns.
+        landed = await ledger.fail(
+            session,
+            job_id,
+            attempt_id,
+            reason=error_message,
+            expect=ACTIVE_STATUSES,
+            mirror=job,
+        )
+        await session.commit()
+        written = True
+    except DBAPIError as write_failure:
+        # The caller re-raises the ingest failure, and a rollback that raised
+        # would take its place.
+        with suppress(Exception):  # broad: best-effort, the caller re-raises
+            await session.rollback()
+        log_job_error_write_failure(write_failure, job_id=str(job_id), task=task_name)
+
+    # Before the `landed` return, so this attempt's (attempt-scoped) table is
+    # dropped even when a newer attempt already owns the job row.
+    if staging_table:
+        try:
+            await session.execute(
+                text(
+                    f"DROP TABLE IF EXISTS {_qtable(staging_table, schema=_current_tenant_schema())}"
+                )
+            )
+            await session.commit()
+        except Exception as cleanup_exc:  # broad: best-effort cleanup
+            structlog.get_logger().warning(
+                f"Staging-table cleanup failed during {task_name} failure",
+                staging_table=staging_table,
+                cleanup_error=str(cleanup_exc),
+                original_error=str(exc),
+            )
+            try:
+                await session.rollback()
+            except Exception:  # broad: a dead connection cannot be rolled back
+                structlog.get_logger().warning(
+                    "staging_cleanup_rollback_failed",
+                    staging_table=staging_table,
+                    task=task_name,
+                )
+
+    if written and not landed:
+        return
+    structlog.get_logger().exception(
+        "Ingest task failed",
+        job_id=str(job_id),
+        task=task_name,
+    )
+
+    # After the attempted terminal write, so a notification error cannot roll
+    # back a committed failed status; if that write raised DBAPIError, the
+    # job may still be active.
+    from app.platform.notifications.events import (
+        build_event_notification,
+        emit_event_safe,
+    )
+
+    _job_id_str = str(job_id)
+    _reason = error_message
+    _task = task_name
+    await emit_event_safe(
+        event_key="ingest_failed",
+        build=lambda: build_event_notification(
+            "ingest_failed",
+            subject=f"Ingest failed: {_task}",
+            body=f"Ingest job (task={_task}) failed.",
+            reason=_reason,
+            extra={"job_id": _job_id_str, "task": _task},
+        ),
+    )
+
+
+async def _ingest_vector_into_staging(
+    session,
+    *,
+    job,
+    file_path: str,
+    target_table: str,
+    source_srid: int | None,
+    ogr_geometry_type: str | None,
+    has_geometry: bool,
+    effective_srid: int | None,
+    layer_name: str | None = None,
+    ogrinfo_columns: list[dict] | None = None,
+    user_wants_geom: bool = False,
+    user_metadata: dict[str, Any] | None = None,
+) -> StagingResult:
+    """Load a vector source into staging and return extracted staging metadata.
+
+    Test-only: a seam over vector ingest's pre-staging half, which production
+    runs inline in its own job lifecycle. Mirrors ``run_ogr2ogr``,
+    ``rename_reserved_columns``, the DBF-truncation check, then
+    ``_detect_and_override_geometry`` under ``user_wants_geom``, as
+    ``tasks_vector.ingest_file`` does, then calls the real
+    ``_run_staging_pipeline``.
+
+    Performs no commits.
+    """
+    from app.processing.ingest.metadata import rename_reserved_columns
+    from app.processing.ingest.ogr import build_pg_conn_str, run_ogr2ogr
+
+    if user_wants_geom and user_metadata is None:
+        raise ValueError("user_metadata is required when user_wants_geom=True")
+
+    db_conn_str = build_pg_conn_str()
+    await run_ogr2ogr(
+        file_path,
+        target_table,
+        db_conn_str,
+        source_srid=source_srid,
+        geometry_type=ogr_geometry_type,
+        layer_name=layer_name,
+        schema=_current_tenant_schema(),
+        effective_srid=effective_srid,
+    )
+
+    reserved_renames = await rename_reserved_columns(
+        session, target_table, schema=_current_tenant_schema()
+    )
+    if reserved_renames:
+        from app.processing.ingest.warnings import make_reserved_rename_warning
+
+        _append_job_warning(job, make_reserved_rename_warning(reserved_renames))
+
+    # Shapefile-only. Keyed on the derived format, not the .zip suffix: a
+    # File Geodatabase arrives in a .zip too and has no DBF to truncate.
+    if derive_source_format(file_path, layer_name) == "shapefile":
+        from app.processing.ingest.metadata import detect_dbf_truncation_collisions
+        from app.processing.ingest.ogr import run_ogrinfo_preview
+        from app.processing.ingest.warnings import make_dbf_truncation_warning
+
+        preview_cols = ogrinfo_columns or []
+        if not preview_cols:
+            preview_info = await run_ogrinfo_preview(
+                file_path, sample_limit=0, layer_name=layer_name
+            )
+            preview_cols = preview_info.get("columns") or []
+        dbf_collisions = detect_dbf_truncation_collisions(preview_cols)
+        if dbf_collisions:
+            _append_job_warning(job, make_dbf_truncation_warning(dbf_collisions))
+
+    geometry_type = ogr_geometry_type
+    if user_wants_geom:
+        override_geom_type = await _detect_and_override_geometry(
+            session,
+            table_name=target_table,
+            user_metadata=user_metadata or {},
+            effective_srid=effective_srid or 4326,
+            renamed_columns=reserved_renames,
+        )
+        if override_geom_type is not None:
+            has_geometry = True
+            geometry_type = override_geom_type
+
+    result = await _run_staging_pipeline(
+        session,
+        table_name=target_table,
+        has_geometry=has_geometry,
+        effective_srid=effective_srid,
+        source_columns=ogrinfo_columns,
+    )
+
+    if result.geometry_type is None and geometry_type is not None:
+        result.geometry_type = geometry_type
+
+    return result

@@ -1,0 +1,425 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { AlertCircle, Loader2, RotateCcw, SendHorizontal, Sparkles, Square, X } from 'lucide-react';
+import type { Map as MaplibreMap } from 'maplibre-gl';
+import { Button } from '@/components/ui/button';
+import { ApiError } from '@/api/client';
+import { streamChatMessage } from '@/api/maps';
+import { useAIAvailability } from '@/hooks/use-ai-availability';
+import { useEphemeralLayers } from '@/components/builder/hooks/use-ephemeral-layers';
+import { EphemeralBadge } from '@/components/builder/EphemeralBadge';
+import { cn } from '@/lib/utils';
+import { chatOverlayCompleteness, overlayFeatureCount } from '@/lib/chat-result-completeness';
+import type { ChatAction, ChatHistoryMessage, MapLayerResponse } from '@/types/api';
+import { randomId } from '@/lib/random-id';
+import { formatQueryCell } from '@/lib/query-cell';
+
+const prefersReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
+
+export interface QueryResult {
+  rows: unknown[];
+  columns: string[];
+  rowCount: number;
+  truncated: boolean;
+}
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'error';
+  content: string;
+  queryResult?: QueryResult;
+  retryMessage?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getChatActions(value: unknown): ChatAction[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is ChatAction => isRecord(item) && typeof item.type === 'string');
+}
+
+/** Compact, read-only render of a `show_query_result` table (cols capped at 5).
+ * Shared with the dataset-scoped chat panel (DatasetChatPanel). */
+export function QueryResultTable({ result }: { result: QueryResult }) {
+  const { t } = useTranslation('common');
+  const { rows, columns, rowCount, truncated } = result;
+  if (rows.length === 0 || columns.length === 0) {
+    return (
+      <div className="mt-2 rounded-md border px-3 py-2">
+        <p className="text-sm text-muted-foreground">{t('viewer.ai.queryResult.empty')}</p>
+      </div>
+    );
+  }
+  const visibleColumns = columns.slice(0, 5);
+  const hasMore = columns.length > 5;
+  return (
+    <div className="mt-2 overflow-hidden rounded-md border">
+      <div className="max-h-48 overflow-y-auto" role="region" aria-label={t('viewer.ai.queryResult.tableLabel')}>
+        <table className="w-full table-fixed text-sm">
+          <thead>
+            <tr className="bg-muted/50">
+              {visibleColumns.map((col) => (
+                <th key={col} scope="col" className="px-2 py-1 text-left text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  {col}
+                </th>
+              ))}
+              {hasMore && <th scope="col" aria-label={t('viewer.ai.queryResult.moreColumns')} className="px-2 py-1 text-xs text-muted-foreground">…</th>}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, idx) => (
+              <tr key={idx} className="border-b border-border last:border-0">
+                {visibleColumns.map((col, colIdx) => {
+                  const raw = Array.isArray(row) ? row[colIdx] : undefined;
+                  const display = formatQueryCell(raw);
+                  return (
+                    <td key={col} className="max-w-[8rem] truncate px-2 py-1 text-foreground" title={raw == null ? '' : String(raw)}>
+                      {display}
+                    </td>
+                  );
+                })}
+                {hasMore && <td className="px-2 py-1 text-muted-foreground">…</td>}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="px-2 py-1 text-xs text-muted-foreground">
+        {t('viewer.ai.queryResult.rowCount', { count: rowCount })}
+        {truncated && <span className="ms-1 text-muted-foreground">{t('viewer.ai.queryResult.truncated')}</span>}
+      </p>
+    </div>
+  );
+}
+
+interface ViewerChatPanelProps {
+  mapId: string;
+  layers: MapLayerResponse[];
+  mapInstanceRef: React.RefObject<MaplibreMap | null>;
+}
+
+/**
+ * Read-only "Ask AI" for the public map viewer.
+ *
+ * The builder's full ChatPanel is reachable only to `can_edit` users; signed-in
+ * viewers get no AI affordance there. The backend chat path serves view-only
+ * callers a read-only toolbox (`query_data` and `run_analysis`, both
+ * SELECT-only); this surfaces it: a question goes to `/ai/chat/stream/`, the
+ * streamed answer renders inline, and a `show_query_result` flies the map to the
+ * matched features (shared `useEphemeralLayers` overlay) and shows a compact
+ * table. A `run_analysis` preview arrives as the same action carrying only
+ * geojson+bbox, so it draws the overlay and skips the table.
+ *
+ * Self-gates on `useAIAvailability` (token + `use_ai_chat` + AI configured), so
+ * anonymous or unpermitted viewers render nothing. No edit actions are applied;
+ * non-query actions are ignored defensively.
+ */
+export function ViewerChatPanel({ mapId, layers, mapInstanceRef }: ViewerChatPanelProps) {
+  const { t, i18n } = useTranslation('common');
+  const { isAIAvailable } = useAIAvailability();
+  const { ephemeralResult, handleQueryResult, handleDismissEphemeral } = useEphemeralLayers(mapInstanceRef);
+
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+
+  const abortRef = useRef<AbortController | null>(null);
+  const inflightRef = useRef(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: prefersReducedMotion ? 'auto' : 'smooth' });
+  }, [messages, isLoading, streamingText]);
+
+  // Abort any in-flight stream on unmount.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  useEffect(() => {
+    if (open) requestAnimationFrame(() => inputRef.current?.focus());
+  }, [open]);
+
+  /** Flyover + highlight (WGS84-bounded bbox guard) and extract the table payload. */
+  const applyQueryResult = useCallback((action: ChatAction): QueryResult | undefined => {
+    const geojson = action.geojson;
+    if (!geojson) {
+      // The winning result has no geometry (empty analysis, attribute-only
+      // query): clear the single-slot overlay instead of leaving the previous
+      // turn's features and badge on the map.
+      handleDismissEphemeral();
+    }
+    if (
+      geojson &&
+      typeof geojson === 'object' &&
+      'type' in geojson &&
+      geojson.type === 'FeatureCollection' &&
+      Array.isArray(action.bbox) &&
+      action.bbox.length === 4 &&
+      // Number.isFinite + non-inverted: NaN/inverted bounds pass the range
+      // comparisons and throw in fitBounds.
+      action.bbox.every((n: unknown) => Number.isFinite(n))
+    ) {
+      const [minX, minY, maxX, maxY] = action.bbox as [number, number, number, number];
+      if (!(minX < -180 || minY < -90 || maxX > 180 || maxY > 90 || minX > maxX || minY > maxY)) {
+        // Forward the truncation pair so the badge discloses "N of TOTAL" rather
+        // than presenting a capped overlay as complete.
+        //
+        // Forward it without a total too. A clip filters rows, so the server
+        // reports none for it; requiring one would drop the disclosure and a
+        // capped clip would read as complete. This surface matters most: an
+        // embed or a shared link lands here.
+        //
+        // `truncated` is the SQL row cap, not a statement about the overlay: the
+        // server clips the FeatureCollection to its own render budget after it,
+        // so a 300-row answer arrives as 50 features with the flag false.
+        // chatOverlayCompleteness catches that too, so the badge never calls a
+        // clipped overlay complete.
+        const preview = geojson;
+        handleQueryResult(
+          preview,
+          [minX, minY, maxX, maxY],
+          chatOverlayCompleteness(action, overlayFeatureCount(preview)),
+        );
+      }
+    }
+    const rows = Array.isArray(action.rows) ? action.rows : null;
+    if (rows === null) return undefined;
+    return {
+      rows,
+      columns: Array.isArray(action.columns) ? action.columns.filter((c): c is string => typeof c === 'string') : [],
+      rowCount: typeof action.row_count === 'number' ? action.row_count : rows.length,
+      truncated: action.truncated === true,
+    };
+  }, [handleQueryResult, handleDismissEphemeral]);
+
+  const handleSend = useCallback(async () => {
+    const userMsg = input.trim();
+    if (!userMsg || isLoading || inflightRef.current) return;
+    inflightRef.current = true;
+    setInput('');
+    const history: ChatHistoryMessage[] = messages
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .slice(-20)
+      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+    setMessages((prev) => [...prev, { id: randomId(), role: 'user', content: userMsg }]);
+    setIsLoading(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let streamed = '';
+    let queryResult: QueryResult | undefined;
+    let modelUnsupported = false;
+    try {
+      for await (const { event, data } of streamChatMessage(mapId, userMsg, layers, i18n.language, history, controller.signal)) {
+        if (event === 'token') {
+          streamed += typeof data.text === 'string' ? data.text : '';
+          setStreamingText(streamed);
+        } else if (event === 'actions') {
+          // Read-only: only show_query_result is acted on; any edit action is
+          // ignored. Apply only the LAST query result: an earlier spatial result
+          // may be superseded by a sanity-check retry, and a per-action apply
+          // would leave the flyover describing a different result than the table
+          // (the builder's winning-action rule).
+          const results = getChatActions(data.actions).filter(
+            (a) => a.type === 'show_query_result',
+          );
+          const winning = results[results.length - 1];
+          if (winning) {
+            const qr = applyQueryResult(winning);
+            if (qr) queryResult = qr;
+          }
+        } else if (event === 'done') {
+          const finalText = (typeof data.explanation === 'string' ? data.explanation : '') || streamed;
+          setMessages((prev) => [...prev, { id: randomId(), role: 'assistant', content: finalText, queryResult }]);
+        } else if (event === 'error') {
+          // A pre-flight HTTP status (403/503) rides the SSE error event; surface it
+          // as ApiError so it classifies honestly rather than as a generic failure.
+          if (typeof data.status === 'number') {
+            throw new ApiError(typeof data.message === 'string' ? data.message : '', data.status);
+          }
+          if (data.code === 'model_requires_responses_api') modelUnsupported = true;
+          throw new Error(typeof data.message === 'string' ? data.message : '');
+        }
+      }
+    } catch {
+      if (controller.signal.aborted) {
+        setMessages((prev) => [
+          ...prev,
+          { id: randomId(), role: 'assistant', content: streamed || t('viewer.ai.cancelled') },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: randomId(),
+            role: 'error',
+            content: t(modelUnsupported ? 'viewer.ai.errorModelUnsupported' : 'viewer.ai.error'),
+            retryMessage: userMsg,
+          },
+        ]);
+      }
+    } finally {
+      abortRef.current = null;
+      inflightRef.current = false;
+      setStreamingText('');
+      setIsLoading(false);
+    }
+  }, [input, isLoading, messages, mapId, layers, i18n.language, applyQueryResult, t]);
+
+  const handleRetry = useCallback((msg: ChatMessage) => {
+    if (msg.retryMessage) setInput(msg.retryMessage);
+    setMessages((prev) => prev.filter((m) => m.id !== msg.id));
+  }, []);
+
+  if (!isAIAvailable) return null;
+
+  return (
+    <>
+      {/* The query overlay needs a badge and dismissal, or the orange
+          highlights are unexplained. Reuse the builder's badge; the viewer's
+          bottom-left column is occupied by BasemapToggle (bottom-8) and the
+          Map data button (bottom-20). */}
+      {/* The builder hosts this affordance in its layer stack
+          (EphemeralPreviewRow) and has no badge. The viewer has no layer stack
+          to host a row, so this badge is its only dismissal surface: removing
+          it leaves an orange overlay with no way to explain or dismiss it. */}
+      {ephemeralResult && (
+        <EphemeralBadge
+          featureCount={ephemeralResult.geojson.features.length}
+          onDismiss={handleDismissEphemeral}
+          truncated={ephemeralResult.truncated}
+          totalCount={ephemeralResult.totalCount}
+          className="bottom-32 start-3"
+        />
+      )}
+    {/* end-16, not end-3 — the problem-reporter lifebuoy (fixed
+        bottom-10 right-4, size-10) appears in the bottom-right corner once
+        errors are captured and would overlap the FAB (as on the dataset
+        page). */}
+    <div className="absolute bottom-8 end-16 z-10 flex flex-col items-end gap-2">
+      {open && (
+        <section
+          role="dialog"
+          aria-label={t('viewer.ai.title')}
+          className="flex h-[min(70vh,520px)] w-[min(360px,calc(100vw-4.75rem))] flex-col overflow-hidden rounded-2xl border bg-background/98 shadow-lg backdrop-blur"
+        >
+          <div className="flex items-center justify-between border-b px-3 py-2">
+            <div className="flex items-center gap-2">
+              <Sparkles className="size-4 text-primary" aria-hidden="true" />
+              <h2 className="text-sm font-semibold text-foreground">{t('viewer.ai.title')}</h2>
+            </div>
+            <Button size="icon-xs" variant="ghost" onClick={() => setOpen(false)} aria-label={t('close')}>
+              <X className="size-4" />
+            </Button>
+          </div>
+
+          <div className="flex-1 space-y-2 overflow-y-auto px-3 py-2" role="log" aria-live="polite">
+            {messages.length === 0 && (
+              <div className="space-y-1 py-6 text-center">
+                <p className="text-sm text-muted-foreground">{t('viewer.ai.emptyHint')}</p>
+                <p className="text-xs text-muted-foreground">{t('viewer.ai.readOnlyNote')}</p>
+              </div>
+            )}
+            {messages.map((msg) =>
+              msg.role === 'error' ? (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="max-w-[85%] rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" />
+                      <p className="text-sm text-foreground">{msg.content}</p>
+                    </div>
+                    <div className="mt-2 flex justify-end">
+                      <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={() => handleRetry(msg)}>
+                        <RotateCcw className="size-3" />
+                        {t('viewer.ai.retry')}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div key={msg.id} className={cn('flex', msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+                  <div
+                    className={cn(
+                      'max-w-[85%] rounded-lg px-3 py-1.5 text-sm',
+                      msg.role === 'user' ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground',
+                    )}
+                  >
+                    <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+                    {msg.queryResult && <QueryResultTable result={msg.queryResult} />}
+                  </div>
+                </div>
+              ),
+            )}
+            {isLoading && (
+              <div className="flex justify-start">
+                <div className="max-w-[85%] rounded-lg bg-muted px-3 py-1.5 text-sm text-foreground">
+                  {streamingText ? (
+                    <p className="whitespace-pre-wrap">{streamingText}</p>
+                  ) : (
+                    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <Loader2 className="size-3 animate-spin" />
+                      {t('viewer.ai.thinking')}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+
+          <div className="flex items-end gap-2 border-t px-3 py-2">
+            {/* Raw textarea kept for the auto-growing
+                chat composer; the ui/textarea primitive covers static fields. */}
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  void handleSend();
+                }
+              }}
+              rows={1}
+              placeholder={t('viewer.ai.placeholder')}
+              disabled={isLoading}
+              aria-label={t('viewer.ai.placeholder')}
+              className="max-h-28 min-h-9 flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+            />
+            {isLoading ? (
+              <Button
+                size="icon-xs"
+                variant="destructive"
+                onClick={() => abortRef.current?.abort()}
+                aria-label={t('viewer.ai.cancel')}
+                title={t('viewer.ai.cancel')}
+              >
+                <Square className="size-3" />
+              </Button>
+            ) : (
+              <Button
+                size="icon-xs"
+                onClick={() => void handleSend()}
+                disabled={!input.trim()}
+                aria-label={t('viewer.ai.send')}
+                title={t('viewer.ai.send')}
+              >
+                <SendHorizontal className="size-3" />
+              </Button>
+            )}
+          </div>
+        </section>
+      )}
+      {!open && (
+        <Button onClick={() => setOpen(true)} aria-haspopup="dialog" className="gap-2 rounded-full shadow-lg">
+          <Sparkles className="size-4" aria-hidden="true" />
+          {t('viewer.ai.launch')}
+        </Button>
+      )}
+    </div>
+    </>
+  );
+}

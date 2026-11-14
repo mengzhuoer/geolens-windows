@@ -1,0 +1,1626 @@
+"""Unit tests for the pure (no-subprocess) helpers in app.ingest.ogr.
+
+These exercise the geometry-column sniffer, the source-path wrapper, the SRID
+extraction from ogrinfo JSON output, and the text-fallback parser. All of
+them are zero-dependency functions — no GDAL or database calls — so they are
+safe to run in any environment.
+"""
+
+import asyncio
+
+import pytest
+
+from app.processing.ingest.metadata import _sql_quote_ident
+from app.processing.ingest.ogr import (
+    IngestionError,
+    _extract_common_layer_metadata,
+    _friendly_open_failure_message,
+    _is_unopenable_source_stderr,
+    _raise_gdal_failure,
+    _sanitize_authorization_token,
+    _strip_ogr_driver_list,
+    extract_srid_from_json,
+    _parse_text_ogrinfo,
+    _resolve_source_path,
+    detect_geometry_columns,
+)
+from app.processing.ingest.tasks import (
+    _append_job_warning,
+    _bind_task_log_context,
+    _parse_temporal_fields,
+    _resolve_effective_srid,
+    _run_service_import_with_wfs_fallback,
+)
+
+
+class TestDetectGeometryColumns:
+    def test_detects_lat_lng_conventional(self):
+        cols = [
+            {"name": "id", "type": "integer"},
+            {"name": "lat", "type": "real"},
+            {"name": "lon", "type": "real"},
+            {"name": "name", "type": "text"},
+        ]
+        result = detect_geometry_columns(cols)
+        assert result == {"x_column": "lon", "y_column": "lat", "wkt_column": None}
+
+    def test_detects_longitude_latitude_spelled_out(self):
+        cols = [
+            {"name": "Longitude", "type": "real"},
+            {"name": "Latitude", "type": "real"},
+        ]
+        result = detect_geometry_columns(cols)
+        # Preserves original casing
+        assert result["x_column"] == "Longitude"
+        assert result["y_column"] == "Latitude"
+        assert result["wkt_column"] is None
+
+    def test_detects_wkt_geom_column(self):
+        cols = [
+            {"name": "id", "type": "integer"},
+            {"name": "the_geom", "type": "text"},
+        ]
+        result = detect_geometry_columns(cols)
+        assert result["wkt_column"] == "the_geom"
+        assert result["x_column"] is None
+        assert result["y_column"] is None
+
+    def test_case_insensitive_match(self):
+        cols = [{"name": "LAT_DD"}, {"name": "LON_DD"}]
+        result = detect_geometry_columns(cols)
+        # Matches are case-insensitive on the pattern side but the returned
+        # value is the original column name
+        assert result["x_column"] == "LON_DD"
+        assert result["y_column"] == "LAT_DD"
+
+    def test_returns_none_when_nothing_matches(self):
+        cols = [{"name": "foo"}, {"name": "bar"}]
+        assert detect_geometry_columns(cols) == {
+            "x_column": None,
+            "y_column": None,
+            "wkt_column": None,
+        }
+
+    def test_empty_columns_list(self):
+        assert detect_geometry_columns([]) == {
+            "x_column": None,
+            "y_column": None,
+            "wkt_column": None,
+        }
+
+
+class TestResolveSourcePath:
+    def test_plain_file_returned_unchanged(self):
+        assert _resolve_source_path("/tmp/data.geojson") == "/tmp/data.geojson"
+        assert _resolve_source_path("/tmp/data.shp") == "/tmp/data.shp"
+
+    def test_zip_wrapped_with_vsizip(self):
+        assert _resolve_source_path("/tmp/data.zip") == "/vsizip//tmp/data.zip"
+
+    def test_case_matters_on_extension(self):
+        # Uppercase .ZIP is NOT wrapped — the helper is case-sensitive
+        assert _resolve_source_path("/tmp/data.ZIP") == "/tmp/data.ZIP"
+
+
+class TestExtractSridFromJson:
+    def test_returns_none_for_empty(self):
+        assert extract_srid_from_json({}) is None
+        assert extract_srid_from_json(None) is None
+
+    def test_extracts_from_projjson_id(self):
+        coord = {
+            "projjson": {
+                "id": {"authority": "EPSG", "code": 4326},
+            }
+        }
+        assert extract_srid_from_json(coord) == 4326
+
+    def test_extracts_from_projjson_id_string_code(self):
+        # Some GDAL versions emit the code as a string
+        coord = {
+            "projjson": {
+                "id": {"authority": "EPSG", "code": "3857"},
+            }
+        }
+        assert extract_srid_from_json(coord) == 3857
+
+    def test_ignores_non_epsg_authority(self):
+        # IAU codes etc. should not be confused for EPSG
+        coord = {
+            "projjson": {
+                "id": {"authority": "IAU", "code": 30100},
+            }
+        }
+        # Falls through to WKT (which is missing) → None
+        assert extract_srid_from_json(coord) is None
+
+    def test_falls_back_to_wkt_authority(self):
+        wkt = 'PROJCS["whatever", AUTHORITY["EPSG","26918"]]'
+        assert extract_srid_from_json({"wkt": wkt}) == 26918
+
+    def test_no_wkt_authority_returns_none(self):
+        wkt = 'PROJCS["whatever"]'
+        assert extract_srid_from_json({"wkt": wkt}) is None
+
+    def test_prefers_projjson_over_wkt(self):
+        coord = {
+            "projjson": {"id": {"authority": "EPSG", "code": 4326}},
+            "wkt": 'AUTHORITY["EPSG","3857"]',
+        }
+        assert extract_srid_from_json(coord) == 4326
+
+
+class TestParseTextOgrinfo:
+    def test_parses_full_output(self):
+        # The text parser scans for the ``EPSG:<n>`` literal, which appears
+        # in the ``Layer SRS WKT`` line on ogrinfo text output (e.g.
+        # "ID[EPSG,26918]" on modern GDAL, but older GDAL also prints an
+        # "EPSG:26918" line separately — we include that here).
+        output = (
+            "INFO: Open of `foo.shp'\n"
+            "Layer name: parcels\n"
+            "Geometry: Polygon\n"
+            "Feature Count: 1234\n"
+            "Layer SRS WKT:\n"
+            '    PROJCS["NAD83"]\n'
+            "EPSG:26918\n"
+        )
+        result = _parse_text_ogrinfo(output)
+        assert result["layer_name"] == "parcels"
+        assert result["geometry_type"] == "Polygon"
+        assert result["feature_count"] == 1234
+        assert result["srid"] == 26918
+
+    def test_handles_missing_fields(self):
+        output = "Layer name: empty\n"
+        result = _parse_text_ogrinfo(output)
+        assert result["layer_name"] == "empty"
+        assert result["geometry_type"] is None
+        assert result["feature_count"] is None
+        assert result["srid"] is None
+
+    def test_non_spatial_layer_reports_no_geometry(self):
+        """`Geometry: None` is a sentinel, not a type."""
+        output = "Layer name: attrs\nGeometry: None\nFeature Count: 3\n"
+        assert _parse_text_ogrinfo(output)["geometry_type"] is None
+
+    def test_invalid_feature_count_is_tolerated(self):
+        output = "Feature Count: not-a-number\nGeometry: Point\n"
+        result = _parse_text_ogrinfo(output)
+        # Parser swallows the ValueError and leaves feature_count as None
+        assert result["feature_count"] is None
+        assert result["geometry_type"] == "Point"
+
+    def test_first_epsg_wins(self):
+        output = "EPSG:4326\nEPSG:3857\n"
+        assert _parse_text_ogrinfo(output)["srid"] == 4326
+
+    def test_empty_output(self):
+        assert _parse_text_ogrinfo("") == {
+            "srid": None,
+            "geometry_type": None,
+            "layer_name": "",
+            "feature_count": None,
+        }
+
+
+class TestDetectDbfTruncationCollisions:
+    """Pure-unit tests for the DBF 10-char truncation collision detector.
+
+    These tests do not require ogr2ogr or a database and always run
+    regardless of environment.
+    """
+
+    def test_detects_collision(self):
+        from app.processing.ingest.metadata import detect_dbf_truncation_collisions
+
+        cols = [
+            {"name": "population_2020", "type": "Integer"},
+            {"name": "population_2021", "type": "Integer"},
+            {"name": "region", "type": "String"},
+        ]
+        result = detect_dbf_truncation_collisions(cols)
+        assert len(result) == 1
+        assert sorted(result[0]["originals"]) == ["population_2020", "population_2021"]
+        # 'population_2020'[:10] = 'population'
+        assert result[0]["truncated"] == "population"
+
+    def test_no_collision_when_names_differ_in_first_10(self):
+        from app.processing.ingest.metadata import detect_dbf_truncation_collisions
+
+        cols = [
+            {"name": "pop_2020", "type": "Integer"},
+            {"name": "pop_2021", "type": "Integer"},
+        ]
+        # 'pop_2020'[:10] = 'pop_2020', 'pop_2021'[:10] = 'pop_2021' — no collision
+        result = detect_dbf_truncation_collisions(cols)
+        assert result == []
+
+    def test_empty_input(self):
+        from app.processing.ingest.metadata import detect_dbf_truncation_collisions
+
+        assert detect_dbf_truncation_collisions([]) == []
+
+    def test_single_column_not_a_collision(self):
+        from app.processing.ingest.metadata import detect_dbf_truncation_collisions
+
+        cols = [{"name": "population_2020", "type": "Integer"}]
+        assert detect_dbf_truncation_collisions(cols) == []
+
+    def test_truncation_is_case_insensitive(self):
+        from app.processing.ingest.metadata import detect_dbf_truncation_collisions
+
+        # GDAL LAUNDER=YES lowercases names; the helper also lowercases
+        cols = [
+            {"name": "Population_2020", "type": "Integer"},
+            {"name": "population_2021", "type": "Integer"},
+        ]
+        result = detect_dbf_truncation_collisions(cols)
+        assert len(result) == 1
+        assert sorted(result[0]["originals"]) == ["Population_2020", "population_2021"]
+
+    def test_multiple_collision_groups(self):
+        from app.processing.ingest.metadata import detect_dbf_truncation_collisions
+
+        cols = [
+            {"name": "population_2020", "type": "Integer"},
+            {"name": "population_2021", "type": "Integer"},
+            {"name": "temperature_avg", "type": "Real"},
+            {"name": "temperature_max", "type": "Real"},
+            {"name": "region", "type": "String"},
+        ]
+        result = detect_dbf_truncation_collisions(cols)
+        assert len(result) == 2
+        truncated_keys = {r["truncated"] for r in result}
+        assert "population" in truncated_keys
+        assert "temperatur" in truncated_keys
+
+
+class TestSqlQuoteIdent:
+    """SQL identifier quoting helper."""
+
+    def test_plain_identifier(self):
+        assert _sql_quote_ident("foo") == '"foo"'
+
+    def test_identifier_with_spaces(self):
+        assert _sql_quote_ident("my col") == '"my col"'
+
+    def test_identifier_with_embedded_double_quote(self):
+        # Embedded double quote must be doubled (PostgreSQL standard).
+        assert _sql_quote_ident('foo"bar') == '"foo""bar"'
+
+    def test_non_ascii_identifier_preserved(self):
+        # Non-ASCII / mixed-case / CJK must round-trip without escaping.
+        assert _sql_quote_ident("nom_français") == '"nom_français"'
+        assert _sql_quote_ident("名称") == '"名称"'
+
+    def test_empty_identifier(self):
+        # Empty string is technically valid but unusual — we still quote it.
+        assert _sql_quote_ident("") == '""'
+
+    def test_identifier_with_multiple_quotes(self):
+        assert _sql_quote_ident('a"b"c') == '"a""b""c"'
+
+
+class TestExtractCommonLayerMetadata:
+    """Shared ogrinfo JSON parser."""
+
+    def test_raises_keyerror_when_no_layers(self):
+        with pytest.raises(KeyError):
+            _extract_common_layer_metadata({"layers": []}, None)
+
+    def test_raises_keyerror_when_layers_missing(self):
+        with pytest.raises(KeyError):
+            _extract_common_layer_metadata({}, None)
+
+    def test_geodatabase_attachment_tables_are_not_offered_as_layers(self):
+        data = {
+            "driverShortName": "OpenFileGDB",
+            "layers": [
+                {"name": "sites__ATTACH", "featureCount": 3, "fields": []},
+                {"name": "sites", "featureCount": 5, "fields": []},
+                {"name": "sites__ATTACHREL", "featureCount": 0, "fields": []},
+                {"name": "roads", "featureCount": 2, "fields": []},
+            ],
+        }
+
+        target, meta = _extract_common_layer_metadata(data, None)
+
+        assert target["name"] == "sites"
+        assert [lyr["name"] for lyr in meta["all_layers"]] == ["sites", "roads"]
+
+    def test_geodatabase_with_one_real_layer_previews_that_layer(self):
+        data = {
+            "driverShortName": "OpenFileGDB",
+            "layers": [
+                {"name": "sites__ATTACH", "featureCount": 3, "fields": []},
+                {"name": "sites", "featureCount": 5, "fields": []},
+            ],
+        }
+
+        target, meta = _extract_common_layer_metadata(data, None)
+
+        assert target["name"] == "sites"
+        assert meta["all_layers"] is None
+        assert meta["attachments_omitted"] is True
+
+    def test_geodatabase_holding_only_attachment_tables_still_previews(self):
+        data = {
+            "driverShortName": "OpenFileGDB",
+            "layers": [{"name": "sites__ATTACH", "featureCount": 3, "fields": []}],
+        }
+
+        target, meta = _extract_common_layer_metadata(data, None)
+
+        assert target["name"] == "sites__ATTACH"
+        assert meta["attachments_omitted"] is False
+
+    def test_attachment_suffix_layers_outside_a_geodatabase_stay_offered(self):
+        data = {
+            "driverShortName": "GPKG",
+            "layers": [
+                {"name": "survey__ATTACH", "featureCount": 3, "fields": []},
+                {"name": "roads", "featureCount": 2, "fields": []},
+            ],
+        }
+
+        _, meta = _extract_common_layer_metadata(data, None)
+
+        assert [lyr["name"] for lyr in meta["all_layers"]] == [
+            "survey__ATTACH",
+            "roads",
+        ]
+        assert meta["attachments_omitted"] is False
+
+    def test_single_layer_with_geometry(self):
+        data = {
+            "layers": [
+                {
+                    "name": "parcels",
+                    "featureCount": 42,
+                    "geometryFields": [
+                        {
+                            "type": "Polygon",
+                            "coordinateSystem": {
+                                "wkt": 'GEOGCS["WGS 84",AUTHORITY["EPSG","4326"]]'
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+        target, meta = _extract_common_layer_metadata(data, None)
+        assert target["name"] == "parcels"
+        assert meta["srid"] == 4326
+        assert meta["geometry_type"] == "Polygon"
+        assert meta["layer_name"] == "parcels"
+        assert meta["feature_count"] == 42
+        assert meta["all_layers"] is None  # single layer → no list
+
+    def test_coord_system_at_top_level(self):
+        # Some GDAL versions place coordinateSystem at the layer root
+        # instead of nested inside geometryFields[0].
+        data = {
+            "layers": [
+                {
+                    "name": "roads",
+                    "featureCount": 100,
+                    "coordinateSystem": {"wkt": 'PROJCS["X",AUTHORITY["EPSG","3857"]]'},
+                    "geometryFields": [{"type": "LineString"}],
+                }
+            ]
+        }
+        _, meta = _extract_common_layer_metadata(data, None)
+        assert meta["srid"] == 3857
+        assert meta["geometry_type"] == "LineString"
+
+    def test_non_spatial_layer_has_no_geometry_fields(self):
+        data = {
+            "layers": [
+                {
+                    "name": "lookup_table",
+                    "featureCount": 5,
+                    "geometryFields": [],
+                }
+            ]
+        }
+        _, meta = _extract_common_layer_metadata(data, None)
+        assert meta["srid"] is None
+        assert meta["geometry_type"] is None
+        assert meta["feature_count"] == 5
+
+    def test_multi_layer_picks_first_without_layer_name(self):
+        data = {
+            "layers": [
+                {
+                    "name": "first",
+                    "featureCount": 10,
+                    "geometryFields": [{"type": "Point"}],
+                },
+                {
+                    "name": "second",
+                    "featureCount": 20,
+                    "geometryFields": [{"type": "Polygon"}],
+                },
+            ]
+        }
+        target, meta = _extract_common_layer_metadata(data, None)
+        assert target["name"] == "first"
+        assert meta["geometry_type"] == "Point"
+        # all_layers surfaces the list when multiple layers exist
+        assert meta["all_layers"] is not None
+        assert len(meta["all_layers"]) == 2
+        assert {lyr["name"] for lyr in meta["all_layers"]} == {"first", "second"}
+
+    def test_multi_layer_picks_named_layer(self):
+        data = {
+            "layers": [
+                {
+                    "name": "first",
+                    "featureCount": 10,
+                    "geometryFields": [{"type": "Point"}],
+                },
+                {
+                    "name": "second",
+                    "featureCount": 20,
+                    "geometryFields": [{"type": "Polygon"}],
+                },
+            ]
+        }
+        target, meta = _extract_common_layer_metadata(data, "second")
+        assert target["name"] == "second"
+        assert meta["geometry_type"] == "Polygon"
+        # all_layers stays populated even when a specific
+        # layer was requested, so the fan-out endpoint can
+        # validate layer names without re-running ogrinfo.
+        assert meta["all_layers"] is not None
+        assert {lyr["name"] for lyr in meta["all_layers"]} == {"first", "second"}
+
+    def test_multi_layer_named_layer_not_found_falls_back_to_first(self):
+        data = {
+            "layers": [
+                {"name": "first", "featureCount": 10, "geometryFields": []},
+                {"name": "second", "featureCount": 20, "geometryFields": []},
+            ]
+        }
+        target, _ = _extract_common_layer_metadata(data, "missing")
+        assert target["name"] == "first"
+
+    def test_columns_populated_from_target_layer_fields(self):
+        """Columns come through the shared helper so shapefile ingest
+        does not need a second run_ogrinfo_preview subprocess.
+        """
+        data = {
+            "layers": [
+                {
+                    "name": "parcels",
+                    "featureCount": 10,
+                    "geometryFields": [{"type": "Polygon"}],
+                    "fields": [
+                        {"name": "PARCELID", "type": "String"},
+                        {"name": "OWNER_NAME", "type": "String"},
+                        {"name": "AREA_ACRES", "type": "Real"},
+                    ],
+                }
+            ]
+        }
+        _, meta = _extract_common_layer_metadata(data, None)
+        assert meta["columns"] == [
+            {"name": "PARCELID", "type": "String"},
+            {"name": "OWNER_NAME", "type": "String"},
+            {"name": "AREA_ACRES", "type": "Real"},
+        ]
+
+    def test_columns_carry_subtype_when_gdal_reports_one(self):
+        """`ogrinfo -json` reports a GeoJSON boolean property as
+        ``{"type": "Integer", "subType": "Boolean"}``; the subtype must
+        survive so a reupload diff can tell it apart from a plain Integer
+        column of the same bare OGR type.
+        """
+        data = {
+            "layers": [
+                {
+                    "name": "cities",
+                    "featureCount": 1,
+                    "geometryFields": [{"type": "Point"}],
+                    "fields": [
+                        {
+                            "name": "is_capital",
+                            "type": "Integer",
+                            "subType": "Boolean",
+                            "width": 1,
+                        },
+                        {"name": "population", "type": "Integer"},
+                    ],
+                }
+            ]
+        }
+        _, meta = _extract_common_layer_metadata(data, None)
+        assert meta["columns"] == [
+            {"name": "is_capital", "type": "Integer", "subtype": "Boolean"},
+            {"name": "population", "type": "Integer"},
+        ]
+
+    def test_columns_empty_when_target_layer_has_no_fields(self):
+        data = {
+            "layers": [
+                {
+                    "name": "empty",
+                    "featureCount": 0,
+                    "geometryFields": [],
+                }
+            ]
+        }
+        _, meta = _extract_common_layer_metadata(data, None)
+        assert meta["columns"] == []
+
+
+class _FakeJob:
+    """Minimal stand-in for IngestJob for pure-unit tests."""
+
+    def __init__(self, user_metadata=None):
+        self.user_metadata = user_metadata
+
+
+class TestAppendJobWarning:
+    """Consolidated warning accumulator.
+
+    Warnings are now TypedDicts built via the producer helpers in
+    ``app.ingest.warnings``. These tests exercise the accumulator logic;
+    producer-shape tests live in ``TestIngestWarningProducers`` below.
+    """
+
+    def test_appends_to_empty_user_metadata(self):
+        from app.processing.ingest.warnings import make_reserved_rename_warning
+
+        job = _FakeJob(user_metadata=None)
+        warning = make_reserved_rename_warning(
+            [{"original": "gid", "renamed": "src_gid"}]
+        )
+        _append_job_warning(job, warning)
+        assert job.user_metadata == {
+            "warnings": [
+                {
+                    "kind": "reserved_rename",
+                    "details": [{"original": "gid", "renamed": "src_gid"}],
+                }
+            ]
+        }
+
+    def test_appends_to_existing_metadata_without_warnings(self):
+        from app.processing.ingest.warnings import make_dbf_truncation_warning
+
+        job = _FakeJob(user_metadata={"title": "Roads", "visibility": "public"})
+        _append_job_warning(job, make_dbf_truncation_warning([]))
+        assert job.user_metadata["title"] == "Roads"
+        assert job.user_metadata["visibility"] == "public"
+        assert job.user_metadata["warnings"] == [
+            {"kind": "dbf_truncation_collision", "details": []}
+        ]
+
+    def test_appends_to_existing_warnings_list(self):
+        from app.processing.ingest.warnings import (
+            make_dbf_truncation_warning,
+            make_reserved_rename_warning,
+        )
+
+        first = make_reserved_rename_warning(
+            [{"original": "gid", "renamed": "src_gid"}]
+        )
+        job = _FakeJob(user_metadata={"warnings": [first]})
+        _append_job_warning(job, make_dbf_truncation_warning([]))
+        assert len(job.user_metadata["warnings"]) == 2
+        assert job.user_metadata["warnings"][0]["kind"] == "reserved_rename"
+        assert job.user_metadata["warnings"][1]["kind"] == "dbf_truncation_collision"
+
+    def test_preserves_unrelated_metadata_keys(self):
+        from app.processing.ingest.warnings import (
+            make_dbf_truncation_warning,
+            make_reserved_rename_warning,
+        )
+
+        existing = make_reserved_rename_warning(
+            [{"original": "fid", "renamed": "src_fid"}]
+        )
+        job = _FakeJob(
+            user_metadata={
+                "title": "T",
+                "collision_warning": "old",
+                "warnings": [existing],
+            }
+        )
+        _append_job_warning(job, make_dbf_truncation_warning([]))
+        assert job.user_metadata["title"] == "T"
+        assert job.user_metadata["collision_warning"] == "old"
+        assert [w["kind"] for w in job.user_metadata["warnings"]] == [
+            "reserved_rename",
+            "dbf_truncation_collision",
+        ]
+
+    def test_does_not_mutate_original_user_metadata_dict_identity(self):
+        from app.processing.ingest.warnings import make_dbf_truncation_warning
+
+        # The helper replaces user_metadata with a new dict so SQLAlchemy
+        # JSONB change-detection sees a dirty attribute.
+        original = {
+            "title": "T",
+            "warnings": [
+                {"kind": "reserved_rename", "details": []},
+            ],
+        }
+        job = _FakeJob(user_metadata=original)
+        _append_job_warning(job, make_dbf_truncation_warning([]))
+        assert job.user_metadata is not original
+
+
+class TestIngestWarningProducers:
+    """Ensure the producer helpers emit shapes the Pydantic models accept."""
+
+    def test_reserved_rename_producer_round_trips_through_pydantic(self):
+        from app.processing.ingest.warnings import make_reserved_rename_warning
+        from app.platform.jobs.schemas import ReservedRenameWarning
+
+        warning = make_reserved_rename_warning(
+            [
+                {"original": "geom", "renamed": "src_geom"},
+                {"original": "fid", "renamed": "src_fid"},
+            ]
+        )
+        validated = ReservedRenameWarning.model_validate(warning)
+        assert validated.kind == "reserved_rename"
+        assert len(validated.details) == 2
+        assert validated.details[0].original == "geom"
+        assert validated.details[1].renamed == "src_fid"
+
+    def test_dbf_truncation_producer_round_trips_through_pydantic(self):
+        from app.processing.ingest.warnings import make_dbf_truncation_warning
+        from app.platform.jobs.schemas import DbfTruncationCollisionWarning
+
+        warning = make_dbf_truncation_warning(
+            [
+                {
+                    "truncated": "population",
+                    "originals": ["population_2020", "population_2021"],
+                }
+            ]
+        )
+        validated = DbfTruncationCollisionWarning.model_validate(warning)
+        assert validated.kind == "dbf_truncation_collision"
+        assert validated.details[0].truncated == "population"
+        assert validated.details[0].originals == [
+            "population_2020",
+            "population_2021",
+        ]
+
+    def test_reserved_rename_producer_coerces_missing_fields(self):
+        """Missing original/renamed keys fall back to empty strings, not KeyError."""
+        from app.processing.ingest.warnings import make_reserved_rename_warning
+
+        warning = make_reserved_rename_warning([{"original": "gid"}])
+        assert warning["details"][0]["original"] == "gid"
+        assert warning["details"][0]["renamed"] == ""
+
+
+class TestRunServiceImportWithWfsFallback:
+    """WFS namespace retry + auth detection."""
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_success_on_first_try_no_retry(self):
+        from app.processing.ingest.ogr import IngestionError  # noqa: F401
+
+        calls = []
+
+        async def import_fn(layer_name: str) -> None:
+            calls.append(layer_name)
+
+        asyncio.run(_run_service_import_with_wfs_fallback(import_fn, "workspace:roads"))
+        assert calls == ["workspace:roads"]
+
+    def test_retries_with_unqualified_layer_on_ingestion_error(self):
+        from app.processing.ingest.ogr import IngestionError
+
+        calls = []
+
+        async def import_fn(layer_name: str) -> None:
+            calls.append(layer_name)
+            if ":" in layer_name:
+                raise IngestionError("WFS layer not found")
+
+        asyncio.run(_run_service_import_with_wfs_fallback(import_fn, "workspace:roads"))
+        assert calls == ["workspace:roads", "roads"]
+
+    def test_reraises_when_layer_has_no_namespace(self):
+        from app.processing.ingest.ogr import IngestionError
+
+        async def import_fn(layer_name: str) -> None:
+            raise IngestionError("any error")
+
+        with pytest.raises(IngestionError, match="any error"):
+            asyncio.run(_run_service_import_with_wfs_fallback(import_fn, "roads"))
+
+    def test_reraises_when_both_attempts_fail(self):
+        from app.processing.ingest.ogr import IngestionError
+
+        calls = []
+
+        async def import_fn(layer_name: str) -> None:
+            calls.append(layer_name)
+            raise IngestionError(f"fail {layer_name}")
+
+        with pytest.raises(IngestionError, match="fail roads"):
+            asyncio.run(
+                _run_service_import_with_wfs_fallback(import_fn, "workspace:roads")
+            )
+        # Retried once with unqualified name, both failed.
+        assert calls == ["workspace:roads", "roads"]
+
+    def test_auth_error_message_raised_on_no_namespace_auth_failure(self):
+        from app.processing.ingest.ogr import IngestionError
+
+        async def import_fn(layer_name: str) -> None:
+            raise IngestionError("HTTP 401 Unauthorized")
+
+        with pytest.raises(IngestionError, match="needs a token"):
+            asyncio.run(
+                _run_service_import_with_wfs_fallback(
+                    import_fn,
+                    "roads",
+                    token=None,
+                    auth_error_message="This service needs a token",
+                )
+            )
+
+    def test_auth_error_message_raised_on_retry_auth_failure(self):
+        from app.processing.ingest.ogr import IngestionError
+
+        async def import_fn(layer_name: str) -> None:
+            raise IngestionError("HTTP 403 Forbidden")
+
+        with pytest.raises(IngestionError, match="needs a token"):
+            asyncio.run(
+                _run_service_import_with_wfs_fallback(
+                    import_fn,
+                    "workspace:roads",
+                    token=None,
+                    auth_error_message="This service needs a token",
+                )
+            )
+
+    def test_auth_error_suppressed_when_token_provided(self):
+        # If the caller DID provide a token and it still fails, the auth
+        # message is NOT substituted — the user already tried a token.
+        from app.processing.ingest.ogr import IngestionError
+
+        async def import_fn(layer_name: str) -> None:
+            raise IngestionError("HTTP 401 Unauthorized")
+
+        with pytest.raises(IngestionError, match="Unauthorized"):
+            asyncio.run(
+                _run_service_import_with_wfs_fallback(
+                    import_fn,
+                    "roads",
+                    token="supplied_token",
+                    auth_error_message="This service needs a token",
+                )
+            )
+
+    def test_auth_error_message_not_used_on_non_auth_error(self):
+        from app.processing.ingest.ogr import IngestionError
+
+        async def import_fn(layer_name: str) -> None:
+            raise IngestionError("Connection refused")
+
+        with pytest.raises(IngestionError, match="Connection refused"):
+            asyncio.run(
+                _run_service_import_with_wfs_fallback(
+                    import_fn,
+                    "roads",
+                    token=None,
+                    auth_error_message="This service needs a token",
+                )
+            )
+
+
+class TestResolveEffectiveSrid:
+    """ingest_file SRID resolution helper."""
+
+    def test_override_wins_over_detected(self):
+        """User-supplied srid_override takes precedence over ogrinfo-detected SRID."""
+        assert _resolve_effective_srid(detected_srid=4326, srid_override=2154) == 2154
+
+    def test_detected_used_when_no_override(self):
+        """Detected SRID is used when override is None."""
+        assert _resolve_effective_srid(detected_srid=3857, srid_override=None) == 3857
+
+    def test_falls_back_to_4326_when_nothing_detected(self):
+        """4326 is the safe default for GeoJSON/CSV with no detected CRS."""
+        assert _resolve_effective_srid(detected_srid=None, srid_override=None) == 4326
+
+    def test_override_wins_over_nothing(self):
+        """srid_override also beats the None-and-fallback path."""
+        assert _resolve_effective_srid(detected_srid=None, srid_override=32633) == 32633
+
+    def test_returns_int_even_when_input_is_int_like(self):
+        """Result is always a plain int — the caller feeds it to add_4326_column."""
+        result = _resolve_effective_srid(detected_srid=4326, srid_override=None)
+        assert isinstance(result, int)
+        assert result == 4326
+
+
+class TestBindTaskLogContext:
+    """Worker task log correlation via structlog contextvars."""
+
+    def test_binds_job_id_and_task_name(self):
+        import structlog
+
+        structlog.contextvars.clear_contextvars()
+        _bind_task_log_context(task_name="ingest_file", job_id="job-123")
+        ctx = structlog.contextvars.get_contextvars()
+        assert ctx["task"] == "ingest_file"
+        assert ctx["job_id"] == "job-123"
+        assert ctx["service"] == "worker"
+        structlog.contextvars.clear_contextvars()
+
+    def test_clears_stale_vars_from_previous_task(self):
+        """Re-used workers must not leak state from a prior job."""
+        import structlog
+
+        # Simulate leftover state from a previous run.
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(
+            stale_key="should_be_gone",
+            task="old_task",
+            job_id="old-job",
+        )
+
+        _bind_task_log_context(task_name="ingest_raster", job_id="job-456")
+
+        ctx = structlog.contextvars.get_contextvars()
+        assert ctx["task"] == "ingest_raster"
+        assert ctx["job_id"] == "job-456"
+        assert "stale_key" not in ctx, (
+            f"stale_key from prior task leaked into new task context: {ctx}"
+        )
+        structlog.contextvars.clear_contextvars()
+
+    def test_extra_kwargs_are_bound(self):
+        """Callers can pass extra correlation keys (e.g., dataset_id for reupload)."""
+        import structlog
+
+        structlog.contextvars.clear_contextvars()
+        _bind_task_log_context(
+            task_name="reupload_file",
+            job_id="job-789",
+            dataset_id="ds-abc",
+        )
+        ctx = structlog.contextvars.get_contextvars()
+        assert ctx["dataset_id"] == "ds-abc"
+        assert ctx["job_id"] == "job-789"
+        structlog.contextvars.clear_contextvars()
+
+
+class TestParseTemporalFields:
+    """Raster ingest temporal field parsing + error surface."""
+
+    def test_both_fields_valid(self):
+        """Happy path: both fields parse cleanly, no errors."""
+        from datetime import date
+
+        start, end, errors = _parse_temporal_fields(
+            temporal_start="2024-01-15",
+            temporal_end="2024-12-31",
+        )
+        assert start == date(2024, 1, 15)
+        assert end == date(2024, 12, 31)
+        assert errors == {}
+
+    def test_both_fields_none(self):
+        """Both None → (None, None, {}) — the no-op case."""
+        start, end, errors = _parse_temporal_fields(
+            temporal_start=None, temporal_end=None
+        )
+        assert start is None
+        assert end is None
+        assert errors == {}
+
+    def test_empty_string_treated_as_absent(self):
+        """Empty strings are falsy → skipped, no errors recorded."""
+        start, end, errors = _parse_temporal_fields(temporal_start="", temporal_end="")
+        assert start is None
+        assert end is None
+        assert errors == {}
+
+    def test_invalid_start_recorded_in_errors(self):
+        """Unparseable temporal_start → parsed=None, errors['temporal_start']=raw."""
+        from datetime import date
+
+        start, end, errors = _parse_temporal_fields(
+            temporal_start="not-a-date",
+            temporal_end="2024-06-01",
+        )
+        assert start is None
+        assert end == date(2024, 6, 1)
+        assert errors == {"temporal_start": "not-a-date"}
+
+    def test_invalid_end_recorded_in_errors(self):
+        """Unparseable temporal_end → parsed=None, errors['temporal_end']=raw."""
+        from datetime import date
+
+        start, end, errors = _parse_temporal_fields(
+            temporal_start="2024-01-01",
+            temporal_end="2024-13-45",
+        )
+        assert start == date(2024, 1, 1)
+        assert end is None
+        assert errors == {"temporal_end": "2024-13-45"}
+
+    def test_both_invalid_both_recorded(self):
+        """Both unparseable → both in errors dict, both parsed return None."""
+        start, end, errors = _parse_temporal_fields(
+            temporal_start="invalid1",
+            temporal_end="invalid2",
+        )
+        assert start is None
+        assert end is None
+        assert errors == {
+            "temporal_start": "invalid1",
+            "temporal_end": "invalid2",
+        }
+
+    def test_very_long_raw_value_truncated_to_100_chars(self):
+        """Long bogus inputs are capped at 100 chars so JSONB doesn't balloon."""
+        long_value = "X" * 500
+
+        _, _, errors = _parse_temporal_fields(
+            temporal_start=long_value, temporal_end=None
+        )
+        assert "temporal_start" in errors
+        assert len(errors["temporal_start"]) == 100
+
+    def test_non_string_type_recorded_as_error(self):
+        """TypeError from passing a non-string also ends up in the errors dict."""
+        # The helper annotates ``str | None`` but real ingest_raster pulls
+        # values from a JSONB dict which can carry any type. Guard the
+        # coercion path even if the type hint suggests it won't happen.
+        start, _, errors = _parse_temporal_fields(
+            temporal_start=12345,  # type: ignore[arg-type]
+            temporal_end=None,
+        )
+        assert start is None
+        assert "temporal_start" in errors
+        # Truncated str() representation of the int input
+        assert errors["temporal_start"] == "12345"
+
+
+class TestStripOgrDriverList:
+    """Driver-list stripping helper that removes GDAL driver enumeration
+    from ogr2ogr stderr so IngestionError messages show only actionable lines.
+    """
+
+    def test_strips_driver_list_lines_and_keeps_error(self):
+        """Core case: contiguous driver-list lines removed; ERROR line preserved."""
+        stderr = "blah\n -> 'FITS' (read-only)\n -> 'PCIDSK'\nERROR 1: real error"
+        result = _strip_ogr_driver_list(stderr)
+        assert "ERROR 1: real error" in result
+        assert "-> 'FITS'" not in result
+        assert "-> 'PCIDSK'" not in result
+
+    def test_no_driver_list_returns_unchanged(self):
+        """When no driver-list lines are present, the string is returned as-is."""
+        stderr = "ERROR 1: timeout after 120002ms"
+        result = _strip_ogr_driver_list(stderr)
+        assert result == "ERROR 1: timeout after 120002ms"
+
+    def test_empty_string_returns_empty(self):
+        """Empty input is safe and returns empty string."""
+        assert _strip_ogr_driver_list("") == ""
+
+    def test_strips_leading_blank_line_between_driver_list_and_error(self):
+        """Blank lines between the driver list and the error line are collapsed."""
+        stderr = (
+            "  -> 'XYZ' (rw+v)\n"
+            "  -> 'OGR_GMT' (rw+v)\n"
+            "\n"
+            "ERROR 6: Unable to load shared library"
+        )
+        result = _strip_ogr_driver_list(stderr)
+        assert result.startswith("ERROR 6:")
+        assert "-> 'XYZ'" not in result
+        assert "-> 'OGR_GMT'" not in result
+
+    def test_settings_has_ingest_http_timeout_seconds_default_300(self):
+        """Settings field ingest_http_timeout_seconds exists and defaults to 300."""
+        from app.core.config import settings
+
+        assert hasattr(settings, "ingest_http_timeout_seconds")
+        assert settings.ingest_http_timeout_seconds == 300
+
+
+class TestIsUnopenableSourceStderr:
+    """The "unable to open datasource" leak: an ogr2ogr/ogrinfo failure whose
+    raw stderr is a 100+ line GDAL driver enumeration (the exact text a demo
+    visitor saw for an invalid march.gpkg upload). This is the pattern-match
+    that gates the friendly-message replacement — it must catch all three
+    stderr shapes GDAL/SQLite produce for "I can't read this as spatial
+    data" and stay narrow enough to leave every other ogr2ogr/ogrinfo
+    failure untouched.
+    """
+
+    def test_matches_driver_enumeration_failure(self):
+        """No driver claims the source at all — the original march.gpkg incident."""
+        stderr = (
+            "ERROR 1: Unable to open datasource "
+            "`/app/staging/9f2c_march.gpkg' with the following drivers.\n"
+            "  -> `GPKG'\n"
+            "  -> `FITS'\n"
+            "  -> `PCIDSK'\n"
+        )
+        assert _is_unopenable_source_stderr(stderr) is True
+
+    def test_matches_sqlite_corrupt_content_failure(self):
+        """A GPKG with an intact SQLite header but corrupt page data — the
+        driver claims the source by header/extension, then SQLite itself
+        refuses to open it. Live-reproduced stderr shape (bad application_id
+        warning + "file is not a database" + the sqlite3_prepare_v2 detail)."""
+        stderr = (
+            "Warning 1: GPKG: bad application_id=0x75de07d1 on "
+            "'/app/staging/1a2b_march.gpkg'\n"
+            "ERROR 1: file is not a database\n"
+            "ERROR 1: sqlite3_prepare_v2(SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name IN ('gpkg_metadata', 'gpkg_metadata_reference') AND "
+            "type IN ('table', 'view')) failed: file is not a database\n"
+        )
+        assert _is_unopenable_source_stderr(stderr) is True
+
+    def test_matches_sqlite_malformed_page_failure(self):
+        """A GPKG with a fully intact SQLite header but a corrupted interior
+        b-tree page — a DIFFERENT SQLite diagnostic from the corrupt-header
+        case above (#1640): "database disk image is
+        malformed", not "file is not a database". Empirically confirmed
+        against a real ogr2ogr-generated GPKG with one byte-flipped leaf
+        page (see test_ingest_open_failure_message.py's
+        _write_malformed_page_gpkg for the real-binaries reproduction)."""
+        stderr = (
+            "ERROR 1: database disk image is malformed\n"
+            "ERROR 1: sqlite3_prepare_v2(SELECT COUNT(*) FROM sqlite_master "
+            "WHERE name IN ('gpkg_metadata', 'gpkg_metadata_reference') AND "
+            "type IN ('table', 'view')) failed: database disk image is "
+            "malformed\n"
+            "ERROR 1: database disk image is malformed\n"
+            "ogrinfo failed - unable to open "
+            "'/app/staging/9a1b_march.gpkg'. Did you intend to call "
+            "gdalinfo?\n"
+        )
+        assert _is_unopenable_source_stderr(stderr) is True
+
+    def test_does_not_match_unrelated_ogr2ogr_failure(self):
+        """Narrow anchoring: a real, different ogr2ogr failure (constraint
+        violation) must NOT be caught by this pattern — those messages keep
+        their real stderr."""
+        stderr = (
+            'ERROR 1: PQclear() failed: ERROR:  null value in column "geom" '
+            "violates not-null constraint\n"
+        )
+        assert _is_unopenable_source_stderr(stderr) is False
+
+    def test_does_not_match_permission_denied(self):
+        stderr = "ERROR 1: permission denied for schema data\n"
+        assert _is_unopenable_source_stderr(stderr) is False
+
+    def test_empty_string_does_not_match(self):
+        assert _is_unopenable_source_stderr("") is False
+
+
+class TestOgrinfoOneLineOpenFailure:
+    """ogrinfo reports an unopenable source in one line of its
+    own rather than ogr2ogr's driver enumeration, so the reason for it is
+    the friendly sentence and not ``ogrinfo failed (exit 1)``.
+    """
+
+    _STDERR = (
+        "ERROR 4: `/app/staging/7c3d-uuid_march.gpkg' not recognized as being "
+        "in a supported file format.\n"
+        "ogrinfo failed - unable to open '/app/staging/7c3d-uuid_march.gpkg'.\n"
+    )
+
+    def test_the_one_line_wording_is_an_open_failure(self):
+        assert _is_unopenable_source_stderr(self._STDERR) is True
+
+    def test_the_reason_names_the_source_and_not_the_staging_path(self):
+        with pytest.raises(IngestionError) as exc_info:
+            _raise_gdal_failure("ogrinfo", 1, self._STDERR, "march.gpkg")
+        reason = str(exc_info.value)
+        assert reason == (
+            "Could not open 'march.gpkg' as a spatial dataset — the file "
+            "may be corrupt, incomplete, or not a valid GeoPackage (.gpkg) "
+            "file."
+        )
+        assert "/app/staging" not in reason
+        assert "7c3d-uuid_march.gpkg" not in reason
+
+    def test_a_layer_that_is_not_in_the_source_is_not_an_open_failure(self):
+        """The other ogrinfo exit-1 shape keeps its own class (#2010)."""
+        stderr = "ERROR 1: Couldn't fetch requested layer parcels.\n"
+        assert _is_unopenable_source_stderr(stderr) is False
+
+
+class TestFriendlyOpenFailureMessage:
+    """The user-facing replacement text — built only from the original
+    upload filename, never from the staging path or the raw stderr."""
+
+    def test_gpkg_extension_names_geopackage(self):
+        msg = _friendly_open_failure_message("march.gpkg")
+        assert msg == (
+            "Could not open 'march.gpkg' as a spatial dataset — the file "
+            "may be corrupt, incomplete, or not a valid GeoPackage (.gpkg) "
+            "file."
+        )
+
+    def test_shp_extension_names_shapefile(self):
+        msg = _friendly_open_failure_message("parcels.shp")
+        assert "Shapefile (.shp)" in msg
+        assert "parcels.shp" in msg
+
+    def test_zip_extension_names_both_zip_formats(self):
+        """A .zip is a Shapefile bundle or a File Geodatabase; name both."""
+        msg = _friendly_open_failure_message("export.zip")
+        assert "zipped Shapefile or File Geodatabase (.zip)" in msg
+
+    def test_unknown_extension_falls_back_to_generic_phrasing(self):
+        msg = _friendly_open_failure_message("data.mysteryformat")
+        assert "data.mysteryformat" in msg
+        assert "not a valid spatial data file" in msg
+
+    def test_no_filename_uses_fully_generic_message(self):
+        msg = _friendly_open_failure_message(None)
+        assert msg == (
+            "Could not open the uploaded file as a spatial dataset — it "
+            "may be corrupt, incomplete, or not a valid spatial data file."
+        )
+
+    def test_staging_path_never_appears_in_message(self):
+        """The staging path GDAL echoes in its own stderr must never reach
+        this message — only the original upload filename does."""
+        msg = _friendly_open_failure_message("march.gpkg")
+        assert "/app/staging" not in msg
+        assert "staging" not in msg
+
+    def test_directory_component_stripped_even_if_passed(self):
+        """Defensive: even if a caller passed a path instead of a bare
+        filename, only the leaf name is shown — never the directories."""
+        msg = _friendly_open_failure_message("/app/staging/9f2c_march.gpkg")
+        assert "march.gpkg" in msg
+        assert "/app/staging" not in msg
+
+
+def _sanitize(value: "str | None") -> "str | None":
+    """`_sanitize_authorization_token` for a WFS job.
+
+    The format only selects the builder's allowlist branch, and both
+    header-auth formats compose an identical bearer line, so every case below
+    reads the same for `ogcapi_features`.
+    """
+    return _sanitize_authorization_token(value, service_format="wfs")
+
+
+class TestSecFu04SanitizeAuthorizationToken:
+    """The credential header LINE filter, before the header file.
+
+    A line with CR/LF or arbitrary unicode could smuggle extra HTTP headers
+    into libcurl through the GDAL_HTTP_HEADER_FILE pipeline, so the shape and
+    the charsets are a security boundary rather than a formatting preference.
+
+    The value crossing from the door to the worker is
+    the finished header line, so this judges a line — printable ASCII, no CR or
+    LF, one ``": "`` separator, an RFC 7230 field name — and keeps the
+    base64url charset and the length floor on the bearer branch of it.
+    """
+
+    def test_sec_fu_04_happy_path_jwt_line_passes_through_unchanged(self):
+        """A JWT-shaped bearer line passes through unchanged."""
+        line = (
+            "Authorization: Bearer "
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature_value-"
+        )
+        assert _sanitize(line) == line
+
+    def test_sec_fu_04_a_basic_line_passes_through_unchanged(self):
+        """The encoded output of a validated username and password.
+
+        Base64 is outside the base64url alphabet whenever it emits ``+`` or
+        ``/``, which is why the bearer charset is applied to the bearer branch
+        alone rather than to every line.
+        """
+        line = "Authorization: Basic dXNlcjpwYSsvd29yZA=="
+        assert _sanitize(line) == line
+
+    def test_sec_fu_04_a_named_api_key_line_passes_through_unchanged(self):
+        line = "X-Api-Key: not-a-real-key-value"
+        assert _sanitize(line) == line
+
+    def test_sec_fu_04_crlf_injection_raises_value_error(self):
+        """A line carrying CR/LF raises ValueError."""
+        line = "Authorization: Bearer valid.jwt.sig\r\nX-Smuggled-Header: evil"
+        with pytest.raises(ValueError) as exc_info:
+            _sanitize(line)
+        msg = str(exc_info.value)
+        assert "did not arrive as one header line" in msg
+
+    def test_sec_fu_04_a_second_separator_raises_value_error(self):
+        """Two ``: `` separators are two headers, whatever the writer intended."""
+        with pytest.raises(ValueError) as exc_info:
+            _sanitize("X-Api-Key: a: b")
+        assert "did not arrive as one header line" in str(exc_info.value)
+
+    def test_sec_fu_04_a_legacy_bare_token_becomes_its_line(self):
+        """The pre-#1770 wire value keeps working.
+
+        A worker that starts while authenticated WFS or OGC API jobs are
+        already queued reads a bare bearer token out of the queue row, or out
+        of the credential store behind a reference the old door stashed.
+        Refusing it would fail every one of those deterministically at the
+        next deploy or restart, and would spend the single-use credential
+        before ogr2ogr started. It is composed into the line the current door
+        would have produced, by the same builder.
+        """
+        token = "not-a-real-legacy-token"
+        assert _sanitize(token) == f"Authorization: Bearer {token}"
+
+    def test_sec_fu_04_a_legacy_token_outside_the_charset_still_raises(self):
+        """Neither a valid line nor a value the previous version dispatched.
+
+        The old door enforced the base64url charset and the length floor on
+        this exact value, so a token failing them was never dispatchable and
+        the compatibility branch must not widen what is accepted.
+        """
+        for bad in ("short", "has spaces here", "plus+slash/", "sig\r\nX-Evil: 1"):
+            with pytest.raises(ValueError) as exc_info:
+                _sanitize(bad)
+            assert "The service credential" in str(exc_info.value)
+            # Policy-only: from here a bad line and a bad legacy token are
+            # indistinguishable, and neither names the value.
+            assert bad not in str(exc_info.value)
+
+    def test_sec_fu_04_an_invalid_field_name_raises_value_error(self):
+        with pytest.raises(ValueError) as exc_info:
+            _sanitize("Bad Name: value")
+        assert "named a header this build will not write" in str(exc_info.value)
+
+    def test_sec_fu_04_whitespace_in_the_bearer_token_raises_value_error(self):
+        """A space inside the token is refused by the bearer charset."""
+        with pytest.raises(ValueError) as exc_info:
+            _sanitize("Authorization: Bearer valid jwt sig")
+        assert "non-base64url" in str(exc_info.value)
+
+    def test_sec_fu_04_unicode_raises_value_error(self):
+        """A non-ASCII character anywhere in the value is refused.
+
+        The header file is written with ``.encode("ascii")``, so this is what
+        stops a UnicodeEncodeError landing after the single-use credential has
+        been claimed.
+        """
+        with pytest.raises(ValueError) as exc_info:
+            _sanitize("X-Api-Key: signaturé")  # U+00E9
+        assert "cannot be written into an HTTP header" in str(exc_info.value)
+
+    def test_sec_fu_04_empty_string_raises_value_error(self):
+        """Empty string raises ValueError (operator misconfiguration guard)."""
+        with pytest.raises(ValueError) as exc_info:
+            _sanitize("")
+        assert "did not arrive as one header line" in str(exc_info.value)
+
+    def test_sec_fu_04_none_returns_none(self):
+        """None passes through unchanged (the no-token path from the calling code)."""
+        assert _sanitize(None) is None
+
+    def test_sec_fu_04_only_the_bearer_branch_names_a_character(self):
+        """The message is policy-only for every other method.
+
+        This exception becomes `IngestJob.error_message`, a log record, a
+        notification reason and the exception the queue records. Naming a
+        character of a password across all four is not a debugging aid worth
+        having; naming one of a bearer token, whose alphabet is already
+        constrained and carries no structure, still is.
+        """
+        password_char = "é"
+        with pytest.raises(ValueError) as exc_info:
+            _sanitize(f"Authorization: Basic dXNlcj{password_char}")
+        assert password_char not in str(exc_info.value)
+        assert "{" not in str(exc_info.value)
+
+        with pytest.raises(ValueError) as exc_info:
+            _sanitize("Authorization: Bearer valid.jwt.sig!")
+        assert "!" in str(exc_info.value)
+
+    def test_sec_fu_04_a_d9_line_registers_the_value_for_exact_scrub(self) -> None:
+        """An Authorization line in the D9 wire format registers its value.
+
+        `register_credential_secret` (`core/service_tokens.py`) is only
+        called from `build_credential_header` -- the whole reason the
+        registry closes the exact-value-reflection class for every OTHER
+        producer. On the D9 wire format (a finished header line WITH a
+        separator, what a modern job actually carries), this function
+        validates the line and returns it unchanged without ever calling
+        that builder: `_legacy_bearer_line` above is the only branch that
+        does, for the legacy bare-token shape. Without the registration the
+        registry would stay empty for the whole worker service-import path on
+        the format every current job actually uses, and only the two explicit
+        `scrub_secret_from_exception` calls covered exceptions -- an
+        ordinary log line calling `_scrub_text` directly was not covered at
+        all. Counterfactual: remove the `register_credential_secret(...)`
+        call from `_sanitize_authorization_token` and the secret below
+        survives `_scrub_text` untouched.
+
+        That call registers the LINE, not the value -- see
+        `test_sec_fu_04_registration_expands_to_every_wire_shape` below for
+        the shapes only the line expands to. A named API key's own value is
+        the tail of its own line, so this test reads the same either way.
+        """
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import reset_registered_credential_secrets
+
+        secret = "s3cret-d9-header-value"
+        reset_registered_credential_secrets()
+        try:
+            line = _sanitize(f"X-Api-Key: {secret}")
+            assert line == f"X-Api-Key: {secret}"
+
+            rendered = _scrub_text(f"worker received header line ...{secret}...")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert secret not in rendered
+
+    def test_sec_fu_04_an_unregistered_value_is_not_scrubbed(self) -> None:
+        """Positive control: the mechanism above is not vacuously passing."""
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import reset_registered_credential_secrets
+
+        reset_registered_credential_secrets()
+        try:
+            rendered = _scrub_text("worker received header line ...never-sanitized...")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert "never-sanitized" in rendered
+
+    def test_sec_fu_04_registration_expands_to_every_wire_shape(self) -> None:
+        """Register the LINE, because only a line expands.
+
+        `_secret_variants` (`core/url_redaction.py`) derives the bare token,
+        the basic blob and the decoded `user:pass` cleartext from a secret
+        that CONTAINS `": "`, and from nothing else. Registering the VALUE
+        (`Bearer <tok>` / `Basic <blob>`) to keep the header NAME out of the
+        registry would mean the worker -- the one process that spends the
+        credential against a hostile origin -- registers a shape the
+        expansion cannot open. So an origin echoing the bare token back in
+        a URL path, or naming the basic username in its own error text
+        ("authentication failed for user ..."), passed the exact-value scrub
+        untouched, and only the two explicit `scrub_secret_from_exception`
+        calls (which are handed the full line) covered anything.
+
+        The name is still never registered on its own: every variant starts
+        after the `": "`, so the bare word `Authorization` stays legible.
+        """
+        import base64
+
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import reset_registered_credential_secrets
+
+        user, other_half = "AAAAAAAAA", "BBBBBBBBB"
+        blob = base64.b64encode(f"{user}:{other_half}".encode()).decode()
+
+        reset_registered_credential_secrets()
+        try:
+            assert _sanitize(f"Authorization: Basic {blob}") == (
+                f"Authorization: Basic {blob}"
+            )
+            echoed_blob = _scrub_text(f"GDAL error on https://host/oops/{blob}")
+            named_user = _scrub_text(f"authentication failed for user {user}")
+            named_half = _scrub_text(f"rejected {other_half} at the origin")
+            header_name = _scrub_text("an Authorization header was sent")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert blob not in echoed_blob
+        assert user not in named_user
+        assert other_half not in named_half
+        assert "Authorization" in header_name
+
+    def test_sec_fu_04_a_bearer_token_is_registered_without_its_scheme(self) -> None:
+        """The other half of the same expansion, on the bearer format.
+
+        An origin that reflects the credential reflects the TOKEN, not the
+        `Bearer ` wrapper GeoLens put around it, so the bare token has to be a
+        registered variant in its own right.
+        """
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import reset_registered_credential_secrets
+
+        token = "AAAAAAAAAAAAAAAAAAAA"
+
+        reset_registered_credential_secrets()
+        try:
+            _sanitize(f"Authorization: Bearer {token}")
+            reflected = _scrub_text(f"GDAL error on https://host/oops/{token}")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert token not in reflected
+
+    def test_sec_fu_04_an_unregistered_bare_token_is_not_scrubbed(self) -> None:
+        """Positive control for the two tests above.
+
+        Both are absence claims about a value the scrubber is supposed to know
+        by exact match. If `_scrub_text` were replacing everything, or the
+        probe strings were somehow not reaching it, they would pass with the
+        registration removed. A token of the same shape that was never
+        sanitised survives.
+        """
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import reset_registered_credential_secrets
+
+        reset_registered_credential_secrets()
+        try:
+            rendered = _scrub_text("GDAL error on https://host/oops/CCCCCCCCCCCCCCCC")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert "CCCCCCCCCCCCCCCC" in rendered
+
+    def test_sec_fu_04_a_refused_short_bearer_registers_nothing(self) -> None:
+        """A line this function REFUSES is not a secret.
+
+        Registering above the bearer grammar checks would let a refused
+        line seed the registry. `Authorization: Bearer e` would seed the
+        one-character variant `e`, and every later `_scrub_text` in the same
+        job then replace every "e" in every log line with the redaction
+        marker -- destroying the diagnostic exactly when something upstream
+        had let a malformed credential through.
+        """
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import (
+            registered_credential_secrets,
+            reset_registered_credential_secrets,
+        )
+
+        reset_registered_credential_secrets()
+        try:
+            with pytest.raises(ValueError):
+                _sanitize("Authorization: Bearer e")
+
+            registered = set(registered_credential_secrets())
+            prose = _scrub_text("the feature set never loaded")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert registered == set()
+        # The whole point: unrelated text is untouched afterwards.
+        assert prose == "the feature set never loaded"
+
+    def test_sec_fu_04_a_refused_bad_charset_bearer_registers_nothing(self) -> None:
+        """The other refusal on the same branch, for the same reason.
+
+        Both raises sit below the registration now, so neither can seed the
+        registry. Covering only the length one would leave the charset one to
+        regress on its own.
+        """
+        from app.core.service_tokens import (
+            registered_credential_secrets,
+            reset_registered_credential_secrets,
+        )
+
+        reset_registered_credential_secrets()
+        try:
+            with pytest.raises(ValueError):
+                _sanitize("Authorization: Bearer valid.jwt.sig!")
+            registered = set(registered_credential_secrets())
+        finally:
+            reset_registered_credential_secrets()
+
+        assert registered == set()
+
+    def test_sec_fu_04_an_accepted_line_is_still_registered(self) -> None:
+        """Positive control: moving the call must not disable it.
+
+        Both tests above are absence claims about the registry, and deleting
+        the registration entirely would satisfy both. A well-formed bearer
+        still registers and still expands to its bare token.
+        """
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import reset_registered_credential_secrets
+
+        token = "AAAAAAAAAAAAAAAAAAAA"
+
+        reset_registered_credential_secrets()
+        try:
+            _sanitize(f"Authorization: Bearer {token}")
+            reflected = _scrub_text(f"GDAL error on https://host/oops/{token}")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert token not in reflected
+
+    def test_sec_fu_04_a_valid_short_basic_pair_still_expands_to_both_halves(
+        self,
+    ) -> None:
+        """No length floor on a derived variant.
+
+        A floor would be wrong. `credential_input_rejection_reason`
+        (`core/service_tokens.py`) accepts any nonempty printable username or
+        password with no minimum, so a one-character half is a VALID credential
+        a user can really configure, not a malformed one -- and a floor decides
+        which valid credentials stop being scrubbed. With a floor, a Basic
+        password of `admin` would stop `authentication failed for user
+        admin` being redacted out of worker logs and the persisted
+        exception text.
+
+        Over-scrubbing a short secret is the deliberate trade-off documented on
+        `scrub_secret_value`. Under-scrubbing a valid one is not a trade this
+        module gets to make.
+        """
+        import base64
+
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import reset_registered_credential_secrets
+        from app.core.url_redaction import _secret_variants
+
+        user, other_half = "a", "b"
+        blob = base64.b64encode(f"{user}:{other_half}".encode()).decode()
+        line = f"Authorization: Basic {blob}"
+
+        reset_registered_credential_secrets()
+        try:
+            assert _sanitize(line) == line
+            variants = _secret_variants(line)
+            named = _scrub_text(f"authentication failed for user {user}")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert user in variants
+        assert other_half in variants
+        # End to end, not just in the variant list: the origin's own wording
+        # for the half is what reaches a log, and it comes back redacted.
+        assert user not in named
+
+    def test_sec_fu_04_a_valid_short_named_header_key_is_still_scrubbed(self) -> None:
+        """The same regression on the named-header method.
+
+        A header key has no length floor either, so a six-character API key is
+        well-formed. This is a separate branch of `_secret_variants` from the
+        Basic pair above (the tail after `": "`, with no scheme word to strip),
+        so covering only one would leave the other free to regress.
+        """
+        from app.core.logging_config import _scrub_text
+        from app.core.service_tokens import reset_registered_credential_secrets
+
+        key = "k3yk3y"
+
+        reset_registered_credential_secrets()
+        try:
+            _sanitize(f"X-Api-Key: {key}")
+            reflected = _scrub_text(f"origin rejected {key} at the door")
+        finally:
+            reset_registered_credential_secrets()
+
+        assert key not in reflected
+
+    def test_sec_fu_04_a_long_basic_pair_still_expands_to_both_halves(self) -> None:
+        """The ordinary case, so the short ones above are not the only coverage.
+
+        The reason the halves are derived at all is that an origin's own error
+        text names them ("authentication failed for user ...").
+        """
+        import base64
+
+        from app.core.url_redaction import _secret_variants
+
+        user, other_half = "AAAAAAAAA", "BBBBBBBBB"
+        blob = base64.b64encode(f"{user}:{other_half}".encode()).decode()
+
+        variants = _secret_variants(f"Authorization: Basic {blob}")
+
+        assert user in variants
+        assert other_half in variants

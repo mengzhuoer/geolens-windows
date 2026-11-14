@@ -1,0 +1,156 @@
+import { render, screen, fireEvent, waitFor } from '@/test/test-utils';
+import userEvent from '@testing-library/user-event';
+import { StyleJsonDialog } from '../StyleJsonDialog';
+
+const exportMutateAsync = vi.fn();
+const importMutateAsync = vi.fn();
+
+vi.mock('@/hooks/use-maps', async () => {
+  const actual = await vi.importActual<typeof import('@/hooks/use-maps')>('@/hooks/use-maps');
+  return {
+    ...actual,
+    useExportMapStyleJson: () => ({ mutateAsync: exportMutateAsync, isPending: false }),
+    useImportMapStyleJson: () => ({ mutateAsync: importMutateAsync, isPending: false }),
+  };
+});
+
+describe('StyleJsonDialog', () => {
+  beforeEach(() => {
+    exportMutateAsync.mockReset();
+    importMutateAsync.mockReset();
+    vi.stubGlobal('URL', {
+      createObjectURL: vi.fn(() => 'blob:style'),
+      revokeObjectURL: vi.fn(),
+    });
+  });
+
+  it('exports the current map style as a JSON download', async () => {
+    exportMutateAsync.mockResolvedValueOnce({ version: 8, sources: {}, layers: [] });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    render(<StyleJsonDialog mapId="map-1" mapName="Transit Map" open onOpenChange={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('button', { name: /export json/i }));
+
+    await waitFor(() => expect(exportMutateAsync).toHaveBeenCalledWith('map-1'));
+    expect(click).toHaveBeenCalled();
+    click.mockRestore();
+  });
+
+  it('shows inline validation for invalid import JSON', async () => {
+    render(<StyleJsonDialog mapId="map-1" mapName="Transit Map" open onOpenChange={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Import' }));
+    fireEvent.change(screen.getByTestId('style-json-input'), { target: { value: '{' } });
+    await userEvent.click(screen.getByRole('button', { name: /import json/i }));
+
+    expect(screen.getByText('Invalid JSON.')).toBeInTheDocument();
+    expect(importMutateAsync).not.toHaveBeenCalled();
+  });
+
+  it('renders import summary warnings returned by the backend', async () => {
+    importMutateAsync.mockResolvedValueOnce({
+      map: { id: 'new-map' },
+      summary: {
+        sources_matched: 1,
+        sources_unsupported: 1,
+        layers_imported: 2,
+        layers_skipped: 1,
+        warnings: [{ code: 'unsupported_source', message: 'External source skipped.' }],
+      },
+    });
+
+    render(<StyleJsonDialog mapId="map-1" mapName="Transit Map" open onOpenChange={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Import' }));
+    fireEvent.change(screen.getByTestId('style-json-input'), {
+      target: { value: '{"version":8,"sources":{},"layers":[]}' },
+    });
+    await userEvent.click(screen.getByRole('button', { name: /import json/i }));
+
+    await waitFor(() => expect(importMutateAsync).toHaveBeenCalledWith({
+      version: 8,
+      sources: {},
+      layers: [],
+    }));
+    expect(screen.getByText('Imported 2 layers')).toBeInTheDocument();
+    expect(screen.getByText('External source skipped.')).toBeInTheDocument();
+    expect(screen.queryByText(/more warnings omitted/)).not.toBeInTheDocument();
+  });
+
+  // The backend stops listing warnings after 100, so a document
+  // with thousands of unmatched sources used to look like it had exactly 100
+  // problems.
+  it('reports how many warnings the backend stopped listing', async () => {
+    importMutateAsync.mockResolvedValueOnce({
+      map: { id: 'new-map' },
+      summary: {
+        sources_matched: 1,
+        sources_unsupported: 900,
+        layers_imported: 2,
+        layers_skipped: 1,
+        warnings: [{ code: 'unsupported_source', message: 'External source skipped.' }],
+        warnings_truncated: 800,
+      },
+    });
+
+    render(<StyleJsonDialog mapId="map-1" mapName="Transit Map" open onOpenChange={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Import' }));
+    fireEvent.change(screen.getByTestId('style-json-input'), {
+      target: { value: '{"version":8,"sources":{},"layers":[]}' },
+    });
+    await userEvent.click(screen.getByRole('button', { name: /import json/i }));
+
+    await waitFor(() =>
+      expect(screen.getByText('800 more warnings omitted.')).toBeInTheDocument(),
+    );
+  });
+
+  it('says nothing about omitted warnings when none were dropped', async () => {
+    importMutateAsync.mockResolvedValueOnce({
+      map: { id: 'new-map' },
+      summary: {
+        sources_matched: 1,
+        sources_unsupported: 0,
+        layers_imported: 2,
+        layers_skipped: 0,
+        warnings: [],
+        warnings_truncated: 0,
+      },
+    });
+
+    render(<StyleJsonDialog mapId="map-1" mapName="Transit Map" open onOpenChange={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Import' }));
+    fireEvent.change(screen.getByTestId('style-json-input'), {
+      target: { value: '{"version":8,"sources":{},"layers":[]}' },
+    });
+    await userEvent.click(screen.getByRole('button', { name: /import json/i }));
+
+    await waitFor(() => expect(screen.getByText('Imported 2 layers')).toBeInTheDocument());
+    expect(screen.queryByText(/omitted/)).not.toBeInTheDocument();
+  });
+
+  it('renders the summary when the response omits the warnings list', async () => {
+    importMutateAsync.mockResolvedValueOnce({
+      map: { id: 'new-map' },
+      summary: {
+        sources_matched: 1,
+        sources_unsupported: 0,
+        layers_imported: 2,
+        layers_skipped: 0,
+      },
+    });
+
+    render(<StyleJsonDialog mapId="map-1" mapName="Transit Map" open onOpenChange={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole('tab', { name: 'Import' }));
+    fireEvent.change(screen.getByTestId('style-json-input'), {
+      target: { value: '{"version":8,"sources":{},"layers":[]}' },
+    });
+    await userEvent.click(screen.getByRole('button', { name: /import json/i }));
+
+    await waitFor(() => expect(screen.getByText('Imported 2 layers')).toBeInTheDocument());
+  });
+});

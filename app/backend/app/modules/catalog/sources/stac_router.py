@@ -1,0 +1,1010 @@
+"""STAC catalog import endpoints.
+
+Allows users to connect to external STAC APIs, browse collections,
+search items, and import selected items as raster datasets.
+"""
+
+import asyncio
+import uuid
+from datetime import date, datetime, timezone
+from typing import Any, Literal
+
+import httpx
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import (
+    BaseModel,
+    Field,
+    HttpUrl,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.standards.ogc.errors import BAD_GATEWAY_RESPONSE, ERROR_RESPONSES_WRITE
+
+from app.core.geo import bbox_to_extent_wkt, crs_columns
+from app.core.url_redaction import has_url_credentials, redact_url_credentials
+from app.modules.audit.service import AuditEvent, audit_emit
+from app.core.identity import Identity
+from app.modules.auth.dependencies import require_permission
+from app.modules.catalog.authorization import check_public_visibility_allowed
+from app.modules.catalog.datasets.domain.models import (
+    Dataset,
+    Record,
+    RecordKeyword,
+)
+from app.core.dependencies import get_db
+from app.platform.dataset_origin import set_dataset_origin
+from app.platform.extensions import get_catalog_port
+from app.modules.catalog.sources.adapters.stac import (
+    MAX_ASSET_KEY_CHARS,
+    MAX_ASSET_MEDIA_TYPE_CHARS,
+    connect_stac_api,
+    list_stac_collections,
+    search_stac_items,
+)
+from app.modules.catalog.sources.stac_resolve_asset_gate import _MAX_STORED_URI_CHARS
+from app.modules.catalog.sources.stac_next_page import (
+    StacNextPage,
+    issue_cursor,
+    open_cursor,
+)
+from app.modules.catalog.sources.cog_info import (
+    fetch_cog_info,
+    import_refusal,
+    reconcile_epsg,
+)
+from app.modules.catalog.sources.schemas import (
+    DEPRECATED_TOKEN_SUFFIX,
+    SERVICE_AUTH_FIELD_DESCRIPTION,
+    ServiceAuthRequest,
+    _validate_safe_token,
+    reject_service_auth_conflict,
+    service_credential_from_request,
+)
+from app.core.service_tokens import STAC_SERVICE_FORMAT, ServiceCredential
+from app.platform.security import SSRFError, same_origin, validate_url_for_ssrf
+from app.platform.service_auth import credential_or_422, credential_over_http_or_422
+
+
+logger = structlog.stdlib.get_logger(__name__)
+Visibility = Literal["private", "restricted", "internal", "public"]
+
+
+def _validate_stac_http_url(v: str) -> str:
+    HttpUrl(v)
+    if has_url_credentials(v):
+        raise ValueError(
+            "url must not include credential query parameters; use a non-secret URL"
+        )
+    return v
+
+
+def _validate_optional_stac_http_url(v: str | None) -> str | None:
+    """``_validate_stac_http_url`` for a nullable field.
+
+    Spelled out because a field validator also runs on an explicit ``None``,
+    and ``HttpUrl(None)`` raises.
+    """
+    return None if v is None else _validate_stac_http_url(v)
+
+
+def _data_asset_import_refusal(
+    href: str | None,
+) -> Literal["not_http", "credentials", "too_long"] | None:
+    """Why ``/import``'s own ``StacImportItem.data_asset_href`` field would
+    refuse *href*, or ``None`` if that field's own checks would accept it.
+    Format, length and credentials only: ``/import`` separately checks each
+    asset's host, which this does not predict.
+
+    Search can tell the caller before an item is ticked, rather than after
+    the whole batch 422s on submit, only if this predicts the SAME field in
+    the SAME order: the field's ``max_length=4096`` (pydantic enforces it
+    before any field_validator runs), then ``HttpUrl(href)``, then
+    ``has_url_credentials`` once ``HttpUrl`` has passed, as in
+    ``_validate_stac_http_url``. So a too-long, credentialed href is
+    ``too_long``, not ``credentials``.
+
+    ``HttpUrl`` also enforces a tighter length ceiling, so an href between
+    the two comes back as pydantic's ``url_too_long`` error. That is read off
+    the raised error's type rather than hardcoding a second length, so this
+    keeps matching ``HttpUrl`` if pydantic changes the ceiling. Any other
+    ``HttpUrl`` failure (an unparseable authority, a disallowed scheme) is
+    ``not_http``.
+    """
+    if href is None:
+        return None
+    if len(href) > 4096:
+        return "too_long"
+    try:
+        HttpUrl(href)
+    except ValidationError as exc:
+        if any(error["type"] == "url_too_long" for error in exc.errors()):
+            return "too_long"
+        return "not_http"
+    if has_url_credentials(href):
+        return "credentials"
+    return None
+
+
+router = APIRouter(
+    prefix="/services/stac",
+    tags=["STAC Import"],
+    responses=ERROR_RESPONSES_WRITE,
+)
+
+
+# A code, not prose: the 200 response bypasses the client's error localization,
+# so the wizard translates it.
+_ITEM_IMPORT_FAILED_CODE = "import_failed"
+_ITEM_TOO_LONG_CODE = "too_long"
+
+# datasets.source_filename holds the item id.
+_MAX_STORED_ITEM_ID_CHARS = 500
+
+# Names the rule, never the href: this reaches a per-item result body.
+_OFF_ORIGIN_ITEM_HREF_MESSAGE = (
+    "This item's own URL is on a different host than the STAC catalog it was "
+    "imported from, so GeoLens will not record it as the item's address."
+)
+
+# Only the doors that CONTACT the catalog take a credential. `/import`
+# contacts none, so it would be accepting a secret it then drops.
+_STAC_TOKEN_DESCRIPTION = (
+    "Optional auth token for a protected STAC catalog." + DEPRECATED_TOKEN_SUFFIX
+)
+
+
+class StacConnectRequest(BaseModel):
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="STAC API root URL to connect to.",
+    )
+    _validate_url = field_validator("url")(_validate_stac_http_url)
+    token: str | None = Field(
+        default=None, max_length=1000, description=_STAC_TOKEN_DESCRIPTION
+    )
+    _validate_token = field_validator("token")(_validate_safe_token)
+    # Auth is declared LAST on every request model: the generated SDK
+    # positions fields by declaration order, so an earlier insertion would
+    # shift an existing positional caller's argument into it.
+    auth: ServiceAuthRequest | None = Field(
+        default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
+    )
+    _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
+
+
+class StacConnectResponse(BaseModel):
+    url: str = Field(description="Normalized STAC API URL.")
+    catalog_id: str = Field(description="Catalog identifier from the landing page.")
+    title: str = Field(description="Catalog title.")
+    description: str = Field(description="Catalog description.")
+    stac_version: str = Field(description="STAC specification version.")
+    conforms_to: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Conformance classes from the landing page conformsTo, which "
+            "tell a client which search extensions the catalog supports."
+        ),
+    )
+
+
+class StacCollectionSummary(BaseModel):
+    id: str = Field(description="Collection identifier.")
+    title: str = Field(description="Collection title.")
+    description: str = Field(description="Collection description.")
+    license: str | None = Field(default=None, description="SPDX license identifier.")
+    keywords: list[str] = Field(default=[], description="Collection keywords.")
+    bbox: list[float] | None = Field(
+        default=None, description="Spatial extent as [west, south, east, north]."
+    )
+    temporal_start: str | None = Field(
+        default=None, description="Start of temporal extent (ISO 8601)."
+    )
+    temporal_end: str | None = Field(
+        default=None, description="End of temporal extent (ISO 8601)."
+    )
+    item_count: int | None = Field(
+        default=None, description="Number of items if reported by the API."
+    )
+
+
+class StacCollectionsResponse(BaseModel):
+    url: str = Field(description="STAC API URL that was queried.")
+    collections: list[StacCollectionSummary] = Field(
+        description="Available collections."
+    )
+
+
+class StacSearchRequest(BaseModel):
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="STAC API root URL.",
+    )
+    _validate_url = field_validator("url")(_validate_stac_http_url)
+    collections: list[str] | None = Field(
+        default=None, description="Filter by collection IDs."
+    )
+    bbox: list[float] | None = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+        description="Bounding box filter as [west, south, east, north].",
+    )
+    datetime_range: str | None = Field(
+        default=None,
+        description="Temporal filter in STAC datetime format (e.g. '2023-01-01/2023-12-31').",
+    )
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum items to return.",
+    )
+    token: str | None = Field(
+        default=None, max_length=1000, description=_STAC_TOKEN_DESCRIPTION
+    )
+    _validate_token = field_validator("token")(_validate_safe_token)
+    auth: ServiceAuthRequest | None = Field(
+        default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
+    )
+    _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
+    max_cloud_cover: float | None = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Only items at or below this eo:cloud_cover percentage.",
+    )
+    cloud_cover_mode: Literal["query", "filter"] | None = Field(
+        default=None,
+        description=(
+            "How to send max_cloud_cover: 'query' for the STAC Query "
+            "extension, 'filter' for CQL2 JSON. Pick the one the catalog "
+            "lists in its landing page conformsTo."
+        ),
+    )
+    next_page: StacNextPage | None = Field(
+        default=None,
+        description=(
+            "The next_page of the previous response, to fetch the page after "
+            "it. Send the same filters as the first request."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _cloud_cover_needs_a_mode(self) -> "StacSearchRequest":
+        if (self.max_cloud_cover is None) != (self.cloud_cover_mode is None):
+            raise ValueError(
+                "max_cloud_cover and cloud_cover_mode must be sent together"
+            )
+        return self
+
+
+class StacItemSummary(BaseModel):
+    id: str = Field(description="Item identifier.")
+    collection: str | None = Field(default=None, description="Parent collection ID.")
+    item_href: str | None = Field(
+        default=None,
+        description=(
+            "The item's own canonical URL, from its rel=self link. Echo it "
+            "back on import so the dataset's origin can point at the item as "
+            "well as the asset; null when the catalog omits a self link."
+        ),
+    )
+    title: str = Field(description="Item title (falls back to ID).")
+    bbox: list[float] | None = Field(default=None, description="Item bounding box.")
+    datetime: str | None = Field(
+        default=None, description="Primary datetime (ISO 8601)."
+    )
+    datetime_start: str | None = Field(
+        default=None, description="Start datetime for ranges."
+    )
+    datetime_end: str | None = Field(
+        default=None, description="End datetime for ranges."
+    )
+    epsg: int | None = Field(default=None, description="EPSG code from proj extension.")
+    gsd: float | None = Field(
+        default=None, description="Ground sample distance in meters."
+    )
+    cloud_cover: float | None = Field(
+        default=None, description="Cloud cover percentage (eo extension)."
+    )
+    data_asset_href: str | None = Field(
+        default=None, description="URL of the primary data asset (COG)."
+    )
+    data_asset_type: str | None = Field(
+        default=None, description="Media type of the data asset."
+    )
+    data_asset_key: str | None = Field(
+        default=None,
+        description=(
+            "The key the data asset is published under on the item. Echo it "
+            "back on import so the dataset records which asset it came from. "
+            "The key remains stable when the href changes."
+        ),
+    )
+    data_asset_size_bytes: int | None = Field(
+        default=None,
+        description="Size of the primary data asset in bytes (from STAC file:size). None when not in manifest.",
+    )
+    data_asset_import_refusal: Literal["not_http", "credentials", "too_long"] | None = (
+        Field(
+            # Optional, not required: a generated SDK client raises on any
+            # field a required-but-nullable schema promises but an older
+            # server never sends. The web app ships bundled with its own
+            # API and always gets this field; the SDK, CLI and MCP can run
+            # ahead of an older GeoLens server that predates this check.
+            default=None,
+            description=(
+                "Why /import would refuse this item's data asset, based on its "
+                "URL alone, or null if the href passes import's format, length "
+                "and credential checks. 'not_http' for a scheme other than "
+                "http/https, such as s3://; 'credentials' for a URL carrying a "
+                "credential query parameter GeoLens won't store; 'too_long' for "
+                "a URL over the length import allows. Import also checks each "
+                "asset's host, and can still refuse a null item there as a "
+                "per-item failure that leaves the rest of the batch importing."
+            ),
+        )
+    )
+    thumbnail_href: str | None = Field(
+        default=None, description="Thumbnail URL if available."
+    )
+    asset_count: int = Field(description="Number of assets on this item.")
+
+
+class StacSearchResponse(BaseModel):
+    items: list[StacItemSummary] = Field(description="Matching items.")
+    matched: int | None = Field(
+        default=None, description="Total matches (if reported by API)."
+    )
+    returned: int = Field(description="Number of items in this response.")
+    next_page: StacNextPage | None = Field(
+        default=None,
+        description=(
+            "Link to the next page of results, or null on the last page. "
+            "Send it back as next_page with the same filters."
+        ),
+    )
+
+
+class StacImportItem(BaseModel):
+    id: str = Field(max_length=2048, description="STAC item ID.")
+    collection: str | None = Field(
+        default=None, max_length=255, description="Parent collection ID."
+    )
+    title: str = Field(
+        max_length=500, description="Title to use for the GeoLens dataset."
+    )
+    data_asset_href: str = Field(
+        max_length=4096, description="URL of the COG asset to reference."
+    )
+    _validate_data_asset_href = field_validator("data_asset_href")(
+        _validate_stac_http_url
+    )
+    # Optional so an older client (or a catalog whose items carry no rel=self
+    # link) still imports; the health probe then checks the asset alone.
+    item_href: str | None = Field(
+        default=None,
+        max_length=4096,
+        description="The item's own canonical URL, echoed from search results.",
+    )
+    _validate_item_href = field_validator("item_href")(_validate_optional_stac_http_url)
+    # Optional so an older client still imports; the first refresh then
+    # recovers the key by matching the stored href. Recording it at import
+    # closes the window where the href moves and the item has meanwhile
+    # gained a higher-priority asset.
+    data_asset_key: str | None = Field(
+        default=None,
+        max_length=MAX_ASSET_KEY_CHARS,
+        description="The asset key on the item, echoed from search results.",
+    )
+    # Optional for the same reason as the echoes above; the first refresh
+    # repairs the value from the live item document.
+    data_asset_type: str | None = Field(
+        default=None,
+        max_length=MAX_ASSET_MEDIA_TYPE_CHARS,
+        description="Media type of the data asset, echoed from search results.",
+    )
+    bbox: list[float] | None = Field(default=None, description="Item bounding box.")
+    epsg: int | None = Field(default=None, description="EPSG code.")
+    datetime_start: str | None = Field(
+        default=None, max_length=50, description="Temporal start."
+    )
+    datetime_end: str | None = Field(
+        default=None, max_length=50, description="Temporal end."
+    )
+    keywords: list[str] = Field(
+        default=[], max_length=100, description="Keywords from STAC collection."
+    )
+
+
+class StacImportRequest(BaseModel):
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="STAC API URL for provenance.",
+    )
+    _validate_url = field_validator("url")(_validate_stac_http_url)
+    items: list[StacImportItem] = Field(
+        min_length=1,
+        max_length=50,
+        description="Items to import (max 50 per request).",
+    )
+    visibility: Visibility = Field(
+        default="private",
+        description="Visibility for imported datasets.",
+    )
+    # A boolean, never the credential. Declared last, so no
+    # positional SDK caller shifts.
+    catalog_auth_required: bool = Field(
+        default=False,
+        description=(
+            "Whether browsing this catalog needed a credential. Set it when "
+            "the search that produced these items carried one, so the first "
+            "refresh asks for a credential instead of failing anonymously."
+        ),
+    )
+
+
+class StacImportResult(BaseModel):
+    item_id: str = Field(description="STAC item ID that was processed.")
+    dataset_id: uuid.UUID | None = Field(
+        default=None, description="Created GeoLens dataset ID."
+    )
+    status: Literal["created", "skipped", "error"] = Field(
+        description="Import result status."
+    )
+    error: str | None = Field(default=None, description="Error message if failed.")
+
+
+class StacImportResponse(BaseModel):
+    results: list[StacImportResult] = Field(description="Per-item import results.")
+    created: int = Field(description="Number of datasets created.")
+    skipped: int = Field(description="Number of items skipped (duplicates).")
+    errors: int = Field(description="Number of items that failed.")
+
+
+def _stac_credential(
+    request: StacConnectRequest | StacSearchRequest,
+) -> ServiceCredential | None:
+    """The credential this request may send to the catalog, or None.
+
+    One door helper for all three STAC endpoints, so they cannot judge the
+    same credential three ways. ``credential_or_422`` binds the STAC service
+    format and raises the coded 422 for an input the rules refuse, as does a
+    credential bound for a plain http catalog; the header itself is composed
+    later, at each write site.
+    """
+    credential = credential_or_422(
+        service_credential_from_request(request.auth, request.token),
+        service_format=STAC_SERVICE_FORMAT,
+    )
+    credential_over_http_or_422(request.url, credential)
+    return credential
+
+
+@router.post("/connect", response_model=StacConnectResponse)
+async def stac_connect(
+    request: StacConnectRequest,
+    user: Identity = Depends(require_permission("create_layers")),
+    db: AsyncSession = Depends(get_db),
+) -> StacConnectResponse:
+    """Connect to a STAC API and validate the endpoint.
+
+    Accepts a credential for a protected catalog, applied to this call.
+    """
+    safe_url = redact_url_credentials(request.url)
+    credential = _stac_credential(request)
+    try:
+        await validate_url_for_ssrf(request.url)
+    except SSRFError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    result = await connect_stac_api(request.url, credential)
+    if result is None:
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=user.id,
+                action="stac_connect",
+                resource_type="stac_api",
+                details={"url": safe_url, "result": "not_stac"},
+            ),
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="URL does not appear to be a valid STAC API. Check the URL and try again.",
+        )
+
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=user.id,
+            action="stac_connect",
+            resource_type="stac_api",
+            details={
+                "url": safe_url,
+                "result": "success",
+                "stac_version": result["stac_version"],
+            },
+        ),
+    )
+    await db.commit()
+
+    return StacConnectResponse(
+        url=request.url.rstrip("/"),
+        catalog_id=result["id"],
+        title=result["title"],
+        description=result["description"],
+        stac_version=result["stac_version"],
+        conforms_to=_conformance_classes(result.get("conforms_to")),
+    )
+
+
+def _conformance_classes(value: object) -> list[str]:
+    """The landing page's conformsTo as a bounded list of strings."""
+    if not isinstance(value, list):
+        return []
+    return [c for c in value if isinstance(c, str) and len(c) <= 512][:200]
+
+
+@router.post(
+    "/collections",
+    response_model=StacCollectionsResponse,
+    responses={502: BAD_GATEWAY_RESPONSE},
+)
+async def stac_collections(
+    request: StacConnectRequest,
+    user: Identity = Depends(require_permission("create_layers")),
+) -> StacCollectionsResponse:
+    """List collections from a connected STAC API.
+
+    Accepts a credential for a protected catalog, applied to this call.
+    """
+    safe_url = redact_url_credentials(request.url)
+    credential = _stac_credential(request)
+    try:
+        await validate_url_for_ssrf(request.url)
+    except SSRFError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    try:
+        collections = await list_stac_collections(request.url, credential)
+    except Exception as exc:  # broad: STAC client/HTTP/parse can throw varied errors; map to 502 for the user
+        logger.warning("STAC collections fetch failed", url=safe_url, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to fetch collections from STAC API.",
+        )
+
+    return StacCollectionsResponse(
+        url=request.url.rstrip("/"),
+        collections=[StacCollectionSummary(**c) for c in collections],
+    )
+
+
+def _issued_next_page(
+    request: StacSearchRequest, next_page: dict[str, Any] | None
+) -> StacNextPage | None:
+    if next_page is None:
+        return None
+    cursor = issue_cursor(request.url, request.collections, next_page)
+    return None if cursor is None else StacNextPage(cursor=cursor)
+
+
+async def _validate_next_page_href(catalog_url: str, href: str) -> None:
+    """Refuse a next-page URL that the catalog's own response could not have named.
+
+    The follow-up carries the caller's credential and is fetched by this
+    server, so the client may not steer it to another origin or an internal
+    address.
+    """
+    try:
+        has_userinfo = bool(httpx.URL(href).userinfo)
+    except httpx.InvalidURL:
+        has_userinfo = True
+    if has_userinfo or not same_origin(catalog_url, href):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The next page must be on the same origin as the catalog URL.",
+        )
+    try:
+        await validate_url_for_ssrf(href)
+    except SSRFError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+@router.post(
+    "/search",
+    response_model=StacSearchResponse,
+    responses={502: BAD_GATEWAY_RESPONSE},
+)
+async def stac_search(
+    request: StacSearchRequest,
+    user: Identity = Depends(require_permission("create_layers")),
+) -> StacSearchResponse:
+    """Search items in a STAC API with spatial/temporal filters.
+
+    Accepts a credential for a protected catalog, applied to this call.
+    """
+    safe_url = redact_url_credentials(request.url)
+    credential = _stac_credential(request)
+    try:
+        await validate_url_for_ssrf(request.url)
+    except SSRFError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    next_page = None
+    if request.next_page is not None:
+        next_page = open_cursor(
+            request.url, request.collections, request.next_page.cursor
+        )
+        if next_page is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The next page link is not valid for this search.",
+            )
+        await _validate_next_page_href(request.url, next_page["href"])
+
+    try:
+        result = await search_stac_items(
+            request.url,
+            collections=request.collections,
+            bbox=request.bbox,
+            datetime_range=request.datetime_range,
+            limit=request.limit,
+            credential=credential,
+            next_page=next_page,
+            max_cloud_cover=request.max_cloud_cover,
+            cloud_cover_mode=request.cloud_cover_mode,
+        )
+    except Exception as exc:  # broad: STAC /search client/HTTP/parse can throw varied errors; map to 502 for the user
+        logger.warning("STAC search failed", url=safe_url, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to search STAC API. The endpoint may be unavailable or does not support /search.",
+        )
+
+    return StacSearchResponse(
+        items=[
+            StacItemSummary(
+                **item,
+                data_asset_import_refusal=_data_asset_import_refusal(
+                    item.get("data_asset_href")
+                ),
+            )
+            for item in result["items"]
+        ],
+        matched=result["matched"],
+        returned=result["returned"],
+        next_page=_issued_next_page(request, result.get("next_page")),
+    )
+
+
+def _parse_date(iso_str: str | None) -> date | None:
+    """Parse an ISO 8601 datetime string to a date, tolerant of formats."""
+    if not iso_str:
+        return None
+    try:
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).date()
+    except (ValueError, TypeError):
+        return None
+
+
+@router.post("/import", response_model=StacImportResponse)
+async def stac_import(
+    request: StacImportRequest,
+    user: Identity = Depends(require_permission("create_layers")),
+    db: AsyncSession = Depends(get_db),
+) -> StacImportResponse:
+    """Import selected STAC items as raster datasets.
+
+    Each item is registered as a raster_dataset record referencing the
+    remote COG asset URL. Titiler serves the tiles directly from the
+    remote source — no file download required.
+    """
+    # A non-admin may not create public datasets when the
+    # restrict_public_visibility setting is on.
+    await check_public_visibility_allowed(db, user, request.visibility)
+
+    results: list[StacImportResult] = []
+    safe_url = redact_url_credentials(request.url)
+    created = 0
+    skipped = 0
+    errors = 0
+
+    # Keyed on origin_ref's asset_href (structured pointer), not origin_uri's
+    # string spelling, matching the service-preview guard in
+    # catalog/sources/router.py. source_url is the fallback for rows
+    # migration 0036 could not backfill and which are PATCHable.
+    hrefs = [i.data_asset_href for i in request.items]
+    existing_hrefs: set[str] = {
+        row.asset_href or row.source_url
+        for row in (
+            await db.execute(
+                select(
+                    Dataset.origin_ref["asset_href"].astext.label("asset_href"),
+                    Dataset.source_url,
+                ).where(
+                    or_(
+                        Dataset.origin_ref["asset_href"].astext.in_(hrefs),
+                        and_(
+                            Dataset.origin_uri.is_(None),
+                            Dataset.source_url.in_(hrefs),
+                        ),
+                    ),
+                    Dataset.source_format == "stac",
+                )
+            )
+        ).all()
+        if (row.asset_href or row.source_url) is not None
+    }
+
+    importable: list[StacImportItem] = []
+    for item in request.items:
+        if item.data_asset_href in existing_hrefs:
+            results.append(
+                StacImportResult(
+                    item_id=item.id, status="skipped", error="Already imported"
+                )
+            )
+            skipped += 1
+            continue
+        if (
+            len(item.id) > _MAX_STORED_ITEM_ID_CHARS
+            or len(item.data_asset_href) > _MAX_STORED_URI_CHARS
+        ):
+            results.append(
+                StacImportResult(
+                    item_id=item.id, status="error", error=_ITEM_TOO_LONG_CODE
+                )
+            )
+            errors += 1
+            continue
+        # The item pointer becomes the origin a later credentialed refresh
+        # anchors on, so it may not name a host other than the catalog the
+        # caller submitted. Search already drops such a link; this refuses it
+        # for a client that did not come from there.
+        if item.item_href is not None and not same_origin(request.url, item.item_href):
+            logger.warning("STAC item self link is off the submitted origin")
+            results.append(
+                StacImportResult(
+                    item_id=item.id,
+                    status="error",
+                    error=_OFF_ORIGIN_ITEM_HREF_MESSAGE,
+                )
+            )
+            errors += 1
+            continue
+        try:
+            await validate_url_for_ssrf(item.data_asset_href)
+        except SSRFError as exc:
+            # Surfaced because catalogs commonly expose hrefs the SSRF guard
+            # rejects (e.g. s3:// schemes); href redacted so a presigned
+            # URL's credentials never reach logs.
+            logger.warning(
+                "STAC item SSRF-rejected",
+                item_id=item.id,
+                href=redact_url_credentials(item.data_asset_href),
+                error=str(exc),
+            )
+            results.append(
+                StacImportResult(item_id=item.id, status="error", error=str(exc))
+            )
+            errors += 1
+            continue
+        importable.append(item)
+
+    cog_info_map: dict[str, dict | None] = {}
+    if importable:
+        sem = asyncio.Semaphore(10)
+
+        async def _fetch_bounded(url: str) -> tuple[str, dict | None]:
+            async with sem:
+                return url, await fetch_cog_info(url)
+
+        cog_results = await asyncio.gather(
+            *(_fetch_bounded(item.data_asset_href) for item in importable)
+        )
+        cog_info_map = dict(cog_results)
+
+    # STAC import inserts Record rows directly, beside the datasets façade,
+    # raster and VRT creators, so it takes part in the atomic count-cap
+    # reservation too.
+    from app.modules.quota.service import (
+        DatasetQuotaExceededError,
+        reserve_dataset_slot,
+    )
+
+    for item in importable:
+        refusal = import_refusal(cog_info_map.get(item.data_asset_href))
+        if refusal is not None:
+            results.append(
+                StacImportResult(item_id=item.id, status="error", error=refusal)
+            )
+            errors += 1
+            continue
+        try:
+            # Savepoint per item so a failure doesn't corrupt the session
+            async with db.begin_nested():
+                await reserve_dataset_slot(db, user.id)
+                spatial_extent = None
+                if item.bbox and len(item.bbox) >= 4:
+                    w, s, e, n = item.bbox[:4]
+                    # RFC 7946 §5.2 mandates west > east for a bbox crossing
+                    # the antimeridian; bbox_to_extent_wkt splits those at
+                    # ±180 rather than building the wrong 340° ring.
+                    spatial_extent = func.ST_GeomFromText(
+                        bbox_to_extent_wkt(w, s, e, n), 4326
+                    )
+
+                record = Record(
+                    title=item.title,
+                    record_type="raster_dataset",
+                    visibility=request.visibility,
+                    record_status="published",
+                    spatial_extent=spatial_extent,
+                    temporal_start=_parse_date(item.datetime_start),
+                    temporal_end=_parse_date(item.datetime_end),
+                    source_organization="STAC Import",
+                    created_by=user.id,
+                    updated_by=user.id,
+                )
+                db.add(record)
+                await db.flush()
+
+                table_name = f"stac_{record.id.hex[:16]}"
+                dataset = Dataset(
+                    record_id=record.id,
+                    table_name=table_name,
+                    source_format="stac",
+                    source_url=item.data_asset_href,
+                    source_filename=item.id,
+                    srid=item.epsg,
+                    # Python value, not func.now(): a SQL expression would
+                    # leave the attribute expired and the next read
+                    # lazy-loading.
+                    last_refreshed_at=datetime.now(timezone.utc),
+                )
+                # asset_href is also what the duplicate-source guard keys on
+                # (origin_ref.asset_href), so writing it here keeps both in
+                # agreement. item_href is the only stored value that can
+                # answer "was this item withdrawn?"; a 200 on the asset href
+                # says nothing about that.
+                set_dataset_origin(
+                    dataset,
+                    "stac",
+                    uri=item.data_asset_href,
+                    url=request.url,
+                    asset_href=item.data_asset_href,
+                    item_href=item.item_href,
+                    item_id=item.id,
+                    collection_id=item.collection,
+                    asset_key=item.data_asset_key,
+                    # True or None, never False: the allowlist drops a None,
+                    # which is how "no credential" is spelled on both origin
+                    # kinds.
+                    auth_required=True if request.catalog_auth_required else None,
+                )
+                # Info in hand means Titiler reached the COG. Every failure
+                # shape stays NULL, since a Titiler error is indistinguishable
+                # from local pre-fetch rejections without parsing its error
+                # bodies (see fetch_cog_info).
+                ci = cog_info_map.get(item.data_asset_href)
+                if ci is not None:
+                    dataset.last_checked_at = datetime.now(timezone.utc)
+                ci = ci or {}
+                # Mirrors the raster row's EPSG preference below: both come
+                # from the same probe and must agree, or OGC Records would
+                # publish two disagreeing CRS declarations for one dataset.
+                reconciled_epsg = reconcile_epsg(ci, item.epsg)
+                dataset.srid = reconciled_epsg
+                db.add(dataset)
+                await db.flush()
+
+                nodata_raw = ci.get("nodata")
+                pixel_geometry = (
+                    {k: ci[k] for k in ("res_x", "res_y", "is_rotated")}
+                    if "res_x" in ci
+                    else {}
+                )
+
+                raster_asset = get_catalog_port().raster_asset_orm_class()(
+                    dataset_id=dataset.id,
+                    asset_uri=item.data_asset_href,
+                    storage_backend="remote",
+                    cog_status="verified",
+                    epsg=reconciled_epsg,
+                    band_count=ci.get("band_count"),
+                    dtype=ci.get("dtype"),
+                    width=ci.get("width"),
+                    height=ci.get("height"),
+                    nodata=str(nodata_raw) if nodata_raw is not None else None,
+                    band_info=ci.get("band_info"),
+                    **crs_columns(ci),
+                    # res_x/res_y/is_rotated come off /cog/stac's
+                    # proj:transform as one fact, written together or not at
+                    # all: a probe with no transform must leave them at column
+                    # defaults rather than assert is_rotated=False.
+                    **pixel_geometry,
+                )
+                db.add(raster_asset)
+
+                # dataset_assets row so a generic STAC client (stac-browser,
+                # QGIS, rio-viz) can read pixels from a re-published item; the
+                # internal raster_tiles template renders only in GeoLens's own
+                # frontend. Roled `data` (the tiles asset is `visual`).
+                # Refresh upserts the same row (_upsert_origin_data_asset) to
+                # backfill older imports.
+                db.add(
+                    get_catalog_port().dataset_asset_orm_class()(
+                        dataset_id=dataset.id,
+                        key="data",
+                        href=item.data_asset_href,
+                        media_type=item.data_asset_type,
+                        roles=["data"],
+                    )
+                )
+
+                for kw in item.keywords:
+                    db.add(
+                        RecordKeyword(
+                            record_id=record.id,
+                            keyword=kw,
+                            keyword_type="theme",
+                        )
+                    )
+
+            results.append(
+                StacImportResult(
+                    item_id=item.id,
+                    dataset_id=dataset.id,
+                    status="created",
+                )
+            )
+            created += 1
+
+        except DatasetQuotaExceededError as exc:
+            results.append(
+                StacImportResult(item_id=item.id, status="error", error=str(exc))
+            )
+            errors += 1
+        except Exception:  # broad: per-item STAC import is isolated; any failure is recorded per-item without aborting the batch
+            logger.exception("STAC item import failed", item_id=item.id)
+            results.append(
+                StacImportResult(
+                    item_id=item.id, status="error", error=_ITEM_IMPORT_FAILED_CODE
+                )
+            )
+            errors += 1
+
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=user.id,
+            action="stac_import",
+            resource_type="stac_api",
+            details={
+                "url": safe_url,
+                "requested": len(request.items),
+                "created": created,
+                "skipped": skipped,
+                "errors": errors,
+            },
+        ),
+    )
+    await db.commit()
+
+    return StacImportResponse(
+        results=results,
+        created=created,
+        skipped=skipped,
+        errors=errors,
+    )

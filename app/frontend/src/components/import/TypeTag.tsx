@@ -1,0 +1,99 @@
+import { cn } from '@/lib/utils';
+import type { DataKind } from '@/types/api';
+
+const KIND_CONFIG: Record<DataKind, { label: string; fg: string; bg: string; border: string }> = {
+  vector: {
+    label: 'VEC',
+    fg: 'text-type-vector',
+    bg: 'bg-type-vector-bg',
+    border: 'border-type-vector/20',
+  },
+  raster: {
+    label: 'RAS',
+    fg: 'text-type-raster',
+    bg: 'bg-type-raster-bg',
+    border: 'border-type-raster/20',
+  },
+  table: {
+    label: 'TAB',
+    fg: 'text-type-table',
+    bg: 'bg-type-table-bg',
+    border: 'border-type-table/20',
+  },
+  vrt: {
+    label: 'VRT',
+    fg: 'text-type-vrt',
+    bg: 'bg-type-vrt-bg',
+    border: 'border-type-vrt/20',
+  },
+  tiles3d: {
+    label: '3DT',
+    fg: 'text-type-tiles3d',
+    bg: 'bg-type-tiles3d-bg',
+    border: 'border-type-tiles3d/20',
+  },
+  pointcloud: {
+    label: 'PTS',
+    fg: 'text-type-tiles3d',
+    bg: 'bg-type-tiles3d-bg',
+    border: 'border-type-tiles3d/20',
+  },
+};
+
+interface TypeTagProps {
+  kind: DataKind;
+  size?: 'sm' | 'md';
+  className?: string;
+}
+
+export function TypeTag({ kind, size = 'md', className }: TypeTagProps) {
+  const cfg = KIND_CONFIG[kind];
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center justify-center rounded-lg border font-mono font-bold uppercase tracking-wider',
+        cfg.fg,
+        cfg.bg,
+        cfg.border,
+        size === 'sm' ? 'h-6 w-6 text-2xs' : 'h-8 w-8 text-2xs',
+        className,
+      )}
+    >
+      {cfg.label}
+    </span>
+  );
+}
+
+/** Inline pill variant for format badges (e.g., ".gpkg" with VEC prefix) */
+export function FormatPill({ kind, ext }: { kind: DataKind; ext: string }) {
+  const cfg = KIND_CONFIG[kind];
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-0 px-2 py-0.5 font-mono text-mini text-muted-foreground">
+      <span
+        className={cn(
+          'rounded-sm px-1 py-px text-2xs font-bold uppercase tracking-wider',
+          cfg.fg,
+          cfg.bg,
+        )}
+      >
+        {cfg.label}
+      </span>
+      {ext}
+    </span>
+  );
+}
+
+/** Infer DataKind from file extension */
+export function kindFromExtension(ext: string): DataKind {
+  const e = ext.toLowerCase();
+  if (['.tif', '.tiff', '.cog', '.nc', '.vrt'].includes(e)) return 'raster';
+  if (e === '.laz') return 'pointcloud';
+  // .parquet is vector: GeoParquet carries geometry; plain tabular parquet
+  // degrades to a joinable table at import like a geometry-less CSV.
+  // .fgb/.kml/.kmz fall through to vector for the same reason .gpkg does:
+  // every one of them is a geometry-carrying format.
+  if (['.csv', '.xlsx', '.xls'].includes(e)) return 'table';
+  return 'vector';
+}
+
+export type { DataKind } from '@/types/api';

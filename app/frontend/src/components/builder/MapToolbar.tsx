@@ -1,0 +1,209 @@
+import { useEffect, useMemo, type ComponentType } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Hand, Ruler, Layers, FileJson, Keyboard } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { usePluginStore } from '@/stores/map-plugin-store';
+import { useEnabledPlugins } from '@/hooks/use-settings';
+import { getEnabledPluginDefinitions } from '@/components/map-plugins';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
+
+/**
+ * Floating toolbar centered at the top of the map canvas, grouped into
+ * navigation | plugins.
+ *
+ * There is deliberately no global terrain toggle: terrain is layer-owned and
+ * activates through a DEM layer's editor scene (render mode + exaggeration live
+ * with the layer supplying the elevation data), so a map without a DEM layer
+ * has nothing for a global toggle to enable. Revisit only alongside a global
+ * base DEM giving every map a default source.
+ */
+interface MapToolbarProps {
+  onStyleJsonClick?: () => void;
+  onShortcutsClick?: () => void;
+}
+
+export function MapToolbar({ onStyleJsonClick, onShortcutsClick }: MapToolbarProps) {
+  const { t } = useTranslation('builder');
+  const activePlugins = usePluginStore((s) => s.activePlugins);
+  const toggle = usePluginStore((s) => s.toggle);
+  const close = usePluginStore((s) => s.close);
+  const enabledPluginsQuery = useEnabledPlugins();
+  const enabledPluginIds = useMemo(
+    () => enabledPluginsQuery.data ?? (enabledPluginsQuery.isLoading ? [] : null),
+    [enabledPluginsQuery.data, enabledPluginsQuery.isLoading],
+  );
+  const availablePlugins = useMemo(
+    () => getEnabledPluginDefinitions(enabledPluginIds),
+    [enabledPluginIds],
+  );
+  const measurementPlugin = availablePlugins.find((plugin) => plugin.id === 'measurement');
+  const legendPlugin = availablePlugins.find((plugin) => plugin.id === 'legend');
+  const LegendIcon = legendPlugin?.icon ?? Layers;
+  const measureActive = !!measurementPlugin && activePlugins.has('measurement');
+  const legendActive = !!legendPlugin && activePlugins.has('legend');
+
+  const navTools = useMemo(() => {
+    const tools: Array<{
+      id: string;
+      icon: ComponentType<{ className?: string }>;
+      label: string;
+      shortcut: string;
+      active: boolean;
+      onClick: () => void;
+    }> = [{
+      id: 'pan',
+      icon: Hand,
+      label: t('toolbar.pan', { defaultValue: 'Pan' }),
+      shortcut: 'V',
+      active: !measureActive,
+      onClick: () => { if (activePlugins.has('measurement')) close('measurement'); },
+    }];
+    if (measurementPlugin) {
+      tools.push({
+        id: 'measure',
+        icon: measurementPlugin.icon ?? Ruler,
+        label: t('plugins.measurement.label', { defaultValue: 'Measure' }),
+        shortcut: 'M',
+        active: measureActive,
+        onClick: () => { toggle('measurement'); },
+      });
+    }
+    return tools;
+  }, [activePlugins, close, measureActive, measurementPlugin, toggle, t]);
+
+  // The shortcuts sheet and these buttons' tooltips advertise V/M/L. Guarded
+  // like MapBuilderPage's '?' hotkey: no-op while typing, with modifier keys
+  // held, or when a dialog is open.
+  useEffect(() => {
+    function handleToolHotkey(e: KeyboardEvent) {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const key = e.key.toLowerCase();
+      if (key !== 'v' && key !== 'm' && key !== 'l') return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+        if (target.isContentEditable) return;
+      }
+      if (document.querySelector('[role="dialog"][data-state="open"]')) return;
+      if (key === 'v') {
+        if (activePlugins.has('measurement')) close('measurement');
+      } else if (key === 'm') {
+        if (measurementPlugin) toggle('measurement');
+      } else if (legendPlugin) {
+        toggle('legend');
+      }
+    }
+    window.addEventListener('keydown', handleToolHotkey);
+    return () => window.removeEventListener('keydown', handleToolHotkey);
+  }, [activePlugins, close, toggle, measurementPlugin, legendPlugin]);
+
+  return (
+    <TooltipProvider delayDuration={300}>
+      <div className="absolute top-3 left-1/2 -translate-x-1/2 z-[5]">
+        <div className="inline-flex items-center gap-0.5 p-0.5 bg-background/95 backdrop-blur-sm border rounded-lg shadow-md">
+          {/* Navigation tools (Pan / Measure) */}
+          {navTools.map((tool) => (
+            <Tooltip key={tool.id}>
+              <TooltipTrigger asChild>
+                <button
+                  onClick={tool.onClick}
+                  className={cn(
+                    'flex cursor-pointer items-center justify-center h-7 w-7 rounded-md transition-[color,background-color,box-shadow,border-color,opacity] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                    tool.active
+                      ? 'bg-foreground text-background'
+                      : 'text-muted-foreground hover:bg-accent hover:text-foreground',
+                  )}
+                  aria-label={tool.label}
+                  aria-pressed={tool.active}
+                >
+                  <tool.icon className="h-3.5 w-3.5" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="text-xs">
+                {tool.label}
+                <span className="ms-1.5 font-mono text-2xs text-muted-foreground">{tool.shortcut}</span>
+              </TooltipContent>
+            </Tooltip>
+          ))}
+
+          {legendPlugin && (
+            <>
+              {/* Divider */}
+              <div className="w-px h-4 bg-border mx-0.5" />
+
+              {/* Plugin toggles (Legend) */}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={() => toggle('legend')}
+                    className={cn(
+                      'flex cursor-pointer items-center justify-center h-7 w-7 rounded-md transition-[color,background-color,box-shadow,border-color,opacity] duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                      legendActive
+                        ? 'bg-foreground text-background'
+                        : 'text-muted-foreground hover:bg-accent hover:text-foreground',
+                    )}
+                    aria-label={t('plugins.legend.label', { defaultValue: 'Legend' })}
+                    aria-pressed={legendActive}
+                  >
+                    <LegendIcon className="h-3.5 w-3.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  {t('plugins.legend.label', { defaultValue: 'Legend' })}
+                  <span className="ms-1.5 font-mono text-2xs text-muted-foreground">L</span>
+                </TooltipContent>
+              </Tooltip>
+            </>
+          )}
+
+          {onStyleJsonClick && (
+            <>
+              <div className="w-px h-4 bg-border mx-0.5" />
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={onStyleJsonClick}
+                    className="flex cursor-pointer items-center justify-center h-7 w-7 rounded-md text-muted-foreground transition-[color,background-color,box-shadow,border-color,opacity] duration-200 ease-out hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label={t('toolbar.styleJson', { defaultValue: 'Style JSON' })}
+                  >
+                    <FileJson className="h-3.5 w-3.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  {t('toolbar.styleJson', { defaultValue: 'Style JSON' })}
+                </TooltipContent>
+              </Tooltip>
+            </>
+          )}
+
+          {onShortcutsClick && (
+            <>
+              <div className="w-px h-4 bg-border mx-0.5" />
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={onShortcutsClick}
+                    className="flex cursor-pointer items-center justify-center h-7 w-7 rounded-md text-muted-foreground transition-[color,background-color,box-shadow,border-color,opacity] duration-200 ease-out hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label={t('a11y.shortcuts.title', { defaultValue: 'Keyboard shortcuts' })}
+                  >
+                    <Keyboard className="h-3.5 w-3.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  {t('a11y.shortcuts.title', { defaultValue: 'Keyboard shortcuts' })}
+                  <span className="ms-1.5 font-mono text-2xs text-muted-foreground">?</span>
+                </TooltipContent>
+              </Tooltip>
+            </>
+          )}
+        </div>
+      </div>
+    </TooltipProvider>
+  );
+}

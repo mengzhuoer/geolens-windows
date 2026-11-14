@@ -1,0 +1,19 @@
+.git
+.env
+.env.*
+node_modules/
+dist/
+*.md
+.claude/
+npm-debug.log*
+.npm/
+coverage/
+.eslintcache
+
+# secrets / TLS material — Dockerfile.dev does
+# `COPY . .`, so a stray key/cert here would bake into the dev image layer.
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx

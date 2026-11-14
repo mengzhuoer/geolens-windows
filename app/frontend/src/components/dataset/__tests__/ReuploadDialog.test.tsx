@@ -1,0 +1,1873 @@
+import { act, render as rtlRender, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { QueryClient, QueryClientProvider, onlineManager } from '@tanstack/react-query';
+import { render } from '@/test/test-utils';
+import {
+  useReuploadDataset,
+  useReuploadPreview,
+  useReuploadServicePreview,
+  useReuploadCommit,
+} from '@/components/dataset/hooks/use-dataset';
+import { useJobStatus, useUploadConfig } from '@/components/import/hooks/use-ingest';
+import { probeService } from '@/api/ingest';
+import { useRefreshSearchWhenQuicklookLands } from '@/components/dataset/hooks/use-quicklook-settled';
+import { getDataset, getDatasetRefreshRuns } from '@/api/datasets';
+import { ApiError } from '@/api/client';
+import { queryKeys } from '@/lib/query-keys';
+import { changeTestLanguage } from '@/test/i18n';
+import { ReuploadDialog } from '../ReuploadDialog';
+import type { DatasetResponse, ProbeResponse, RecordType, ReuploadPreviewResponse } from '@/types/api';
+
+let dropHandler: ((acceptedFiles: File[]) => void) | null = null;
+
+vi.mock('react-dropzone', () => ({
+  useDropzone: vi.fn((options: { onDrop: (acceptedFiles: File[]) => void }) => {
+    dropHandler = options.onDrop;
+    return {
+      getRootProps: (props: Record<string, unknown> = {}) => props,
+      getInputProps: () => ({}),
+      isDragActive: false,
+      isDragReject: false,
+    };
+  }),
+}));
+
+vi.mock('@/components/dataset/hooks/use-dataset', () => ({
+  useReuploadDataset: vi.fn(),
+  useReuploadPreview: vi.fn(),
+  useReuploadServicePreview: vi.fn(),
+  useReuploadCommit: vi.fn(),
+}));
+
+vi.mock('@/components/import/hooks/use-ingest', () => ({
+  useUploadConfig: vi.fn(),
+  useJobStatus: vi.fn(),
+}));
+
+vi.mock('@/components/dataset/hooks/use-quicklook-settled', () => ({
+  useRefreshSearchWhenQuicklookLands: vi.fn(),
+}));
+
+vi.mock('@/api/ingest', () => ({
+  probeService: vi.fn(),
+}));
+
+vi.mock('@/api/datasets', () => ({
+  reuploadPresigned: vi.fn(),
+  getDataset: vi.fn(),
+  getDatasetRefreshRuns: vi.fn(),
+}));
+
+vi.mock('sonner', () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+    message: vi.fn(),
+  },
+}));
+
+const mockUseReuploadDataset = vi.mocked(useReuploadDataset);
+const mockUseReuploadPreview = vi.mocked(useReuploadPreview);
+const mockUseReuploadServicePreview = vi.mocked(useReuploadServicePreview);
+const mockUseReuploadCommit = vi.mocked(useReuploadCommit);
+const mockUseUploadConfig = vi.mocked(useUploadConfig);
+const mockUseJobStatus = vi.mocked(useJobStatus);
+const mockProbeService = vi.mocked(probeService);
+const mockGetDataset = vi.mocked(getDataset);
+
+const uploadMutateAsync = vi.fn();
+const previewMutateAsync = vi.fn();
+const servicePreviewMutateAsync = vi.fn();
+const commitMutateAsync = vi.fn();
+
+function makeDataset(): DatasetResponse {
+  return {
+    id: 'dataset-1',
+    record_id: 'record-1',
+    table_name: 'roads',
+    source_health: 'unknown',
+    schema_drift_status: 'unknown',
+    source_freshness: 'unknown',
+    has_generic_geometry: false,
+    title: 'Roads',
+    summary: 'Road centerlines',
+    srid: 4326,
+    geometry_type: 'LineString',
+    feature_count: 42,
+    extent_bbox: [-1, -1, 1, 1],
+    column_info: [{ name: 'name', type: 'text' }],
+    license: null,
+    attribution: null,
+    source_organization: null,
+    data_vintage_start: null,
+    data_vintage_end: null,
+    source_format: 'GeoJSON',
+    source_filename: 'roads.geojson',
+    original_srid: 4326,
+    visibility: 'public',
+    created_by: 'user-1',
+    created_by_display: 'editor-user',
+    created_at: '2026-03-01T00:00:00Z',
+    updated_at: '2026-03-01T00:00:00Z',
+    last_edited_by_display: null,
+    last_edited_at: null,
+    record_status: 'published',
+    lineage_summary: null,
+    update_frequency: null,
+    usage_constraints: null,
+    access_constraints: null,
+    sensitivity_classification: null,
+    theme_category: null,
+    owner_org: null,
+    published_at: null,
+    updated_by: null,
+    current_version: 1,
+    source_url: null,
+    quality_statement: null,
+    collections: [],
+    tile_columns: null,
+    quality_detail: null,
+    record_type: 'vector_dataset',
+    raster: null,
+  };
+}
+
+// #1289: raster reupload fixture — upload -> commit, no schema preview.
+function makeRasterDataset(): DatasetResponse {
+  return {
+    ...makeDataset(),
+    id: 'dataset-raster-1',
+    table_name: 'ortho',
+    title: 'Orthophoto',
+    source_format: 'GeoTIFF',
+    source_filename: 'ortho.tif',
+    record_type: 'raster_dataset',
+    raster: {
+      tile_url: '/raster-tiles/dataset-raster-1/{z}/{x}/{y}.png',
+    } as DatasetResponse['raster'],
+  };
+}
+
+function makeProbeResponse(): ProbeResponse {
+  return {
+    service_type: 'WFS',
+    url: 'https://example.com/wfs',
+    selected_layer_id: null,
+    layers: [
+      {
+        name: 'parcels',
+        title: 'Parcels',
+        geometry_type: 'Polygon',
+        feature_count: 12,
+        layer_type: 'vector',
+        layer_id: 1,
+        object_id_field: null,
+        importable: true,
+        kind: 'vector' as const,
+      },
+      {
+        name: 'roads',
+        title: 'Roads',
+        geometry_type: 'LineString',
+        feature_count: 30,
+        layer_type: 'vector',
+        layer_id: 2,
+        object_id_field: null,
+        importable: true,
+        kind: 'vector' as const,
+      },
+    ],
+  };
+}
+
+function makePreviewResponse(
+  overrides: Partial<ReuploadPreviewResponse> = {},
+): ReuploadPreviewResponse {
+  return {
+    job_id: 'job-1',
+    source_filename: 'roads.geojson',
+    columns: [{ name: 'name', type: 'text' }],
+    crs: 4326,
+    geometry_type: 'LineString',
+    feature_count: 42,
+    sample_rows: [{ name: 'Main St' }],
+    layer_name: 'roads',
+    schema_diff: {
+      columns_added: [],
+      columns_removed: [],
+      type_changes: [],
+      row_count_old: 40,
+      row_count_new: 42,
+      row_count_delta: 2,
+    },
+    // Default single-layer — null means no layer-select step
+    all_layers: null,
+    previous_source_layer: null,
+    ...overrides,
+  };
+}
+
+function renderDialog() {
+  render(
+    <ReuploadDialog
+      dataset={makeDataset()}
+      open
+      onOpenChange={vi.fn()}
+    />,
+  );
+}
+
+function renderRasterDialog() {
+  render(
+    <ReuploadDialog
+      dataset={makeRasterDataset()}
+      open
+      onOpenChange={vi.fn()}
+    />,
+  );
+}
+
+async function openFileSource(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole('button', { name: 'File' }));
+  expect(screen.getByTestId('reupload-file-dropzone')).toBeInTheDocument();
+}
+
+async function dropFile(fileName = 'roads.geojson') {
+  const file = new File(['{}'], fileName, { type: 'application/geo+json' });
+  await act(async () => {
+    if (!dropHandler) {
+      throw new Error('drop handler not ready');
+    }
+    dropHandler([file]);
+  });
+}
+
+async function openServicePreview(
+  user: ReturnType<typeof userEvent.setup>,
+  options: { token?: string } = {},
+) {
+  await user.click(screen.getByRole('button', { name: 'Service URL' }));
+  await user.type(
+    screen.getByLabelText('Service URL'),
+    'https://example.com/wfs',
+  );
+  if (options.token) {
+    await user.type(screen.getByLabelText('Access Token (optional)'), options.token);
+  }
+  await user.click(screen.getByRole('button', { name: 'Connect' }));
+  await screen.findByText('Select a layer');
+  await user.click(screen.getByText('Parcels'));
+  await user.click(screen.getByRole('button', { name: 'Preview Layer' }));
+  await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+}
+
+describe('ReuploadDialog', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dropHandler = null;
+
+    uploadMutateAsync.mockResolvedValue({ job_id: 'file-job' });
+    previewMutateAsync.mockResolvedValue(
+      makePreviewResponse({ job_id: 'file-job' }),
+    );
+    servicePreviewMutateAsync.mockResolvedValue(
+      makePreviewResponse({
+        job_id: 'service-job',
+        source_filename: 'Parcels',
+        layer_name: 'parcels',
+      }),
+    );
+    commitMutateAsync.mockResolvedValue({
+      job_id: 'commit-job',
+      status: 'pending',
+      message: 'queued',
+    });
+    mockProbeService.mockResolvedValue(makeProbeResponse());
+
+    mockUseReuploadDataset.mockReturnValue({
+      mutateAsync: uploadMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadDataset>);
+    mockUseReuploadPreview.mockReturnValue({
+      mutateAsync: previewMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadPreview>);
+    mockUseReuploadServicePreview.mockReturnValue({
+      mutateAsync: servicePreviewMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadServicePreview>);
+    mockUseReuploadCommit.mockReturnValue({
+      mutateAsync: commitMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadCommit>);
+    mockUseUploadConfig.mockReturnValue({
+      data: {
+        presigned_uploads: false,
+        presigned_threshold_bytes: 10485760,
+        max_file_size_bytes: 524288000,
+        allowed_extensions: '.zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls',
+      },
+    } as unknown as ReturnType<typeof useUploadConfig>);
+    mockUseJobStatus.mockReturnValue({
+      data: null,
+    } as unknown as ReturnType<typeof useJobStatus>);
+  });
+
+  it('renders source selector and allows switching between service and file sources', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    expect(screen.getByTestId('reupload-source-selector')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Service URL' }));
+    expect(screen.getByLabelText('Service URL')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    expect(screen.getByTestId('reupload-source-selector')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    expect(screen.getByTestId('reupload-file-dropzone')).toBeInTheDocument();
+  });
+
+  it('skips a layer without features when preselecting and refuses to select it', async () => {
+    const user = userEvent.setup();
+    const probe = makeProbeResponse();
+    probe.layers = [
+      {
+        ...probe.layers[0],
+        name: 'detailed',
+        title: 'Detailed',
+        source_layer_type: 'Group Layer',
+        importable: false,
+      },
+      probe.layers[1],
+    ];
+    mockProbeService.mockResolvedValue(probe);
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'Service URL' }));
+    await user.type(screen.getByLabelText('Service URL'), 'https://example.com/wfs');
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    await screen.findByText('Select a layer');
+
+    expect(screen.getByText('Group Layer holds no features and cannot be re-uploaded from.')).toBeInTheDocument();
+    await user.click(screen.getByText('Detailed'));
+    expect(screen.getByRole('button', { name: 'Preview Layer' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Preview Layer' }));
+    await waitFor(() =>
+      expect(servicePreviewMutateAsync).toHaveBeenCalledWith(
+        expect.objectContaining({
+          request: expect.objectContaining({ layer_name: 'roads' }),
+        }),
+      ),
+    );
+  });
+
+  it('renders nothing for an unknown record type', () => {
+    render(
+      <ReuploadDialog
+        dataset={{ ...makeDataset(), record_type: 'hologram_dataset' as RecordType }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it.each(['tiles3d_dataset', 'pointcloud_dataset'] as const)('renders nothing for a %s', (recordType) => {
+    render(
+      <ReuploadDialog
+        dataset={{ ...makeDataset(), record_type: recordType }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  // This is a request-only service token, not a login credential,
+  // so it must opt every password manager out explicitly.
+  it('opts every password manager out of the service token field', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'Service URL' }));
+
+    const input = screen.getByLabelText('Access Token (optional)');
+    expect(input).toHaveAttribute('type', 'password');
+    expect(input).toHaveAttribute('autocomplete', 'new-password');
+    expect(input).toHaveAttribute('data-1p-ignore');
+    expect(input).toHaveAttribute('data-lpignore', 'true');
+    expect(input).toHaveAttribute('data-bwignore');
+  });
+
+  it('advertises only formats supported by vector and table reupload', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await openFileSource(user);
+
+    expect(screen.getByText('.geojson')).toBeInTheDocument();
+    expect(screen.queryByText('.tif')).not.toBeInTheDocument();
+    expect(screen.queryByText('.tiff')).not.toBeInTheDocument();
+    expect(screen.queryByText('.vrt')).not.toBeInTheDocument();
+  });
+
+  it('does not offer a .3tz tileset archive or a .laz point cloud', async () => {
+    mockUseUploadConfig.mockReturnValue({
+      data: {
+        presigned_uploads: false,
+        presigned_threshold_bytes: 10485760,
+        max_file_size_bytes: 524288000,
+        allowed_extensions: '.zip,.geojson,.3tz,.laz',
+      },
+    } as unknown as ReturnType<typeof useUploadConfig>);
+    const user = userEvent.setup();
+    renderDialog();
+
+    await openFileSource(user);
+
+    expect(screen.getByText('.geojson')).toBeInTheDocument();
+    expect(screen.queryByText('.3tz')).not.toBeInTheDocument();
+    expect(screen.queryByText('.laz')).not.toBeInTheDocument();
+  });
+
+  it('moves through service probe and layer selection into schema diff preview', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await openServicePreview(user);
+
+    expect(servicePreviewMutateAsync).toHaveBeenCalledWith({
+      datasetId: 'dataset-1',
+      request: expect.objectContaining({
+        url: 'https://example.com/wfs',
+        service_type: 'WFS',
+        layer_name: 'parcels',
+      }),
+    });
+    expect(screen.getByRole('button', { name: 'Confirm Re-Upload' })).toBeInTheDocument();
+  });
+
+  it('sends no commit token for file-source re-upload', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    const payload = commitMutateAsync.mock.calls[0][0];
+    expect(payload.datasetId).toBe('dataset-1');
+    expect(payload.jobId).toBe('file-job');
+    expect(payload.token).toBeUndefined();
+  });
+
+  it('includes service token in commit payload when provided', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await openServicePreview(user, { token: 'secret-token' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    const payload = commitMutateAsync.mock.calls[0][0];
+    expect(payload.datasetId).toBe('dataset-1');
+    expect(payload.jobId).toBe('service-job');
+    expect(payload.token).toBe('secret-token');
+  });
+
+  it('omits service token in commit payload when not provided', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await openServicePreview(user);
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    const payload = commitMutateAsync.mock.calls[0][0];
+    expect(payload.token).toBeUndefined();
+  });
+
+  it('shows schema warning copy for file-source previews with destructive changes', async () => {
+    const user = userEvent.setup();
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        schema_diff: {
+          columns_added: [],
+          columns_removed: [{ name: 'legacy_col', type: 'text' }],
+          type_changes: [],
+          row_count_old: 40,
+          row_count_new: 42,
+          row_count_delta: 2,
+        },
+      }),
+    );
+    renderDialog();
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByText(
+      'Warning: This re-upload includes schema changes that may affect existing queries.',
+    );
+  });
+
+  it('lists the review reasons and sends the fingerprint of what it showed', async () => {
+    const user = userEvent.setup();
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        review_reasons: ['destructive_schema_change', 'geometry_type_changed'],
+        review_fingerprint: 'a'.repeat(64),
+      }),
+    );
+    renderDialog();
+
+    await openFileSource(user);
+    await dropFile();
+    const reasons = await screen.findByRole('list', { name: 'Changes that need review' });
+    expect(reasons).toHaveTextContent('The new data removes columns or changes their types.');
+    expect(reasons).toHaveTextContent('The new data changes the geometry type.');
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    expect(commitMutateAsync.mock.calls[0][0].reviewFingerprint).toBe('a'.repeat(64));
+  });
+
+  it('sends the review fingerprint with a service-source commit', async () => {
+    const user = userEvent.setup();
+    servicePreviewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({ job_id: 'service-job', review_fingerprint: 'b'.repeat(64) }),
+    );
+    renderDialog();
+
+    await openServicePreview(user);
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    expect(commitMutateAsync.mock.calls[0][0].reviewFingerprint).toBe('b'.repeat(64));
+  });
+
+  it('pre-fills service URL from dataset source_url', async () => {
+    const user = userEvent.setup();
+    const dataset = makeDataset();
+    dataset.source_url = 'https://services.arcgis.com/org/arcgis/rest/services/Layer/FeatureServer';
+
+    render(
+      <ReuploadDialog
+        dataset={dataset}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Service URL' }));
+    const urlInput = screen.getByLabelText('Service URL') as HTMLInputElement;
+    expect(urlInput.value).toBe(
+      'https://services.arcgis.com/org/arcgis/rest/services/Layer/FeatureServer',
+    );
+  });
+
+  it('service URL is empty when dataset has no source_url', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'Service URL' }));
+    const urlInput = screen.getByLabelText('Service URL') as HTMLInputElement;
+    expect(urlInput.value).toBe('');
+  });
+
+  it('shows schema warning copy for service-source previews with destructive changes', async () => {
+    const user = userEvent.setup();
+    servicePreviewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'service-warning-job',
+        layer_name: 'parcels',
+        source_filename: 'Parcels',
+        schema_diff: {
+          columns_added: [],
+          columns_removed: [],
+          type_changes: [
+            { name: 'parcel_id', old_type: 'integer', new_type: 'text' },
+          ],
+          row_count_old: 10,
+          row_count_new: 10,
+          row_count_delta: 0,
+        },
+      }),
+    );
+    renderDialog();
+
+    await openServicePreview(user);
+    expect(
+      screen.getByText(
+        'Warning: This re-upload includes schema changes that may affect existing queries.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  // Guard — service URL preview still uses service layer name, not file-path layer
+  it('service URL preview Layer: line uses service layer name (not file-path layer)', async () => {
+    const user = userEvent.setup();
+    servicePreviewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'service-job',
+        layer_name: 'parcels',
+        source_filename: 'Parcels',
+      }),
+    );
+    renderDialog();
+
+    await openServicePreview(user);
+
+    // The preview pane should show "Layer:" followed by the service layer name ('Parcels')
+    expect(screen.getByText(/Layer:/)).toBeInTheDocument();
+    // The service layer humanized name "Parcels" (from probeResult layer title) should be visible
+    expect(screen.getByText('Parcels')).toBeInTheDocument();
+    // There should be NO "File:" header line in service-URL preview
+    expect(screen.queryByText(/^File:/)).not.toBeInTheDocument();
+  });
+
+  // The commit carries the origin the dialog SAW when it staged
+  // the replacement, so the server can refuse a dataset rebound mid-flow
+  // instead of severing the new binding on the swap.
+  it('sends the origin it saw with a file-source commit', async () => {
+    const user = userEvent.setup();
+    render(
+      <ReuploadDialog
+        dataset={{ ...makeDataset(), origin: 'upload' }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    expect(commitMutateAsync.mock.calls[0][0].expectedOriginKind).toBe('upload');
+  });
+
+  it('sends the origin it saw with a service-source commit', async () => {
+    const user = userEvent.setup();
+    render(
+      <ReuploadDialog
+        dataset={{ ...makeDataset(), origin: 'service' }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    await openServicePreview(user);
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    expect(commitMutateAsync.mock.calls[0][0].expectedOriginKind).toBe('service');
+  });
+
+  it('asserts no origin when the dataset reports none', async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    expect(commitMutateAsync.mock.calls[0][0].expectedOriginKind).toBeNull();
+  });
+
+  it('sends the staged origin, not the origin the live dataset now reports', async () => {
+    // The point of the condition: `dataset` is a live query result, so a
+    // rebinding that lands mid-flow updates the prop. Reading it at confirm
+    // time would send the changed value and always agree with the server,
+    // which is exactly the race #1768 is about.
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <ReuploadDialog
+        dataset={{ ...makeDataset(), origin: 'upload' }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    rerender(
+      <ReuploadDialog
+        dataset={{ ...makeDataset(), origin: 'service' }}
+        open
+        onOpenChange={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    expect(commitMutateAsync.mock.calls[0][0].expectedOriginKind).toBe('upload');
+  });
+
+  // The refusal tells the user to start the replacement
+  // again, and `handleRetry` clears the captured origin — but the origin is
+  // re-captured from the `dataset` prop, which is served from the cache the
+  // server just disagreed with. Without the invalidation the retry re-sends
+  // the same stale kind and 409s forever.
+  // "Try Again" stays disabled until the origin refetch lands.
+  it('keeps "Try Again" disabled until the origin refetch resolves, then enables it', async () => {
+    const user = userEvent.setup();
+    commitMutateAsync.mockRejectedValueOnce(
+      new ApiError('This dataset’s source changed', 409, {
+        code: 'origin_changed',
+        origin_kind: 'service',
+        expected_origin_kind: 'upload',
+      }),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    let resolveRefetch: () => void = () => {};
+    const fetchQuery = vi.spyOn(queryClient, 'fetchQuery').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRefetch = () => resolve(undefined);
+        }),
+    );
+
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog
+          dataset={{ ...makeDataset(), origin: 'upload' }}
+          open
+          onOpenChange={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    const retryButton = await screen.findByTestId('reupload-try-again');
+    await waitFor(() => {
+      expect(retryButton).toBeDisabled();
+    });
+    expect(retryButton).toHaveTextContent('Refreshing...');
+    expect(fetchQuery).toHaveBeenCalledWith({
+      queryKey: queryKeys.datasets.detail('dataset-1'),
+      queryFn: expect.any(Function),
+      staleTime: 0,
+    });
+
+    // A click while disabled must not proceed — retrying now would still
+    // send the stale prop's origin.
+    await user.click(retryButton);
+    expect(commitMutateAsync).toHaveBeenCalledTimes(1);
+
+    resolveRefetch();
+
+    await waitFor(() => {
+      expect(retryButton).not.toBeDisabled();
+    });
+    expect(retryButton).toHaveTextContent('Try Again');
+  });
+
+  it('shows the refetch error and keeps "Try Again" disabled when the origin refetch fails', async () => {
+    const user = userEvent.setup();
+    commitMutateAsync.mockRejectedValueOnce(
+      new ApiError('This dataset’s source changed', 409, {
+        code: 'origin_changed',
+        origin_kind: 'service',
+        expected_origin_kind: 'upload',
+      }),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    vi.spyOn(queryClient, 'fetchQuery').mockRejectedValue(new Error('network error'));
+
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog
+          dataset={{ ...makeDataset(), origin: 'upload' }}
+          open
+          onOpenChange={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await screen.findByText(
+      "Could not refresh the dataset's info after this conflict. Reload the page and try again.",
+    );
+    // The original commit error is superseded — retrying is dead either way,
+    // and the refetch failure is the one the user needs to act on.
+    expect(screen.queryByText('This dataset’s source changed')).not.toBeInTheDocument();
+
+    const retryButton = screen.getByTestId('reupload-try-again');
+    expect(retryButton).toBeDisabled();
+    expect(retryButton).toHaveTextContent('Try Again');
+  });
+
+  it('does not touch the origin refetch or disable "Try Again" for an unrelated commit failure', async () => {
+    // The counterfactual's other half: the recovery refetch is keyed on the
+    // refusal code, not fired on every commit error.
+    const user = userEvent.setup();
+    commitMutateAsync.mockRejectedValueOnce(
+      new ApiError('A refresh is already running', 409, { code: 'dataset_busy' }),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    const fetchQuery = vi.spyOn(queryClient, 'fetchQuery').mockResolvedValue(undefined);
+
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog
+          dataset={{ ...makeDataset(), origin: 'upload' }}
+          open
+          onOpenChange={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await screen.findByText('A refresh is already running');
+    const retryButton = screen.getByTestId('reupload-try-again');
+    expect(retryButton).not.toBeDisabled();
+    expect(retryButton).toHaveTextContent('Try Again');
+    expect(fetchQuery).not.toHaveBeenCalled();
+  });
+
+  // DatasetPage always renders ReuploadDialog and only
+  // toggles its `open` prop, so closing it does not unmount the component —
+  // a refetch started before the close keeps running after resetState.
+  it('ignores a stale refetch completion from before a reset (dialog closed mid-refetch)', async () => {
+    const user = userEvent.setup();
+    const originChangedError = () =>
+      new ApiError('This dataset’s source changed', 409, {
+        code: 'origin_changed',
+        origin_kind: 'service',
+        expected_origin_kind: 'upload',
+      });
+    commitMutateAsync
+      .mockRejectedValueOnce(originChangedError())
+      .mockRejectedValueOnce(originChangedError());
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    let settleFirst: () => void = () => {};
+    let settleSecond: () => void = () => {};
+    vi.spyOn(queryClient, 'fetchQuery')
+      .mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            settleFirst = () => reject(new Error('cancelled'));
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            settleSecond = () => resolve(undefined);
+          }),
+      );
+
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog
+          dataset={{ ...makeDataset(), origin: 'upload' }}
+          open
+          onOpenChange={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    // First attempt: origin_changed, refetch #1 starts and hangs.
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    let retryButton = await screen.findByTestId('reupload-try-again');
+    await waitFor(() => expect(retryButton).toBeDisabled());
+
+    // Close while refetch #1 is still in flight.
+    await user.click(within(retryButton.parentElement as HTMLElement).getByRole('button', { name: 'Close' }));
+
+    // Re-stage and confirm again: a second origin_changed, a second refetch.
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    retryButton = await screen.findByTestId('reupload-try-again');
+    await waitFor(() => expect(retryButton).toBeDisabled());
+
+    // Attempt #1 settles late (as a cancellation would) — must be ignored.
+    settleFirst();
+    await waitFor(() => {
+      expect(
+        screen.queryByText(
+          "Could not refresh the dataset's info after this conflict. Reload the page and try again.",
+        ),
+      ).not.toBeInTheDocument();
+    });
+    expect(retryButton).toBeDisabled();
+
+    // Attempt #2 succeeds — it governs the UI.
+    settleSecond();
+    await waitFor(() => expect(retryButton).not.toBeDisabled());
+    expect(retryButton).toHaveTextContent('Try Again');
+  });
+
+  // Retry stays disabled through an offline
+  // pause. Real QueryClient/fetchQuery (no spy) to exercise TanStack
+  // Query's own pause/resume.
+  it('keeps "Try Again" disabled while offline, then enables it once reconnecting lets the fetch land', async () => {
+    const user = userEvent.setup();
+    commitMutateAsync.mockRejectedValueOnce(
+      new ApiError('This dataset’s source changed', 409, {
+        code: 'origin_changed',
+        origin_kind: 'service',
+        expected_origin_kind: 'upload',
+      }),
+    );
+    mockGetDataset.mockResolvedValue({ ...makeDataset(), origin: 'upload' });
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+
+    try {
+      onlineManager.setOnline(false);
+
+      rtlRender(
+        <QueryClientProvider client={queryClient}>
+          <ReuploadDialog
+            dataset={{ ...makeDataset(), origin: 'upload' }}
+            open
+            onOpenChange={vi.fn()}
+          />
+        </QueryClientProvider>,
+      );
+
+      await openFileSource(user);
+      await dropFile();
+      await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+      await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+      const retryButton = await screen.findByTestId('reupload-try-again');
+      await waitFor(() => expect(retryButton).toBeDisabled());
+      // Paused: the fetch never actually runs while offline.
+      expect(mockGetDataset).not.toHaveBeenCalled();
+      expect(
+        screen.queryByText(
+          "Could not refresh the dataset's info after this conflict. Reload the page and try again.",
+        ),
+      ).not.toBeInTheDocument();
+
+      onlineManager.setOnline(true);
+
+      await waitFor(() => expect(retryButton).not.toBeDisabled());
+      expect(mockGetDataset).toHaveBeenCalled();
+      expect(retryButton).toHaveTextContent('Try Again');
+    } finally {
+      onlineManager.setOnline(true);
+    }
+  });
+
+  // A fetch already in flight for this key
+  // (e.g. window-focus) must not let its stale resolution govern retry.
+  it('cancels an in-flight detail fetch first, so the recovery never resolves with the stale value', async () => {
+    const user = userEvent.setup();
+    commitMutateAsync.mockRejectedValueOnce(
+      new ApiError('This dataset’s source changed', 409, {
+        code: 'origin_changed',
+        origin_kind: 'service',
+        expected_origin_kind: 'upload',
+      }),
+    );
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+
+    let resolveFirst: (v: DatasetResponse) => void = () => {};
+    let resolveSecond: (v: DatasetResponse) => void = () => {};
+    mockGetDataset
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve; }));
+
+    // Something else (e.g. a window-focus refetch) already has this query
+    // in flight when origin_changed arrives.
+    const inFlight = queryClient.fetchQuery({
+      queryKey: queryKeys.datasets.detail('dataset-1'),
+      queryFn: () => getDataset('dataset-1'),
+    });
+    inFlight.catch(() => {}); // cancelled by the fix; expected to reject.
+
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog
+          dataset={{ ...makeDataset(), origin: 'upload' }}
+          open
+          onOpenChange={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    await openFileSource(user);
+    await dropFile();
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    const retryButton = await screen.findByTestId('reupload-try-again');
+    await waitFor(() => expect(retryButton).toBeDisabled());
+    await waitFor(() => expect(mockGetDataset).toHaveBeenCalledTimes(2));
+
+    // The stale (pre-conflict) resolution must not govern the UI.
+    resolveFirst({ ...makeDataset(), origin: 'service' });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(retryButton).toBeDisabled();
+
+    // Only the fresh, post-cancel fetch does.
+    resolveSecond({ ...makeDataset(), origin: 'upload' });
+    await waitFor(() => expect(retryButton).not.toBeDisabled());
+  });
+});
+
+// Multi-layer file path tests
+describe('ReuploadDialog file path multi-layer', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dropHandler = null;
+
+    uploadMutateAsync.mockResolvedValue({ job_id: 'file-job' });
+    // Default: single-layer response (null all_layers) — existing tests unaffected
+    previewMutateAsync.mockResolvedValue(
+      makePreviewResponse({ job_id: 'file-job', all_layers: null }),
+    );
+    commitMutateAsync.mockResolvedValue({
+      job_id: 'commit-job',
+      status: 'pending',
+      message: 'queued',
+    });
+
+    mockUseReuploadDataset.mockReturnValue({
+      mutateAsync: uploadMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadDataset>);
+    mockUseReuploadPreview.mockReturnValue({
+      mutateAsync: previewMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadPreview>);
+    mockUseReuploadServicePreview.mockReturnValue({
+      mutateAsync: servicePreviewMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadServicePreview>);
+    mockUseReuploadCommit.mockReturnValue({
+      mutateAsync: commitMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadCommit>);
+    mockUseUploadConfig.mockReturnValue({
+      data: {
+        presigned_uploads: false,
+        presigned_threshold_bytes: 10485760,
+        max_file_size_bytes: 524288000,
+        allowed_extensions: '.zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls',
+      },
+    } as unknown as ReturnType<typeof useUploadConfig>);
+    mockUseJobStatus.mockReturnValue({
+      data: null,
+    } as unknown as ReturnType<typeof useJobStatus>);
+  });
+
+  it('skips selecting-file-layer step for single-layer files', async () => {
+    const user = userEvent.setup();
+    // all_layers: null → skip the layer-select step
+    previewMutateAsync.mockResolvedValue(
+      makePreviewResponse({ job_id: 'file-job', all_layers: null }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile();
+
+    // Should land directly at preview step (Confirm Re-Upload visible, no layer table)
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    expect(screen.queryByTestId('reupload-file-layer-select')).not.toBeInTheDocument();
+  });
+
+  it('shows selecting-file-layer step when all_layers has multiple entries', async () => {
+    const user = userEvent.setup();
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        all_layers: [
+          { name: 'buildings', feature_count: 10, field_count: 2 },
+          { name: 'addresses', feature_count: 5, field_count: 3 },
+        ],
+        previous_source_layer: null,
+      }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile('multi.gpkg');
+
+    // Layer-select step should be visible
+    await screen.findByTestId('reupload-file-layer-select');
+    expect(screen.getByText('buildings')).toBeInTheDocument();
+    expect(screen.getByText('addresses')).toBeInTheDocument();
+  });
+
+  it('pre-selects previous_source_layer when present in all_layers', async () => {
+    const user = userEvent.setup();
+    // First preview call (initial upload) → shows layer-select
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        all_layers: [
+          { name: 'buildings', feature_count: 10, field_count: 2 },
+          { name: 'addresses', feature_count: 5, field_count: 3 },
+        ],
+        previous_source_layer: 'buildings',
+      }),
+    );
+    // Second preview call (after clicking Preview Layer) → returns normal preview
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({ job_id: 'file-job', layer_name: 'buildings' }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile('multi.gpkg');
+    await screen.findByTestId('reupload-file-layer-select');
+
+    // Preview button should be enabled (buildings was pre-selected)
+    const previewBtn = screen.getByRole('button', { name: 'Preview Layer' });
+    expect(previewBtn).not.toBeDisabled();
+
+    // Click Preview — triggers second previewMutateAsync call with layerName
+    await user.click(previewBtn);
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    // Assert second call included layerName: 'buildings'
+    const secondCall = previewMutateAsync.mock.calls[1][0];
+    expect(secondCall.layerName).toBe('buildings');
+  });
+
+  it('warns and forces explicit selection when previous_source_layer is missing from new file', async () => {
+    const user = userEvent.setup();
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        all_layers: [
+          { name: 'addresses', feature_count: 5, field_count: 3 },
+        ],
+        previous_source_layer: 'buildings',
+      }),
+    );
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({ job_id: 'file-job', layer_name: 'addresses' }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile('multi.gpkg');
+    await screen.findByTestId('reupload-file-layer-select');
+
+    // Warning message should be visible
+    expect(screen.getByText(/buildings/)).toBeInTheDocument();
+
+    // Preview button initially disabled (no layer selected — buildings is missing)
+    const previewBtn = screen.getByRole('button', { name: 'Preview Layer' });
+    expect(previewBtn).toBeDisabled();
+
+    // Click the addresses row to select it
+    await user.click(screen.getByText('addresses'));
+
+    // Preview button should now be enabled
+    expect(previewBtn).not.toBeDisabled();
+
+    // Click Preview
+    await user.click(previewBtn);
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    // Second call must include layerName: 'addresses'
+    const secondCall = previewMutateAsync.mock.calls[1][0];
+    expect(secondCall.layerName).toBe('addresses');
+  });
+
+  it('plumbs selected layer through commit', async () => {
+    const user = userEvent.setup();
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        all_layers: [
+          { name: 'buildings', feature_count: 10, field_count: 2 },
+          { name: 'addresses', feature_count: 5, field_count: 3 },
+        ],
+        previous_source_layer: 'buildings',
+      }),
+    );
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({ job_id: 'file-job', layer_name: 'buildings' }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile('multi.gpkg');
+    await screen.findByTestId('reupload-file-layer-select');
+
+    // Click Preview (buildings pre-selected)
+    await user.click(screen.getByRole('button', { name: 'Preview Layer' }));
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    // Click Confirm
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    const commitCall = commitMutateAsync.mock.calls[0][0];
+    expect(commitCall.layerName).toBe('buildings');
+  });
+
+  // Preview pane parity tests
+  it('renders Layer line in preview when selectedFileLayer is set', async () => {
+    const user = userEvent.setup();
+    // First preview: multi-layer, triggers selecting-file-layer step
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        all_layers: [
+          { name: 'buildings', feature_count: 10, field_count: 2 },
+          { name: 'addresses', feature_count: 5, field_count: 3 },
+        ],
+        previous_source_layer: 'buildings',
+      }),
+    );
+    // Second preview: after layer selection
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({ job_id: 'file-job', layer_name: 'buildings' }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile('multi.gpkg');
+    await screen.findByTestId('reupload-file-layer-select');
+
+    // Click Preview (buildings pre-selected)
+    await user.click(screen.getByRole('button', { name: 'Preview Layer' }));
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    // Both File: and Layer: lines should be visible, Layer: showing 'buildings'
+    expect(screen.getByText(/File:/)).toBeInTheDocument();
+    const layerElements = screen.getAllByText(/Layer:/);
+    expect(layerElements.length).toBeGreaterThan(0);
+    expect(screen.getByText('buildings')).toBeInTheDocument();
+  });
+
+  it('does NOT render Layer line for single-layer file', async () => {
+    const user = userEvent.setup();
+    // Single-layer: all_layers: null — skips selecting-file-layer step, selectedFileLayer stays null
+    previewMutateAsync.mockResolvedValue(
+      makePreviewResponse({ job_id: 'file-job', all_layers: null, layer_name: 'parcels' }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile('single.geojson');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    // File: line should exist; no standalone Layer: prefix in the preview header
+    expect(screen.getByText(/File:/)).toBeInTheDocument();
+    // The preview header should NOT show a Layer: line — only one <p> with File:
+    // queryByText with regex that matches only the label "Layer:" (not inside layer table header)
+    // Service layer table is not rendered here so this checks preview header only
+    const layerLabels = screen.queryAllByText('Layer:');
+    expect(layerLabels).toHaveLength(0);
+  });
+
+  it('renders schema-change advisory banner when columns_added or columns_removed is non-empty', async () => {
+    const user = userEvent.setup();
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        all_layers: [
+          { name: 'buildings', feature_count: 10, field_count: 2 },
+          { name: 'addresses', feature_count: 5, field_count: 3 },
+        ],
+        previous_source_layer: 'buildings',
+      }),
+    );
+    // Second preview: schema diff has adds and removes
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        layer_name: 'buildings',
+        schema_diff: {
+          columns_added: [{ name: 'foo', type: 'text' }],
+          columns_removed: [{ name: 'bar', type: 'integer' }],
+          type_changes: [],
+          row_count_old: 40,
+          row_count_new: 42,
+          row_count_delta: 2,
+        },
+      }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile('multi.gpkg');
+    await screen.findByTestId('reupload-file-layer-select');
+
+    await user.click(screen.getByRole('button', { name: 'Preview Layer' }));
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    // Advisory banner should be visible with the column counts
+    expect(screen.getByTestId('schema-change-advisory')).toBeInTheDocument();
+    expect(screen.getByText(/1 columns added, 1 removed/)).toBeInTheDocument();
+  });
+
+  it('does NOT render schema-change advisory when columns are identical', async () => {
+    const user = userEvent.setup();
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        all_layers: [
+          { name: 'buildings', feature_count: 10, field_count: 2 },
+          { name: 'addresses', feature_count: 5, field_count: 3 },
+        ],
+        previous_source_layer: 'buildings',
+      }),
+    );
+    // Second preview: no column changes
+    previewMutateAsync.mockResolvedValueOnce(
+      makePreviewResponse({
+        job_id: 'file-job',
+        layer_name: 'buildings',
+        schema_diff: {
+          columns_added: [],
+          columns_removed: [],
+          type_changes: [],
+          row_count_old: 40,
+          row_count_new: 42,
+          row_count_delta: 2,
+        },
+      }),
+    );
+    renderDialog();
+
+    await user.click(screen.getByRole('button', { name: 'File' }));
+    await dropFile('multi.gpkg');
+    await screen.findByTestId('reupload-file-layer-select');
+
+    await user.click(screen.getByRole('button', { name: 'Preview Layer' }));
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    // Advisory banner should NOT be rendered
+    expect(screen.queryByTestId('schema-change-advisory')).not.toBeInTheDocument();
+  });
+});
+
+// #1289: raster reupload — upload -> commit, skipping the vector
+// schema-preview step (the preview endpoint 400s for raster by design).
+describe('ReuploadDialog raster reupload', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    dropHandler = null;
+
+    uploadMutateAsync.mockResolvedValue({ job_id: 'raster-job' });
+    commitMutateAsync.mockResolvedValue({
+      job_id: 'commit-job',
+      status: 'pending',
+      message: 'queued',
+    });
+
+    mockUseReuploadDataset.mockReturnValue({
+      mutateAsync: uploadMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadDataset>);
+    mockUseReuploadPreview.mockReturnValue({
+      mutateAsync: previewMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadPreview>);
+    mockUseReuploadServicePreview.mockReturnValue({
+      mutateAsync: servicePreviewMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadServicePreview>);
+    mockUseReuploadCommit.mockReturnValue({
+      mutateAsync: commitMutateAsync,
+    } as unknown as ReturnType<typeof useReuploadCommit>);
+    mockUseUploadConfig.mockReturnValue({
+      data: {
+        presigned_uploads: false,
+        presigned_threshold_bytes: 10485760,
+        max_file_size_bytes: 524288000,
+        allowed_extensions: '.zip,.gpkg,.geojson,.json,.csv,.tif,.tiff,.xlsx,.xls',
+      },
+    } as unknown as ReturnType<typeof useUploadConfig>);
+    mockUseJobStatus.mockReturnValue({
+      data: null,
+    } as unknown as ReturnType<typeof useJobStatus>);
+  });
+
+  // Raster has no service path — the backend refuses a
+  // raster service-preview outright, so the source selector must not offer it.
+  it('shows only the File source option for raster datasets', () => {
+    renderRasterDialog();
+
+    expect(screen.getByTestId('reupload-source-selector')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'File' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Service URL' })).not.toBeInTheDocument();
+  });
+
+  it('advertises only raster formats for raster reupload', async () => {
+    const user = userEvent.setup();
+    renderRasterDialog();
+
+    await openFileSource(user);
+
+    // deriveFormatBadges collapses the .tif/.tiff alias pair into one badge.
+    expect(screen.getByText('.tif')).toBeInTheDocument();
+    expect(screen.queryByText('.tiff')).not.toBeInTheDocument();
+    expect(screen.queryByText('.geojson')).not.toBeInTheDocument();
+    expect(screen.queryByText('.gpkg')).not.toBeInTheDocument();
+    expect(screen.queryByText('.vrt')).not.toBeInTheDocument();
+  });
+
+  it('skips the schema-preview call and lands on the confirm gate', async () => {
+    const user = userEvent.setup();
+    renderRasterDialog();
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    // The preview endpoint 400s for raster by design — the raster branch
+    // must never call it.
+    expect(previewMutateAsync).not.toHaveBeenCalled();
+    expect(servicePreviewMutateAsync).not.toHaveBeenCalled();
+    // No schema diff to show for raster.
+    expect(screen.queryByTestId('schema-change-advisory')).not.toBeInTheDocument();
+    expect(screen.getByTestId('raster-preview-note')).toBeInTheDocument();
+    expect(screen.getByText(/ortho\.tif/)).toBeInTheDocument();
+  });
+
+  it('commits using the uploaded job id when confirmed', async () => {
+    const user = userEvent.setup();
+    renderRasterDialog();
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(commitMutateAsync).toHaveBeenCalled();
+    });
+    const payload = commitMutateAsync.mock.calls[0][0];
+    expect(payload.datasetId).toBe('dataset-raster-1');
+    expect(payload.jobId).toBe('raster-job');
+    expect(payload.token).toBeUndefined();
+    expect(payload.layerName).toBeUndefined();
+  });
+
+  it('shows COG-conversion progress copy while tracking the background job', async () => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'pending' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    renderRasterDialog();
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await screen.findByText('Converting to Cloud Optimized GeoTIFF...');
+    expect(
+      screen.getByText(/This can take a few minutes/),
+    ).toBeInTheDocument();
+  });
+
+  // The raster hero map's MapLibre source is added once and
+  // never re-added on prop change (the tile URL is a fixed per-dataset route,
+  // not content-versioned), so the caller needs an explicit signal to remount
+  // it once the replacement job completes.
+  it('calls onReplaceComplete once the replacement job completes', async () => {
+    const user = userEvent.setup();
+    const onReplaceComplete = vi.fn();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'complete' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+
+    render(
+      <ReuploadDialog
+        dataset={makeRasterDataset()}
+        open
+        onOpenChange={vi.fn()}
+        onReplaceComplete={onReplaceComplete}
+      />,
+    );
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(onReplaceComplete).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it.each([
+    [true, 'Nothing changed'],
+    [false, 'Re-upload complete!'],
+  ])('reads a completed replacement whose data_unchanged is %s as "%s"', async (unchanged, title) => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'complete' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    vi.mocked(getDatasetRefreshRuns).mockResolvedValue({
+      runs: [{ ingest_job_id: 'raster-job', verification: { data_unchanged: unchanged } }],
+      total: 1,
+    } as unknown as Awaited<ReturnType<typeof getDatasetRefreshRuns>>);
+
+    render(<ReuploadDialog dataset={makeRasterDataset()} open onOpenChange={vi.fn()} />);
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    expect(await screen.findByText(title)).toBeInTheDocument();
+    // The header never claims an update the replacement didn't make.
+    const updated = screen.queryByText('The dataset has been updated successfully.');
+    if (unchanged) {
+      expect(updated).not.toBeInTheDocument();
+      expect(
+        screen.getByText('The re-upload finished without changing the dataset.'),
+      ).toBeInTheDocument();
+    } else {
+      expect(updated).toBeInTheDocument();
+    }
+  });
+
+  it('keeps watching for the new thumbnail when the job completes before its quicklook lands', async () => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'complete', quicklook_pending: true },
+    } as unknown as ReturnType<typeof useJobStatus>);
+
+    render(
+      <ReuploadDialog dataset={makeRasterDataset()} open onOpenChange={vi.fn()} />,
+    );
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(useRefreshSearchWhenQuicklookLands).toHaveBeenLastCalledWith('raster-job');
+    });
+  });
+
+  it.each([
+    ['a replacement held for review', 'review_required', 'This replacement was held for review.'],
+    ['a failed job', 'worker_lost', 'Something went wrong during the re-upload.'],
+  ])('titles %s as %s', async (_label, errorCode, heading) => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'failed', error_code: errorCode, error_message: 'reason text' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+
+    render(<ReuploadDialog dataset={makeRasterDataset()} open onOpenChange={vi.fn()} />);
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    expect(await screen.findByText(heading)).toBeInTheDocument();
+    const tryAgain = screen.queryByTestId('reupload-try-again');
+    if (errorCode === 'review_required') expect(tryAgain).not.toBeInTheDocument();
+    else expect(tryAgain).toBeInTheDocument();
+  });
+
+  it('does not call onReplaceComplete while the job is still pending', async () => {
+    const user = userEvent.setup();
+    const onReplaceComplete = vi.fn();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'pending' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+
+    render(
+      <ReuploadDialog
+        dataset={makeRasterDataset()}
+        open
+        onOpenChange={vi.fn()}
+        onReplaceComplete={onReplaceComplete}
+      />,
+    );
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await screen.findByText('Converting to Cloud Optimized GeoTIFF...');
+    expect(onReplaceComplete).not.toHaveBeenCalled();
+  });
+
+  // invalidateQueries only SCHEDULES a refetch, so firing
+  // onReplaceComplete without waiting for it raced the remount against the
+  // still-in-flight dataset-detail refetch, so a replacement with a
+  // different extent could remount using the OLD bbox. Uses a real
+  // QueryClient (spied, not mocked away) so the fix's actual await matters.
+  it('waits for the dataset invalidation to settle before firing onReplaceComplete', async () => {
+    const user = userEvent.setup();
+    const onReplaceComplete = vi.fn();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'complete' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    const pendingResolvers: Array<() => void> = [];
+    vi.spyOn(queryClient, 'invalidateQueries').mockImplementation(
+      () => new Promise<void>((resolve) => { pendingResolvers.push(resolve); }),
+    );
+
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog
+          dataset={makeRasterDataset()}
+          open
+          onOpenChange={vi.fn()}
+          onReplaceComplete={onReplaceComplete}
+        />
+      </QueryClientProvider>,
+    );
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    // The invalidations were kicked off but left deliberately unresolved —
+    // onReplaceComplete (and the 'complete' step transition) must not have
+    // fired yet.
+    await waitFor(() => {
+      expect(pendingResolvers.length).toBeGreaterThan(0);
+    });
+    expect(onReplaceComplete).not.toHaveBeenCalled();
+    expect(screen.queryByText('Re-upload complete!')).not.toBeInTheDocument();
+
+    // Now let the invalidations settle.
+    await act(async () => {
+      pendingResolvers.forEach((resolve) => resolve());
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(onReplaceComplete).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // The await above leaves the completion continuation in
+  // flight across renders — closing the dialog before it settles must not
+  // let it apply setStep('complete')/onReplaceComplete on top of the reset
+  // state (or, worse, on top of a second reupload started in the meantime).
+  it('ignores a stale completion once the dialog resets mid-invalidation', async () => {
+    const user = userEvent.setup();
+    const onReplaceComplete = vi.fn();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'complete' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    const pendingResolvers: Array<() => void> = [];
+    vi.spyOn(queryClient, 'invalidateQueries').mockImplementation(
+      () => new Promise<void>((resolve) => { pendingResolvers.push(resolve); }),
+    );
+
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog
+          dataset={makeRasterDataset()}
+          open
+          onOpenChange={vi.fn()}
+          onReplaceComplete={onReplaceComplete}
+        />
+      </QueryClientProvider>,
+    );
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => {
+      expect(pendingResolvers.length).toBeGreaterThan(0);
+    });
+
+    // User closes the dialog (its own X button) while the invalidation is
+    // still in flight — this resets `step` out from under the pending run.
+    await user.click(screen.getByRole('button', { name: 'Close' }));
+    await screen.findByTestId('reupload-source-selector');
+
+    // Let the stale invalidation settle now.
+    await act(async () => {
+      pendingResolvers.forEach((resolve) => resolve());
+      await Promise.resolve();
+    });
+
+    expect(onReplaceComplete).not.toHaveBeenCalled();
+    expect(screen.queryByText('Re-upload complete!')).not.toBeInTheDocument();
+    // Reset really did win: still on the reset source-selector screen.
+    expect(screen.getByTestId('reupload-source-selector')).toBeInTheDocument();
+  });
+
+  // Decision 3 stores `internal_error` in place of a
+  // failure the server did not compose, so the dialog is the surface that
+  // has to turn that code into something a reader understands.
+  it('refetches the run history when a replacement is held for review', async () => {
+    const user = userEvent.setup();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    mockUseJobStatus.mockReturnValue({
+      data: {
+        status: 'failed',
+        error_code: 'review_required',
+        error_message: 'Review the detected changes before publication.',
+      },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ReuploadDialog dataset={makeDataset()} open onOpenChange={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    await openFileSource(user);
+    await dropFile();
+    await user.click(await screen.findByRole('button', { name: 'Confirm Re-Upload' }));
+
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({
+      queryKey: queryKeys.datasets.refreshRunsPrefix('dataset-1'),
+    }));
+  });
+
+  it('renders the localized line for the coded internal failure', async () => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: { status: 'failed', error_message: 'internal_error' },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    renderRasterDialog();
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    expect(await screen.findByText('Re-upload job failed.')).toBeInTheDocument();
+    expect(screen.queryByText('internal_error')).not.toBeInTheDocument();
+  });
+
+  // check_missing_crs's text ends with the SRID-override remedy, which the
+  // vector import gate's missing_crs sentence does not carry --
+  // missing_crs_reupload is its own code so that remedy survives
+  // translation instead of being replaced by the vector gate's shorter one.
+  it('renders the SRID-override remedy for a re-upload missing-CRS failure, in de', async () => {
+    // Switched before the interaction, not after: the dialog computes and
+    // stores the localized error once, when the job status effect fires --
+    // a later language change would not re-render stale stored text. So the
+    // UI is driven in German throughout, not through openFileSource/the
+    // English "Confirm Re-Upload" label the other tests here use.
+    await changeTestLanguage('de');
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: {
+        status: 'failed',
+        error_code: 'missing_crs_reupload',
+        error_message:
+          'Missing CRS: no coordinate system detected. Ensure the file includes CRS information (e.g., .prj file for Shapefiles) or provide an SRID override.',
+      },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    renderRasterDialog();
+
+    await user.click(screen.getByRole('button', { name: 'Datei' }));
+    expect(screen.getByTestId('reupload-file-dropzone')).toBeInTheDocument();
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Erneutes Hochladen bestätigen' });
+    await user.click(screen.getByRole('button', { name: 'Erneutes Hochladen bestätigen' }));
+
+    expect(
+      await screen.findByText(
+        'CRS fehlt: Es wurde kein Koordinatensystem erkannt. Stellen Sie sicher, dass die Datei CRS-Informationen enthält (z. B. eine .prj-Datei bei Shapefiles), oder geben Sie eine SRID-Überschreibung an.',
+      ),
+    ).toBeInTheDocument();
+
+    await changeTestLanguage('en');
+  });
+
+  it('still shows a composed failure message verbatim', async () => {
+    const user = userEvent.setup();
+    mockUseJobStatus.mockReturnValue({
+      data: {
+        status: 'failed',
+        error_message: "Layer 'parcels' has no geometry column",
+      },
+    } as unknown as ReturnType<typeof useJobStatus>);
+    renderRasterDialog();
+
+    await openFileSource(user);
+    await dropFile('ortho.tif');
+    await screen.findByRole('button', { name: 'Confirm Re-Upload' });
+    await user.click(screen.getByRole('button', { name: 'Confirm Re-Upload' }));
+
+    expect(
+      await screen.findByText("Layer 'parcels' has no geometry column"),
+    ).toBeInTheDocument();
+  });
+});

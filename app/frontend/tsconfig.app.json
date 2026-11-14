@@ -1,0 +1,46 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "types": ["vite/client", "vitest/globals", "@testing-library/jest-dom"],
+    "skipLibCheck": true,
+    "ignoreDeprecations": "6.0",
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Path aliases */
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+
+    /*
+     * `noUncheckedIndexedAccess` is deliberately OFF.
+     * Enabling it produces roughly 550 errors across ~100 files,
+     * concentrated in map-styling / style-spec code (VrtCreatorForm,
+     * SpatialFilterPanel, classification, plus builder tests). Enabling
+     * it is its own migration, best done alongside a typed adapter
+     * seam that also removes the `as unknown as` cluster. Same call for
+     * exactOptionalPropertyTypes / noImplicitReturns / noImplicitOverride.
+     */
+  },
+  "include": ["src"]
+}

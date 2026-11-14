@@ -1,0 +1,421 @@
+"""S3-compatible storage backend.
+
+Wraps the synchronous boto3 client in `asyncio.to_thread` so callers can
+await uploads/downloads without blocking the event loop. Works with AWS S3,
+MinIO, GCS (via its S3-compatible API), DigitalOcean Spaces, and other
+S3-compatible providers via `endpoint`/`addressing_style` env vars.
+
+Endpoint: unset for AWS S3; `http://minio:9000` + `allow_http=True` for
+MinIO; `https://storage.googleapis.com` + `region=auto` + HMAC keys (not
+GCP service account keys) for GCS.
+
+Addressing style: `path` for MinIO, `virtual` for some AWS regions, `auto`
+lets the SDK decide (usually correct for AWS).
+
+Public endpoint: when the endpoint is a container hostname or private address,
+presigned URLs signed against it are unreachable for browsers and external
+clients. SigV4 signs the Host header, so a URL can't be rewritten after
+signing; `public_endpoint` signs presigned URLs with a second client instead.
+Every other operation keeps using the internal endpoint.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from functools import partial
+from pathlib import Path
+from typing import AsyncIterator, BinaryIO
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+from app.core.async_io import run_in_thread_draining
+from app.platform.storage.provider import StoredObject, as_utc
+
+# Matches LocalStorageProvider's chunk size.
+_STREAM_CHUNK_BYTES = 1024 * 1024
+
+
+def _endpoint_url(endpoint: str | None, allow_http: bool) -> str | None:
+    if not endpoint:
+        return None
+    if endpoint.startswith(("http://", "https://")):
+        return endpoint
+    return f"{'http' if allow_http else 'https'}://{endpoint}"
+
+
+class S3StorageProvider:
+    """Storage provider wrapping boto3 S3 client via asyncio.to_thread."""
+
+    _public_client = None
+
+    def __init__(
+        self,
+        bucket: str,
+        endpoint: str | None = None,
+        region: str = "us-east-1",
+        access_key_id: str | None = None,
+        secret_access_key: str | None = None,
+        allow_http: bool = False,
+        addressing_style: str = "auto",
+        public_endpoint: str | None = None,
+    ) -> None:
+        self.bucket = bucket
+
+        config = Config(
+            s3={"addressing_style": addressing_style},
+            retries={"max_attempts": 3, "mode": "adaptive"},
+            connect_timeout=10,
+            read_timeout=60,
+        )
+
+        kwargs: dict = {
+            "service_name": "s3",
+            "region_name": region,
+            "config": config,
+        }
+        if access_key_id:
+            kwargs["aws_access_key_id"] = access_key_id
+        if secret_access_key:
+            kwargs["aws_secret_access_key"] = secret_access_key
+
+        self.client = boto3.client(
+            **kwargs, endpoint_url=_endpoint_url(endpoint, allow_http)
+        )
+        public_url = _endpoint_url(public_endpoint, allow_http)
+        if public_url:
+            self._public_client = boto3.client(**kwargs, endpoint_url=public_url)
+
+    @property
+    def _presign_client(self):
+        return self._public_client or self.client
+
+    async def put(self, key: str, data: BinaryIO | bytes) -> str:
+        """Store data at key. Returns s3://bucket/key URI.
+
+        Drained on cancellation: a bare ``to_thread`` would return while the
+        SDK upload kept running, racing cleanup (undo-delete, closed source
+        handle, orphaned multipart parts). Draining costs a cancelled request
+        the rest of its upload; that's the safer trade.
+        """
+        if isinstance(data, bytes):
+            await run_in_thread_draining(
+                partial(self.client.put_object, Bucket=self.bucket, Key=key, Body=data)
+            )
+        else:
+            await run_in_thread_draining(
+                self.client.upload_fileobj, data, self.bucket, key
+            )
+        return f"s3://{self.bucket}/{key}"
+
+    async def get(self, key: str) -> bytes:
+        """Retrieve raw bytes for a key."""
+
+        def _get():
+            try:
+                response = self.client.get_object(Bucket=self.bucket, Key=key)
+                return response["Body"].read()
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                    raise FileNotFoundError(key) from e
+                raise
+
+        return await asyncio.to_thread(_get)
+
+    async def copy(self, src_key: str, dst_key: str) -> None:
+        """Server-side copy within the bucket.
+
+        Uses the managed ``client.copy`` transfer rather than ``copy_object``:
+        the single-request CopyObject API caps at 5 GB, and presigned uploads
+        exist precisely for objects that can exceed it. The managed API falls
+        back to multipart copy above that ceiling on its own.
+        """
+
+        def _copy() -> None:
+            try:
+                self.client.copy(
+                    CopySource={"Bucket": self.bucket, "Key": src_key},
+                    Bucket=self.bucket,
+                    Key=dst_key,
+                )
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                    raise FileNotFoundError(src_key) from e
+                raise
+
+        await asyncio.to_thread(_copy)
+
+    async def get_range(self, key: str, start: int, length: int) -> bytes:
+        """Read at most ``length`` bytes from byte offset ``start``."""
+
+        def _get_range() -> bytes:
+            try:
+                response = self.client.get_object(
+                    Bucket=self.bucket,
+                    Key=key,
+                    Range=f"bytes={start}-{start + length - 1}",
+                )
+                return response["Body"].read()
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code")
+                if code in ("404", "NoSuchKey"):
+                    raise FileNotFoundError(key) from e
+                # A window that starts at or past the end of the object is an
+                # empty read, not an error — matches local/POSIX seek+read.
+                if code in ("416", "InvalidRange", "RequestedRangeNotSatisfiable"):
+                    return b""
+                raise
+
+        return await asyncio.to_thread(_get_range)
+
+    async def get_stream(self, key: str) -> AsyncIterator[bytes]:
+        """Stream the whole object from ONE ``get_object``, in 1 MiB chunks.
+
+        A resumed range whose ``If-Range`` no longer matches must be answered
+        with the complete representation (RFC 9110 13.1.5), which a presigned
+        URL can't do since the bucket never evaluates the precondition. One
+        request, never a ranged ``get_object`` per chunk, which costs 5,120
+        requests for a 5 GiB COG. Body closed in ``finally`` so a disconnecting
+        client releases its pool connection.
+        """
+
+        def _open():
+            try:
+                return self.client.get_object(Bucket=self.bucket, Key=key)["Body"]
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                    raise FileNotFoundError(key) from e
+                raise
+
+        body = await asyncio.to_thread(_open)
+        try:
+            while True:
+                chunk = await asyncio.to_thread(body.read, _STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            await asyncio.to_thread(body.close)
+
+    async def get_range_stream(
+        self, key: str, start: int, length: int
+    ) -> AsyncIterator[bytes]:
+        """Stream a byte window from ONE ranged ``get_object``.
+
+        Avoids looping ``get_range`` per 1 MiB chunk, which turns
+        one ``Range`` request into one ``GetObject`` per chunk — invisible to
+        the rate limiter's per-request count but not to the bill. A window
+        starting at or past the end is an empty stream, matching
+        ``get_range`` and local/POSIX seek-then-read.
+        """
+
+        def _open():
+            try:
+                return self.client.get_object(
+                    Bucket=self.bucket,
+                    Key=key,
+                    Range=f"bytes={start}-{start + length - 1}",
+                )["Body"]
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code")
+                if code in ("404", "NoSuchKey"):
+                    raise FileNotFoundError(key) from e
+                if code in ("416", "InvalidRange", "RequestedRangeNotSatisfiable"):
+                    return None
+                raise
+
+        body = await asyncio.to_thread(_open)
+        if body is None:
+            return
+        try:
+            while True:
+                chunk = await asyncio.to_thread(body.read, _STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            await asyncio.to_thread(body.close)
+
+    async def get_to_file(self, key: str, dest: Path) -> Path:
+        """Download key to a local file path. Creates parent dirs."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(self.client.download_file, self.bucket, key, str(dest))
+        return dest
+
+    async def delete(self, key: str) -> None:
+        """Delete a key. S3 silently ignores missing keys."""
+        await asyncio.to_thread(self.client.delete_object, Bucket=self.bucket, Key=key)
+
+    async def exists(self, key: str) -> bool:
+        """Check if a key exists via head_object."""
+
+        def _exists():
+            try:
+                self.client.head_object(Bucket=self.bucket, Key=key)
+                return True
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "404":
+                    return False
+                raise
+
+        return await asyncio.to_thread(_exists)
+
+    async def size(self, key: str) -> int:
+        """Return object size in bytes via head_object."""
+
+        def _size() -> int:
+            try:
+                response = self.client.head_object(Bucket=self.bucket, Key=key)
+                return int(response["ContentLength"])
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                    raise FileNotFoundError(key) from e
+                raise
+
+        return await asyncio.to_thread(_size)
+
+    async def list(self, prefix: str) -> list[str]:
+        """List keys matching a prefix."""
+
+        def _list():
+            keys = []
+            params = {"Bucket": self.bucket, "Prefix": prefix}
+            while True:
+                response = self.client.list_objects_v2(**params)
+                keys.extend(obj["Key"] for obj in response.get("Contents", []))
+                if not response.get("IsTruncated"):
+                    break
+                params["ContinuationToken"] = response["NextContinuationToken"]
+            return keys
+
+        return await asyncio.to_thread(_list)
+
+    async def iter_object_pages(
+        self, prefix: str, *, start_after: str | None = None
+    ) -> AsyncIterator[list[StoredObject]]:
+        """Yield ListObjectsV2 pages, each entry with its last-modified time.
+
+        One request per page, not drain-then-return, so a
+        consumer that stops early pays for a bounded number of round trips
+        against an arbitrarily large prefix. ``start_after`` becomes S3's
+        ``StartAfter`` on the FIRST request only — ListObjectsV2 ignores it
+        once a ``ContinuationToken`` is present.
+        """
+        params: dict = {"Bucket": self.bucket, "Prefix": prefix}
+        if start_after is not None:
+            params["StartAfter"] = start_after
+        while True:
+            response = await asyncio.to_thread(self.client.list_objects_v2, **params)
+            yield [
+                StoredObject(
+                    key=obj["Key"],
+                    last_modified=as_utc(obj["LastModified"]),
+                )
+                for obj in response.get("Contents", [])
+            ]
+            if not response.get("IsTruncated"):
+                return
+            params.pop("StartAfter", None)
+            params["ContinuationToken"] = response["NextContinuationToken"]
+
+    async def health_check(self) -> None:
+        """Verify the S3 bucket is reachable via head_bucket."""
+        await asyncio.to_thread(self.client.head_bucket, Bucket=self.bucket)
+
+    # Presigned URL methods are synchronous; the router wraps them in
+    # asyncio.to_thread.
+
+    def generate_presigned_put_url(
+        self,
+        key: str,
+        content_type: str = "application/octet-stream",
+        expiration: int = 3600,
+    ) -> str:
+        """Generate a presigned PUT URL for direct upload.
+
+        Clamped to the job lifetime, same as the part URLs below
+        — a lower configured timeout would otherwise let a 3600s URL silently
+        outlive the job it belongs to.
+        """
+        from app.core.config import settings
+
+        expiration = min(expiration, settings.pending_job_timeout_seconds)
+        return self._presign_client.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={"Bucket": self.bucket, "Key": key, "ContentType": content_type},
+            ExpiresIn=expiration,
+        )
+
+    def generate_presigned_get_url(
+        self,
+        key: str,
+        expiration: int = 3600,
+    ) -> str:
+        """Generate a presigned GET URL for download."""
+        return self._presign_client.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={"Bucket": self.bucket, "Key": key},
+            ExpiresIn=expiration,
+        )
+
+    def initiate_multipart_upload(
+        self,
+        key: str,
+        content_type: str = "application/octet-stream",
+    ) -> str:
+        """Initiate a multipart upload, returns upload_id."""
+        response = self.client.create_multipart_upload(
+            Bucket=self.bucket,
+            Key=key,
+            ContentType=content_type,
+        )
+        return response["UploadId"]
+
+    def generate_presigned_part_url(
+        self,
+        key: str,
+        upload_id: str,
+        part_number: int,
+        expiration: int = 7200,
+    ) -> str:
+        """Generate a presigned URL for uploading a single part.
+
+        Clamped to the job lifetime: an unclamped part URL would stay usable
+        against a row the pending sweep already failed.
+        """
+        from app.core.config import settings
+
+        expiration = min(expiration, settings.pending_job_timeout_seconds)
+        return self._presign_client.generate_presigned_url(
+            ClientMethod="upload_part",
+            Params={
+                "Bucket": self.bucket,
+                "Key": key,
+                "UploadId": upload_id,
+                "PartNumber": part_number,
+            },
+            ExpiresIn=expiration,
+        )
+
+    def complete_multipart_upload(
+        self,
+        key: str,
+        upload_id: str,
+        parts: list[dict],
+    ) -> None:
+        """Complete a multipart upload with the list of {ETag, PartNumber} dicts."""
+        self.client.complete_multipart_upload(
+            Bucket=self.bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+
+    def abort_multipart_upload(self, key: str, upload_id: str) -> None:
+        """Abort an in-progress multipart upload."""
+        self.client.abort_multipart_upload(
+            Bucket=self.bucket,
+            Key=key,
+            UploadId=upload_id,
+        )

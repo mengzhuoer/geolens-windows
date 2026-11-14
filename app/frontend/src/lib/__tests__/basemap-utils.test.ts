@@ -1,0 +1,819 @@
+import { describe, it, expect, vi } from 'vitest';
+import type { StyleSpecification } from 'maplibre-gl';
+import {
+  toMaplibreStyle,
+  sanitizeMaplibreStyle,
+  resolveBasemapId,
+  getThemeBasemap,
+  findBasemapById,
+  basemapThumbnail,
+  hasVisibleBasemapStyle,
+  applyBasemapConfigToStyle,
+  isKnownMissingRemoteStyleImage,
+  isPmtilesArchiveUrl,
+  makeStyleImageMissingResolver,
+  isBasemapOwnedLayer,
+  LIGHT_PRESET_ID,
+  DARK_PRESET_ID,
+  BLANK_BASEMAP_ID,
+  FALLBACK_BASEMAP_STYLE_URL,
+  FALLBACK_BASEMAP_STYLE_URL_DARK,
+} from '../basemap-utils';
+import type { BasemapEntry } from '@/api/settings';
+
+describe('isBasemapOwnedLayer', () => {
+  it.each([
+    [{ id: 'water', source: 'basemap' }, 'source-', true],
+    [{ id: 'background' }, 'source-', true],
+    [{ id: 'water', source: 0 }, 'source-', true],
+    [{ id: 'layer-1', source: 'source-data-population' }, 'source-', false],
+    [{ id: 'layer-1', source: 'preview-source-data-population' }, 'preview-source-', false],
+    [{ id: 'attribute-table-highlight', source: 'basemap' }, 'source-', false],
+    [{ id: 'attribute-table-highlight-line', source: 'basemap' }, 'source-', false],
+    [{ id: 'attribute-table-highlight-point', source: 'basemap' }, 'source-', false],
+    [{ id: 'attribute-table-highlight-road', source: 'basemap' }, 'source-', true],
+    [{ id: 'attribute-table-highlight-line-label', source: 'basemap' }, 'source-', true],
+    [{ id: 'road', source: 'attribute-table-highlight' }, 'source-', true],
+  ])('classifies %j with prefix %s as owned=%s', (layer, prefix, owned) => {
+    expect(isBasemapOwnedLayer(layer, prefix)).toBe(owned);
+  });
+});
+
+describe('toMaplibreStyle', () => {
+  it('returns GL style JSON URL as-is', () => {
+    const url = 'https://example.com/style.json';
+    expect(toMaplibreStyle(url)).toBe(url);
+  });
+
+  it('ignores attribution for GL style JSON URLs', () => {
+    const url = 'https://example.com/style.json';
+    expect(toMaplibreStyle(url, '© Example')).toBe(url);
+  });
+
+  it('returns /styles/ URL as-is (GL style without .json extension)', () => {
+    const url = 'https://tiles.openfreemap.org/styles/bright';
+    expect(toMaplibreStyle(url)).toBe(url);
+  });
+
+  it('returns MapTiler style.json URL with query params as-is', () => {
+    const url = 'https://api.maptiler.com/maps/streets-v2/style.json?key=abc123';
+    expect(toMaplibreStyle(url)).toBe(url);
+  });
+
+  it('returns Mapbox /styles/ URL with query params as-is', () => {
+    const url = 'https://api.mapbox.com/styles/v1/mapbox/streets-v12?access_token=pk.test';
+    expect(toMaplibreStyle(url)).toBe(url);
+  });
+
+  it('wraps XYZ URL in StyleSpecification', () => {
+    const url = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+    const result = toMaplibreStyle(url) as StyleSpecification;
+    expect(result.version).toBe(8);
+    expect(result.sources.basemap).toEqual({
+      type: 'raster',
+      tiles: [url],
+      tileSize: 256,
+    });
+    expect(result.layers).toHaveLength(2);
+    expect(result.layers[0]).toMatchObject({
+      id: 'background',
+      type: 'background',
+      paint: { 'background-color': 'rgba(0,0,0,0)' },
+    });
+    expect(result.layers[1]).toMatchObject({
+      id: 'basemap-tiles',
+      type: 'raster',
+      source: 'basemap',
+    });
+  });
+
+  it('points raster-basemap glyphs at the bundled same-origin fonts', () => {
+    const result = toMaplibreStyle('https://tile.openstreetmap.org/{z}/{x}/{y}.png') as StyleSpecification;
+    expect(result.glyphs).toBe(`${window.location.origin}/fonts/{fontstack}/{range}.pbf`);
+  });
+
+  it.each([
+    ['/geolens/', '/geolens/'],
+    ['/geolens', '/geolens/'],
+    ['./', '/'],
+    ['', '/'],
+  ])('keeps the build base %j in the bundled glyph URL', (base, path) => {
+    vi.stubEnv('BASE_URL', base);
+    try {
+      const result = toMaplibreStyle('https://tile.openstreetmap.org/{z}/{x}/{y}.png') as StyleSpecification;
+      expect(result.glyphs).toBe(`${window.location.origin}${path}fonts/{fontstack}/{range}.pbf`);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('uses an absolute build base as is', () => {
+    vi.stubEnv('BASE_URL', 'https://static.example.com/app/');
+    try {
+      const result = toMaplibreStyle('https://tile.openstreetmap.org/{z}/{x}/{y}.png') as StyleSpecification;
+      expect(result.glyphs).toBe('https://static.example.com/app/fonts/{fontstack}/{range}.pbf');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('includes attribution on raster source when provided', () => {
+    const url = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+    const attribution = '© OpenStreetMap contributors';
+    const result = toMaplibreStyle(url, attribution) as StyleSpecification;
+    expect((result.sources.basemap as Record<string, unknown>).attribution).toBe(attribution);
+  });
+
+  it('omits attribution on raster source when not provided', () => {
+    const url = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+    const result = toMaplibreStyle(url) as StyleSpecification;
+    expect((result.sources.basemap as Record<string, unknown>).attribution).toBeUndefined();
+  });
+
+  it('includes glyphs URL for raster basemaps', () => {
+    const url = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+    const result = toMaplibreStyle(url) as StyleSpecification;
+    expect(result.glyphs).toBeDefined();
+  });
+});
+
+describe('isPmtilesArchiveUrl', () => {
+  it('matches a bare https .pmtiles archive URL', () => {
+    expect(isPmtilesArchiveUrl('https://example.com/world.pmtiles')).toBe(true);
+  });
+
+  it('matches a bare http .pmtiles archive URL', () => {
+    expect(isPmtilesArchiveUrl('http://internal.example.com/world.pmtiles')).toBe(true);
+  });
+
+  it('matches a pmtiles://-prefixed archive URL', () => {
+    expect(isPmtilesArchiveUrl('pmtiles://https://example.com/world.pmtiles')).toBe(true);
+  });
+
+  it('matches an archive URL with a query string', () => {
+    expect(isPmtilesArchiveUrl('https://example.com/world.pmtiles?token=abc')).toBe(true);
+  });
+
+  it('is case-insensitive on the .pmtiles extension', () => {
+    expect(isPmtilesArchiveUrl('https://example.com/world.PMTiles')).toBe(true);
+  });
+
+  it('does not match a style JSON URL', () => {
+    expect(isPmtilesArchiveUrl('https://example.com/style.json')).toBe(false);
+  });
+
+  it('does not match a /styles/ URL', () => {
+    expect(isPmtilesArchiveUrl('https://tiles.openfreemap.org/styles/bright')).toBe(false);
+  });
+
+  it('does not match an XYZ template URL', () => {
+    expect(isPmtilesArchiveUrl('https://tile.openstreetmap.org/{z}/{x}/{y}.png')).toBe(false);
+  });
+
+  it('does not match a wrong-extension archive URL', () => {
+    expect(isPmtilesArchiveUrl('https://example.com/world.mbtiles')).toBe(false);
+  });
+});
+
+describe('toMaplibreStyle pmtiles archives', () => {
+  it('wraps a bare .pmtiles archive URL in a raster StyleSpecification using `url` (not `tiles`)', () => {
+    const url = 'https://example.com/world.pmtiles';
+    const result = toMaplibreStyle(url) as StyleSpecification;
+    expect(result.version).toBe(8);
+    expect(result.sources.basemap).toEqual({
+      type: 'raster',
+      url: 'pmtiles://https://example.com/world.pmtiles',
+      tileSize: 256,
+    });
+    expect(result.layers[1]).toMatchObject({
+      id: 'basemap-tiles',
+      type: 'raster',
+      source: 'basemap',
+    });
+  });
+
+  it('leaves an already pmtiles://-prefixed archive URL untouched', () => {
+    const url = 'pmtiles://https://example.com/world.pmtiles';
+    const result = toMaplibreStyle(url) as StyleSpecification;
+    expect((result.sources.basemap as Record<string, unknown>).url).toBe(url);
+  });
+
+  it('includes attribution on the pmtiles raster source when provided', () => {
+    const url = 'https://example.com/world.pmtiles';
+    const attribution = '© Example';
+    const result = toMaplibreStyle(url, attribution) as StyleSpecification;
+    expect((result.sources.basemap as Record<string, unknown>).attribution).toBe(attribution);
+  });
+
+
+  it('classifies a pmtiles archive hosted under a /styles/ path as an archive, not a style URL (#1688 round 4)', () => {
+    const url = 'https://host.example.com/styles/world.pmtiles';
+    const result = toMaplibreStyle(url) as StyleSpecification;
+    expect(typeof result).not.toBe('string');
+    expect(result.sources.basemap).toEqual({
+      type: 'raster',
+      url: 'pmtiles://https://host.example.com/styles/world.pmtiles',
+      tileSize: 256,
+    });
+  });
+});
+
+describe('sanitizeMaplibreStyle', () => {
+  it('identifies only known missing remote style images', () => {
+    expect(isKnownMissingRemoteStyleImage('road_')).toBe(true);
+    expect(isKnownMissingRemoteStyleImage('us-state_')).toBe(true);
+    expect(isKnownMissingRemoteStyleImage('custom-marker')).toBe(false);
+  });
+
+  it('removes unsupported fill-pattern references from remote styles', () => {
+    const style = {
+      version: 8,
+      sources: {},
+      layers: [
+        {
+          id: 'landcover_wood',
+          type: 'fill',
+          paint: {
+            'fill-color': '#222',
+            'fill-pattern': 'wood-pattern',
+            'fill-opacity': 0.8,
+          },
+        },
+        {
+          id: 'background',
+          type: 'background',
+          paint: { 'background-color': '#111' },
+        },
+      ],
+    } as StyleSpecification;
+
+    const result = sanitizeMaplibreStyle(style);
+
+    expect(result.layers[0]).toMatchObject({
+      id: 'landcover_wood',
+      paint: {
+        'fill-color': '#222',
+        'fill-opacity': 0.8,
+      },
+    });
+    expect(result.layers[0].paint).not.toHaveProperty('fill-pattern');
+    expect(result.layers[1]).toBe(style.layers[1]);
+  });
+
+  it('removes known missing icon-image references from remote styles', () => {
+    const style = {
+      version: 8,
+      sources: {
+        openmaptiles: {
+          type: 'vector',
+          tiles: ['https://example.com/{z}/{x}/{y}.pbf'],
+        },
+      },
+      layers: [
+        {
+          id: 'place_city',
+          type: 'symbol',
+          source: 'openmaptiles',
+          'source-layer': 'place',
+          layout: {
+            'icon-image': ['step', ['zoom'], 'circle-11', 9, ''],
+            'text-field': ['get', 'name'],
+          },
+        },
+      ],
+    } as StyleSpecification;
+
+    const result = sanitizeMaplibreStyle(style);
+
+    expect(result.layers[0]).toMatchObject({
+      id: 'place_city',
+      layout: {
+        'icon-image': '',
+        'text-field': ['get', 'name'],
+      },
+    });
+  });
+
+  it('removes Positron road shield icon expressions before MapLibre loads the style', () => {
+    const style = {
+      version: 8,
+      sources: {
+        openmaptiles: {
+          type: 'vector',
+          tiles: ['https://example.com/{z}/{x}/{y}.pbf'],
+        },
+      },
+      layers: [
+        {
+          id: 'road_shield',
+          type: 'symbol',
+          source: 'openmaptiles',
+          'source-layer': 'transportation_name',
+          layout: {
+            'icon-image': ['concat', 'road_', ['get', 'network']],
+            'text-field': ['get', 'ref'],
+          },
+        },
+      ],
+    } as StyleSpecification;
+
+    const result = sanitizeMaplibreStyle(style);
+
+    expect(result.layers[0]).toMatchObject({
+      id: 'road_shield',
+      layout: {
+        'icon-image': '',
+        'text-field': ['get', 'ref'],
+      },
+    });
+  });
+
+  it('removes Positron network-derived highway shield expressions', () => {
+    const style = {
+      version: 8,
+      sources: {
+        openmaptiles: {
+          type: 'vector',
+          tiles: ['https://example.com/{z}/{x}/{y}.pbf'],
+        },
+      },
+      layers: [
+        {
+          id: 'road_shield_us',
+          type: 'symbol',
+          source: 'openmaptiles',
+          'source-layer': 'transportation_name',
+          layout: {
+            'icon-image': ['concat', ['get', 'network'], '_', ['get', 'ref_length']],
+            'text-field': ['get', 'ref'],
+          },
+        },
+      ],
+    } as StyleSpecification;
+
+    const result = sanitizeMaplibreStyle(style);
+
+    expect(result.layers[0]).toMatchObject({
+      id: 'road_shield_us',
+      layout: {
+        'icon-image': '',
+        'text-field': ['get', 'ref'],
+      },
+    });
+  });
+
+  it('wraps remote style numeric filters so null feature values do not warn', () => {
+    const style = {
+      version: 8,
+      sources: {
+        openmaptiles: {
+          type: 'vector',
+          tiles: ['https://example.com/{z}/{x}/{y}.pbf'],
+        },
+      },
+      layers: [
+        {
+          id: 'boundary_3',
+          type: 'line',
+          source: 'openmaptiles',
+          'source-layer': 'boundary',
+          filter: ['all', ['>=', ['get', 'admin_level'], 3], ['<=', ['get', 'admin_level'], 6]],
+          paint: { 'line-color': '#aaa' },
+        },
+      ],
+    } as StyleSpecification;
+
+    const result = sanitizeMaplibreStyle(style);
+    const layer = result.layers[0] as StyleSpecification['layers'][number] & { filter?: unknown };
+
+    expect(layer.filter).toEqual([
+      'all',
+      ['all', ['!=', ['typeof', ['get', 'admin_level']], 'null'], ['>=', ['to-number', ['get', 'admin_level'], -1_000_000_000_000], 3]],
+      ['all', ['!=', ['typeof', ['get', 'admin_level']], 'null'], ['<=', ['to-number', ['get', 'admin_level'], 1_000_000_000_000], 6]],
+    ]);
+  });
+});
+
+describe('BLANK_BASEMAP_ID', () => {
+  it('toMaplibreStyle returns a StyleSpecification with transparent background for blank ID', () => {
+    const result = toMaplibreStyle(BLANK_BASEMAP_ID) as StyleSpecification;
+    expect(result.version).toBe(8);
+    expect(result.sources).toEqual({});
+    expect(result.layers).toHaveLength(1);
+    expect(result.layers[0]).toMatchObject({
+      id: 'background',
+      type: 'background',
+      paint: { 'background-color': 'rgba(0,0,0,0)' },
+    });
+    // The blank basemap MUST carry a glyphs URL — user data
+    // label layers (companion `*-label`, symbol-mode text) are added to this
+    // style, and MapLibre cannot render any text-field without one. Glyphs are
+    // fetched lazily, so a label-free blank map still makes no font requests.
+    expect(result.glyphs).toBe(`${window.location.origin}/fonts/{fontstack}/{range}.pbf`);
+  });
+
+  it('toMaplibreStyle blank ignores attribution param', () => {
+    const result = toMaplibreStyle(BLANK_BASEMAP_ID, '© Example') as StyleSpecification;
+    expect(result.version).toBe(8);
+    expect(result.sources).toEqual({});
+  });
+
+  it('basemapThumbnail returns a defined string for blank ID', () => {
+    expect(basemapThumbnail(BLANK_BASEMAP_ID)).toBeDefined();
+    expect(typeof basemapThumbnail(BLANK_BASEMAP_ID)).toBe('string');
+    expect(basemapThumbnail(BLANK_BASEMAP_ID).length).toBeGreaterThan(0);
+  });
+
+  it('hasVisibleBasemapStyle treats blank and missing basemaps as hidden', () => {
+    expect(hasVisibleBasemapStyle(BLANK_BASEMAP_ID)).toBe(false);
+    expect(hasVisibleBasemapStyle(null)).toBe(false);
+    expect(hasVisibleBasemapStyle(undefined)).toBe(false);
+    expect(hasVisibleBasemapStyle('openfreemap-positron')).toBe(true);
+  });
+});
+
+describe('resolveBasemapId', () => {
+  it('maps legacy "positron" to openfreemap-positron', () => {
+    expect(resolveBasemapId('positron')).toBe('openfreemap-positron');
+  });
+
+  it('maps legacy "dark-matter" to openfreemap-dark', () => {
+    expect(resolveBasemapId('dark-matter')).toBe('openfreemap-dark');
+  });
+
+  it('maps legacy "voyager" to openfreemap-positron', () => {
+    expect(resolveBasemapId('voyager')).toBe('openfreemap-positron');
+  });
+
+  it('maps legacy "carto-positron" to openfreemap-positron', () => {
+    expect(resolveBasemapId('carto-positron')).toBe('openfreemap-positron');
+  });
+
+  it('maps legacy "carto-dark-matter" to openfreemap-dark', () => {
+    expect(resolveBasemapId('carto-dark-matter')).toBe('openfreemap-dark');
+  });
+
+  it('passes through openfreemap-positron as-is', () => {
+    expect(resolveBasemapId('openfreemap-positron')).toBe('openfreemap-positron');
+  });
+
+  it('returns non-legacy keys unchanged', () => {
+    expect(resolveBasemapId('openstreetmap')).toBe('openstreetmap');
+    expect(resolveBasemapId('custom-123')).toBe('custom-123');
+  });
+});
+
+describe('getThemeBasemap', () => {
+  const basemaps: BasemapEntry[] = [
+    { id: LIGHT_PRESET_ID, label: 'Light', url: 'https://tiles.openfreemap.org/styles/positron', enabled: true, is_preset: true },
+    { id: DARK_PRESET_ID, label: 'Dark', url: 'https://tiles.openfreemap.org/styles/dark', enabled: true, is_preset: true },
+    { id: 'osm', label: 'OSM', url: 'https://tile.osm.org/{z}/{x}/{y}.png', enabled: true, is_preset: true },
+  ];
+
+  it('returns light preset for light theme', () => {
+    expect(getThemeBasemap(basemaps, 'light')?.id).toBe(LIGHT_PRESET_ID);
+  });
+
+  it('returns dark preset for dark theme', () => {
+    expect(getThemeBasemap(basemaps, 'dark')?.id).toBe(DARK_PRESET_ID);
+  });
+
+  it('falls back to first enabled basemap when preferred is disabled', () => {
+    const noDark = basemaps.map((b) =>
+      b.id === DARK_PRESET_ID ? { ...b, enabled: false } : b,
+    );
+    expect(getThemeBasemap(noDark, 'dark')?.id).toBe(LIGHT_PRESET_ID);
+  });
+
+  it('returns undefined when no basemaps are enabled', () => {
+    const allDisabled = basemaps.map((b) => ({ ...b, enabled: false }));
+    expect(getThemeBasemap(allDisabled, 'light')).toBeUndefined();
+  });
+
+  it('returns undefined for empty array', () => {
+    expect(getThemeBasemap([], 'light')).toBeUndefined();
+  });
+});
+
+describe('findBasemapById', () => {
+  const basemaps: BasemapEntry[] = [
+    { id: 'openfreemap-positron', label: 'OpenFreeMap Positron', url: 'https://tiles.openfreemap.org/styles/positron', enabled: true, is_preset: true },
+    { id: 'openfreemap-dark', label: 'OpenFreeMap Dark', url: 'https://tiles.openfreemap.org/styles/dark', enabled: true, is_preset: true },
+    { id: 'custom-1', label: 'Custom', url: 'https://tiles.example.com/{z}/{x}/{y}.png', enabled: true, is_preset: false },
+  ];
+
+  it('finds by exact id', () => {
+    expect(findBasemapById(basemaps, 'custom-1')?.label).toBe('Custom');
+  });
+
+  it('finds by legacy key "positron"', () => {
+    expect(findBasemapById(basemaps, 'positron')?.id).toBe('openfreemap-positron');
+  });
+
+  it('finds by legacy key "carto-positron"', () => {
+    expect(findBasemapById(basemaps, 'carto-positron')?.id).toBe('openfreemap-positron');
+  });
+
+  it('finds by legacy key "carto-dark-matter"', () => {
+    expect(findBasemapById(basemaps, 'carto-dark-matter')?.id).toBe('openfreemap-dark');
+  });
+
+  it('returns undefined for unknown id', () => {
+    expect(findBasemapById(basemaps, 'nonexistent')).toBeUndefined();
+  });
+});
+
+describe('preset IDs', () => {
+  it('LIGHT_PRESET_ID is openfreemap-positron', () => {
+    expect(LIGHT_PRESET_ID).toBe('openfreemap-positron');
+  });
+
+  it('DARK_PRESET_ID is openfreemap-dark', () => {
+    expect(DARK_PRESET_ID).toBe('openfreemap-dark');
+  });
+});
+
+// Every map surface must fall back to the same basemap provider.
+// A surface hardcoding its own style URL (e.g. CARTO) would diverge.
+describe('FALLBACK_BASEMAP_STYLE_URL', () => {
+  it('is the shared OpenFreeMap style, not a vendor-specific URL', () => {
+    expect(FALLBACK_BASEMAP_STYLE_URL).toBe('https://tiles.openfreemap.org/styles/positron');
+    expect(FALLBACK_BASEMAP_STYLE_URL_DARK).toBe('https://tiles.openfreemap.org/styles/dark');
+  });
+});
+
+describe('applyBasemapConfigToStyle master opacity', () => {
+  it('multiplies raster-opacity on raster basemap layers by config.opacity', () => {
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { osm: { type: 'raster', tiles: ['x'], tileSize: 256 } },
+      layers: [
+        { id: 'osm', type: 'raster', source: 'osm' },
+      ],
+    };
+    const next = applyBasemapConfigToStyle(style, { opacity: 0.55 });
+    const layer = next.layers[0] as unknown as { paint: { 'raster-opacity': number } };
+    expect(layer.paint['raster-opacity']).toBeCloseTo(0.55, 5);
+  });
+
+  it('multiplies existing line-opacity by config.opacity (compose with applyProminence)', () => {
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { v: { type: 'vector', tiles: ['x'] } },
+      layers: [
+        {
+          id: 'road-primary',
+          type: 'line',
+          source: 'v',
+          'source-layer': 'transportation',
+          paint: { 'line-opacity': 1 },
+        },
+      ],
+    };
+    const next = applyBasemapConfigToStyle(style, {
+      road_visibility: 'subtle',
+      opacity: 0.5,
+    });
+    const layer = next.layers[0] as unknown as { paint: { 'line-opacity': number } };
+    // applyProminence writes line-opacity = 0.35 for subtle roads;
+    // master opacity 0.5 multiplies to 0.175.
+    expect(layer.paint['line-opacity']).toBeCloseTo(0.175, 5);
+  });
+
+  it('opacity=1 writes absolute 1.0 so previously-dimmed values are reset (CR-01)', () => {
+    // Master opacity is always absolute (never multiplicative
+    // against live paint). At opacity=1 we write 1.0 explicitly so the map-sync
+    // diff loop can reset any previously-stamped value back to MapLibre default.
+    // Without this, a slider drag down then back up would leave the basemap
+    // stuck at the lower value (the original bug).
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { osm: { type: 'raster', tiles: ['x'], tileSize: 256 } },
+      layers: [{ id: 'osm', type: 'raster', source: 'osm', paint: { 'raster-opacity': 0.8 } }],
+    };
+    const next = applyBasemapConfigToStyle(style, { opacity: 1 });
+    const layer = next.layers[0] as unknown as { paint: { 'raster-opacity': number } };
+    expect(layer.paint['raster-opacity']).toBe(1);
+  });
+
+  it('master opacity is reversible when reapplied (does not compound — CR-01 regression)', () => {
+    // Regression test: applying opacity 0.5 then opacity 1
+    // against the same (already-mutated) style must restore raster-opacity to 1,
+    // not stay at 0.5. The previous design multiplied against live paint and
+    // short-circuited at >=1, leaving the slider monotonic-downward.
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { osm: { type: 'raster', tiles: ['x'], tileSize: 256 } },
+      layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
+    };
+    const afterFirst = applyBasemapConfigToStyle(style, { opacity: 0.5 });
+    const afterSecond = applyBasemapConfigToStyle(afterFirst, { opacity: 1 });
+    const layer = afterSecond.layers[0] as unknown as { paint: { 'raster-opacity': number } };
+    expect(layer.paint['raster-opacity']).toBeCloseTo(1, 5);
+  });
+
+  it('compound master-opacity drags compose against fresh stamps not stale paint (CR-01 regression)', () => {
+    // Second drag: 0.5 → 0.8 must produce 0.8 (absolute), not 0.5 * 0.8 = 0.4.
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { osm: { type: 'raster', tiles: ['x'], tileSize: 256 } },
+      layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
+    };
+    const afterFirst = applyBasemapConfigToStyle(style, { opacity: 0.5 });
+    const afterSecond = applyBasemapConfigToStyle(afterFirst, { opacity: 0.8 });
+    const layer = afterSecond.layers[0] as unknown as { paint: { 'raster-opacity': number } };
+    expect(layer.paint['raster-opacity']).toBeCloseTo(0.8, 5);
+  });
+
+  it('leaves expression-valued *-opacity untouched (no AST surgery)', () => {
+    const expression = ['interpolate', ['linear'], ['zoom'], 0, 0.2, 14, 0.8] as unknown as number;
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { osm: { type: 'raster', tiles: ['x'], tileSize: 256 } },
+      layers: [
+        { id: 'osm', type: 'raster', source: 'osm', paint: { 'raster-opacity': expression } },
+      ],
+    };
+    const next = applyBasemapConfigToStyle(style, { opacity: 0.5 });
+    const layer = next.layers[0] as unknown as { paint: { 'raster-opacity': unknown } };
+    expect(layer.paint['raster-opacity']).toEqual(expression);
+  });
+
+  it('dims boundary symbol icons in lockstep with text under subtle + master opacity', () => {
+    // applyBasemapLayerConfig's boundary branch previously stamped only
+    // `text-opacity: 0.45` for symbol layers, so `applyMasterOpacity` (which
+    // iterates BOTH text-opacity and icon-opacity for symbol type) fell back to
+    // writing absolute master for icon-opacity — text dimmed, icon stayed full.
+    // Fix stamps `icon-opacity: 0.45` alongside `text-opacity: 0.45` so both
+    // dim in lockstep to 0.45 * 0.5 = 0.225 under subtle + master=0.5.
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { v: { type: 'vector', tiles: ['x'] } },
+      layers: [
+        {
+          id: 'boundary_country_label',
+          type: 'symbol',
+          source: 'v',
+          'source-layer': 'boundary',
+          layout: { 'text-field': ['get', 'name'], 'icon-image': 'border-dot' },
+          paint: {},
+        },
+      ],
+    };
+    const next = applyBasemapConfigToStyle(style, {
+      boundary_visibility: 'subtle',
+      opacity: 0.5,
+    });
+    const layer = next.layers[0] as unknown as {
+      paint: { 'text-opacity': number; 'icon-opacity': number };
+    };
+    expect(layer.paint['text-opacity']).toBeCloseTo(0.225, 5);
+    expect(layer.paint['icon-opacity']).toBeCloseTo(0.225, 5);
+  });
+});
+
+describe('applyBasemapConfigToStyle prominence reversibility (builder-audit #338 COMPLEX-01)', () => {
+  // Lock the prose invariants in basemap-utils.ts (master-opacity and
+  // prominence-stamp composition) with CI-enforced regression tests: a subtle+dimmed pass
+  // followed by a full+opacity-1 pass must restore the canonical *-opacity
+  // defaults (1.0) across line, symbol, and raster layer types. A future edit
+  // that adds a new stamp, a new opacity key, or reorders applyMasterOpacity
+  // relative to applyProminence will fail here rather than ship the
+  // monotonic-slider bug the comments describe.
+
+  it('line: road subtle (master 0.5) then full (master 1.0) restores line-opacity to 1', () => {
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { v: { type: 'vector', tiles: ['x'] } },
+      layers: [
+        { id: 'road-primary', type: 'line', source: 'v', 'source-layer': 'transportation', paint: {} },
+      ],
+    };
+    const dimmed = applyBasemapConfigToStyle(style, { road_visibility: 'subtle', opacity: 0.5 });
+    const dimmedLayer = dimmed.layers[0] as unknown as { paint: { 'line-opacity': number } };
+    expect(dimmedLayer.paint['line-opacity']).toBeCloseTo(0.35 * 0.5, 5);
+
+    const restored = applyBasemapConfigToStyle(dimmed, { road_visibility: 'full', opacity: 1 });
+    const restoredLayer = restored.layers[0] as unknown as { paint: { 'line-opacity': number } };
+    expect(restoredLayer.paint['line-opacity']).toBeCloseTo(1, 5);
+  });
+
+  it('symbol: label subtle (master 0.5) then full (master 1.0) restores text/icon-opacity to 1', () => {
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { v: { type: 'vector', tiles: ['x'] } },
+      layers: [
+        {
+          id: 'place_label',
+          type: 'symbol',
+          source: 'v',
+          'source-layer': 'place',
+          layout: { 'text-field': ['get', 'name'], 'icon-image': 'dot' },
+          paint: {},
+        },
+      ],
+    };
+    const dimmed = applyBasemapConfigToStyle(style, { label_mode: 'subtle', opacity: 0.5 });
+    const dimmedLayer = dimmed.layers[0] as unknown as {
+      paint: { 'text-opacity': number; 'icon-opacity': number };
+    };
+    expect(dimmedLayer.paint['text-opacity']).toBeCloseTo(0.55 * 0.5, 5);
+    expect(dimmedLayer.paint['icon-opacity']).toBeCloseTo(0.45 * 0.5, 5);
+
+    const restored = applyBasemapConfigToStyle(dimmed, { label_mode: 'full', opacity: 1 });
+    const restoredLayer = restored.layers[0] as unknown as {
+      paint: { 'text-opacity': number; 'icon-opacity': number };
+    };
+    expect(restoredLayer.paint['text-opacity']).toBeCloseTo(1, 5);
+    expect(restoredLayer.paint['icon-opacity']).toBeCloseTo(1, 5);
+  });
+
+  it('raster: master 0.5 then master 1.0 restores raster-opacity to 1', () => {
+    const style: StyleSpecification = {
+      version: 8,
+      sources: { osm: { type: 'raster', tiles: ['x'], tileSize: 256 } },
+      layers: [{ id: 'osm', type: 'raster', source: 'osm', paint: {} }],
+    };
+    const dimmed = applyBasemapConfigToStyle(style, { opacity: 0.5 });
+    const dimmedLayer = dimmed.layers[0] as unknown as { paint: { 'raster-opacity': number } };
+    expect(dimmedLayer.paint['raster-opacity']).toBeCloseTo(0.5, 5);
+
+    const restored = applyBasemapConfigToStyle(dimmed, { opacity: 1 });
+    const restoredLayer = restored.layers[0] as unknown as { paint: { 'raster-opacity': number } };
+    expect(restoredLayer.paint['raster-opacity']).toBeCloseTo(1, 5);
+  });
+
+  it('mixed style: subtle+master 0.5 then full+master 1.0 restores every opacity key across all three types', () => {
+    const style: StyleSpecification = {
+      version: 8,
+      sources: {
+        v: { type: 'vector', tiles: ['x'] },
+        osm: { type: 'raster', tiles: ['x'], tileSize: 256 },
+      },
+      layers: [
+        { id: 'road-primary', type: 'line', source: 'v', 'source-layer': 'transportation', paint: {} },
+        {
+          id: 'place_label',
+          type: 'symbol',
+          source: 'v',
+          'source-layer': 'place',
+          layout: { 'text-field': ['get', 'name'], 'icon-image': 'dot' },
+          paint: {},
+        },
+        { id: 'osm', type: 'raster', source: 'osm', paint: {} },
+      ],
+    };
+    const dimmed = applyBasemapConfigToStyle(style, {
+      road_visibility: 'subtle',
+      label_mode: 'subtle',
+      opacity: 0.5,
+    });
+    const restored = applyBasemapConfigToStyle(dimmed, {
+      road_visibility: 'full',
+      label_mode: 'full',
+      opacity: 1,
+    });
+    const [line, symbol, raster] = restored.layers as unknown as Array<{ paint: Record<string, number> }>;
+    expect(line.paint['line-opacity']).toBeCloseTo(1, 5);
+    expect(symbol.paint['text-opacity']).toBeCloseTo(1, 5);
+    expect(symbol.paint['icon-opacity']).toBeCloseTo(1, 5);
+    expect(raster.paint['raster-opacity']).toBeCloseTo(1, 5);
+  });
+});
+
+// Shared missing-style-image resolver; knownImagesOnly parameterizes
+// the builder-vs-viewer/dataset divergence instead of three inline copies.
+// v6 passes the bare id, not an event object.
+describe('makeStyleImageMissingResolver', () => {
+  function fakeImageHost(has = false) {
+    return {
+      hasImage: vi.fn(() => has),
+      addImage: vi.fn(),
+    };
+  }
+
+  it('stubs any missing image when knownImagesOnly is false (viewer/dataset surfaces)', () => {
+    const map = fakeImageHost();
+    makeStyleImageMissingResolver(map, { knownImagesOnly: false })('circle_11_black');
+    expect(map.addImage).toHaveBeenCalledWith('circle_11_black', {
+      width: 1,
+      height: 1,
+      data: expect.any(Uint8Array),
+    });
+  });
+
+  it('stubs only known-noisy ids when knownImagesOnly is true (builder surface)', () => {
+    const map = fakeImageHost();
+    const resolve = makeStyleImageMissingResolver(map, { knownImagesOnly: true });
+    resolve('circle_11_black');
+    expect(map.addImage).not.toHaveBeenCalled();
+    resolve('circle-11');
+    expect(map.addImage).toHaveBeenCalledTimes(1);
+  });
+
+  it('never re-adds an image the map already has', () => {
+    const map = fakeImageHost(true);
+    makeStyleImageMissingResolver(map, { knownImagesOnly: false })('circle-11');
+    expect(map.addImage).not.toHaveBeenCalled();
+  });
+});

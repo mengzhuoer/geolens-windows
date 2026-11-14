@@ -1,0 +1,960 @@
+from __future__ import annotations
+
+import hashlib
+import math
+import re
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any
+
+from geoalchemy2.shape import to_shape
+from sqlalchemy import (
+    Integer,
+    and_,
+    case,
+    cast,
+    column,
+    func,
+    or_,
+    select,
+    text,
+    true,
+)
+from sqlalchemy import table as sql_table
+from sqlalchemy.orm import aliased
+from sqlalchemy.sql.elements import ColumnElement
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+
+# Rings are written by our own code at exact ±180 and round-trip
+# through WKB as exact float64, so this tolerance only absorbs serialization
+# noise -- deliberately too tight to promote real coordinates near the seam.
+_SEAM_TOL = 1e-9
+
+
+def _near(a: float, b: float) -> bool:
+    return abs(a - b) <= _SEAM_TOL
+
+
+def _seam_split_bbox(shape: object) -> tuple[float, float, float, float] | None:
+    """Recognize a two-ring antimeridian-split extent and return its
+    spec bbox as ``(west, south, east, north)`` with ``west > east``, else None.
+
+    The two parts must share one latitude band; a rollup of crossing extents
+    with different bands falls back to the honest, over-broad -180..180 bounds.
+    """
+    geoms = getattr(shape, "geoms", None)
+    if geoms is None or len(geoms) != 2:
+        return None
+    first, second = (g.bounds for g in geoms)
+
+    # `left` is flush against +180, `right` against -180; else not a seam split.
+    if _near(first[2], 180.0) and _near(second[0], -180.0):
+        left, right = first, second
+    elif _near(second[2], 180.0) and _near(first[0], -180.0):
+        left, right = second, first
+    else:
+        return None
+
+    # Halves must share a latitude band and not overlap in longitude -- the
+    # west > east form below is refused unless both hold.
+    if not (_near(left[1], right[1]) and _near(left[3], right[3])):
+        return None
+    if left[0] <= right[2]:
+        return None
+
+    return (left[0], left[1], right[2], left[3])
+
+
+def extent_to_bbox(extent: object | None) -> list[float] | None:
+    """Convert a geometry extent to an RFC 7946 §5.2 / STAC bbox.
+
+    Returns ``[west, south, east, north]``; a two-ring antimeridian-crossing
+    extent (see :func:`_seam_split_bbox`) yields ``west > east``. Callers
+    needing monotonic bounds must use :func:`extent_to_span_bbox` instead.
+    """
+    if extent is None:
+        return None
+    try:
+        shape = to_shape(extent)
+        seam = _seam_split_bbox(shape)
+        if seam is not None:
+            return list(seam)
+        return list(shape.bounds)
+    except Exception:  # broad: input is user-supplied; any geoalchemy/shapely parse failure should fall back to None
+        return None
+
+
+class VrtExtents(dict):
+    """``visible_vrt_extents``: each VRT's shown extent by dataset id.
+
+    ``narrowed`` names the VRTs whose shown extent leaves out a member the
+    requester cannot read.
+    """
+
+    def __init__(self, extents: Mapping[Any, object], narrowed: Iterable[Any]):
+        super().__init__(extents)
+        self.narrowed = frozenset(narrowed)
+
+
+def shows_mosaic_size(
+    record: Any, dataset_id: object, vrt_extents: Mapping[Any, object] | None
+) -> bool:
+    """Whether a dataset's full raster size (width, height) may be shown.
+
+    A VRT's size spans every member, so it shows only for a VRT the caller
+    resolved in ``vrt_extents`` and found no hidden member in.
+    """
+    if record.record_type != "vrt_dataset":
+        return True
+    return (
+        isinstance(vrt_extents, VrtExtents)
+        and dataset_id in vrt_extents
+        and dataset_id not in vrt_extents.narrowed
+    )
+
+
+def shown_extent(
+    record: Any, dataset_id: object, vrt_extents: Mapping[Any, object] | None
+) -> object | None:
+    """The extent to serialize for a dataset's ``record``.
+
+    A VRT's stored extent covers members the requester may not read, so a VRT
+    shows only what ``vrt_extents`` (the requester's ``visible_vrt_extents``)
+    holds for it, and nothing when the caller resolved none.
+    """
+    if record.record_type == "vrt_dataset":
+        return (vrt_extents or {}).get(dataset_id)
+    return record.spatial_extent
+
+
+def extent_to_span_bbox(extent: object | None) -> list[float] | None:
+    """Convert a geometry extent to monotonic planar bounds (``west <= east``).
+
+    Sibling of :func:`extent_to_bbox` for span arithmetic, planar
+    WKT, and tile bounds. A crossing extent reads -180..180: over-broad, never
+    inverted.
+    """
+    if extent is None:
+        return None
+    try:
+        return list(to_shape(extent).bounds)
+    except Exception:  # broad: input is user-supplied; any geoalchemy/shapely parse failure should fall back to None
+        return None
+
+
+# Shared floor for any float comparison gating a longitude shift,
+# re-frame, or domain choice. +/-360 round-trips disagree by ~1e-14 degrees on
+# the same edge, and a bare `<` lets that noise move geometry by a third of a
+# world (hit in ``_narrower_domain`` and the VRT frame chooser/rewrite).
+LON_EPSILON_DEGREES = 1e-9
+
+
+def extent_lon_span(extent: object | None) -> float | None:
+    """Longitudinal width of an extent in degrees, honest across ±180.
+
+    Companion to :func:`extent_to_span_bbox`, which reports the over-broad
+    -180..180 for a crossing extent; ``maxx - minx`` on that would understate a
+    10°-wide Pacific raster's resolution by 36x. Reads the ``west > east`` pair
+    instead and closes it the short way.
+    """
+    bbox = extent_to_bbox(extent)
+    if bbox is None:
+        return None
+    west, _, east, _ = bbox
+    span = east - west
+    return span + 360.0 if span < 0 else span
+
+
+def _ring(x0: float, south: float, x1: float, north: float) -> str:
+    return f"({x0} {south},{x1} {south},{x1} {north},{x0} {north},{x0} {south})"
+
+
+# 1e-9 pad matches the ``ST_Expand`` calls on POINT/LINESTRING
+# extents in ``processing/ingest/metadata_extent.py`` and
+# ``catalog/features/service.py``, so a padded extent here is the same size.
+_DEGENERATE_SPAN = 1e-12
+_DEGENERATE_PAD = 1e-9
+
+
+def _pad_degenerate(low: float, high: float, limit: float) -> tuple[float, float]:
+    """Widen a zero-span axis to a sliver, without leaving ``±limit``.
+
+    An axis on its domain edge (antimeridian, pole) has no room on one side,
+    so the sliver grows inward there instead. Non-degenerate spans pass
+    through untouched.
+
+    Callers must reject a non-finite bbox first: NaN passes the span test and
+    ``max``/``min`` would quietly substitute the domain edge.
+    """
+    if high - low >= _DEGENERATE_SPAN:
+        return low, high
+    return max(-limit, low - _DEGENERATE_PAD), min(limit, high + _DEGENERATE_PAD)
+
+
+def bbox_to_extent_wkt(west: float, south: float, east: float, north: float) -> str:
+    """Build extent WKT for an RFC 7946 §5.2 bbox, splitting it at ±180.
+
+    Producer side of :func:`extent_to_bbox`. A naive single ring
+    silently becomes the complement when ``west > east`` -- ``[170,-20,-170,-15]``
+    would emit a valid 1700 deg² rectangle covering the wrong side of the
+    world instead of the intended 100. Emits a two-part MULTIPOLYGON instead
+    (``west..180`` plus ``-180..east``), which :func:`extent_to_bbox` reads
+    back as the original pair.
+
+    A degenerate axis (``south == north``, or zero-width) is padded
+    to a sliver first -- else it yields collinear vertices, not a valid
+    polygon. Padding matches the ``ST_Expand`` producers rather than
+    rejecting, so data the schema stores happily still ingests.
+
+    A non-finite coordinate is refused outright, else NaN
+    passes every test below and silently records an almost-global extent for
+    a malformed ``StacImportItem.bbox``. STAC import isolates each item in a
+    savepoint, so raising costs the batch nothing.
+    """
+    if not all(math.isfinite(v) for v in (west, south, east, north)):
+        raise ValueError(f"bbox must be finite, got ({west}, {south}, {east}, {north})")
+    south, north = _pad_degenerate(south, north, 90.0)
+    if west <= east:
+        west, east = _pad_degenerate(west, east, 180.0)
+        return f"POLYGON({_ring(west, south, east, north)})"
+
+    # Drop a zero-width half (west at +180, or east at
+    # -180) -- right for a continuous rectangle caller (raster/STAC bbox),
+    # which loses nothing at that half. Wrong for discrete stored features, so
+    # seam_extent_wkt_for_table pads the seam edge before calling here.
+    halves = [
+        _ring(x0, south, x1, north)
+        for x0, x1 in ((west, 180.0), (-180.0, east))
+        if x0 < x1
+    ]
+    if not halves:
+        return f"POLYGON({_ring(-180.0, south, 180.0, north)})"
+    if len(halves) == 1:
+        return f"POLYGON({halves[0]})"
+    return f"MULTIPOLYGON({','.join(f'({h})' for h in halves)})"
+
+
+# antimeridian-aware extent rollups.
+
+# Used to detect footprints ST_ShiftLongitude would tear apart (see
+# _shifted_longitude_geom).
+_PRIME_MERIDIAN_WKT = "LINESTRING(0 -90,0 90)"
+
+# Margin before the shifted domain is preferred. +/-360 round-trips
+# disagree by ~3e-14 degrees on the same footprint, and without a margin that
+# noise wins the comparison and rewrites a non-crossing bbox with drifted
+# edges. Same floor as _SEAM_TOL.
+_DOMAIN_MARGIN = 1e-9
+
+
+def wrap_longitude(lng: float) -> float:
+    """Fold a longitude from the shifted domain back into ``[-180, 180]``.
+
+    Intermediate values from the ``+360``-shifted domain run up to
+    ~540; one subtraction suffices since a winning shifted range is always
+    narrower than 360 degrees. ``180`` stays ``180``, never flips to ``-180``.
+    """
+    if lng > 180.0:
+        return lng - 360.0
+    if lng < -180.0:
+        return lng + 360.0
+    return lng
+
+
+def _shifted_longitude_geom(geom_col: ColumnElement) -> ColumnElement:
+    """Move a footprint into the ``+360``-shifted longitude domain.
+
+    ``ST_ShiftLongitude`` shifts each vertex with ``x < 0``, right
+    for the two-ring seam form but wrong for a prime-meridian-crossing
+    footprint: Europe's ``-10..30`` becomes vertices ``350, 30``, claiming
+    span ``30..350`` and excluding Europe from a rollup that wins on that
+    span (verified false-covering in PostGIS). So whole footprints reaching
+    the prime meridian are translated instead; that preserves their own span,
+    so the shifted domain can only lose the comparison, never invent a
+    narrower range than the data has.
+
+    Requires a 4326 (degree) geometry column.
+    """
+    return case(
+        (
+            and_(
+                func.ST_XMin(geom_col) < 0,
+                func.ST_Intersects(
+                    geom_col,
+                    func.ST_SetSRID(func.ST_GeomFromText(_PRIME_MERIDIAN_WKT), 4326),
+                ),
+            ),
+            func.ST_Translate(geom_col, 360, 0),
+        ),
+        else_=func.ST_ShiftLongitude(geom_col),
+    )
+
+
+def rollup_bbox_columns(geom_col: ColumnElement) -> list[ColumnElement]:
+    """Six aggregate columns describing an extent rollup in two longitude domains.
+
+    A bare ``ST_Extent`` fold over records on both sides of the
+    antimeridian manufactures a global bbox -- two Fiji datasets at lon 179
+    and -179 roll up to ``-180..180``. These columns aggregate the rows both
+    as stored and in the ``+360``-shifted domain, so :func:`rollup_bbox` can
+    keep whichever is narrower.
+
+    Returns ``[xmin, ymin, xmax, ymax, shifted_xmin, shifted_xmax]``; splat as
+    the leading columns of a ``select()`` for :func:`rollup_bbox`. Latitudes
+    come from the unshifted extent since shifting longitude cannot change them.
+    """
+    normal = func.ST_Extent(geom_col)
+    shifted = func.ST_Extent(_shifted_longitude_geom(geom_col))
+    return [
+        func.ST_XMin(normal),
+        func.ST_YMin(normal),
+        func.ST_XMax(normal),
+        func.ST_YMax(normal),
+        func.ST_XMin(shifted),
+        func.ST_XMax(shifted),
+    ]
+
+
+def rollup_envelope(geom_col: ColumnElement) -> ColumnElement:
+    """Aggregate: the rows' extent as one geometry, as :func:`rollup_bbox` then
+    :func:`bbox_to_extent_wkt` would build it.
+
+    The narrower longitude domain wins, and a range that crosses ±180 comes
+    back split there into two parts. NULL when no row has an extent.
+    """
+    normal = func.ST_Extent(geom_col)
+    shifted = func.ST_Extent(_shifted_longitude_geom(geom_col))
+    south, north = func.ST_YMin(normal), func.ST_YMax(normal)
+    return case(
+        (
+            func.ST_XMax(shifted) - func.ST_XMin(shifted)
+            < func.ST_XMax(normal) - func.ST_XMin(normal) - _DOMAIN_MARGIN,
+            func.ST_WrapX(
+                func.ST_MakeEnvelope(
+                    func.ST_XMin(shifted), south, func.ST_XMax(shifted), north, 4326
+                ),
+                180,
+                -360,
+            ),
+        ),
+        else_=func.ST_MakeEnvelope(
+            func.ST_XMin(normal), south, func.ST_XMax(normal), north, 4326
+        ),
+    )
+
+
+def _narrower_domain(
+    xmin: float, ymin: float, xmax: float, ymax: float, sxmin: float, sxmax: float
+) -> list[float]:
+    """Keep whichever longitude domain spans less, as an RFC 7946 §5.2 bbox.
+
+    A tie, or anything inside ``_DOMAIN_MARGIN``, goes to the unshifted
+    domain, so an ordinary catalog's bbox stays byte-identical.
+
+    Documented ceiling, not the true minimal covering range: only the two cut
+    points (-180, 0) are tried, so a footprint whose largest gap falls
+    elsewhere (e.g. four bands spanning -170..165 with the real gap at
+    -160..-20) returns a valid but non-minimal cover (see
+    ``test_documented_ceiling_is_covering_but_not_minimal``). Always covering,
+    never inverted or partial.
+
+    A winning shifted edge can also land up to ~6e-14 degrees inside the true
+    union from the ``+360``/``-360`` round-trip -- not worth correcting, since
+    stored float64 geometry edges are fuzzy at the same scale already.
+    """
+    if sxmax - sxmin < (xmax - xmin) - _DOMAIN_MARGIN:
+        return [wrap_longitude(sxmin), ymin, wrap_longitude(sxmax), ymax]
+    return [xmin, ymin, xmax, ymax]
+
+
+def _rollup_floats(values: Sequence[object]) -> list[float] | None:
+    """Coerce a :func:`rollup_bbox_columns` row slice to six floats, or None."""
+    if values is None or len(values) < 6:
+        return None
+    if any(v is None for v in values[:6]):
+        return None
+    try:
+        return [float(v) for v in values[:6]]  # type: ignore[arg-type]
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def rollup_bbox(values: Sequence[object]) -> list[float] | None:
+    """Fold a :func:`rollup_bbox_columns` row into an RFC 7946 §5.2 bbox.
+
+    Returns ``[west, south, east, north]`` with ``west > east`` when the rollup
+    honestly crosses the antimeridian --- the STAC / OGC / GeoJSON encoding.
+    """
+    nums = _rollup_floats(values)
+    return None if nums is None else _narrower_domain(*nums)
+
+
+async def seam_extent_wkt_for_table(
+    session: AsyncSession,
+    table_name: str,
+    *,
+    schema: str | None = None,
+    geom_column: str = "geom_4326",
+) -> str | None:
+    """Two-ring extent WKT for a data table that honestly crosses ±180, else None.
+
+    Producer-side twin of :func:`rollup_bbox` for the per-dataset
+    extent writers. A naive ``ST_Extent`` over a Pacific-crossing table reads
+    near-global (150..250 shifted folds to -170..170, 340 degrees for a
+    100-degree footprint); this aggregates both longitude domains via
+    :func:`rollup_bbox_columns` and returns the honest two-ring MULTIPOLYGON
+    when the shifted domain wins. Returns None for a non-crossing/empty table.
+
+    ``table_name``/``schema`` go through SQLAlchemy identifier quoting, never
+    string-interpolated into SQL; callers still pass
+    validated names (``_validate_table_name`` / ``Dataset.table_name``).
+    """
+    tbl = sql_table(table_name, column(geom_column), schema=schema)
+    stmt = select(*rollup_bbox_columns(tbl.columns[geom_column])).select_from(tbl)
+    row = (await session.execute(stmt)).first()
+    values = _rollup_floats(row) if row is not None else None
+    if values is None:
+        return None
+    bbox = _narrower_domain(*values)
+    west, south, east, north = bbox
+    crossing = west > east
+    # Mirror of the +180 seam edge. Features at -180/170
+    # can win the shifted fold as apparently non-crossing [170..180], but the
+    # feature is STORED at planar -180, uncovered by that polygon. Re-express
+    # as crossing with east at -180 so bbox_to_extent_wkt pads that lobe.
+    if not crossing and east >= 180.0 and (west != values[0] or east != values[2]):
+        east = -180.0
+        crossing = True
+    if not crossing:
+        return None
+    # A fold with west at +180 or east at -180 has a
+    # zero-width half; bbox_to_extent_wkt drops it, right for a continuous
+    # rectangle but wrong here, since that half is exactly where the discrete
+    # row is stored. Widen the seam edge to a sub-mm sliver (same 1e-9 as the
+    # ST_Expand degenerate paths) so both planar reps of the seam stay covered.
+    if west >= 180.0:
+        west = 180.0 - 1e-9
+    if east <= -180.0:
+        east = -180.0 + 1e-9
+    return bbox_to_extent_wkt(west, south, east, north)
+
+
+def merge_bboxes(bboxes: Iterable[Sequence[float] | None]) -> list[float] | None:
+    """Merge RFC 7946 §5.2 bboxes on the circle, preferring the narrower domain.
+
+    The Python twin of :func:`rollup_bbox`, for folds that already
+    hold per-record bboxes (from :func:`extent_to_bbox`) instead of a SQL
+    aggregate. Inputs may themselves be ``west > east``; so may the result.
+    """
+    xmin = ymin = sxmin = float("inf")
+    xmax = ymax = sxmax = float("-inf")
+    seen = False
+
+    for bbox in bboxes:
+        if bbox is None or len(bbox) < 4:
+            continue
+        west, south, east, north = (float(v) for v in bbox[:4])
+        seen = True
+        ymin, ymax = min(ymin, south), max(ymax, north)
+        if west > east:
+            # Crossing: the unshifted domain can only say "the whole world",
+            # while the shifted domain holds the real, contiguous range.
+            xmin, xmax = min(xmin, -180.0), max(xmax, 180.0)
+            shifted = (west, east + 360.0)
+        else:
+            xmin, xmax = min(xmin, west), max(xmax, east)
+            # Shift the whole interval, mirroring _shifted_longitude_geom:
+            # a footprint reaching the prime meridian must move as one piece.
+            shifted = (west + 360.0, east + 360.0) if west < 0 else (west, east)
+        sxmin, sxmax = min(sxmin, shifted[0]), max(sxmax, shifted[1])
+
+    if not seen:
+        return None
+    return _narrower_domain(xmin, ymin, xmax, ymax, sxmin, sxmax)
+
+
+def make_bbox_filter(
+    geom_col: ColumnElement, bbox: list[float], *, predicate: str = "intersects"
+):
+    """Build a SQLAlchemy spatial filter from a bbox, handling antimeridian crossing.
+
+    When ``bbox[0] > bbox[2]`` (minx > maxx), the bbox crosses the antimeridian
+    and is split into two envelopes ORed together.
+
+    Args:
+        geom_col: SQLAlchemy column with geometry (e.g. ``Record.spatial_extent``).
+        bbox: ``[west, south, east, north]`` floats.
+        predicate: ``"intersects"`` or ``"within"``.
+
+    Returns:
+        A SQLAlchemy filter clause.
+    """
+    spatial_fn = func.ST_Within if predicate == "within" else func.ST_Intersects
+    west, south, east, north = bbox
+
+    if west > east:
+        # Antimeridian-crossing: split into [west..180] and [-180..east]
+        env_left = func.ST_MakeEnvelope(west, south, 180, north, 4326)
+        env_right = func.ST_MakeEnvelope(-180, south, east, north, 4326)
+        return or_(
+            and_(geom_col.op("&&")(env_left), spatial_fn(geom_col, env_left)),
+            and_(geom_col.op("&&")(env_right), spatial_fn(geom_col, env_right)),
+        )
+    else:
+        envelope = func.ST_MakeEnvelope(west, south, east, north, 4326)
+        return and_(geom_col.op("&&")(envelope), spatial_fn(geom_col, envelope))
+
+
+# World copies wrap_geometry_longitudes folds per member; check_wrap_turns
+# refuses wider input so nothing is ever truncated.
+MAX_WRAP_TURNS = 8
+
+
+def _member_coordinates(geometry: dict) -> Iterator[object]:
+    """Coordinates of each member of a GeoJSON geometry, split as ST_Dump splits it."""
+    kind = geometry.get("type")
+    if kind == "GeometryCollection":
+        for member in geometry.get("geometries") or []:
+            if isinstance(member, dict):
+                yield from _member_coordinates(member)
+    elif kind in ("MultiPoint", "MultiLineString", "MultiPolygon"):
+        yield from geometry.get("coordinates") or []
+    else:
+        yield geometry.get("coordinates")
+
+
+def _longitudes(coordinates: object) -> Iterator[float]:
+    if not isinstance(coordinates, list) or not coordinates:
+        return
+    if isinstance(coordinates[0], int | float):
+        try:
+            lng = float(coordinates[0])
+        except OverflowError as exc:
+            raise ValueError("a coordinate is too large") from exc
+        if math.isfinite(lng):
+            yield lng
+        return
+    for nested in coordinates:
+        yield from _longitudes(nested)
+
+
+def check_wrap_turns(geometry: object) -> None:
+    """Raise ``ValueError`` if a GeoJSON member spans more than ``MAX_WRAP_TURNS``
+    world copies, counted as :func:`wrap_geometry_longitudes` counts them.
+
+    Malformed geometry passes; PostGIS rejects it when it is parsed.
+    """
+    if not isinstance(geometry, dict):
+        return
+    for coordinates in _member_coordinates(geometry):
+        xs = list(_longitudes(coordinates))
+        if not xs:
+            continue
+        first = math.ceil((min(xs) - 180) / 360.0)
+        last = math.floor((max(xs) + 180) / 360.0)
+        if last - first + 1 > MAX_WRAP_TURNS:
+            raise ValueError(
+                f"a member spans more than {MAX_WRAP_TURNS} world copies of longitude"
+            )
+
+
+def wrap_geometry_longitudes(geom: ColumnElement) -> ColumnElement:
+    """Fold a 4326 geometry drawn on a wrapped web map into ``[-180, 180]``.
+
+    Returns ``geom`` itself when it is valid and every longitude lies strictly
+    inside ``(-180, 180)``. Otherwise each member is repaired, cut into the world copies it
+    spans (at most ``MAX_WRAP_TURNS``; :func:`check_wrap_turns` refuses wider
+    input), each slice is shifted by whole turns into range, and the union of the
+    slices is returned. Slices keep their member's dimension, so collapsed
+    repair output and seam slivers are dropped. Non-finite input yields NULL.
+    """
+    members = func.ST_Dump(geom).table_valued("geom")
+    member = members.c.geom
+    dimension = func.ST_Dimension(member)
+    # Closed world copies: a member on ±180 lands on both sides of the seam.
+    first_turn = func.ceil((func.ST_XMin(member) - 180) / 360.0)
+    last_turn = func.floor((func.ST_XMax(member) + 180) / 360.0)
+    extra_turns = func.least(last_turn - first_turn, MAX_WRAP_TURNS - 1)
+    steps = func.generate_series(0, cast(extra_turns, Integer))
+    steps = steps.table_valued("value").render_derived().lateral()
+    turn = first_turn + steps.c.value
+    # Repairing overlapping polygons together would drop their shared area, and
+    # ST_Intersection raises on an invalid one; repair each polygon on its own.
+    repaired = case(
+        (dimension == 2, func.ST_CollectionExtract(func.ST_MakeValid(member), 3)),
+        else_=member,
+    )
+    world = func.ST_MakeEnvelope(turn * 360 - 180, -90, turn * 360 + 180, 90, 4326)
+    piece = func.ST_CollectionExtract(
+        func.ST_Intersection(repaired, world), dimension + 1
+    )
+    folded = (
+        select(
+            func.ST_UnaryUnion(
+                func.ST_Collect(func.ST_Translate(piece, turn * -360, 0))
+            )
+        )
+        .select_from(members)
+        .join(steps, true())
+        .scalar_subquery()
+    )
+    xmin, xmax = func.ST_XMin(geom), func.ST_XMax(geom)
+    # Non-finite input matches nothing; GEOS raises on it.
+    finite = xmax - xmin + func.ST_YMax(geom) - func.ST_YMin(geom) < math.inf
+    return case(
+        (and_(xmin > -180, xmax < 180, func.ST_IsValid(geom)), geom),
+        (finite, folded),
+    )
+
+
+def wrapped_spatial_filter(
+    entity: Any,
+    folded: ColumnElement,
+    predicate: str = "intersects",
+    *,
+    extent_match: Callable[[Any, Callable[[ColumnElement], ColumnElement]], Any]
+    | None = None,
+) -> ColumnElement:
+    """Rows of ``entity`` whose ``spatial_extent`` meets ``folded`` under ``predicate``.
+
+    A fold across ±180 has pieces at both ends, so its single envelope spans every
+    longitude. Both the ``&&`` prefilter and the index condition PostGIS adds for
+    the predicate then admit the whole latitude band. Probing the index once per
+    piece keeps each probe to its own side of the seam. Intersection decomposes
+    over pieces; ``within`` is checked against the whole fold.
+
+    ``extent_match(candidate, test)`` replaces the test (``&&`` prefilter
+    included) on the stored extent, for a caller whose rows may show a
+    narrower extent than they store.
+    """
+    candidate = aliased(entity)
+    pieces = func.ST_Dump(folded).table_valued("geom")
+    spatial_fn = func.ST_Within if predicate == "within" else func.ST_Intersects
+    target = folded if predicate == "within" else pieces.c.geom
+
+    def test(extent: ColumnElement) -> ColumnElement:
+        return and_(
+            extent.op("&&")(func.ST_Envelope(pieces.c.geom)),
+            spatial_fn(extent, target),
+        )
+
+    matches = (
+        select(candidate.id)
+        .select_from(pieces)
+        .join(
+            candidate,
+            test(candidate.spatial_extent)
+            if extent_match is None
+            else extent_match(candidate, test),
+        )
+    )
+    return entity.id.in_(matches)
+
+
+@lru_cache(maxsize=512)
+def _proj_knows_epsg(srid: int) -> bool:
+    """True when PROJ, GDAL's registry, has this EPSG code.
+
+    Function-scope import and cache for the same reasons as ``_parse_crs``.
+    """
+    try:
+        from rasterio.crs import CRS
+
+        CRS.from_epsg(srid)
+        return True
+    except Exception:  # broad: any PROJ refusal means "not a code PROJ knows"
+        return False
+
+
+async def unknown_srid_refusal(
+    session: AsyncSession, srid: int | None, *, field: str = "srid_override"
+) -> str | None:
+    """The refusal when a caller-supplied SRID is in neither EPSG registry.
+
+    An unassigned EPSG code would otherwise ingest under the DETECTED CRS,
+    reading the coordinates under a system nobody asked for with no note in
+    the response.
+
+    Both registries count, because both consume the value:
+    a vector override reaches PostGIS ``ST_Transform``, a raster one reaches
+    ``gdal_translate -a_srs``, and the two EPSG databases are versioned
+    independently. A code in neither is refused; a code in one is the
+    consuming layer's to accept or report.
+    """
+    if srid is None:
+        return None
+    if _proj_knows_epsg(srid):
+        return None
+    known = await session.scalar(
+        text("SELECT 1 FROM spatial_ref_sys WHERE srid = :srid"), {"srid": srid}
+    )
+    if known:
+        return None
+    return (
+        f"{field} {srid} is not a known coordinate system: neither PROJ nor "
+        f"PostGIS spatial_ref_sys has that EPSG code. Use an assigned code, or "
+        f"omit {field} to keep the source CRS."
+    )
+
+
+# Shared with processing/raster/vrt.py through `crs_has_degree_unit`
+# below, so there is one implementation.
+_RADIANS_PER_DEGREE = math.pi / 180.0
+
+
+@lru_cache(maxsize=256)
+def _parse_crs(crs_wkt: str) -> object | None:
+    """Parse stored CRS WKT with PROJ, or None when PROJ will not accept it.
+
+    A regex scan of WKT structure cannot reliably answer "is this geographic"
+    or "what are its axis units" -- WKT is a nested grammar, so a flat scan
+    can't tell which subtree a unit belongs to (PRIMEM, MERIDIAN, BEARING,
+    conversion PARAMETERs all carry angular units). Ask PROJ instead, which
+    reads the actual tree and handles a BoundCRS's SOURCE units or a 3D
+    geographic CRS's axis unit correctly.
+
+    PROJ may open files the text names, so only the raster probe child calls
+    this. Import is function-scope because rasterio pulls in GDAL and ``core``
+    is the lowest layer; results are cached because callers repeat the same
+    few CRSs.
+    """
+    try:
+        from rasterio.crs import CRS
+
+        return CRS.from_wkt(crs_wkt)
+    except Exception:  # broad: crs_wkt is whatever GDAL wrote at ingest; any parse failure means "PROJ cannot answer", which is a fallback, not an error
+        return None
+
+
+def wkt_is_geographic(crs_wkt: str | None) -> bool | None:
+    """Classify a CRS WKT as geographic (lon/lat axes) or projected.
+
+    Unclassifiable/engineering/local/unknown CRSs return None.
+
+    PROJ decides whenever it can parse the WKT. The keyword sniff
+    below is the fallback for WKT PROJ rejects (abbreviated/truncated/legacy).
+    It checks PROJCRS/PROJCS first since WKT1 nests a GEOGCS inside every
+    PROJCS, and blanks quoted content first so a CRS name mentioning PROJCS
+    can't misclassify.
+
+    This is a CLASS test, not a units test: a grads GEOGCS (e.g. EPSG:4807) is
+    geographic without its resolutions being degrees. Pair with
+    :func:`wkt_has_degree_unit` when "geographic" must mean "in degrees".
+    """
+    # isinstance not truthiness: callers hand this RasterAsset.crs_wkt or test
+    # mocks; a non-string is an unknown CRS, not a crash.
+    if not isinstance(crs_wkt, str) or not crs_wkt:
+        return None
+    return _is_geographic(_parse_crs(crs_wkt), crs_wkt)
+
+
+def _is_geographic(crs: object | None, crs_wkt: str | None) -> bool | None:
+    """:func:`wkt_is_geographic`'s answer for ``crs``, PROJ's parse of ``crs_wkt``."""
+    if crs is not None:
+        try:
+            if crs.is_geographic:
+                return True
+            if crs.is_projected:
+                return False
+        except Exception:  # broad: exotic CRSs raise from PROJ rather than answering; fall through to the sniff
+            pass
+        # Parsed but neither geographic nor projected: geocentric/engineering.
+    if not isinstance(crs_wkt, str) or not crs_wkt:
+        return None
+    # Blank quoted content BEFORE truncating: a pathologically long quoted
+    # name could otherwise push a real keyword past the truncation point.
+    head = re.sub(r'"[^"]*"', '""', crs_wkt)[:2000].upper()
+    if "PROJCRS" in head or "PROJCS" in head:
+        return False
+    if "GEOGCRS" in head or "GEOGCS" in head:
+        return True
+    if "GEODCRS" in head or "GEODETICCRS" in head:
+        if "ELLIPSOIDAL" in head:
+            return True
+        if "CARTESIAN" in head:
+            return False
+        return None
+    return None
+
+
+def crs_has_degree_unit(crs: object | None) -> bool | None:
+    """Whether a PARSED CRS's coordinate axes are measured in degrees.
+
+    The one implementation of the radians-per-unit test.
+    :func:`wkt_has_degree_unit` is this plus a WKT parse; ``_is_degree_based``
+    (``processing/raster/vrt.py``) is this plus an ``is_geographic``
+    precondition -- it takes a CRS object because ``vrt.py`` holds a live
+    ``rasterio.crs.CRS`` and must not round-trip through WKT to reach here.
+
+    ``rel_tol`` is correct: this compares two fixed physical constants of the
+    same tiny magnitude (0.01745 rad/degree vs whatever PROJ reports), and the
+    nearest wrong answer, grads at 0.01571, is 10% away.
+
+    Returns None when there is no CRS or PROJ cannot report a unit factor;
+    callers read that as "unknown" and decide for themselves.
+    """
+    if crs is None:
+        return None
+    try:
+        _, radians_per_unit = crs.units_factor
+    except Exception:  # broad: units_factor raises CRSError on exotic/!undefined CRSs, which are exactly the ones we cannot answer for
+        return None
+    return math.isclose(radians_per_unit, _RADIANS_PER_DEGREE, rel_tol=1e-9)
+
+
+def wkt_has_degree_unit(crs_wkt: str | None) -> bool | None:
+    """Whether a CRS WKT's coordinate axes are measured in degrees.
+
+    Companion to :func:`wkt_is_geographic`, a class test that
+    admits grads CRSs -- only meaningful for a WKT already classed geographic.
+    Delegates to :func:`crs_has_degree_unit`, so reading PROJ's
+    ``units_factor`` rather than the unit's name means a custom spelling like
+    ``UNIT["arc-degree",0.01745...]`` still reads as degrees.
+
+    Returns None when there is no WKT or PROJ cannot parse it. Callers must
+    treat None as "unknown", not "not degrees": ``processing/tiles/router.py``
+    tests ``is not False`` so an unparseable CRS keeps the historical degrees
+    assumption instead of silently dropping the resolution.
+    """
+    if not isinstance(crs_wkt, str) or not crs_wkt:
+        return None
+    return crs_has_degree_unit(_parse_crs(crs_wkt))
+
+
+def crs_metres_per_unit(crs: object | None) -> float | None:
+    """Metres per linear unit of a PROJECTED CRS, or None when that is not a
+    question with an answer.
+
+    STAC's ``gsd`` is in metres, but a stored resolution is in whatever unit
+    its CRS measures. ``units_factor`` reports ``('metre', 1.0)`` for UTM/Web
+    Mercator and ``('US survey foot', 0.3048006...)`` for state-plane systems.
+
+    Returns None for a GEOGRAPHIC CRS on purpose: ``units_factor`` reports
+    RADIANS per unit there, and an angular resolution has no fixed length (a
+    degree of longitude is 111 km at the equator, 0 at the pole) without a
+    latitude this function isn't given. Callers must omit the value rather
+    than publish it unconverted, as the STAC item serializer does.
+    """
+    if crs is None:
+        return None
+    try:
+        if not crs.is_projected:
+            return None
+        _, metres_per_unit = crs.units_factor
+    except Exception:  # broad: exotic CRSs raise from PROJ rather than answering, and "no answer" is exactly the None case
+        return None
+    if not metres_per_unit or metres_per_unit <= 0:
+        return None
+    return float(metres_per_unit)
+
+
+def wkt_metres_per_unit(crs_wkt: str | None) -> float | None:
+    """:func:`crs_metres_per_unit` plus the WKT parse.
+
+    Same shape as :func:`wkt_has_degree_unit` over :func:`crs_has_degree_unit`.
+    None covers every uncertainty: no WKT, an unparseable one, or a CRS whose
+    units PROJ won't report.
+    """
+    if not isinstance(crs_wkt, str) or not crs_wkt:
+        return None
+    return crs_metres_per_unit(_parse_crs(crs_wkt))
+
+
+def crs_facts_of(crs: object | None, crs_wkt: str | None) -> dict:
+    """What request paths read about a raster's CRS, keyed by ``raster_assets`` column.
+
+    ``crs`` is PROJ's parse of ``crs_wkt``, or None when there is none.
+    """
+    return {
+        "crs_is_geographic": _is_geographic(crs, crs_wkt),
+        "crs_has_degree_unit": crs_has_degree_unit(crs),
+        "crs_metres_per_unit": crs_metres_per_unit(crs),
+    }
+
+
+def wkt_crs_facts(crs_wkt: str | None) -> dict:
+    """:func:`crs_facts_of` for CRS text, parsed here."""
+    if not isinstance(crs_wkt, str) or not crs_wkt:
+        return crs_facts_of(None, None)
+    return crs_facts_of(_parse_crs(crs_wkt), crs_wkt)
+
+
+CRS_FACT_COLUMNS = ("crs_is_geographic", "crs_has_degree_unit", "crs_metres_per_unit")
+
+
+def crs_columns(meta: dict) -> dict:
+    """A raster's CRS text and the facts derived from it, as ``raster_assets`` columns.
+
+    Every writer stores them together, so the facts describe the stored text.
+    ``crs_facts_digest`` is the SHA-256 of the text's UTF-8 bytes, which
+    migration 0073's trigger compares with ``sha256(convert_to(crs_wkt,
+    'UTF8'))`` to keep these facts when the text changes.
+    """
+    crs_wkt = meta.get("crs_wkt")
+    return {
+        "crs_wkt": crs_wkt,
+        **{column: meta.get(column) for column in CRS_FACT_COLUMNS},
+        "crs_facts_digest": (
+            hashlib.sha256(crs_wkt.encode("utf-8")).digest()
+            if isinstance(crs_wkt, str)
+            else None
+        ),
+    }
+
+
+@lru_cache(maxsize=256)
+def crs_facts_for_epsg(epsg: int) -> dict:
+    """:func:`crs_facts_of` for an EPSG code, read from the PROJ database.
+
+    Only a positive integer is looked up; anything else has no facts.
+    """
+    if not isinstance(epsg, int) or isinstance(epsg, bool) or epsg <= 0:
+        return crs_facts_of(None, None)
+    from rasterio.crs import CRS
+    from rasterio.errors import CRSError
+
+    try:
+        crs = CRS.from_epsg(epsg)
+    except CRSError:
+        return crs_facts_of(None, None)
+    return crs_facts_of(crs, crs.to_wkt(version="WKT2_2019"))
+
+
+def raster_crs_facts(raster: object) -> dict:
+    """A raster row's stored CRS facts or, while none are stored, its EPSG code's.
+
+    Stored facts always win. A row's facts stay NULL until the worker's repair
+    job fills them, and its EPSG code answers meanwhile; that code is PROJ's
+    lenient match for the text, so the job replaces these with the text's own.
+    """
+    stored = {column: getattr(raster, column, None) for column in CRS_FACT_COLUMNS}
+    if any(value is not None for value in stored.values()):
+        return stored
+    return dict(crs_facts_for_epsg(getattr(raster, "epsg", None)))
+
+
+def pixel_size_from_affine(
+    a: float, b: float, d: float, e: float
+) -> tuple[float, float]:
+    """Per-pixel ground distances along a raster's OWN axes, from its affine.
+
+    Not ``abs(a)``/``abs(e)``. Those are the pixel vectors'
+    COMPONENTS on the world axes, which equal the pixel sizes only when the
+    raster is axis-aligned. A geotransform maps pixel (col, row) to world
+    ``x = a*col + b*row + c``, ``y = d*col + e*row + f``, so one step along the
+    column axis moves the world point by the vector ``(a, d)`` and one step
+    along the row axis by ``(b, e)``. The LENGTHS of those two vectors are the
+    resolutions; ``a`` and ``e`` alone are their projections onto x and y.
+
+    Rotate a 10 m-pixel raster by 30° and ``abs(a)`` reports 8.66 m, a 13%
+    understatement that reaches the UI and STAC's ``gsd``.
+
+    For an axis-aligned raster ``b`` and ``d`` are zero and this returns
+    exactly ``abs(a)``/``abs(e)``. Both raster ingest paths call this so a
+    rotated scene reports the same resolution whether uploaded or imported
+    from a remote catalog.
+    """
+    return math.hypot(a, d), math.hypot(b, e)

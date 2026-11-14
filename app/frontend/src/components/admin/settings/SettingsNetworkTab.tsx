@@ -1,0 +1,228 @@
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { SettingSourceBadge } from './SettingSourceBadge';
+import { SettingsFormActions } from './SettingsFormActions';
+import { findSetting } from './utils';
+import { useSettingsForm, type ResetHandler } from './useSettingsForm';
+import { useNotificationStatus, useSendTestNotification } from '@/hooks/use-settings';
+import type { SettingItem, NotificationTestChannelResult } from '@/api/settings';
+import { Textarea } from '@/components/ui/textarea';
+
+interface TabProps {
+  settings: SettingItem[];
+  envOnly: boolean;
+  onSave: (changes: Record<string, unknown>) => void;
+  onReset: ResetHandler;
+  isSaving: boolean;
+  settingsUpdatedAt?: number;
+  saveFailed?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+}
+
+const FIELDS = [
+  { key: 'cors_allowed_origins', defaultValue: '' },
+  { key: 'global_rate_limit', defaultValue: 60 },
+  { key: 'ogc_items_max_page_size', defaultValue: 1000 },
+  // These two live on tab="network"; the admin Settings UI is their only
+  // control (there is no env var for either).
+  { key: 'semantic_search_rate_limit', defaultValue: 30 },
+  { key: 'basemap_proxy_rate_limit', defaultValue: 120 },
+] as const;
+
+function NotificationChannelBadge({ ok, label }: { ok: boolean; label: string }) {
+  const { t } = useTranslation('admin');
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className="text-sm text-muted-foreground">{label}:</span>
+      <Badge variant={ok ? 'default' : 'secondary'}>{ok ? t('common:yes') : t('common:no')}</Badge>
+    </span>
+  );
+}
+
+function ChannelResult({ result }: { result: NotificationTestChannelResult }) {
+  const { t } = useTranslation('admin');
+  return (
+    <div className="flex items-center gap-2 text-sm">
+      <Badge variant={result.ok ? 'default' : 'destructive'}>{result.channel}</Badge>
+      {result.ok ? (
+        <span className="text-muted-foreground">{t('settings.notifications.delivered')}</span>
+      ) : (
+        <span className="text-destructive">{result.error ?? t('settings.notifications.failed')}</span>
+      )}
+    </div>
+  );
+}
+
+export function SettingsNetworkTab({ settings, envOnly, onSave, onReset: submitReset, isSaving, settingsUpdatedAt, saveFailed, onDirtyChange }: TabProps) {
+  const { t } = useTranslation('admin');
+  const { values, setters, dirty, hasDirty, discard, onReset } = useSettingsForm(settings, FIELDS, isSaving, settingsUpdatedAt, saveFailed, submitReset);
+
+  // Notification channel status + test-send.
+  const { data: notifStatus, isLoading: notifLoading } = useNotificationStatus();
+  const testSend = useSendTestNotification();
+  const [testResult, setTestResult] = useState<{ sent: boolean; channels: NotificationTestChannelResult[]; message: string } | null>(null);
+
+  const handleSendTest = () => {
+    setTestResult(null);
+    testSend.mutate(undefined, {
+      onSuccess: (data) => setTestResult(data),
+      onError: () => {
+        setTestResult({
+          sent: false,
+          channels: [],
+          message: t('settings.notifications.testError'),
+        });
+      },
+    });
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="cors-origins">{t('settings.network.corsAllowedOrigins')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'cors_allowed_origins')?.source ?? 'default'} settingKey="cors_allowed_origins" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.network.corsAllowedOriginsDescription')}</p>
+        <Textarea
+          id="cors-origins"
+          value={values.cors_allowed_origins as string}
+          onChange={(e) => setters.cors_allowed_origins(e.target.value)}
+          disabled={envOnly}
+          placeholder={t('settings.network.corsAllowedOriginsPlaceholder')}
+          rows={3}
+          className="max-w-md"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="global-rate-limit">{t('settings.network.globalRateLimit')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'global_rate_limit')?.source ?? 'default'} settingKey="global_rate_limit" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.network.globalRateLimitDescription')}</p>
+        <Input
+          id="global-rate-limit"
+          type="number"
+          min={1}
+          max={1000}
+          value={values.global_rate_limit as number}
+          onChange={(e) => setters.global_rate_limit(Number(e.target.value))}
+          disabled={envOnly}
+          className="w-32"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="ogc-items-max-page-size">{t('settings.network.ogcItemsMaxPageSize')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'ogc_items_max_page_size')?.source ?? 'default'} settingKey="ogc_items_max_page_size" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.network.ogcItemsMaxPageSizeDescription')}</p>
+        <Input
+          id="ogc-items-max-page-size"
+          type="number"
+          min={1}
+          max={100000}
+          value={values.ogc_items_max_page_size as number}
+          onChange={(e) => setters.ogc_items_max_page_size(Number(e.target.value))}
+          disabled={envOnly}
+          className="w-32"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="semantic-search-rate-limit">{t('settings.network.semanticSearchRateLimit')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'semantic_search_rate_limit')?.source ?? 'default'} settingKey="semantic_search_rate_limit" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.network.semanticSearchRateLimitDescription')}</p>
+        <Input
+          id="semantic-search-rate-limit"
+          type="number"
+          min={1}
+          max={1000}
+          value={values.semantic_search_rate_limit as number}
+          onChange={(e) => setters.semantic_search_rate_limit(Number(e.target.value))}
+          disabled={envOnly}
+          className="w-32"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="basemap-proxy-rate-limit">{t('settings.network.basemapProxyRateLimit')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'basemap_proxy_rate_limit')?.source ?? 'default'} settingKey="basemap_proxy_rate_limit" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.network.basemapProxyRateLimitDescription')}</p>
+        <Input
+          id="basemap-proxy-rate-limit"
+          type="number"
+          min={1}
+          max={1000}
+          value={values.basemap_proxy_rate_limit as number}
+          onChange={(e) => setters.basemap_proxy_rate_limit(Number(e.target.value))}
+          disabled={envOnly}
+          className="w-32"
+        />
+      </div>
+
+      {/* Notification channel status + test-send */}
+      <div className="space-y-3 border rounded-md p-4">
+        <div>
+          <h3 className="text-sm font-medium">{t('settings.notifications.title')}</h3>
+          <p className="text-sm text-muted-foreground mt-1">{t('settings.notifications.description')}</p>
+        </div>
+
+        {notifLoading ? (
+          <p className="text-sm text-muted-foreground">{t('common:loading')}</p>
+        ) : notifStatus ? (
+          <div className="flex flex-wrap gap-4">
+            <NotificationChannelBadge ok={notifStatus.notifications_enabled} label={t('settings.notifications.statusEnabled')} />
+            <NotificationChannelBadge ok={notifStatus.smtp_configured} label={t('settings.notifications.smtpConfigured')} />
+            <NotificationChannelBadge ok={notifStatus.webhook_configured} label={t('settings.notifications.webhookConfigured')} />
+          </div>
+        ) : null}
+
+        <div className="flex items-center gap-3">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleSendTest}
+            disabled={testSend.isPending}
+          >
+            {testSend.isPending ? t('settings.notifications.sending') : t('settings.notifications.sendTest')}
+          </Button>
+        </div>
+
+        {testResult && (
+          <div className="space-y-2">
+            <p className="text-sm font-medium">
+              {testResult.sent
+                ? t('settings.notifications.testSuccess')
+                : testResult.channels.length > 0
+                  ? t('settings.notifications.testFailed')
+                  : t('settings.notifications.testNoChannel')}
+            </p>
+            {testResult.channels.length > 0 && (
+              <div className="space-y-1">
+                {testResult.channels.map((r) => (
+                  <ChannelResult key={r.channel} result={r} />
+                ))}
+              </div>
+            )}
+            {testResult.channels.length === 0 && (
+              <p className="text-sm text-muted-foreground">{testResult.message}</p>
+            )}
+          </div>
+        )}
+      </div>
+
+      <SettingsFormActions dirty={dirty} hasDirty={hasDirty} envOnly={envOnly} isSaving={isSaving} onSave={onSave} onDiscard={discard} onDirtyChange={onDirtyChange} />
+    </div>
+  );
+}

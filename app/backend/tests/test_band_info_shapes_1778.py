@@ -1,0 +1,118 @@
+"""Either producer's band_info reaches OGC records and STAC items as raster:bands."""
+
+import uuid
+
+import pytest
+
+
+class TestBandInfoShapes:
+    def test_stac_nodata_is_published_as_a_number(self) -> None:
+        """``extract_raster_metadata`` stores ``str(src.nodata)``."""
+        bands = _stac_bands(
+            [{"index": 1, "dtype": "uint8", "nodata": "0.0", "color_interp": "Red"}]
+        )
+        assert bands == [{"data_type": "uint8", "nodata": 0.0, "name": "Red"}]
+        assert isinstance(bands[0]["nodata"], float)
+
+    @pytest.mark.parametrize("sentinel", ["nan", "inf", "-inf", "NaN"])
+    def test_the_extension_sentinels_stay_strings(self, sentinel: str) -> None:
+        bands = _stac_bands([{"dtype": "float32", "nodata": sentinel}])
+        assert bands[0]["nodata"] == sentinel.lower()
+
+    def test_an_unparseable_nodata_is_dropped(self) -> None:
+        bands = _stac_bands([{"dtype": "uint8", "nodata": "unknown"}])
+        assert bands == [{"data_type": "uint8"}]
+
+    def test_a_remotely_described_cog_publishes_its_statistics(self) -> None:
+        """``fetch_cog_info`` writes ``{min, max, mean}`` and nothing else."""
+        bands = _stac_bands([{"min": 0, "max": 255, "mean": 12.5}], dtype="uint8")
+        assert bands == [
+            {
+                "data_type": "uint8",
+                "statistics": {"minimum": 0, "maximum": 255, "mean": 12.5},
+            }
+        ]
+
+    def test_a_bands_own_nodata_wins_over_the_rasters(self) -> None:
+        bands = _stac_bands(
+            [{"dtype": "uint8", "nodata": None}, {"dtype": "uint8"}], nodata="0"
+        )
+        assert bands == [{"data_type": "uint8"}, {"data_type": "uint8", "nodata": 0.0}]
+
+    def test_a_band_with_no_field_is_left_out(self) -> None:
+        assert _stac_bands([{"min": None, "max": None}, {"dtype": "uint8"}]) == [
+            {"data_type": "uint8"}
+        ]
+
+    @pytest.mark.parametrize(
+        ("dtype", "data_type"),
+        [("float32", "float32"), ("complex64", "cfloat32"), ("bool", None)],
+    )
+    def test_a_data_type_takes_the_extensions_name(self, dtype, data_type) -> None:
+        bands = _stac_bands([{"dtype": dtype, "color_interp": "Gray"}])
+        assert bands[0].get("data_type") == data_type
+
+    def test_the_ogc_records_serializer_reports_the_band_name(self) -> None:
+        """``color_interp`` is the key the local producer writes; nothing
+        writes the ``name`` this serializer used to read."""
+        bands = _ogc_bands(
+            [
+                {"index": 1, "dtype": "uint8", "color_interp": "Red"},
+                {"index": 2, "dtype": "uint8", "color_interp": "Green"},
+                {"index": 3, "dtype": "uint8", "color_interp": "Blue"},
+            ]
+        )
+        assert [band["name"] for band in bands] == ["Red", "Green", "Blue"]
+
+
+def _ogc_record(band_info: list[dict]) -> dict:
+    """The OGC record of a raster whose band_info is ``band_info``.
+
+    Transient ORM instances rather than a session: the serializer is
+    synchronous and reads attributes, so nothing here needs to be persisted.
+    """
+    from datetime import datetime, timezone
+
+    from app.modules.catalog.datasets.domain.models import Dataset, Record
+    from app.modules.catalog.search.service_records import dataset_to_ogc_record
+
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    record = Record(
+        id=uuid.uuid4(),
+        title="raster",
+        record_type="raster_dataset",
+        visibility="public",
+        record_status="published",
+        created_at=now,
+        updated_at=now,
+    )
+    dataset = Dataset(
+        id=uuid.uuid4(), record_id=record.id, table_name="raster_x", srid=4326
+    )
+    dataset.record = record
+    return dataset_to_ogc_record(
+        dataset,
+        "https://example.test",
+        raster_meta={"band_count": len(band_info), "band_info": band_info},
+    )
+
+
+def _ogc_bands(band_info: list[dict]) -> list[dict]:
+    return _ogc_record(band_info)["properties"].get("raster:bands", [])
+
+
+def _stac_bands(
+    band_info: list[dict], dtype: str | None = None, nodata: str | None = None
+) -> list[dict]:
+    from app.standards.stac.serializer import ogc_record_to_stac_item
+
+    record = _ogc_record(band_info)
+    record["assets"]["data"] = {"href": "https://example.test/cog.tif"}
+    item = ogc_record_to_stac_item(
+        record,
+        stac_api_url="https://example.test/stac",
+        band_info=band_info,
+        dtype=dtype,
+        nodata=nodata,
+    )
+    return item["assets"]["data"].get("raster:bands", [])

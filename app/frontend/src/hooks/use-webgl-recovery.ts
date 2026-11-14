@@ -1,0 +1,67 @@
+import { useEffect, useState, type RefObject } from 'react';
+import type { Map as MaplibreMap } from 'maplibre-gl';
+import { logger } from '@/lib/logger';
+
+/**
+ * Detect WebGL context loss on a MapLibre map and provide recovery state.
+ * When context is lost, `contextLost` becomes true and an overlay should
+ * be rendered. When context is restored, `contextLost` resets to false.
+ */
+export function useWebGLRecovery(
+  mapRef: RefObject<MaplibreMap | null>,
+  mapReady: boolean,
+  /**
+   * Fired after a successful context restore, before the
+   * style is re-applied. Callers use it to invalidate tile tokens: a GPU outage
+   * can outlast a signed token's expiry, and re-applying the same style would
+   * otherwise reinstall tile URLs carrying a now-dead token.
+   */
+  onRestore?: () => void,
+) {
+  const [contextLost, setContextLost] = useState(false);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+
+    const canvas = map.getCanvas();
+    if (!canvas) return;
+
+    const onLost = (e: Event) => {
+      e.preventDefault(); // allow context restoration
+      setContextLost(true);
+      // Structured warning so production issues are detectable in logs (GPU
+      // driver crash, eviction under memory pressure, canvas2d-blocking extensions).
+      if (import.meta.env.DEV) {
+        console.warn('[map] WebGL context lost', {
+          timestamp: new Date().toISOString(),
+        });
+      }
+    };
+
+    const onRestored = () => {
+      if (import.meta.env.DEV) console.warn('[map] WebGL context restored');
+      // Refresh tile tokens before re-applying the style so the reinstalled
+      // tile URLs carry unexpired tokens.
+      onRestore?.();
+      try {
+        const style = map.getStyle();
+        if (style) map.setStyle(style);
+        setContextLost(false);
+      } catch (err) {
+        logger.error('WebGL recovery: style restoration failed', err);
+        setContextLost(true); // Keep overlay visible so user knows to reload
+      }
+    };
+
+    canvas.addEventListener('webglcontextlost', onLost);
+    canvas.addEventListener('webglcontextrestored', onRestored);
+
+    return () => {
+      canvas.removeEventListener('webglcontextlost', onLost);
+      canvas.removeEventListener('webglcontextrestored', onRestored);
+    };
+  }, [mapRef, mapReady, onRestore]);
+
+  return { contextLost, reload: () => window.location.reload() };
+}

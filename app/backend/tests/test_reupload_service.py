@@ -1,0 +1,483 @@
+"""Tests for service-source re-upload commit dispatch and worker invariants."""
+
+import uuid
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import select, text
+
+from app.modules.catalog.collections.models import DatasetVersion
+from app.modules.catalog.datasets.domain.models import Dataset
+from app.platform.jobs.heartbeat import attempt_scoped_staging_table
+from app.processing.ingest.ogr import IngestionError
+from app.processing.ingest.tasks import reupload_service
+from app.platform.jobs.models import IngestJob
+from app.platform.refresh import credentials as creds
+
+from tests.factories import create_dataset, get_user_id
+from tests.test_service_refresh_1220 import credential_backend  # noqa: F401
+
+
+async def _create_dataset(
+    session,
+    *,
+    created_by: uuid.UUID,
+    name: str = "Service Reupload Dataset",
+    visibility: str = "public",
+) -> Dataset:
+    return await create_dataset(
+        session,
+        created_by=created_by,
+        name=name,
+        description=f"Test dataset: {name}",
+        theme_category=[],
+        visibility=visibility,
+        feature_count=100,
+        source_filename="original.geojson",
+        source_url="https://old.example.com/source",
+        column_info=[
+            {"name": "name", "type": "character varying"},
+            {"name": "value", "type": "integer"},
+        ],
+    )
+
+
+async def _create_service_reupload_job(
+    session,
+    *,
+    dataset_id: uuid.UUID,
+    created_by: uuid.UUID,
+    source_url: str = "https://example.com/wfs",
+    source_layer: str = "roads",
+    source_filename: str = "Roads Layer",
+    refresh: bool = False,
+) -> IngestJob:
+    job = IngestJob(
+        dataset_id=dataset_id,
+        source_filename=source_filename,
+        source_url=source_url,
+        source_layer=source_layer,
+        created_by=created_by,
+        status="pending",
+        user_metadata={
+            "reupload": True,
+            "dataset_id": str(dataset_id),
+            "service_type": "WFS 2.0.0",
+            "layer_id": None,
+            "source_type": "service_url",
+            # router_refresh stamps this; reupload_commit does
+            # not. It is the only thing separating the two doors inside a
+            # task that serves both.
+            **({"refresh": True} if refresh else {}),
+        },
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+def test_verified_refresh_has_a_distinct_registered_task_name() -> None:
+    from app.platform.extensions.defaults_catalog_port import DefaultCatalogPort
+    from app.processing.ingest.tasks import reupload_verified_refresh
+
+    verified_task = DefaultCatalogPort().verified_refresh_service_task()
+
+    assert verified_task is reupload_verified_refresh
+    assert verified_task.name == "app.ingest.tasks.reupload_verified_refresh"
+    assert verified_task.name != reupload_service.name
+    assert verified_task.name not in reupload_service.aliases
+    assert verified_task.func is reupload_service.func
+
+
+class TestServiceReuploadCommitDispatch:
+    async def test_commit_dispatches_to_reupload_service_and_keeps_token_request_only(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        credential_backend,  # noqa: F811
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        job = await _create_service_reupload_job(
+            test_db_session,
+            dataset_id=dataset.id,
+            created_by=admin_id,
+        )
+
+        mock_reupload_service = MagicMock()
+        mock_reupload_file = MagicMock()
+        mock_reupload_service.defer_async = AsyncMock(return_value=None)
+        mock_reupload_file.defer_async = AsyncMock(return_value=None)
+        mock_reupload_file.configure.return_value.defer_async = AsyncMock(
+            return_value=None
+        )
+        mock_catalog_port = MagicMock()
+        mock_catalog_port.reupload_service_task.return_value = mock_reupload_service
+        mock_catalog_port.reupload_file_task.return_value = mock_reupload_file
+        mock_catalog_port.priority_queue_threshold_bytes = 10_000_000
+
+        with patch(
+            "app.modules.catalog.datasets.api.router_reupload.get_catalog_port",
+            return_value=mock_catalog_port,
+        ):
+            resp = await client.post(
+                f"/datasets/{dataset.id}/reupload/{job.id}/commit",
+                json={"token": "super-secret-token"},
+                headers=admin_auth_header,
+            )
+
+        assert resp.status_code == 202
+        payload = resp.json()
+        assert payload["status"] == "pending"
+        assert payload["message"] == "Re-upload queued"
+
+        # A WFS bearer credential defers on the task's own queue.
+        mock_reupload_service.configure.assert_not_called()
+        mock_reupload_service.defer_async.assert_awaited_once()
+        service_kwargs = mock_reupload_service.defer_async.call_args.kwargs
+        assert service_kwargs["job_id"] == str(job.id)
+        assert service_kwargs["dataset_id"] == str(dataset.id)
+        assert service_kwargs["source_url"] == "https://example.com/wfs"
+        assert service_kwargs["source_layer"] == "roads"
+        assert service_kwargs["user_id"] == str(admin_id)
+        # A WFS origin's credential is staged as the finished header line.
+        assert "token" not in service_kwargs
+        assert "super-secret-token" not in str(service_kwargs)
+        assert (
+            await creds.claim_service_credential(service_kwargs["credential_ref"])
+            == "Authorization: Bearer super-secret-token"
+        )
+
+        mock_reupload_file.defer_async.assert_not_awaited()
+        mock_reupload_file.configure.assert_not_called()
+
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.id == job.id)
+        )
+        updated_job = result.scalar_one()
+        await test_db_session.refresh(updated_job)
+        assert "token" not in (updated_job.user_metadata or {})
+        assert "super-secret-token" not in str(updated_job.user_metadata)
+        assert updated_job.user_metadata["service_auth_required"] is True
+
+
+class TestServiceReuploadWorker:
+    @pytest.mark.parametrize(
+        "worker_token",
+        ["runtime-token", None],
+        ids=["with_token", "without_token"],
+    )
+    async def test_reupload_service_preserves_identity_and_increments_version(
+        self,
+        client: AsyncClient,  # ensures app.database.async_session points to test DB
+        test_db_session,
+        worker_token: str | None,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        job = await _create_service_reupload_job(
+            test_db_session,
+            dataset_id=dataset.id,
+            created_by=admin_id,
+            source_url="https://services.example.com/wfs",
+            source_layer="roads",
+            source_filename="roads_wfs",
+        )
+        original_dataset_id = dataset.id
+        original_table_name = dataset.table_name
+        original_version = dataset.current_version
+
+        async def _fake_run_ogr2ogr_service(
+            gdal_source: str,
+            layer_name: str,
+            table_name: str,
+            db_conn_str: str,
+            service_type: str,
+            timeout: float = 1800.0,
+            token: str | None = None,
+            is_non_spatial: bool = False,
+            append: bool = False,
+            *,
+            schema: str,
+            on_spawn=None,
+            keep_z: bool = False,
+        ) -> None:
+            # Mirrors the real runner: a successful spawn fires on_spawn
+            # (fix #1271 review — the contact-stamp signal).
+            if on_spawn is not None:
+                on_spawn()
+            import app.core.db as db_module
+
+            async with db_module.async_session() as session:
+                await session.execute(
+                    text(f'DROP TABLE IF EXISTS "{schema}"."{table_name}"')
+                )
+                await session.execute(
+                    text(
+                        f'CREATE TABLE "{schema}"."{table_name}" '
+                        "(gid serial PRIMARY KEY, name text, value integer)"
+                    )
+                )
+                await session.commit()
+
+        metadata_payload = {
+            "srid": 4326,
+            "geometry_type": "MULTIPOLYGON",
+            "feature_count": 275,
+            "extent_wkt": "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+            "column_info": [
+                {
+                    "name": "name",
+                    "type": "character varying",
+                    "ordinal_position": 1,
+                    "is_nullable": True,
+                },
+                {
+                    "name": "value",
+                    "type": "integer",
+                    "ordinal_position": 2,
+                    "is_nullable": True,
+                },
+            ],
+        }
+
+        with (
+            # commit f8c91297 added a defense-in-depth
+            # SSRF re-validation of ``source_url`` at the top of the
+            # ``reupload_service`` worker body (tasks_reupload.py:373-378)
+            # via a LAZY from-import inside the function body:
+            #     from app.platform.security import validate_url_for_ssrf
+            # The lazy import re-binds the symbol on every call, so the
+            # patch target MUST be the function's defining module (NOT
+            # the worker's namespace). The fixture URL
+            # ``services.example.com`` fails DNS resolution in the test
+            # sandbox, which is unrelated to this test's contract
+            # (identity preservation + version increment), so we no-op
+            # the gate via AsyncMock. Same fix shape as in
+            # test_ingest.py.
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.modules.catalog.sources.preview.build_gdal_source",
+                return_value=("WFS:https://services.example.com/wfs", "roads"),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogr2ogr_service", new_callable=AsyncMock
+            ) as mock_run_ogr2ogr_service,
+            patch(
+                "app.processing.ingest.metadata.ensure_geom_column",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "app.processing.ingest.metadata.clip_to_mercator_bounds",
+                new_callable=AsyncMock,
+            ) as mock_clip,
+            patch(
+                "app.processing.ingest.metadata.add_4326_column",
+                new_callable=AsyncMock,
+            ) as mock_add_4326,
+            patch(
+                "app.processing.ingest.metadata.grant_reader_access",
+                new_callable=AsyncMock,
+            ) as mock_grant,
+            patch(
+                "app.processing.ingest.metadata.extract_metadata",
+                new_callable=AsyncMock,
+            ) as mock_extract_metadata,
+            patch(
+                "app.processing.ingest.metadata.get_sample_values",
+                new_callable=AsyncMock,
+            ) as mock_sample_values,
+            patch(
+                "app.processing.ingest.metadata.refresh_attribute_metadata",
+                new_callable=AsyncMock,
+            ) as mock_refresh_attributes,
+            patch(
+                "app.processing.ingest.metadata.score_quality",
+                new_callable=AsyncMock,
+            ) as mock_quality_score,
+            patch(
+                "app.processing.ingest.metadata.compute_table_content_digest",
+                new_callable=AsyncMock,
+            ) as mock_content_digest,
+            patch(
+                "app.processing.ingest.publish_followups.invalidate_catalog_cache",
+                new_callable=AsyncMock,
+            ) as mock_invalidate_catalog,
+        ):
+            mock_run_ogr2ogr_service.side_effect = _fake_run_ogr2ogr_service
+            mock_extract_metadata.return_value = metadata_payload
+            mock_sample_values.return_value = {"name": ["Main St"]}
+            mock_quality_score.return_value = {
+                "overall": 92,
+                "metadata_completeness": 90,
+                "geometry_validity": 100,
+                "attribute_completeness": 85,
+                "crs_defined": 100,
+            }
+
+            await reupload_service(
+                job_id=str(job.id),
+                attempt_id=str(job.attempt_id),
+                dataset_id=str(dataset.id),
+                source_url=job.source_url or "",
+                source_layer=job.source_layer or "",
+                user_id=str(admin_id),
+                token=worker_token,
+            )
+
+        await test_db_session.refresh(dataset)
+
+        assert dataset.id == original_dataset_id
+        assert dataset.table_name == original_table_name
+        assert dataset.current_version == original_version + 1
+        assert dataset.feature_count == 275
+        assert dataset.source_url == "https://services.example.com/wfs"
+        assert dataset.source_format == "wfs"
+        assert dataset.source_filename == "roads_wfs"
+
+        # The swap records that the pull needed a credential, as a
+        # boolean. True or ABSENT, never False — a token-less success stores
+        # the ref shape it stored before the key existed, which is also how a
+        # service that went public gets un-marked. The token itself is never
+        # written to the dataset row, in any form.
+        origin_ref = dataset.origin_ref or {}
+        if worker_token is None:
+            assert "auth_required" not in origin_ref
+        else:
+            assert origin_ref["auth_required"] is True
+        assert "runtime-token" not in str(origin_ref)
+        assert "runtime-token" not in str(dataset.origin_uri)
+
+        table_exists = await test_db_session.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema='data' AND table_name=:tn)"
+            ),
+            {"tn": original_table_name},
+        )
+        assert table_exists.scalar() is True
+
+        version_result = await test_db_session.execute(
+            select(DatasetVersion)
+            .where(DatasetVersion.dataset_id == dataset.id)
+            .order_by(DatasetVersion.version_number.desc())
+        )
+        version, kept = version_result.scalars().all()
+        assert version.version_number == original_version + 1
+        assert kept.version_number == original_version
+        assert version.source_format == "wfs"
+        assert version.source_filename == "roads_wfs"
+        assert version.feature_count == 275
+        assert version.srid == 4326
+        assert version.geometry_type == "MULTIPOLYGON"
+        assert version.file_hash is None
+        assert version.uploaded_by == admin_id
+
+        await test_db_session.refresh(job)
+        assert job.status == "complete"
+        assert job.error_message is None
+        assert job.attempt_id is not None
+
+        staging_table = attempt_scoped_staging_table(
+            original_table_name, job.attempt_id
+        )
+
+        mock_clip.assert_awaited_once_with(ANY, staging_table, schema="data")
+        mock_add_4326.assert_awaited_once_with(ANY, staging_table, 4326, schema="data")
+        mock_grant.assert_awaited_once_with(
+            ANY,
+            staging_table,
+            schema="data",
+            role="geolens_reader",
+        )
+        mock_refresh_attributes.assert_awaited_once()
+        mock_quality_score.assert_awaited_once()
+        mock_content_digest.assert_not_awaited()
+        mock_invalidate_catalog.assert_awaited_once_with()
+
+    @pytest.mark.parametrize(
+        ("refresh", "expected"),
+        [
+            (False, "Retry the re-upload with the credential"),
+            (True, "Retry the refresh with the credential"),
+        ],
+        ids=["reupload_commit", "refresh"],
+    )
+    async def test_reupload_service_without_token_returns_retry_guidance_on_auth_failure(
+        self,
+        client: AsyncClient,  # ensures app.database.async_session points to test DB
+        test_db_session,
+        refresh: bool,
+        expected: str,
+    ):
+        """The copy names the door the operator actually used.
+
+        One task serves the refresh endpoint and the re-upload commit, and the
+        old string said "Retry commit" on both — advice about a door half the
+        callers never came through. It also names the request field that fixes
+        it, since a credential is request-only and there is nothing to
+        un-expire.
+
+        That field is the `auth` object rather than
+        the deprecated `token`, which always means a bearer credential and so
+        could not authenticate the basic or named-key origin that produced this
+        failure.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        job = await _create_service_reupload_job(
+            test_db_session,
+            dataset_id=dataset.id,
+            created_by=admin_id,
+            source_url="https://protected.example.com/wfs",
+            source_layer="roads",
+            refresh=refresh,
+        )
+
+        with (
+            # Same SSRF defense-in-depth as the first
+            # worker test. Fixture URL ``protected.example.com`` fails DNS
+            # in the sandbox; mock the gate so the test exercises its actual
+            # contract (401-retry guidance message from IngestionError).
+            # test_ingest.py:1369 is the canonical pattern.
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.modules.catalog.sources.preview.build_gdal_source",
+                return_value=("WFS:https://protected.example.com/wfs", "roads"),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogr2ogr_service",
+                new_callable=AsyncMock,
+            ) as mock_run_ogr2ogr_service,
+        ):
+            mock_run_ogr2ogr_service.side_effect = IngestionError(
+                "ogr2ogr failed (exit 1): HTTP error code : 401 Unauthorized"
+            )
+
+            with pytest.raises(IngestionError, match=expected):
+                await reupload_service(
+                    job_id=str(job.id),
+                    attempt_id=str(job.attempt_id),
+                    dataset_id=str(dataset.id),
+                    source_url=job.source_url or "",
+                    source_layer=job.source_layer or "",
+                    user_id=str(admin_id),
+                    token=None,
+                )
+
+        await test_db_session.refresh(job)
+        assert job.status == "failed"
+        assert expected in (job.error_message or "")
+        assert "`auth` object" in (job.error_message or "")
+        # The door that was NOT used is never named.
+        assert "Retry commit with a service token" not in (job.error_message or "")

@@ -1,0 +1,334 @@
+"""Map layer access checks and mutation helpers."""
+
+import uuid
+from collections.abc import Iterable
+from typing import Any
+
+from fastapi import HTTPException, status
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db.sqlstate import is_lock_conflict
+from app.core.identity import Identity
+from app.modules.catalog.authorization import apply_visibility_filter, get_user_roles
+from app.modules.catalog.datasets.domain.models import Dataset, DatasetGrant, Record
+from app.modules.catalog.maps.models import Map, MapLayer
+from app.modules.catalog.maps.schemas import (
+    _MAX_LAYERS_PER_MAP,
+    MapLayerInput,
+    split_legacy_builder_paint,
+)
+from app.modules.catalog.maps.service_shared import (
+    _infer_layer_type,
+    generate_default_style,
+    get_dataset_meta,
+    normalize_dem_style_config,
+)
+from app.modules.catalog.write_recheck import admit_writer, recheck_admitted_writer
+
+MAP_WRITE_DENIED = "Not authorized to modify this map"
+
+
+async def bulk_check_dataset_access(
+    session: AsyncSession,
+    dataset_ids: list[uuid.UUID],
+    user: Identity,
+    user_roles: set[str],
+) -> set[uuid.UUID]:
+    """Return the subset of dataset_ids the user can access. Single round-trip.
+
+    Routes through apply_visibility_filter, not an inline policy mirror, so an
+    overlay permission extension's decision, creator exemption included, is
+    honored on map-attach paths. An id matching no dataset is never reported
+    accessible.
+    """
+    if not dataset_ids:
+        return set()
+
+    stmt = (
+        select(Dataset.id)
+        .join(Record, Dataset.record_id == Record.id)
+        .where(Dataset.id.in_(dataset_ids))
+    )
+    stmt = apply_visibility_filter(stmt, user, user_roles, Record, DatasetGrant)
+    result = await session.execute(stmt)
+    return {row[0] for row in result}
+
+
+async def terrain_dataset_ids_visible_to(
+    session: AsyncSession,
+    terrain_config: Any,
+    layer_dataset_ids: Iterable[uuid.UUID],
+    user: Identity | None,
+) -> set[str]:
+    """Dataset ids a terrain binding may name in a read by ``user``.
+
+    The visible layers count, and so does a DEM outside them that the caller can
+    see or that no longer exists, which the builder shows as a missing source.
+    Only a DEM that exists and is hidden from the caller is left out.
+    """
+    allowed = {str(dataset_id) for dataset_id in layer_dataset_ids}
+    source_id = (
+        terrain_config.get("source_dataset_id")
+        if isinstance(terrain_config, dict)
+        else None
+    )
+    if source_id is None or str(source_id) in allowed:
+        return allowed
+    try:
+        dem_id = uuid.UUID(str(source_id))
+    except ValueError:
+        return allowed | {str(source_id)}
+    user_roles = await get_user_roles(session, user) if user is not None else set()
+    visible = apply_visibility_filter(
+        select(Dataset.id)
+        .join(Record, Dataset.record_id == Record.id)
+        .where(Dataset.id == dem_id),
+        user,
+        user_roles,
+        Record,
+        DatasetGrant,
+    )
+    if (await session.execute(visible)).first() is not None or (
+        await session.execute(select(Dataset.id).where(Dataset.id == dem_id))
+    ).first() is None:
+        allowed.add(str(source_id))
+    return allowed
+
+
+_LAYER_LOCK_TIMEOUT = "2s"
+
+
+async def lock_map_layers(session: AsyncSession, map_id: uuid.UUID) -> None:
+    """Serialize the writers that change one map's layers or the tokens that
+    share it.
+
+    Take it before reading the layers a write will count or reconcile, and hold
+    it through the caller's commit: a writer that counted first would otherwise
+    insert on a stale count after another admitted its layer. Only the wait for
+    this lock is bounded; a wait that outlasts the bound answers 409. The lock
+    leaves the map's key shareable, so a layer delete holding its rows can still
+    insert the history event that references the map. Re-checks the writer
+    ``check_map_ownership`` admitted, so a write that leaves the map row itself
+    unchanged takes it before its first write too.
+    """
+    await session.execute(
+        text("SELECT set_config('lock_timeout', :timeout, true)"),
+        {"timeout": _LAYER_LOCK_TIMEOUT},
+    )
+    try:
+        await session.execute(
+            select(Map.id).where(Map.id == map_id).with_for_update(key_share=True)
+        )
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another change to this map is in progress. Retry shortly.",
+        ) from exc
+    await session.execute(text("RESET lock_timeout"))
+    await recheck_map_ownership(session, map_id)
+
+
+async def lock_maps_for_admin_write(
+    session: AsyncSession, map_ids: Iterable[uuid.UUID], user: Identity
+) -> None:
+    """Take each map's row with ``lock_map_layers``, in map id order, for an
+    admin write to the tokens that share them, and re-check ``user`` under
+    each: still active, an admin or the map's owner, and still granted the
+    capabilities ``require_permission`` admitted the request under."""
+    for map_id in sorted(set(map_ids)):
+        admit_writer(session, ("map", map_id), user)
+        await lock_map_layers(session, map_id)
+
+
+async def recheck_map_ownership(session: AsyncSession, map_id: uuid.UUID) -> None:
+    """Re-run ``check_map_ownership`` for the writer it admitted, against the
+    owner and roles as committed now. Call holding the map row lock."""
+
+    async def enforce(user: Identity, row: Any) -> None:
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Map not found"
+            )
+        if not row.active or (row.created_by != user.id and "admin" not in row.roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=MAP_WRITE_DENIED
+            )
+
+    await recheck_admitted_writer(
+        session, ("map", map_id), (Map.created_by,), Map.id == map_id, enforce
+    )
+
+
+async def _admit_layer(session: AsyncSession, map_id: uuid.UUID) -> None:
+    """Refuse an append past the per-map layer limit.
+
+    Maps already over the limit can still shrink: only additions come through
+    here.
+    """
+    await lock_map_layers(session, map_id)
+    layer_count = (
+        await session.execute(
+            select(func.count()).select_from(MapLayer).where(MapLayer.map_id == map_id)
+        )
+    ).scalar_one()
+    if layer_count >= _MAX_LAYERS_PER_MAP:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"A map holds at most {_MAX_LAYERS_PER_MAP} layers",
+        )
+
+
+async def touch_map(session: AsyncSession, map_id: uuid.UUID) -> None:
+    """Advance the map's ``updated_at`` for a change to its layers, which
+    leaves the map row as it was, so a reader comparing ``updated_at`` and a
+    write naming ``expected_updated_at`` both see the change."""
+    await session.execute(
+        update(Map)
+        .where(Map.id == map_id)
+        .values(updated_at=func.now())
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def add_layer(
+    session: AsyncSession,
+    map_id: uuid.UUID,
+    body: MapLayerInput,
+) -> MapLayer:
+    """Add a layer to a map. Applies default style if paint/layout is None.
+
+    Raises 422 when the map is at its layer limit. Does NOT commit.
+    """
+    meta = await get_dataset_meta(session, body.dataset_id)
+    record_type = meta.record_type if meta else None
+    geometry_type = meta.geometry_type if meta else None
+
+    # Asked even when the caller names a layer type, so a dataset that cannot
+    # be a layer is refused either way.
+    dataset_layer_type = _infer_layer_type(record_type)
+    resolved_layer_type = body.layer_type or dataset_layer_type
+
+    paint = body.paint
+    layout = body.layout
+    style_config = body.style_config
+    # Raster layers use empty paint/layout (no vector style defaults)
+    if resolved_layer_type == "raster_geolens":
+        if paint is None:
+            paint = {}
+        if layout is None:
+            layout = {}
+    elif paint is None or layout is None:
+        defaults = generate_default_style(geometry_type)
+        if paint is None:
+            paint = defaults["paint"]
+        if layout is None:
+            layout = defaults["layout"]
+        if style_config is None:
+            style_config = defaults.get("style_config")
+
+    paint, style_config = split_legacy_builder_paint(paint, style_config)
+    style_config = normalize_dem_style_config(
+        style_config,
+        is_dem=meta.is_dem if meta else None,
+    )
+    await _admit_layer(session, map_id)
+    sort_order = body.sort_order
+    if "sort_order" not in body.model_fields_set:
+        result = await session.execute(
+            select(MapLayer.sort_order)
+            .where(MapLayer.map_id == map_id)
+            .order_by(MapLayer.sort_order.desc())
+            .limit(1)
+        )
+        highest_sort_order = result.scalar_one_or_none()
+        sort_order = 0 if highest_sort_order is None else highest_sort_order + 1
+
+    layer = MapLayer(
+        map_id=map_id,
+        dataset_id=body.dataset_id,
+        sort_order=sort_order,
+        visible=body.visible,
+        opacity=body.opacity,
+        paint=paint,
+        layout=layout,
+        layer_type=resolved_layer_type,
+        # Dialog-added layers POST no display_name; persist the dataset title
+        # so API consumers don't see null.
+        display_name=body.display_name or (meta.title if meta else None),
+        filter=body.filter,
+        label_config=body.label_config,
+        popup_config=body.popup_config.model_dump() if body.popup_config else None,
+        style_config=style_config,
+        show_in_legend=body.show_in_legend,
+    )
+    session.add(layer)
+    await touch_map(session, map_id)
+    await session.flush()
+    return layer
+
+
+async def remove_layer(
+    session: AsyncSession,
+    layer_id: uuid.UUID,
+    *,
+    map_id: uuid.UUID,
+) -> bool:
+    """Delete a map layer by ID. Returns True if deleted, False if not found."""
+    await lock_map_layers(session, map_id)
+    result = await session.execute(
+        delete(MapLayer).where(MapLayer.id == layer_id, MapLayer.map_id == map_id)
+    )
+    # SQLAlchemy CursorResult exposes rowcount for DML; the async Result
+    # type stub is less specific so mypy can't narrow it here.
+    removed = result.rowcount > 0  # type: ignore[attr-defined]
+    if removed:
+        await touch_map(session, map_id)
+    return removed
+
+
+async def remove_layers_bulk(
+    session: AsyncSession,
+    layer_ids: list[uuid.UUID],
+    map_id: uuid.UUID,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Batch-delete multiple layers from a map in a single transaction.
+
+    One SELECT to discover existing ids, then one DELETE. Returns
+    (deleted_ids, failed_pairs); failed_pairs entries are
+    (layer_id_str, "not_found"). Does NOT commit — caller commits so
+    audit/history can share the transaction.
+    """
+    if not layer_ids:
+        return [], []
+
+    await lock_map_layers(session, map_id)
+    existing_result = await session.execute(
+        select(MapLayer.id).where(
+            MapLayer.map_id == map_id,
+            MapLayer.id.in_(layer_ids),
+        )
+    )
+    existing_ids: set[uuid.UUID] = set(existing_result.scalars().all())
+
+    failed_pairs: list[tuple[str, str]] = [
+        (str(lid), "not_found") for lid in layer_ids if lid not in existing_ids
+    ]
+
+    if not existing_ids:
+        return [], failed_pairs
+
+    await session.execute(
+        delete(MapLayer).where(
+            MapLayer.map_id == map_id,
+            MapLayer.id.in_(existing_ids),
+        )
+    )
+    await touch_map(session, map_id)
+
+    deleted_ids = [str(lid) for lid in layer_ids if lid in existing_ids]
+    return deleted_ids, failed_pairs

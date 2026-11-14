@@ -1,0 +1,376 @@
+"""Shared search filters and filter query helpers."""
+
+from __future__ import annotations
+
+import uuid as uuid_mod
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Literal, TypedDict
+
+from fastapi import HTTPException, status
+from sqlalchemy import and_, exists, func, literal_column, or_, select
+from sqlalchemy.orm import aliased
+
+from app.core.geo import (
+    make_bbox_filter,
+    wrap_geometry_longitudes,
+    wrapped_spatial_filter,
+)
+from app.core.identity import Identity
+from app.core.text import escape_ilike
+from app.modules.catalog.authorization import visible_extent_match
+from app.modules.catalog.collections.models import CollectionDataset
+from app.modules.catalog.datasets.domain.models import (
+    Dataset,
+    Record,
+    RecordContact,
+    RecordKeyword,
+    RecordTranslation,
+)
+
+
+class FacetCounts(TypedDict):
+    record_type: dict
+    keywords: list[dict]
+    source_organization: list[dict]
+    srid: list[dict]
+    collections: list[dict]
+
+
+@dataclass(frozen=True, slots=True)
+class SearchFilters:
+    """Common filter parameters shared by search and facet queries."""
+
+    # Text / spatial
+    q: str | None = None
+    bbox: list[float] | None = None
+    keywords: list[str] | None = None
+    geometry_type: str | None = None
+    srid: int | None = None
+    source_organization: str | None = None
+    record_type: str | None = None
+    record_ids: tuple[uuid_mod.UUID, ...] | None = None
+    external_ids: tuple[str, ...] | None = None
+    public_resource_types: tuple[str, ...] | None = None
+    standards_query_params: tuple[tuple[str, tuple[str, ...]], ...] | None = None
+    date_from: date | None = None
+    date_to: date | None = None
+    vintage_start: date | None = None
+    vintage_end: date | None = None
+    datetime_param: str | None = None
+    exclude_synthetic: bool = True
+    collection_id: uuid_mod.UUID | None = None
+    spatial_predicate: Literal["intersects", "within"] = "intersects"
+    geometry_geojson: str | None = None
+
+    # search_datasets-only fields
+    cql2_filter: str | None = None
+    cql2_filter_lang: str = "cql2-text"
+    sort_by: str = "relevance"
+    sort_desc: bool | None = None
+    skip: int = 0
+    limit: int = 10
+
+
+def _build_text_filter(q: str):
+    """Build the full-text OR clause for a query string.
+
+    Combines tsvector match on ``search_vector``, ILIKE on title/summary,
+    and FTS + ILIKE on RecordKeyword and RecordContact (name + org).
+    """
+    query_text = q.strip()
+    # Use 'simple' regconfig for non-Latin scripts that 'english' can't tokenize;
+    # combine both so accented/stemmed English still works alongside CJK/Arabic/etc.
+    ts_query_en = func.websearch_to_tsquery("english", query_text)
+    ts_query_simple = func.websearch_to_tsquery("simple", query_text)
+    ts_query = ts_query_en.bool_op("||")(ts_query_simple)
+    # Use || (IMMUTABLE), not concat_ws (STABLE), to match the functional GIN
+    # index ix_records_simple_search_vector (migration 0001_baseline).
+    # immutable_text_array_join is the IMMUTABLE array_to_string wrapper from
+    # the same migration.
+    record_simple_vector = func.to_tsvector(
+        "simple",
+        func.coalesce(Record.title, "")
+        + " "
+        + func.coalesce(Record.summary, "")
+        + " "
+        + func.coalesce(Record.lineage_summary, "")
+        + " "
+        + func.coalesce(
+            literal_column("catalog.immutable_text_array_join(theme_category, ' ')"),
+            "",
+        ),
+    )
+
+    # catalog.immutable_unaccent (IMMUTABLE) matches the trigram GIN
+    # indexes; a plain func.unaccent() resolves to public.unaccent (STABLE)
+    # via search_path and forces a seq scan instead.
+    # escape_ilike() keeps user %, _, \ literal; escape="\\" on every .like()
+    # makes the ESCAPE character explicit.
+    unaccented_like = func.concat(
+        "%", func.catalog.immutable_unaccent(escape_ilike(query_text).lower()), "%"
+    )
+    english_vector_match = Record.search_vector.bool_op("@@")(ts_query)
+    simple_vector_match = record_simple_vector.bool_op("@@")(ts_query_simple)
+    vector_match = or_(english_vector_match, simple_vector_match)
+    title_match = func.lower(func.catalog.immutable_unaccent(Record.title)).like(
+        unaccented_like, escape="\\"
+    )
+    summary_match = func.lower(
+        func.catalog.immutable_unaccent(func.coalesce(Record.summary, ""))
+    ).like(unaccented_like, escape="\\")
+
+    translation_vector = func.to_tsvector(
+        "simple",
+        func.coalesce(RecordTranslation.title, "")
+        + " "
+        + func.coalesce(RecordTranslation.summary, ""),
+    )
+    translation_fts_sel = select(RecordTranslation.record_id).where(
+        RecordTranslation.record_id == Record.id,
+        translation_vector.bool_op("@@")(ts_query_simple),
+    )
+    translation_like_sel = select(RecordTranslation.record_id).where(
+        RecordTranslation.record_id == Record.id,
+        or_(
+            func.lower(func.catalog.immutable_unaccent(RecordTranslation.title)).like(
+                unaccented_like, escape="\\"
+            ),
+            func.lower(
+                func.catalog.immutable_unaccent(
+                    func.coalesce(RecordTranslation.summary, "")
+                )
+            ).like(unaccented_like, escape="\\"),
+        ),
+    )
+
+    kw_fts_sel = select(RecordKeyword.id).where(
+        RecordKeyword.record_id == Record.id,
+        (
+            func.to_tsvector("english", RecordKeyword.keyword).bool_op("||")(
+                func.to_tsvector("simple", RecordKeyword.keyword)
+            )
+        ).bool_op("@@")(ts_query),
+    )
+    kw_like_sel = select(RecordKeyword.id).where(
+        RecordKeyword.record_id == Record.id,
+        func.lower(func.catalog.immutable_unaccent(RecordKeyword.keyword)).like(
+            unaccented_like, escape="\\"
+        ),
+    )
+    ct_fts_sel = select(RecordContact.id).where(
+        RecordContact.record_id == Record.id,
+        (
+            func.to_tsvector(
+                "english",
+                func.coalesce(RecordContact.name, "")
+                + " "
+                + func.coalesce(RecordContact.organization, ""),
+            ).bool_op("||")(
+                func.to_tsvector(
+                    "simple",
+                    func.coalesce(RecordContact.name, "")
+                    + " "
+                    + func.coalesce(RecordContact.organization, ""),
+                )
+            )
+        ).bool_op("@@")(ts_query),
+    )
+    ct_like_sel = select(RecordContact.id).where(
+        RecordContact.record_id == Record.id,
+        func.lower(
+            func.catalog.immutable_unaccent(
+                func.coalesce(RecordContact.name, "")
+                + " "
+                + func.coalesce(RecordContact.organization, "")
+            )
+        ).like(unaccented_like, escape="\\"),
+    )
+
+    keyword_exists = exists(kw_fts_sel)
+    keyword_partial_exists = exists(kw_like_sel)
+    contact_exists = exists(ct_fts_sel)
+    contact_partial_exists = exists(ct_like_sel)
+    translation_exists = exists(translation_fts_sel)
+    translation_partial_exists = exists(translation_like_sel)
+
+    clause = or_(
+        vector_match,
+        title_match,
+        summary_match,
+        keyword_exists,
+        keyword_partial_exists,
+        contact_exists,
+        contact_partial_exists,
+        translation_exists,
+        translation_partial_exists,
+    )
+
+    # Return individual parts too -- search_datasets needs them for ranking.
+    return clause, {
+        "ts_query": ts_query,
+        "ts_query_simple": ts_query_simple,
+        "vector_match": vector_match,
+        "english_vector_match": english_vector_match,
+        "simple_vector_match": simple_vector_match,
+        "record_simple_vector": record_simple_vector,
+        "title_match": title_match,
+        "summary_match": summary_match,
+        "keyword_exists": keyword_exists,
+        "keyword_partial_exists": keyword_partial_exists,
+        "contact_exists": contact_exists,
+        "contact_partial_exists": contact_partial_exists,
+        "translation_exists": translation_exists,
+        "translation_partial_exists": translation_partial_exists,
+    }
+
+
+def utc_midnight(day: date, days: int = 0) -> datetime:
+    """Midnight UTC starting ``day`` plus ``days``, saturating at year 9999.
+
+    timestamptz columns compared with a bare ``date`` bind use the database
+    session's TimeZone, which shifts the day on non-UTC servers.
+    """
+    try:
+        shifted = day + timedelta(days=days)
+    except OverflowError:
+        return datetime.max.replace(tzinfo=timezone.utc)
+    return datetime.combine(shifted, time.min, tzinfo=timezone.utc)
+
+
+def parse_ogc_datetime(datetime_str: str) -> tuple[date | None, date | None]:
+    """Parse an OGC datetime interval string into (start, end) dates.
+
+    Supports an instant, a bounded interval, or ``../end``/``start/..``.
+    Raises HTTP 400 on a malformed value; the single chokepoint for
+    collection_items, search_datasets, and facets.
+    """
+    try:
+        if "/" in datetime_str:
+            left, right = datetime_str.split("/", 1)
+            dt_start = None if left == ".." else date.fromisoformat(left[:10])
+            dt_end = None if right == ".." else date.fromisoformat(right[:10])
+            return dt_start, dt_end
+        instant = date.fromisoformat(datetime_str[:10])
+        return instant, instant
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid datetime value: {e}",
+        )
+
+
+def _apply_common_filters(
+    stmt,
+    filters: SearchFilters,
+    *,
+    user: Identity | None,
+    user_roles: set[str],
+    skip_text: bool = False,
+):
+    """Apply the shared filter stack used by both search and facets.
+
+    Pass ``skip_text=True`` when the caller already handles text search with
+    custom ranking (e.g. ``search_datasets``). Spatial filters match each
+    VRT by the extent ``user`` sees.
+    """
+    if not skip_text and filters.q and filters.q.strip():
+        text_clause, _parts = _build_text_filter(filters.q)
+        stmt = stmt.where(text_clause)
+    if filters.geometry_geojson:
+        geom = wrap_geometry_longitudes(
+            func.ST_SetSRID(func.ST_GeomFromGeoJSON(filters.geometry_geojson), 4326)
+        )
+        stmt = stmt.where(
+            wrapped_spatial_filter(
+                Record,
+                geom,
+                filters.spatial_predicate,
+                extent_match=lambda candidate, test: visible_extent_match(
+                    user, user_roles, test, record=candidate
+                ),
+            )
+        )
+    elif filters.bbox and len(filters.bbox) == 4:
+        bbox = filters.bbox
+        stmt = stmt.where(
+            visible_extent_match(
+                user,
+                user_roles,
+                lambda extent: make_bbox_filter(
+                    extent, bbox, predicate=filters.spatial_predicate
+                ),
+            )
+        )
+    if filters.keywords:
+        _RK = aliased(RecordKeyword)
+        for kw in filters.keywords:
+            stmt = stmt.where(
+                exists(
+                    select(_RK.id)
+                    .where(
+                        _RK.record_id == Record.id,
+                        func.lower(_RK.keyword) == kw.lower(),
+                    )
+                    .correlate(Record)
+                )
+            )
+    if filters.geometry_type:
+        stmt = stmt.where(Dataset.geometry_type == filters.geometry_type)
+    if filters.srid:
+        stmt = stmt.where(Dataset.srid == filters.srid)
+    if filters.source_organization:
+        stmt = stmt.where(Record.source_organization == filters.source_organization)
+    if filters.datetime_param:
+        dt_start, dt_end = parse_ogc_datetime(filters.datetime_param)
+        # Fully null-temporal records compare against created_at (mirrors
+        # stac/router.py's _apply_datetime_filter); a bare `.is_(None)` would
+        # match every null-temporal record for ANY datetime filter.
+        # One-bound-set records keep the open-ended reading on the other
+        # bound.
+        null_temporal = Record.temporal_start.is_(None) & Record.temporal_end.is_(None)
+        if dt_start is not None:
+            stmt = stmt.where(
+                or_(
+                    Record.temporal_end >= dt_start,
+                    and_(
+                        Record.temporal_end.is_(None), Record.temporal_start.isnot(None)
+                    ),
+                    and_(null_temporal, Record.created_at >= utc_midnight(dt_start)),
+                )
+            )
+        if dt_end is not None:
+            stmt = stmt.where(
+                or_(
+                    Record.temporal_start <= dt_end,
+                    and_(
+                        Record.temporal_start.is_(None), Record.temporal_end.isnot(None)
+                    ),
+                    and_(
+                        null_temporal,
+                        Record.created_at < utc_midnight(dt_end, 1),
+                    ),
+                )
+            )
+    if filters.collection_id is not None:
+        stmt = stmt.where(
+            exists(
+                select(CollectionDataset.dataset_id).where(
+                    CollectionDataset.dataset_id == Dataset.id,
+                    CollectionDataset.collection_id == filters.collection_id,
+                )
+            )
+        )
+    if filters.exclude_synthetic:
+        _RKS = aliased(RecordKeyword)
+        stmt = stmt.where(
+            ~exists(
+                select(_RKS.id)
+                .where(
+                    _RKS.record_id == Record.id,
+                    func.lower(_RKS.keyword) == "synthetic",
+                )
+                .correlate(Record)
+            )
+        )
+    return stmt

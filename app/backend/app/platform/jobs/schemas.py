@@ -1,0 +1,220 @@
+import uuid
+from datetime import datetime
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+# Structured ingest-warning contract: warnings land in
+# ``IngestJob.user_metadata['warnings']``. Producers use TypedDicts in
+# ``app.processing.ingest.warnings``; the router re-parses through ``IngestJobWarning``
+# so malformed warnings are caught before they cross the wire.
+
+
+class ReservedRenameDetail(BaseModel):
+    original: str
+    renamed: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ReservedRenameWarning(BaseModel):
+    kind: Literal["reserved_rename"]
+    details: list[ReservedRenameDetail]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class DbfTruncationDetail(BaseModel):
+    truncated: str
+    originals: list[str]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class DbfTruncationCollisionWarning(BaseModel):
+    kind: Literal["dbf_truncation_collision"]
+    details: list[DbfTruncationDetail]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MercatorClipDetail(BaseModel):
+    """Counts geometry changed by the Web Mercator clamp.
+
+    The clamp is a box, not a latitude cutoff: longitude -180 to 180 and
+    latitude -85.06 to 85.06. Either bound can be the one that cost the user
+    geometry, so clients must not present this as a latitude-only problem.
+
+    ``dropped_features`` lost their geometry entirely (a valid point at lat
+    -89.95 becomes ``MULTIPOINT EMPTY``); ``clipped_features`` survived in
+    reduced form.
+    """
+
+    dropped_features: int = Field(ge=0)
+    clipped_features: int = Field(ge=0)
+    # True when the clip was skipped because the Mercator safe envelope
+    # degenerates under ST_Transform (e.g. EPSG:4807 collapses it to a line);
+    # counts are 0/0 then. Defaults False so older warnings validate.
+    clip_skipped: bool = False
+    # Defaults False so older warnings keep the check-your-source wording.
+    polar_only: bool = False
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class MercatorClipWarning(BaseModel):
+    kind: Literal["mercator_clip"]
+    details: MercatorClipDetail
+
+    model_config = ConfigDict(extra="forbid")
+
+
+IngestJobWarning = Annotated[
+    ReservedRenameWarning | DbfTruncationCollisionWarning | MercatorClipWarning,
+    Field(discriminator="kind"),
+]
+
+
+JobStatus = Literal[
+    "pending", "running", "complete", "failed", "cancelled", "fanned_out"
+]
+
+# Stamped at creation so a pending job reads as queued, not as having nothing
+# to say. Analysis today; any producer may set it.
+JobCurrentStep = Literal[
+    "queued",
+    # The URL import's server-side download, before the file is staged and
+    # previewable.
+    "downloading",
+    "validating",
+    "ogr2ogr",
+    "finalize",
+    "complete",
+    "cog_convert",
+    "quicklook",
+    # Analysis materialize: single CTAS, no progress to report between these.
+    "analyzing",
+    "registering",
+]
+
+
+class JobStatusResponse(BaseModel):
+    id: uuid.UUID
+    status: JobStatus
+    dataset_id: uuid.UUID | None
+    source_filename: str | None
+    error_message: str | None
+    error_code: str | None = Field(
+        default=None,
+        description="Stable code for a fixed failure reason, so a client can show "
+        "it in the reader's language; `error_message` keeps its English text. "
+        "Null when the reason is free text.",
+    )
+    # Computed by ``_job_to_status_response``; required in OpenAPI so
+    # generated clients match the hand-maintained frontend boundary type.
+    can_retry: bool
+    retry_reason: str | None
+    warning_message: str | None = None
+    # Structured warnings from IngestJob.user_metadata. Legacy
+    # scalar ``warning_message`` stays as a fallback for the pre-structured
+    # table-name collision case; clients should prefer ``warnings``.
+    warnings: list[IngestJobWarning] = Field(default_factory=list)
+    # Progress fields from the ingest worker, for multi-minute ingests.
+    # Default None so older and service rows validate. The DB column is
+    # String(32); this Literal is the source of truth.
+    progress: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    current_step: JobCurrentStep | None = None
+    rows_processed: Annotated[int, Field(ge=0)] | None = None
+    # Rows processed but NOT completed. `rows_processed`
+    # alone can't distinguish a clean run from a partial one (e.g. embedding
+    # backfill after a FORCE run). Read from generic `user_metadata["rows_failed"]`.
+    rows_failed: Annotated[int, Field(ge=0)] | None = None
+    archive_failed: bool = False
+    quicklook_pending: bool = Field(
+        default=False,
+        description="True while the dataset's quicklook image is still owed after "
+        "publication, so a client showing the thumbnail can poll again until the "
+        "image has been replaced.",
+    )
+    # The temporal parser only ever emits these two keys.
+    temporal_parse_errors: dict[Literal["temporal_start", "temporal_end"], str] = Field(
+        default_factory=dict
+    )
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class JobCancelResponse(BaseModel):
+    """Outcome of ``POST /jobs/{id}/cancel``.
+
+    ``run_id`` is the ``dataset_refresh_runs`` row this cancel finalized, when
+    the job had one bound (refreshes and reuploads do; plain imports don't).
+    ``already`` is True when the job was cancelled before this request — the
+    repeat is idempotent and nothing was written.
+    """
+
+    id: uuid.UUID
+    status: Literal["cancelled"]
+    run_id: uuid.UUID | None
+    already: bool = False
+
+
+class StaleCleanupResponse(BaseModel):
+    pending_failed: int
+    running_failed: int
+    total_cleaned: int
+    vrt_assets_recovered: int
+    vrt_generations_failed: int
+    terminal_jobs_purged: int
+    staged_paths_considered: int
+    local_files_reaped: int
+    storage_objects_reaped: int
+    staged_paths_skipped: int
+    staged_cleanup_failures: int
+    total_affected: int
+
+
+class JobStatusBatchRequest(BaseModel):
+    job_ids: list[uuid.UUID] = Field(
+        min_length=1,
+        max_length=100,
+        description="Jobs to report on. Repeated ids are answered once.",
+    )
+
+
+class JobRefreshRunSummary(BaseModel):
+    id: uuid.UUID
+    status: str = Field(
+        description="Refresh run status. `blocked` means the run is held for review."
+    )
+    review_reasons: list[str] = Field(
+        default_factory=list,
+        description="Why a blocked run needs review.",
+    )
+
+
+class JobStatusBatchEntry(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    status: JobStatus | Literal["not_found"] = Field(
+        description="Job status. `not_found` covers an unknown id and a job the "
+        "caller may not read alike."
+    )
+    dataset_id: uuid.UUID | None = None
+    progress: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    current_step: JobCurrentStep | None = None
+    error_code: str | None = None
+    warnings: list[IngestJobWarning] = Field(default_factory=list)
+    can_retry: bool = False
+    refresh_run: JobRefreshRunSummary | None = Field(
+        default=None,
+        description="The refresh run bound to a reupload or manifest update job.",
+    )
+
+
+class JobStatusBatchResponse(BaseModel):
+    jobs: list[JobStatusBatchEntry]

@@ -1,0 +1,489 @@
+"""Regression test: the reupload swap must retry once on lock_timeout failure.
+
+Background: the swap ran ``SET LOCAL lock_timeout = '5s'`` before three
+``ALTER TABLE ... RENAME TO`` statements. Under autovacuum contention on
+large tables the AccessExclusiveLock acquire failed at the 5s mark, AFTER
+staging had been loaded — surfacing a late, user-visible failure.
+
+Fix: on ``LockNotAvailableError`` (SQLSTATE 55P03), retry exactly ONCE
+with ``SET LOCAL lock_timeout = '15s'`` plus a 200ms sleep. Log a WARNING
+event on contention + an INFO event on retry success.
+"""
+
+import types
+import uuid
+
+import pytest
+import structlog
+from asyncpg.exceptions import LockNotAvailableError
+from sqlalchemy import text
+
+from app.platform.jobs.heartbeat import previous_version_table
+from app.processing.ingest.catalog_projection import Measurement
+from app.processing.ingest.tasks_common import (
+    _install_reupload_table,
+    _is_lock_timeout_error,
+    _write_reupload_catalog,
+    rename_pkey_to_match_table,
+)
+
+# What the settlement seam reads off a file or service strategy to take the rows.
+_SWAP = types.SimpleNamespace(raster_row=False, catalog_event="reupload_swap_catalog")
+
+
+async def swap_in(session, *, dataset, staging_table, measurement, **writes):
+    """Publish a staging table as the settlement seam does, outside a job."""
+    from app.platform import catalog_locks
+    from app.processing.ingest.publication import _take_catalog_rows
+
+    await _install_reupload_table(
+        session, dataset=dataset, staging_table=staging_table, measurement=measurement
+    )
+    await _take_catalog_rows(session, _SWAP, dataset)
+    written = await _write_reupload_catalog(
+        session, dataset=dataset, measurement=measurement, field_labels=None, **writes
+    )
+    await catalog_locks.bump_tile_cache_version_on(session, dataset)
+    return written
+
+
+class TestIsLockTimeoutError:
+    """Pure helper unit tests — no DB needed."""
+
+    def test_detects_direct_asyncpg_exception(self) -> None:
+        """Direct ``LockNotAvailableError`` instances are detected."""
+        exc = LockNotAvailableError("locked")
+        assert _is_lock_timeout_error(exc) is True
+
+    def test_detects_sqlalchemy_wrapped(self) -> None:
+        """A SQLAlchemy-style wrapper exposing ``.orig.sqlstate == '55P03'`` is detected."""
+        wrapped = types.SimpleNamespace(
+            orig=types.SimpleNamespace(sqlstate="55P03"),
+        )
+        # Cast to ``BaseException`` shape via a real exception with the orig attribute
+        exc = RuntimeError("wrapped")
+        exc.orig = wrapped.orig  # type: ignore[attr-defined]
+        assert _is_lock_timeout_error(exc) is True
+
+    def test_returns_false_for_unrelated(self) -> None:
+        """Random exceptions and other SQLSTATE codes do not trigger retry."""
+        assert _is_lock_timeout_error(ValueError("nope")) is False
+
+        # Different sqlstate — e.g., unique violation
+        exc = RuntimeError("other")
+        exc.orig = types.SimpleNamespace(sqlstate="23505")  # type: ignore[attr-defined]
+        assert _is_lock_timeout_error(exc) is False
+
+        # Wrapper with no ``.orig`` attribute at all
+        assert _is_lock_timeout_error(RuntimeError("bare")) is False
+
+
+# ---------------------------------------------------------------------------
+# DB-touching tests for the retry path itself.
+# ---------------------------------------------------------------------------
+
+
+def _make_dataset_stub(table_name: str):
+    """Build a minimal dataset object satisfying the attributes the swap reads."""
+    return types.SimpleNamespace(
+        id=uuid.uuid4(),
+        record=types.SimpleNamespace(updated_by=None),
+        record_id=uuid.uuid4(),
+        table_name=table_name,
+        current_version=1,
+        tile_cache_version=1,
+        source_url=None,
+        origin_ref=None,
+        last_refreshed_at=None,
+        column_info=None,
+    )
+
+
+def _stub_projection(monkeypatch, trace: list | None = None) -> None:
+    """Stand in for ``project``, which writes catalog rows these stubs do not have."""
+
+    async def _project(session, dataset, measurement, **_):
+        if trace is not None:
+            trace.append(("write", "project"))
+        return {}
+
+    monkeypatch.setattr("app.processing.ingest.catalog_projection.project", _project)
+
+
+def _stub_atomic_bump(monkeypatch) -> None:
+    """Roll the stub's counter in place of ``bump_tile_cache_version_on``."""
+
+    async def _bump(session, dataset):
+        dataset.tile_cache_version = dataset.tile_cache_version + 1
+        return dataset.tile_cache_version
+
+    monkeypatch.setattr("app.platform.catalog_locks.bump_tile_cache_version_on", _bump)
+
+
+def _make_port():
+    """The ProcessingPort surface the swap actually reaches for.
+
+    The swap resolves both mapped classes through the port, so a stub offering
+    only ``get_dataset_version_orm_class`` AttributeErrors. The real classes
+    are safe: the stub dataset carries ids no row has, so each ``FOR UPDATE``
+    locks nothing.
+    """
+    from app.modules.catalog.datasets.domain.models import Dataset, Record
+
+    class _Port:
+        @staticmethod
+        def get_dataset_version_orm_class():
+            return lambda **kwargs: types.SimpleNamespace(**kwargs)
+
+        @staticmethod
+        def get_dataset_orm_class():
+            return Dataset
+
+        @staticmethod
+        def get_record_orm_class():
+            return Record
+
+    return _Port
+
+
+def _minimal_measurement() -> Measurement:
+    return Measurement(
+        metadata={
+            "srid": 4326,
+            "geometry_type": "POINT",
+            "feature_count": 1,
+            "extent_wkt": None,
+            "column_info": [{"name": "name", "type": "character varying"}],
+        },
+        sample_values={},
+        three_d={},
+        geometry_type="POINT",
+        quality_detail={},
+    )
+
+
+class TestReuploadSwapRetry:
+    """Exercise the swap retry behavior on a real test DB session."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_tables(self, test_db_session):
+        """Create a unique live + staging table pair for each test."""
+        self.session = test_db_session
+        suffix = uuid.uuid4().hex[:8]
+        self.live = f"swap_live_{suffix}"
+        self.staging = f"swap_staging_{suffix}"
+
+        for tn in (self.live, self.staging, f"{self.live}_old"):
+            await self.session.execute(
+                text(f'DROP TABLE IF EXISTS data."{tn}" CASCADE')
+            )
+        await self.session.commit()
+
+        # Build matching schemas; staging row is the post-swap winner.
+        await self.session.execute(
+            text(
+                f'CREATE TABLE data."{self.live}" '
+                "(id serial PRIMARY KEY, name text, geom geometry(Point, 4326))"
+            )
+        )
+        await self.session.execute(
+            text(f"INSERT INTO data.\"{self.live}\" (name) VALUES ('original')")
+        )
+        await self.session.execute(
+            text(
+                f'CREATE TABLE data."{self.staging}" '
+                "(id serial PRIMARY KEY, name text, geom geometry(Point, 4326))"
+            )
+        )
+        await self.session.execute(
+            text(f"INSERT INTO data.\"{self.staging}\" (name) VALUES ('new_data')")
+        )
+        await self.session.commit()
+
+        yield
+
+        for tn in (self.live, self.staging, f"{self.live}_old"):
+            await self.session.execute(
+                text(f'DROP TABLE IF EXISTS data."{tn}" CASCADE')
+            )
+        await self.session.commit()
+
+    async def test_happy_path_no_retry(self, monkeypatch) -> None:
+        """No contention → swap completes silently; neither retry log fires."""
+        dataset = _make_dataset_stub(self.live)
+
+        async def _noop_audit(*args, **kwargs):
+            return None
+
+        _stub_projection(monkeypatch)
+        monkeypatch.setattr(
+            "app.modules.audit.service.audit_emit",
+            _noop_audit,
+        )
+
+        # Stub the DatasetVersion ORM so `session.add(...)` is a no-op.
+        monkeypatch.setattr(
+            "app.platform.extensions.get_processing_port",
+            _make_port,
+        )
+        _stub_atomic_bump(monkeypatch)
+        # ``session.add`` rejects unknown types; swap to a recording shim.
+        monkeypatch.setattr(self.session, "add", lambda *a, **kw: None)
+
+        with structlog.testing.capture_logs() as captured:
+            await swap_in(
+                self.session,
+                dataset=dataset,
+                staging_table=self.staging,
+                measurement=_minimal_measurement(),
+                user_id=str(uuid.uuid4()),
+                source_filename="x.csv",
+                source_format="csv",
+                original_srid=4326,
+            )
+
+        # No contention/retry events expected on the happy path.
+        events = [r.get("event") for r in captured]
+        assert "reupload_swap_lock_contention" not in events
+        assert "reupload_swap_retry_succeeded" not in events
+
+        # The swap completed: the live table now contains the staging row.
+        row = (
+            await self.session.execute(text(f'SELECT name FROM data."{self.live}"'))
+        ).scalar_one()
+        assert row == "new_data"
+
+        # Staging table is gone (renamed into the live spot).
+        staging_exists = (
+            await self.session.execute(
+                text(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema='data' AND table_name=:tn)"
+                ),
+                {"tn": self.staging},
+            )
+        ).scalar()
+        assert staging_exists is False
+
+        # The swap also renamed the staging-era PK
+        # constraint, so direct-DB clients see `<live_table>_pkey`.
+        pkey = (
+            await self.session.execute(
+                text(
+                    "SELECT con.conname FROM pg_constraint con "
+                    "JOIN pg_class c ON c.oid = con.conrelid "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = 'data' AND c.relname = :tn "
+                    "AND con.contype = 'p'"
+                ),
+                {"tn": self.live},
+            )
+        ).scalar_one()
+        assert pkey == f"{self.live}_pkey"
+
+        # A file reupload contacts no origin, so the swap stamps
+        # last_refreshed_at but leaves last_checked_at cleared.
+        assert dataset.last_refreshed_at is not None
+        assert dataset.last_checked_at is None
+        # The swap rolled the `_v=` cache-buster, through the atomic spelling.
+        assert dataset.tile_cache_version == 2
+
+    async def test_service_swap_stamps_last_checked_at(self, monkeypatch) -> None:
+        """A service reupload fetched its bytes from the
+        origin moments before the swap, so the swap IS a contact. Clearing
+        probe state without re-stamping the timestamp made the API claim the
+        origin was never contacted right after it demonstrably was."""
+        dataset = _make_dataset_stub(self.live)
+
+        async def _noop_audit(*args, **kwargs):
+            return None
+
+        _stub_projection(monkeypatch)
+        monkeypatch.setattr(
+            "app.modules.audit.service.audit_emit",
+            _noop_audit,
+        )
+
+        monkeypatch.setattr(
+            "app.platform.extensions.get_processing_port",
+            _make_port,
+        )
+        _stub_atomic_bump(monkeypatch)
+        monkeypatch.setattr(self.session, "add", lambda *a, **kw: None)
+
+        await swap_in(
+            self.session,
+            dataset=dataset,
+            staging_table=self.staging,
+            measurement=_minimal_measurement(),
+            user_id=str(uuid.uuid4()),
+            source_filename=None,
+            source_format="wfs",
+            original_srid=4326,
+            source_url="https://svc.test/wfs/topp:roads",
+            origin_ref={
+                "service_type": "wfs",
+                "url": "https://svc.test/wfs",
+                "layer_id": "topp:roads",
+            },
+        )
+
+        assert dataset.last_checked_at is not None
+        assert dataset.last_checked_at == dataset.last_refreshed_at
+        # The health verdict itself stays with the probe's classifier.
+        assert dataset.source_health is None
+
+    async def test_retry_path_logs_and_succeeds(self, monkeypatch) -> None:
+        """First swap raises ``LockNotAvailableError``; retry succeeds and both logs fire."""
+        dataset = _make_dataset_stub(self.live)
+
+        async def _noop_audit(*args, **kwargs):
+            return None
+
+        _stub_projection(monkeypatch)
+        monkeypatch.setattr(
+            "app.modules.audit.service.audit_emit",
+            _noop_audit,
+        )
+
+        monkeypatch.setattr(
+            "app.platform.extensions.get_processing_port",
+            _make_port,
+        )
+        _stub_atomic_bump(monkeypatch)
+        monkeypatch.setattr(self.session, "add", lambda *a, **kw: None)
+
+        # Record asyncio.sleep durations so we can assert the 200ms gap.
+        sleep_durations: list[float] = []
+
+        async def _recording_sleep(seconds: float) -> None:
+            sleep_durations.append(seconds)
+            # Don't actually sleep — keep the test fast.
+            return None
+
+        monkeypatch.setattr(
+            "app.processing.ingest.tasks_common.asyncio.sleep",
+            _recording_sleep,
+        )
+
+        # Intercept ``session.execute`` so the first ``ALTER TABLE ... RENAME``
+        # call inside ``_swap_with_timeout`` raises ``LockNotAvailableError``.
+        original_execute = self.session.execute
+        raised = {"once": False}
+        kept = previous_version_table(self.live, dataset.id, 1)
+
+        async def _flaky_execute(stmt, *args, **kwargs):
+            # Only intercept the live-table rename on the first pass: the
+            # full RENAME shape, since the table name alone would also match
+            # the SELECT EXISTS pre-check.
+            sql = str(getattr(stmt, "text", stmt))
+            if not raised["once"] and f'RENAME TO "{kept}"' in sql:
+                raised["once"] = True
+                raise LockNotAvailableError("simulated autovacuum contention")
+            return await original_execute(stmt, *args, **kwargs)
+
+        monkeypatch.setattr(self.session, "execute", _flaky_execute)
+
+        with structlog.testing.capture_logs() as captured:
+            await swap_in(
+                self.session,
+                dataset=dataset,
+                staging_table=self.staging,
+                measurement=_minimal_measurement(),
+                user_id=str(uuid.uuid4()),
+                source_filename="x.csv",
+                source_format="csv",
+                original_srid=4326,
+            )
+
+        # The first attempt raised; the retry must have run.
+        assert raised["once"] is True, (
+            "Test scaffolding bug — flaky_execute never tripped"
+        )
+
+        # Exactly one 200ms sleep between attempts.
+        assert sleep_durations == [pytest.approx(0.2)], (
+            f"Expected one ~0.2s sleep between attempts; got {sleep_durations!r}"
+        )
+
+        # Both structured events fire, with the documented fields.
+        contention_events = [
+            r for r in captured if r.get("event") == "reupload_swap_lock_contention"
+        ]
+        success_events = [
+            r for r in captured if r.get("event") == "reupload_swap_retry_succeeded"
+        ]
+        assert len(contention_events) == 1, (
+            f"Expected one reupload_swap_lock_contention event; got: {captured}"
+        )
+        assert len(success_events) == 1, (
+            f"Expected one reupload_swap_retry_succeeded event; got: {captured}"
+        )
+
+        contention = contention_events[0]
+        assert contention["log_level"] == "warning"
+        assert contention["table_name"] == self.live
+        assert contention["attempt"] == 1
+        assert contention["first_timeout_seconds"] == 5
+        assert contention["retry_timeout_seconds"] == 15
+        assert contention["sleep_ms"] == 200
+        assert "autovacuum" in contention["hint"].lower()
+
+        success = success_events[0]
+        assert success["log_level"] == "info"
+        assert success["table_name"] == self.live
+        assert success["attempt"] == 2
+        assert success["retry_timeout_seconds"] == 15
+
+        # And the swap really did complete: live table holds the new row.
+        row = (
+            await self.session.execute(text(f'SELECT name FROM data."{self.live}"'))
+        ).scalar_one()
+        assert row == "new_data"
+
+
+class TestRenamePkeyToMatchTable:
+    """Direct coverage for ``rename_pkey_to_match_table``."""
+
+    _PKEY_SQL = (
+        "SELECT con.conname FROM pg_constraint con "
+        "JOIN pg_class c ON c.oid = con.conrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'data' AND c.relname = :tn AND con.contype = 'p'"
+    )
+
+    async def test_renames_staging_pkey_and_is_idempotent(
+        self, test_db_session
+    ) -> None:
+        """A staging-era pkey name is renamed; a second call is a no-op."""
+        suffix = uuid.uuid4().hex[:8]
+        table = f"pkey_fix_{suffix}"
+        staging_pkey = f"{table}_staging_{suffix}_pkey"
+        await test_db_session.execute(
+            text(
+                f'CREATE TABLE data."{table}" '
+                f'(id serial CONSTRAINT "{staging_pkey}" PRIMARY KEY)'
+            )
+        )
+        try:
+            await rename_pkey_to_match_table(test_db_session, table)
+            pkey = (
+                await test_db_session.execute(text(self._PKEY_SQL), {"tn": table})
+            ).scalar_one()
+            assert pkey == f"{table}_pkey"
+
+            # Idempotent: already-correct name stays put, no error raised.
+            await rename_pkey_to_match_table(test_db_session, table)
+            pkey = (
+                await test_db_session.execute(text(self._PKEY_SQL), {"tn": table})
+            ).scalar_one()
+            assert pkey == f"{table}_pkey"
+        finally:
+            await test_db_session.execute(
+                text(f'DROP TABLE IF EXISTS data."{table}" CASCADE')
+            )
+            await test_db_session.commit()
+
+    async def test_missing_table_is_swallowed(self, test_db_session) -> None:
+        """A vanished table must not raise — the rename is cosmetic by contract."""
+        await rename_pkey_to_match_table(test_db_session, "no_such_table_anywhere_xyz")

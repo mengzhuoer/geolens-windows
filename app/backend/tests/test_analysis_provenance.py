@@ -1,0 +1,1108 @@
+"""Provenance written onto materialized analysis outputs.
+
+A materialized result must carry a lineage sentence, keywords, and a durable
+link to the dataset it came from. These tests pin the three products end to
+end: ``records.lineage_summary``, ``records.derived_from``, and
+inherited ``record_keywords`` child rows.
+
+Requirements:
+  - Docker database must be running (docker compose up db)
+"""
+
+import ast
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import NamedTuple
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.catalog.datasets.domain.models import Dataset, Record, RecordKeyword
+from app.processing.analysis.provenance import (
+    build_derived_from,
+    build_lineage_sentence,
+)
+from app.processing.analysis.tasks import _materialize
+from app.standards.stac.serializer import _build_stac_links
+
+from tests.factories import get_user_id
+from tests.test_analysis_materialize import _create_job
+from tests.test_analysis_preview import _create_polygon_dataset
+
+pytestmark = pytest.mark.anyio
+
+
+async def _add_keyword(
+    session: AsyncSession,
+    record_id: uuid.UUID,
+    keyword: str,
+    keyword_type: str = "place",
+) -> None:
+    session.add(
+        RecordKeyword(record_id=record_id, keyword=keyword, keyword_type=keyword_type)
+    )
+    await session.commit()
+
+
+async def _buffer_to_dataset(
+    session: AsyncSession,
+    source: Dataset,
+    user_id: uuid.UUID,
+    *,
+    title: str | None = None,
+    distance_meters: float = 100,
+) -> Dataset:
+    """Run the real worker path and return the registered output dataset."""
+    job = await _create_job(session, user_id)
+    await _materialize(
+        job_id=str(job.id),
+        dataset_id=str(source.id),
+        user_id=str(user_id),
+        operation="buffer",
+        title=title or f"Buffered {uuid.uuid4().hex[:6]}",
+        distance_meters=distance_meters,
+    )
+    await session.refresh(job)
+    assert job.status == "complete", job.error_message
+    out = await session.get(Dataset, job.dataset_id)
+    assert out is not None
+    return out
+
+
+async def _record_of(session: AsyncSession, dataset: Dataset) -> Record:
+    record = await session.get(Record, dataset.record_id)
+    assert record is not None
+    await session.refresh(record)
+    return record
+
+
+class TestMaterializedProvenance:
+    async def test_output_carries_lineage_and_derived_from(
+        self, test_db_session: AsyncSession
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        source_record = await _record_of(test_db_session, source)
+        source_record.title = f"Reservoirs {uuid.uuid4().hex[:6]}"
+        await test_db_session.commit()
+
+        out = await _buffer_to_dataset(test_db_session, source, admin_id)
+        record = await _record_of(test_db_session, out)
+
+        assert record.derived_from is not None
+        assert record.derived_from["dataset_id"] == str(source.id)
+        assert record.derived_from["operation"] == "buffer"
+        assert record.derived_from["params"]["distance_meters"] == 100
+        assert record.derived_from["created_at"]
+
+        # The sentence names the operation, the source, the parameter and the
+        # actor -- the four things that make it readable without the JSON.
+        assert record.lineage_summary is not None
+        assert record.lineage_summary.startswith("Buffered from")
+        assert source_record.title in record.lineage_summary
+        assert "100 m" in record.lineage_summary
+        assert "admin" in record.lineage_summary
+
+    async def test_keywords_inherit_as_child_rows_with_their_type(
+        self, test_db_session: AsyncSession
+    ):
+        """Keywords are ``record_keywords`` rows, not ``theme_category`` values.
+
+        ``Record.keywords`` is a relationship with a ``keyword_type`` CHECK
+        constraint; ``theme_category`` is the array column sitting next to it.
+        Writing the inherited values into the array would look like it worked.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        term = f"hydrology-{uuid.uuid4().hex[:6]}"
+        await _add_keyword(test_db_session, source.record_id, term, "place")
+
+        out = await _buffer_to_dataset(test_db_session, source, admin_id)
+        record = await _record_of(test_db_session, out)
+
+        rows = (
+            (
+                await test_db_session.execute(
+                    select(RecordKeyword).where(RecordKeyword.record_id == record.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert [(r.keyword, r.keyword_type) for r in rows] == [(term, "place")]
+        assert term not in (record.theme_category or [])
+
+    async def test_keywords_inherit_from_a_restricted_source(
+        self, test_db_session: AsyncSession
+    ):
+        """Deliberate: the creator already has read access (Rule 1 gates the
+        analysis) and the output is registered private, so an inherited keyword
+        goes no further unless its owner publishes it. Recorded as a test so it
+        is not "fixed" later; apply_analysis_provenance carries the argument.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="restricted"
+        )
+        term = f"restricted-{uuid.uuid4().hex[:6]}"
+        await _add_keyword(test_db_session, source.record_id, term, "theme")
+
+        out = await _buffer_to_dataset(test_db_session, source, admin_id)
+        inherited = (
+            (
+                await test_db_session.execute(
+                    select(RecordKeyword.keyword).where(
+                        RecordKeyword.record_id == out.record_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert inherited == [term]
+
+    async def test_output_no_longer_fails_the_lineage_validation_gate(
+        self, test_db_session: AsyncSession
+    ):
+        """Validation treats an empty ``lineage_summary`` as an error, so every
+        materialized output used to fail that check on creation.
+        """
+        from app.modules.catalog.validation.service import validate_record
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        out = await _buffer_to_dataset(test_db_session, source, admin_id)
+        record = await _record_of(test_db_session, out)
+
+        result = await validate_record(test_db_session, record, out)
+        fields = [issue.field for issue in result.errors]
+        assert "lineage_summary" not in fields
+
+    async def test_search_finds_the_output_by_a_lineage_only_term(
+        self,
+        client: AsyncClient,
+        test_db_session: AsyncSession,
+        admin_auth_header: dict,
+    ):
+        """Populating lineage changes search results, which is the point: the
+        source title now reaches the derived dataset's search vector.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        term = f"zoquil{uuid.uuid4().hex[:6]}"
+        source_record = await _record_of(test_db_session, source)
+        source_record.title = term
+        await test_db_session.commit()
+
+        out = await _buffer_to_dataset(
+            test_db_session, source, admin_id, title=f"Output {uuid.uuid4().hex[:6]}"
+        )
+
+        resp = await client.get(
+            "/search/datasets/", params={"q": term}, headers=admin_auth_header
+        )
+        assert resp.status_code == 200, resp.text
+        ids = {feature["id"] for feature in resp.json()["features"]}
+        assert str(out.id) in ids
+
+    def test_the_buffer_distance_survives_the_sentence(self):
+        """The lineage sentence must record the distance the
+        geometry was actually built with.
+
+        `:g` defaults to SIX significant digits and would round silently. The
+        cases are an ordinary 8-digit distance, a repeating
+        decimal, and a value just under MAX_BUFFER_METERS that would round UP past
+        the ceiling it was checked against.
+        """
+        for distance, expected in (
+            (500.0, "500 m"),
+            (1609.34, "1609.34 m"),
+            (12345.678, "12345.678 m"),
+            (33.333333333, "33.333333333 m"),
+            (99999.99, "99999.99 m"),
+            (100000.0, "100000 m"),
+        ):
+            sentence = build_lineage_sentence(
+                operation="buffer",
+                source_title="Parcels",
+                params={"distance_meters": distance},
+                actor="admin",
+                created_at=datetime(2026, 7, 31),
+            )
+            assert expected in sentence, f"{distance!r} rendered as {sentence!r}"
+
+    async def test_clip_lineage_names_the_mask_layer(
+        self, test_db_session: AsyncSession
+    ):
+        """The generator is the extension point for new operations; clip is the
+        case that reads a second dataset's title rather than a scalar."""
+        sentence = build_lineage_sentence(
+            operation="clip",
+            source_title="Parcels",
+            params={"mask_source": "layer", "mask_dataset_id": str(uuid.uuid4())},
+            actor="admin",
+            created_at=datetime(2026, 7, 31),
+            mask_title="Flood Zone",
+        )
+        assert sentence == (
+            'Clipped from "Parcels" to "Flood Zone", created by admin on 2026-07-31.'
+        )
+
+    def test_every_operation_names_its_second_layer(self):
+        """Each operation needs its own branch, or it
+        falls through to "<operation> applied to <source>".
+
+        That sentence is a product surface — the dataset page renders it,
+        search indexes it, and DCAT exports it — so an overlay whose entire
+        point is the second layer would be described without naming one.
+        """
+        cases = [
+            (
+                "spatial_join",
+                {"join_dataset_id": "x", "join_fields": ["owner", "value"]},
+                {"join_title": "Parcels Registry"},
+                'Joined from "Points" against "Parcels Registry"',
+            ),
+            (
+                "intersect",
+                {"mask_dataset_id": "x"},
+                {"mask_title": "Zones"},
+                'Intersected from "Points" with "Zones"',
+            ),
+            (
+                "select_by_location",
+                {"mask_source": "layer", "mask_dataset_id": "x"},
+                {"mask_title": "Zones"},
+                'Selected from "Points" by "Zones"',
+            ),
+            (
+                "select_by_location",
+                {"mask_source": "drawn"},
+                {},
+                'Selected from "Points" by a drawn area',
+            ),
+            ("measure", {}, {}, 'Measurements computed from "Points"'),
+        ]
+        for operation, params, titles, expected in cases:
+            sentence = build_lineage_sentence(
+                operation=operation,
+                source_title="Points",
+                params=params,
+                actor="admin",
+                created_at=datetime(2026, 7, 31),
+                **titles,
+            )
+            assert sentence == (f"{expected}, created by admin on 2026-07-31."), (
+                f"{operation} with {params!r} rendered as {sentence!r}"
+            )
+            # The fallback is what these branches exist to avoid.
+            assert "applied to" not in sentence, operation
+
+    def test_the_sentence_never_names_a_private_layers_columns(self):
+        """lineage_summary has no per-requester form.
+
+        It is stored once and served raw — the dataset page returns it, search
+        indexes it, three DCAT services export it — and none of those pass it
+        through visible_derived_from, which is what access-checks the
+        structured provenance per requester.
+
+        So anything the redaction treats as sensitive must not reach this
+        prose. join_fields is a dependent of join_dataset_id in
+        _DATASET_ID_PARAMS precisely because a column list is most of a
+        schema.
+        """
+        from app.modules.catalog.authorization import _DATASET_ID_PARAMS
+
+        sentence = build_lineage_sentence(
+            operation="spatial_join",
+            source_title="Points",
+            params={
+                "join_dataset_id": "x",
+                "join_fields": ["parcel_owner", "assessed_value"],
+            },
+            actor="admin",
+            created_at=datetime(2026, 7, 31),
+            join_title="Parcels Registry",
+        )
+        assert "parcel_owner" not in sentence
+        assert "assessed_value" not in sentence
+        # And the reason, stated where it can rot loudly: these are the keys
+        # the redaction drops, so they are the keys prose may not carry.
+        assert "join_fields" in _DATASET_ID_PARAMS["join_dataset_id"]
+
+    def test_a_second_layer_whose_title_is_gone_still_reads_as_a_sentence(self):
+        """A deleted or unreadable layer yields no title, and a bare UUID would
+        not read. Same treatment clip already gave it, extended to the
+        operations that now name a layer."""
+        for operation, params in (
+            ("spatial_join", {"join_dataset_id": "x"}),
+            ("intersect", {"mask_dataset_id": "x"}),
+            ("select_by_location", {"mask_source": "layer", "mask_dataset_id": "x"}),
+        ):
+            sentence = build_lineage_sentence(
+                operation=operation,
+                source_title="Points",
+                params=params,
+                actor="admin",
+                created_at=datetime(2026, 7, 31),
+            )
+            assert "another layer" in sentence, operation
+            assert "x" not in sentence.replace("Intersected", "").replace(
+                "transferring", ""
+            ), f"{operation} leaked an id into the sentence: {sentence!r}"
+
+
+class TestDerivedFromVisibility:
+    async def test_detail_omits_derived_from_without_access_to_the_source(
+        self,
+        client: AsyncClient,
+        test_db_session: AsyncSession,
+        admin_auth_header: dict,
+        viewer_auth_header: dict,
+    ):
+        """The output can be shared while its source stays private. The
+        reference is omitted for a requester who cannot open the source, so a
+        private dataset's id never leaks through a derived one.
+
+        The inherited KEYWORD is the deliberate exception, asserted below so
+        the decision is pinned rather than described. A keyword is a copied
+        value its owner can delete before publishing, not a reference the
+        requester could act on; see apply_analysis_provenance.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="private"
+        )
+        term = f"codename-{uuid.uuid4().hex[:6]}"
+        await _add_keyword(test_db_session, source.record_id, term, "theme")
+        out = await _buffer_to_dataset(test_db_session, source, admin_id)
+
+        # Publish the OUTPUT only.
+        out_record = await _record_of(test_db_session, out)
+        out_record.visibility = "public"
+        out_record.record_status = "published"
+        await test_db_session.commit()
+
+        owner = await client.get(f"/datasets/{out.id}", headers=admin_auth_header)
+        assert owner.status_code == 200, owner.text
+        assert owner.json()["derived_from"]["dataset_id"] == str(source.id)
+
+        other = await client.get(f"/datasets/{out.id}", headers=viewer_auth_header)
+        assert other.status_code == 200, other.text
+        assert other.json()["derived_from"] is None
+
+        # The keyword endpoint gates the source itself...
+        denied = await client.get(
+            f"/records/{source.record_id}/keywords/", headers=viewer_auth_header
+        )
+        assert denied.status_code == 404
+
+        # ...and yet the COPY on the published output is visible to that same
+        # viewer. Intended, not an oversight: the output was registered
+        # private and its owner published it.
+        keywords = await client.get(
+            f"/records/{out.record_id}/keywords/", headers=viewer_auth_header
+        )
+        assert keywords.status_code == 200, keywords.text
+        assert [k["keyword"] for k in keywords.json()["keywords"]] == [term]
+
+
+class TestDerivedFromParamsVisibility:
+    async def test_a_private_mask_id_is_dropped_from_visible_params(
+        self, test_db_session: AsyncSession
+    ):
+        """A clip carries a SECOND dataset id in its params.
+
+        Source public, mask private: a requester who passes the source check
+        would otherwise be handed the private mask's UUID, and with it the
+        fact that it exists.
+        """
+        from app.modules.catalog.authorization import visible_derived_from
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="public"
+        )
+        mask = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="private"
+        )
+        reference = {
+            "dataset_id": str(source.id),
+            "operation": "clip",
+            "params": {"mask_source": "layer", "mask_dataset_id": str(mask.id)},
+            "created_at": "2026-07-31T00:00:00+00:00",
+        }
+
+        anonymous = await visible_derived_from(test_db_session, reference, None, set())
+        assert anonymous is not None
+        assert anonymous["dataset_id"] == str(source.id)
+        assert "mask_dataset_id" not in anonymous["params"]
+        # The rest of the reference survives; only the id it may not see goes.
+        assert anonymous["params"]["mask_source"] == "layer"
+        # ...and the record's own JSONB is untouched by the redaction.
+        assert reference["params"]["mask_dataset_id"] == str(mask.id)
+
+    async def test_a_visible_mask_id_is_kept(self, test_db_session: AsyncSession):
+        from app.modules.catalog.authorization import visible_derived_from
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="public"
+        )
+        mask = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="public"
+        )
+        reference = {
+            "dataset_id": str(source.id),
+            "operation": "clip",
+            "params": {"mask_source": "layer", "mask_dataset_id": str(mask.id)},
+            "created_at": "2026-07-31T00:00:00+00:00",
+        }
+
+        visible = await visible_derived_from(test_db_session, reference, None, set())
+        assert visible is not None
+        assert visible["params"]["mask_dataset_id"] == str(mask.id)
+
+    async def test_a_private_join_layer_takes_its_column_names_with_it(
+        self, test_db_session: AsyncSession
+    ):
+        """The mask is not the only dataset id in params.
+
+        Spatial join carries join_dataset_id, and the redaction has to cover
+        more than the mask — otherwise a public join output derived through a
+        PRIVATE join layer publishes that layer's id to every viewer.
+
+        join_fields goes with it. Dropping the id alone would still publish the
+        private layer's column names, which is most of what its schema is: an
+        id you cannot resolve is a weaker disclosure than the list of fields
+        someone chose to copy out of it.
+        """
+        from app.modules.catalog.authorization import visible_derived_from
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="public"
+        )
+        join = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="private"
+        )
+        reference = {
+            "dataset_id": str(source.id),
+            "operation": "spatial_join",
+            "params": {
+                "join_dataset_id": str(join.id),
+                "join_fields": ["parcel_owner", "assessed_value"],
+            },
+            "created_at": "2026-07-31T00:00:00+00:00",
+        }
+
+        anonymous = await visible_derived_from(test_db_session, reference, None, set())
+        assert anonymous is not None
+        assert "join_dataset_id" not in anonymous["params"]
+        assert "join_fields" not in anonymous["params"]
+        # The record's own JSONB is untouched — this redacts a copy per
+        # requester, it does not destroy the provenance.
+        assert reference["params"]["join_fields"] == ["parcel_owner", "assessed_value"]
+
+    async def test_a_visible_join_layer_keeps_its_fields(
+        self, test_db_session: AsyncSession
+    ):
+        """The guard on the redaction above: it must key off ACCESS, not off
+        the param existing. An owner reading their own output still gets the
+        lineage that makes it reproducible."""
+        from app.modules.catalog.authorization import visible_derived_from
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="public"
+        )
+        join = await _create_polygon_dataset(
+            test_db_session, created_by=admin_id, visibility="public"
+        )
+        reference = {
+            "dataset_id": str(source.id),
+            "operation": "spatial_join",
+            "params": {
+                "join_dataset_id": str(join.id),
+                "join_fields": ["parcel_owner"],
+            },
+            "created_at": "2026-07-31T00:00:00+00:00",
+        }
+
+        visible = await visible_derived_from(test_db_session, reference, None, set())
+        assert visible is not None
+        assert visible["params"]["join_dataset_id"] == str(join.id)
+        assert visible["params"]["join_fields"] == ["parcel_owner"]
+
+    async def test_a_spatial_join_records_the_layer_and_fields_it_used(
+        self, test_db_session: AsyncSession
+    ):
+        """End to end, through the real worker.
+
+        The unit-level whitelist check above says the key is allowed through.
+        This says it actually arrives, because the two are separable: the
+        params reach apply_analysis_provenance and are then filtered, so a
+        whitelist assertion alone would pass while nothing was being stored.
+        """
+        from tests.test_analysis_spatial_join import (
+            _create_probe_points,
+            _create_two_overlapping_polygons,
+        )
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        points = await _create_probe_points(test_db_session, created_by=admin_id)
+        polys = await _create_two_overlapping_polygons(
+            test_db_session, created_by=admin_id
+        )
+        job = await _create_job(test_db_session, admin_id)
+
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(points.id),
+            user_id=str(admin_id),
+            operation="spatial_join",
+            title=f"Joined {uuid.uuid4().hex[:6]}",
+            join_dataset_id=str(polys.id),
+            join_fields=["name", "pop"],
+        )
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        out = await test_db_session.get(Dataset, job.dataset_id)
+        record = await _record_of(test_db_session, out)
+        assert record.derived_from is not None
+        params = record.derived_from["params"]
+        # The layer it joined against, and the columns it copied. Without both,
+        # the lineage cannot explain where the join_* columns came from.
+        assert params["join_dataset_id"] == str(polys.id)
+        assert params["join_fields"] == ["name", "pop"]
+
+    async def test_a_drawn_selection_still_records_that_it_was_drawn(
+        self, test_db_session: AsyncSession
+    ):
+        """mask_source must be recorded for a drawn area, not for clip alone.
+
+        The drawn geometry itself is deliberately kept out of provenance — it
+        can be kilobytes — so this discriminator is the ONLY trace that an area
+        shaped the selection. Without it a drawn select_by_location would serialise
+        empty params: a lineage saying a selection happened by no visible
+        means.
+        """
+        from tests.test_analysis_preview import _create_polygon_dataset
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await _create_polygon_dataset(test_db_session, created_by=admin_id)
+        job = await _create_job(test_db_session, admin_id)
+
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(source.id),
+            user_id=str(admin_id),
+            operation="select_by_location",
+            title=f"Selected {uuid.uuid4().hex[:6]}",
+            mask={
+                "type": "Polygon",
+                "coordinates": [[[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]],
+            },
+        )
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        out = await test_db_session.get(Dataset, job.dataset_id)
+        record = await _record_of(test_db_session, out)
+        assert record.derived_from["params"]["mask_source"] == "drawn"
+
+    def test_both_writers_of_mask_source_agree_on_which_operations_have_one(self):
+        """The two writers of this fact must not drift.
+
+        The router records it on the job (Admin Jobs reads that to diagnose a
+        run) and the worker records it in provenance (the durable lineage).
+        They are separate constants because processing/ cannot import from
+        app.modules.catalog, and separate constants are how the
+        previous round's fix landed in one writer and not the other.
+
+        Pinned rather than deduplicated, since the import boundary is the
+        reason the duplication exists.
+        """
+        from app.modules.catalog.datasets.domain.schemas import MASK_OPERATIONS
+        from app.processing.analysis.tasks import _DRAWN_MASK_OPERATIONS
+
+        assert set(_DRAWN_MASK_OPERATIONS) == set(MASK_OPERATIONS), (
+            "the job metadata and the durable provenance disagree about which "
+            "operations can take a drawn mask, so one of them is recording a "
+            "discriminator the other omits"
+        )
+
+    def test_every_dataset_id_param_is_redactable(self):
+        """Structural: everything STORED that names a dataset must be
+        access-checked per requester.
+
+        This reads PARAM_KEYS, not the params dict at the _materialize call
+        site: join_dataset_id is passed there and then dropped by
+        build_derived_from's PARAM_KEYS filter, so it never reaches
+        records.derived_from, and checking the call site would confirm a
+        pairing that has no bearing on what is stored.
+
+        PARAM_KEYS is the storage contract, so it is the one that matters: a
+        key added there becomes visible to every requester who can see the
+        output. This is also why the redaction and the whitelist have to move
+        together — adding join_dataset_id to PARAM_KEYS without the matching
+        _DATASET_ID_PARAMS row is precisely how a private join layer's id would
+        reach an unauthorised reader.
+
+        The failure mode is silence: an unredacted id looks like ordinary
+        provenance and nothing errors.
+        """
+        from app.modules.catalog.authorization import _DATASET_ID_PARAMS
+        from app.processing.analysis.provenance import PARAM_KEYS
+
+        stored_ids = {k for k in PARAM_KEYS if k.endswith("_dataset_id")}
+        assert stored_ids, (
+            "no *_dataset_id keys in PARAM_KEYS — either the naming convention "
+            "changed or this test has stopped checking anything"
+        )
+        missing = stored_ids - set(_DATASET_ID_PARAMS)
+        assert not missing, (
+            f"{sorted(missing)} are stored in records.derived_from but are not "
+            "in _DATASET_ID_PARAMS, so they are published to requesters who "
+            "cannot access the dataset they name. Add a row (and list any "
+            "param that DESCRIBES that dataset as a dependent, the way "
+            "join_fields hangs off join_dataset_id)."
+        )
+
+
+class TestStacDerivedFromLink:
+    """The STAC half.
+
+    STAC Items are served for the raster family only
+    (``_STAC_RECORD_TYPES``), so a vector analysis output never appears there
+    today; these cover the link itself and the gate that decides whether a
+    requester sees it.
+    """
+
+    def test_link_is_emitted_when_a_source_id_is_supplied(self):
+        links = _build_stac_links(
+            "item-1", "coll-1", "https://example.test/api/stac", "source-1"
+        )
+        derived = [link for link in links if link["rel"] == "derived_from"]
+        assert derived == [
+            {
+                "rel": "derived_from",
+                "href": "https://example.test/api/stac/items/source-1",
+                "type": "application/geo+json",
+            }
+        ]
+
+    def test_no_link_without_a_source_id(self):
+        links = _build_stac_links("item-1", "coll-1", "https://example.test/api/stac")
+        assert not [link for link in links if link["rel"] == "derived_from"]
+
+    async def test_gate_hides_a_source_the_requester_cannot_fetch(
+        self, test_db_session: AsyncSession
+    ):
+        """The gate runs the same query the item endpoints serve from, so the
+        link can never point at an item the requester would get a 404 for.
+        """
+        from app.modules.auth.models import User
+        from app.standards.stac.router import _visible_derived_from_id
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = Record(
+            title="Private raster source",
+            visibility="private",
+            record_status="published",
+            record_type="raster_dataset",
+            created_by=admin_id,
+        )
+        test_db_session.add(source)
+        await test_db_session.flush()
+        source_ds = Dataset(
+            record_id=source.id,
+            table_name=f"ds_{uuid.uuid4().hex[:12]}",
+            srid=4326,
+        )
+        test_db_session.add(source_ds)
+        await test_db_session.commit()
+
+        derived = Record(
+            title="Derived raster",
+            visibility="public",
+            record_status="published",
+            record_type="raster_dataset",
+            created_by=admin_id,
+            derived_from={"dataset_id": str(source_ds.id), "operation": "buffer"},
+        )
+        test_db_session.add(derived)
+        await test_db_session.commit()
+
+        admin = await test_db_session.get(User, admin_id)
+        assert (
+            await _visible_derived_from_id(test_db_session, derived, admin, {"admin"})
+        ) == str(source_ds.id)
+        # Anonymous cannot open a private source, so the reference disappears
+        # rather than dangling.
+        assert (
+            await _visible_derived_from_id(test_db_session, derived, None, set())
+        ) is None
+
+    async def test_gate_ignores_a_record_with_no_provenance(
+        self, test_db_session: AsyncSession
+    ):
+        from app.standards.stac.router import _visible_derived_from_id
+
+        record = Record(title="Plain", visibility="public", record_status="published")
+        assert (
+            await _visible_derived_from_id(test_db_session, record, None, set())
+        ) is None
+
+
+class _ClipOutput(NamedTuple):
+    """A published output whose stored lineage names two other datasets."""
+
+    source_id: uuid.UUID
+    source_title: str
+    mask_id: uuid.UUID
+    mask_title: str
+    output_id: uuid.UUID
+    sentence: str
+
+
+async def _published_clip_output(
+    session: AsyncSession,
+    owner_id: uuid.UUID,
+    *,
+    source_visibility: str = "public",
+    mask_visibility: str = "private",
+) -> _ClipOutput:
+    """Register the record state a clip materialize leaves behind.
+
+    The sentence and the reference come from the real generators rather than a
+    hand-typed string: the redaction is only worth anything against what
+    ``apply_analysis_provenance`` actually writes. The analysis itself is not
+    re-run here — the write path has its own tests above, and this is a read
+    path.
+    """
+    source = await _create_polygon_dataset(
+        session, created_by=owner_id, visibility=source_visibility
+    )
+    mask = await _create_polygon_dataset(
+        session, created_by=owner_id, visibility=mask_visibility
+    )
+    output = await _create_polygon_dataset(
+        session, created_by=owner_id, visibility="public"
+    )
+
+    source_title = f"Parcels {uuid.uuid4().hex[:6]}"
+    mask_title = f"Flood Zone {uuid.uuid4().hex[:6]}"
+    source_record = await _record_of(session, source)
+    mask_record = await _record_of(session, mask)
+    source_record.title = source_title
+    mask_record.title = mask_title
+
+    params = {"mask_source": "layer", "mask_dataset_id": str(mask.id)}
+    created_at = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    sentence = build_lineage_sentence(
+        operation="clip",
+        source_title=source_title,
+        params=params,
+        actor="owner",
+        created_at=created_at,
+        mask_title=mask_title,
+    )
+    output_record = await _record_of(session, output)
+    output_record.lineage_summary = sentence
+    output_record.derived_from = build_derived_from(
+        source_dataset_id=str(source.id),
+        operation="clip",
+        params=params,
+        created_at=created_at,
+    )
+    await session.commit()
+
+    return _ClipOutput(
+        source_id=source.id,
+        source_title=source_title,
+        mask_id=mask.id,
+        mask_title=mask_title,
+        output_id=output.id,
+        sentence=sentence,
+    )
+
+
+class TestLineageSummaryVisibility:
+    """The prose is stored once; the redaction is per requester.
+
+    ``lineage_summary`` names the TITLE of every dataset an analysis output was
+    built from. Served raw to everyone who can see the output, a published clip
+    of a public layer against a private mask would tell every viewer that
+    mask's name and that it exists. That is the disclosure
+    ``visible_derived_from`` prevents for the mask's ID, here arriving by a
+    channel with no redaction of its own.
+    """
+
+    async def test_a_private_masks_title_reaches_only_requesters_who_can_open_it(
+        self,
+        client: AsyncClient,
+        test_db_session: AsyncSession,
+        admin_auth_header: dict,
+        editor_auth_header: dict,
+        viewer_auth_header: dict,
+    ):
+        """Three requesters, one stored sentence.
+
+        The owner ran the analysis and can open both layers, so they get the
+        sentence as written. The viewer can open the output and the public
+        source but not the mask, so only the mask's title goes — and it is
+        replaced by the phrase the generator itself uses for a title it could
+        not read, not by the mask's id, which _DATASET_ID_PARAMS withholds for
+        the same reason. An admin is not filtered at all.
+        """
+        owner_id = uuid.UUID(
+            (await client.get("/auth/me/", headers=editor_auth_header)).json()["id"]
+        )
+        clip = await _published_clip_output(test_db_session, owner_id)
+
+        owner = await client.get(
+            f"/datasets/{clip.output_id}", headers=editor_auth_header
+        )
+        assert owner.status_code == 200, owner.text
+        assert owner.json()["lineage_summary"] == clip.sentence
+
+        other = await client.get(
+            f"/datasets/{clip.output_id}", headers=viewer_auth_header
+        )
+        assert other.status_code == 200, other.text
+        lineage = other.json()["lineage_summary"]
+        assert clip.mask_title not in lineage
+        assert str(clip.mask_id) not in lineage
+        # all-or-nothing — the sentence interleaves
+        # attacker-influenced free text with the titles, so no in-place edit of
+        # it is trustworthy. A viewer missing ANY referenced dataset gets the
+        # constant; the source title they could look up stays available in the
+        # structured derived_from reference, not in prose.
+        assert lineage == "Derived from another dataset."
+        assert clip.source_title not in lineage
+
+        admin = await client.get(
+            f"/datasets/{clip.output_id}", headers=admin_auth_header
+        )
+        assert admin.status_code == 200, admin.text
+        assert admin.json()["lineage_summary"] == clip.sentence
+
+    async def test_a_private_source_title_goes_with_it(
+        self,
+        client: AsyncClient,
+        test_db_session: AsyncSession,
+        editor_auth_header: dict,
+        viewer_auth_header: dict,
+    ):
+        """The source is a dataset the requester may not reach either.
+
+        ``visible_derived_from`` already drops the whole reference in this case;
+        the prose keeps its shape and loses both titles.
+        """
+        owner_id = uuid.UUID(
+            (await client.get("/auth/me/", headers=editor_auth_header)).json()["id"]
+        )
+        clip = await _published_clip_output(
+            test_db_session, owner_id, source_visibility="private"
+        )
+
+        other = await client.get(
+            f"/datasets/{clip.output_id}", headers=viewer_auth_header
+        )
+        assert other.status_code == 200, other.text
+        payload = other.json()
+        assert payload["derived_from"] is None
+        lineage = payload["lineage_summary"]
+        assert clip.source_title not in lineage
+        assert clip.mask_title not in lineage
+        assert str(clip.source_id) not in lineage
+        assert lineage == "Derived from another dataset."
+
+        owner = await client.get(
+            f"/datasets/{clip.output_id}", headers=editor_auth_header
+        )
+        assert owner.json()["lineage_summary"] == clip.sentence
+
+    async def test_no_read_surface_serves_the_hidden_title(
+        self,
+        client: AsyncClient,
+        test_db_session: AsyncSession,
+        editor_auth_header: dict,
+        viewer_auth_header: dict,
+    ):
+        """Every payload that carries the sentence, not just the dataset page.
+
+        The issue is that ``lineage_summary`` is read by five serializers — the
+        dataset response, the OGC record properties, and the three DCAT
+        profiles — and a fix that only covers the one the bug was reported
+        against leaves the same title on a catalog feed an anonymous harvester
+        can pull.
+        """
+        owner_id = uuid.UUID(
+            (await client.get("/auth/me/", headers=editor_auth_header)).json()["id"]
+        )
+        clip = await _published_clip_output(test_db_session, owner_id)
+
+        for url in (
+            f"/datasets/{clip.output_id}",
+            f"/datasets/{clip.output_id}/dcat/",
+            f"/datasets/{clip.output_id}/geodcat-ap/",
+            f"/collections/datasets/items/{clip.output_id}",
+        ):
+            resp = await client.get(url, headers=viewer_auth_header)
+            assert resp.status_code == 200, f"{url}: {resp.text}"
+            assert clip.mask_title not in resp.text, url
+            assert str(clip.mask_id) not in resp.text, url
+            # Redacted, not dropped. Without this a surface that simply stopped
+            # serving the sentence would satisfy the two assertions above.
+            assert "Derived from another dataset." in resp.text, url
+
+        # The feeds carry every visible dataset, so only the negative holds.
+        for url in ("/datasets/", "/datasets/dcat/", "/datasets/geodcat-ap/"):
+            resp = await client.get(url, headers=viewer_auth_header)
+            assert resp.status_code == 200, f"{url}: {resp.text}"
+            assert clip.mask_title not in resp.text, url
+            assert str(clip.mask_id) not in resp.text, url
+
+        # ...and the owner still gets the prose on the same surfaces.
+        owner_detail = await client.get(
+            f"/datasets/{clip.output_id}/dcat/", headers=editor_auth_header
+        )
+        assert clip.mask_title in owner_detail.text
+
+    async def test_prose_is_never_edited_only_passed_or_replaced(self):
+        """The forgery family that rules out span editing.
+
+        Each of these breaks an in-place edit of the sentence: an
+        unnamed source shifts every span onto the wrong dataset; embedded
+        quotes in a hidden title (odd or even) corrupt the span boundaries so
+        fragments survive between them; and quote characters in NON-title free
+        text (an actor name) compensate for a missing title so even a
+        quote-character count reads as aligned. The sentence interleaves
+        attacker-influenced free text with the secrets, so the rule is binary —
+        and this pins that no shape of stored prose changes it: whatever the
+        text contains, a restricted viewer gets the constant and nothing else.
+        """
+        from app.modules.catalog.authorization import (
+            _REDACTED_SUMMARY,
+            visible_lineage_summaries,
+        )
+
+        hidden_mask = uuid.uuid4()
+        adversarial_sentences = [
+            # even embedded quotes — fragments between spans
+            'Clipped from "Roads" to "Flood "Zone" map", created by admin.',
+            # odd embedded quote — span counts coincide
+            'Clipped from "Roads" to "Flood "Zone", created by admin.',
+            # unnamed source + quoted actor — char counts coincide
+            'Clipped from an unnamed dataset to "Secret Zone", created by "bob".',
+            # plain prose, nothing adversarial at all
+            'Clipped from "Roads" to "Secret Zone", created by admin.',
+        ]
+        for sentence in adversarial_sentences:
+            record = SimpleNamespace(
+                id=uuid.uuid4(),
+                lineage_summary=sentence,
+                derived_from={
+                    "operation": "clip",
+                    "dataset_id": str(uuid.uuid4()),
+                    "params": {"mask_dataset_id": str(hidden_mask)},
+                },
+            )
+            # No DB session needed: an unresolvable dataset id is unprovable,
+            # hence hidden — but _accessible_dataset_ids still runs, so give it
+            # a session-shaped refusal by making every id unparseable instead.
+            record.derived_from["dataset_id"] = "not-a-uuid"
+            record.derived_from["params"]["mask_dataset_id"] = "also-not-a-uuid"
+            result = await visible_lineage_summaries(None, [record], None, set())
+            assert result[record.id] == _REDACTED_SUMMARY, sentence
+            assert "Zone" not in result[record.id], sentence
+
+    async def test_a_record_with_no_provenance_costs_no_query(self):
+        """Hand-written lineage is not assembled from other datasets' titles.
+
+        It is also the common case by a wide margin: passing ``None`` for the
+        session proves the redaction never reaches the database for a record
+        with no ``derived_from``, which is what makes it affordable on a page
+        of results.
+        """
+        from app.modules.catalog.authorization import visible_lineage_summaries
+
+        record = Record(
+            id=uuid.uuid4(),
+            title="Plain",
+            lineage_summary="Compiled from the 2024 field survey.",
+        )
+        assert await visible_lineage_summaries(None, [record], None, set()) == {
+            record.id: "Compiled from the 2024 field survey."
+        }
+
+    def test_an_unparseable_provenance_id_counts_as_inaccessible(self):
+        """Access to it cannot be established, so its title is withheld."""
+        from app.modules.catalog.authorization import _provenance_dataset_ids
+
+        assert _provenance_dataset_ids({"dataset_id": "not-a-uuid"}) == [None]
+
+    def test_no_read_path_serves_lineage_summary_unchecked(self):
+        """Structural: only the redaction may read the column for a payload.
+
+        The failure mode is silence — a new serializer reads
+        ``record.lineage_summary``, the payload looks correct, and someone
+        else's private layer is named in it. Every serializer takes the prose as
+        an argument now, so a caller that forgets emits no lineage instead.
+
+        Additions to the allowlist are fine when the read is not a
+        requester-facing payload; say which, and why, in the value.
+        """
+        allowed = {
+            "app/modules/catalog/authorization.py": (
+                "the redaction itself — visible_lineage_summaries"
+            ),
+            "app/modules/catalog/search/service_filters.py": (
+                "Record.lineage_summary as a SQL expression in the FTS filter; "
+                "it selects rows, it does not serialize a value"
+            ),
+            "app/modules/catalog/validation/service.py": (
+                "VAL-01 completeness — tests presence, never emits the value"
+            ),
+            # _score_metadata_completeness is split out of
+            # ingest/metadata.py into this module.
+            "app/processing/ingest/metadata_quality.py": (
+                "metadata completeness scoring on the record's own fields"
+            ),
+            "app/processing/ai/metadata_service.py": (
+                "the suggestion prompt for the record's own editor, who is "
+                "owner-or-admin on it"
+            ),
+            "app/processing/embeddings/service.py": (
+                "embedding index text; the vector is not served back as prose"
+            ),
+        }
+
+        app_root = Path(__file__).resolve().parents[1] / "app"
+        offenders: list[str] = []
+        for path in sorted(app_root.rglob("*.py")):
+            rel = f"app/{path.relative_to(app_root).as_posix()}"
+            if rel in allowed:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "lineage_summary"
+                    and isinstance(node.ctx, ast.Load)
+                ):
+                    offenders.append(f"{rel}:{node.lineno}")
+
+        assert not offenders, (
+            "these read lineage_summary off a record instead of taking the "
+            "access-checked value from visible_lineage_summary(), which is how "
+            "a private layer's title reaches a requester who cannot open it "
+            f"(#1103): {offenders}"
+        )

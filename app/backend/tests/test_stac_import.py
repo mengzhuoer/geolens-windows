@@ -1,0 +1,1912 @@
+"""Tests for STAC catalog import endpoints.
+
+Tests cover: connect, collections, search, import — with mocked external
+STAC API responses. Also covers SSRF validation, auth requirements,
+duplicate detection, and partial import failure handling.
+
+Requirements:
+  - Docker database must be running (docker compose up db)
+  - Alembic migrations must be applied
+"""
+
+import uuid
+from unittest.mock import AsyncMock, patch
+
+import httpx
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import text
+
+
+# ---------------------------------------------------------------------------
+# Canned STAC API responses
+# ---------------------------------------------------------------------------
+
+STAC_LANDING = {
+    "id": "test-catalog",
+    "type": "Catalog",
+    "title": "Test STAC Catalog",
+    "description": "A test catalog",
+    "stac_version": "1.0.0",
+    "conformsTo": ["https://api.stacspec.org/v1.0.0/core"],
+}
+
+STAC_COLLECTIONS = {
+    "collections": [
+        {
+            "id": "dem-collection",
+            "title": "DEM Collection",
+            "description": "Digital elevation models",
+            "license": "proprietary",
+            "keywords": ["dem", "elevation"],
+            "extent": {
+                "spatial": {"bbox": [[-180, -90, 180, 90]]},
+                "temporal": {
+                    "interval": [["2021-01-01T00:00:00Z", "2021-12-31T00:00:00Z"]]
+                },
+            },
+        },
+        {
+            "id": "imagery",
+            "title": "Satellite Imagery",
+            "description": "Multi-spectral imagery",
+            "license": "CC-BY-4.0",
+            "keywords": ["satellite"],
+            "extent": {
+                "spatial": {"bbox": [[-120, 30, -80, 50]]},
+                "temporal": {"interval": [["2020-01-01T00:00:00Z", None]]},
+            },
+        },
+    ]
+}
+
+STAC_SEARCH_RESULTS = {
+    "type": "FeatureCollection",
+    "features": [
+        {
+            "id": "item-001",
+            "type": "Feature",
+            "collection": "dem-collection",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[-1, -1], [1, -1], [1, 1], [-1, 1], [-1, -1]]],
+            },
+            "bbox": [-1, -1, 1, 1],
+            "properties": {
+                "datetime": "2021-06-15T00:00:00Z",
+                "title": "DEM Tile 001",
+                "proj:code": "EPSG:4326",
+                "gsd": 30,
+            },
+            "assets": {
+                "data": {
+                    "href": "https://example.com/data/item-001.tif",
+                    "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                    "roles": ["data"],
+                },
+                "thumbnail": {
+                    "href": "https://example.com/thumbs/item-001.png",
+                    "type": "image/png",
+                    "roles": ["thumbnail"],
+                },
+            },
+        },
+        {
+            "id": "item-002",
+            "type": "Feature",
+            "collection": "dem-collection",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[[1, -1], [3, -1], [3, 1], [1, 1], [1, -1]]],
+            },
+            "bbox": [1, -1, 3, 1],
+            "properties": {
+                "datetime": "2021-06-16T00:00:00Z",
+                "title": "DEM Tile 002",
+                "proj:epsg": 4326,
+                "gsd": 30,
+            },
+            "assets": {
+                "data": {
+                    "href": "https://example.com/data/item-002.tif",
+                    "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                    "roles": ["data"],
+                },
+            },
+        },
+    ],
+    "numberMatched": 2,
+}
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def mock_stac_ssrf():
+    with patch("app.modules.catalog.sources.stac_router.validate_url_for_ssrf") as mock:
+        yield mock
+
+
+@pytest.fixture
+def mock_stac_connect():
+    with patch(
+        "app.modules.catalog.sources.stac_router.connect_stac_api",
+        new_callable=AsyncMock,
+    ) as mock:
+        mock.return_value = {
+            "id": "test-catalog",
+            "title": "Test STAC Catalog",
+            "description": "A test catalog",
+            "stac_version": "1.0.0",
+            "conforms_to": [],
+        }
+        yield mock
+
+
+@pytest.fixture
+def mock_stac_collections():
+    with patch(
+        "app.modules.catalog.sources.stac_router.list_stac_collections",
+        new_callable=AsyncMock,
+    ) as mock:
+        mock.return_value = [
+            {
+                "id": "dem-collection",
+                "title": "DEM Collection",
+                "description": "Digital elevation models",
+                "license": "proprietary",
+                "keywords": ["dem", "elevation"],
+                "bbox": [-180, -90, 180, 90],
+                "temporal_start": "2021-01-01T00:00:00Z",
+                "temporal_end": "2021-12-31T00:00:00Z",
+                "item_count": 100,
+            },
+        ]
+        yield mock
+
+
+@pytest.fixture
+def mock_stac_search():
+    with patch(
+        "app.modules.catalog.sources.stac_router.search_stac_items",
+        new_callable=AsyncMock,
+    ) as mock:
+        mock.return_value = {
+            "items": [
+                {
+                    "id": "item-001",
+                    "collection": "dem-collection",
+                    "bbox": [-1, -1, 1, 1],
+                    "datetime": "2021-06-15T00:00:00Z",
+                    "datetime_start": "2021-06-15T00:00:00Z",
+                    "datetime_end": "2021-06-15T00:00:00Z",
+                    "title": "DEM Tile 001",
+                    "epsg": 4326,
+                    "gsd": 30,
+                    "cloud_cover": None,
+                    "data_asset_href": "https://example.com/data/item-001.tif",
+                    "data_asset_type": "image/tiff",
+                    "thumbnail_href": "https://example.com/thumbs/item-001.png",
+                    "asset_count": 2,
+                },
+            ],
+            "matched": 1,
+            "returned": 1,
+        }
+        yield mock
+
+
+# ---------------------------------------------------------------------------
+# Connect endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestStacConnect:
+    async def test_connect_success(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        mock_stac_connect,
+    ):
+        resp = await client.post(
+            "/services/stac/connect",
+            json={"url": "https://stac.example.com/v1"},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["catalog_id"] == "test-catalog"
+        assert data["title"] == "Test STAC Catalog"
+        assert data["stac_version"] == "1.0.0"
+
+    async def test_connect_unauthenticated(self, client: AsyncClient):
+        resp = await client.post(
+            "/services/stac/connect",
+            json={"url": "https://stac.example.com/v1"},
+        )
+        assert resp.status_code == 401
+
+    async def test_connect_not_stac(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        with patch(
+            "app.modules.catalog.sources.stac_router.connect_stac_api",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            resp = await client.post(
+                "/services/stac/connect",
+                json={"url": "https://not-stac.example.com"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 400
+            assert "not appear to be a valid STAC API" in resp.json()["detail"]
+
+    async def test_connect_ssrf_blocked(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        with patch(
+            "app.modules.catalog.sources.stac_router.validate_url_for_ssrf",
+            side_effect=__import__(
+                "app.platform.security", fromlist=["SSRFError"]
+            ).SSRFError("URLs targeting private/internal networks are not allowed"),
+        ):
+            resp = await client.post(
+                "/services/stac/connect",
+                json={"url": "http://169.254.169.254/latest/meta-data"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 400
+            assert "private" in resp.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Collections endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestStacCollections:
+    async def test_collections_success(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        mock_stac_collections,
+    ):
+        resp = await client.post(
+            "/services/stac/collections",
+            json={"url": "https://stac.example.com/v1"},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["collections"]) == 1
+        assert data["collections"][0]["id"] == "dem-collection"
+        assert data["collections"][0]["title"] == "DEM Collection"
+
+    async def test_collections_fetch_failure(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        with patch(
+            "app.modules.catalog.sources.stac_router.list_stac_collections",
+            new_callable=AsyncMock,
+            side_effect=Exception("Connection refused"),
+        ):
+            resp = await client.post(
+                "/services/stac/collections",
+                json={"url": "https://unreachable.example.com"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 502
+
+
+# ---------------------------------------------------------------------------
+# Search endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestStacSearch:
+    async def test_search_success(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        mock_stac_search,
+    ):
+        resp = await client.post(
+            "/services/stac/search",
+            json={
+                "url": "https://stac.example.com/v1",
+                "collections": ["dem-collection"],
+                "limit": 10,
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["returned"] == 1
+        assert data["items"][0]["id"] == "item-001"
+        assert data["items"][0]["epsg"] == 4326
+
+    async def test_search_invalid_bbox_length(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+    ):
+        resp = await client.post(
+            "/services/stac/search",
+            json={
+                "url": "https://stac.example.com/v1",
+                "bbox": [1.0, 2.0],  # too short
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+
+    async def test_search_fetch_failure(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        with patch(
+            "app.modules.catalog.sources.stac_router.search_stac_items",
+            new_callable=AsyncMock,
+            side_effect=Exception("Timeout"),
+        ):
+            resp = await client.post(
+                "/services/stac/search",
+                json={"url": "https://stac.example.com/v1"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 502
+
+
+class TestStacSearchAssetEligibility:
+    """`data_asset_import_refusal` predicts /import's own StacImportItem
+    validation, so a caller can screen an item out before ticking it rather
+    than after the whole batch 422s (#2296)."""
+
+    async def _search_one(self, client, admin_auth_header, data_asset_href):
+        with patch(
+            "app.modules.catalog.sources.stac_router.search_stac_items",
+            new_callable=AsyncMock,
+        ) as mock:
+            mock.return_value = {
+                "items": [
+                    {
+                        "id": "item-001",
+                        "collection": "dem-collection",
+                        "bbox": None,
+                        "datetime": None,
+                        "datetime_start": None,
+                        "datetime_end": None,
+                        "title": "Item",
+                        "epsg": None,
+                        "gsd": None,
+                        "cloud_cover": None,
+                        "data_asset_href": data_asset_href,
+                        "data_asset_type": None,
+                        "thumbnail_href": None,
+                        "asset_count": 1,
+                    },
+                ],
+                "matched": 1,
+                "returned": 1,
+            }
+            return await client.post(
+                "/services/stac/search",
+                json={"url": "https://stac.example.com/v1"},
+                headers=admin_auth_header,
+            )
+
+    async def test_flags_a_non_http_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        resp = await self._search_one(
+            client, admin_auth_header, "s3://copernicus-dem-90m/tile.tif"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "not_http"
+
+    async def test_flags_a_credentialed_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        resp = await self._search_one(
+            client,
+            admin_auth_header,
+            "https://example.com/data.tif?X-Amz-Signature=abc123",
+        )
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "credentials"
+
+    async def test_flags_an_overlong_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        href = "https://example.com/" + ("a" * 4090) + ".tif"
+        assert len(href) > 4096
+        resp = await self._search_one(client, admin_auth_header, href)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "too_long"
+
+    async def test_flags_an_asset_between_httpurls_and_the_fields_length_ceiling(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        # Under the field's 4096-char cap but over HttpUrl's own, tighter
+        # 2083-char ceiling: /import's validator refuses this via HttpUrl
+        # itself (pydantic error type url_too_long), not the field's own
+        # length constraint — the reason must still read as too_long, not
+        # a scheme problem.
+        prefix = "https://example.com/"
+        href = prefix + "a" * (2100 - len(prefix))
+        assert len(href) == 2100
+        resp = await self._search_one(client, admin_auth_header, href)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "too_long"
+
+    async def test_flags_a_too_long_credentialed_asset_as_too_long_not_credentials(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        # /import's validator runs HttpUrl(v) before the credential check —
+        # an href over HttpUrl's own length ceiling never reaches that
+        # check, so the real refusal is too_long even though this href also
+        # carries a credential query parameter.
+        prefix = "https://example.com/"
+        suffix = "?X-Amz-Signature=abc123"
+        href = prefix + "a" * (2100 - len(prefix) - len(suffix)) + suffix
+        assert len(href) == 2100
+        resp = await self._search_one(client, admin_auth_header, href)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "too_long"
+
+    async def test_flags_a_malformed_asset_as_not_http(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        # has_url_credentials() deliberately returns True for an
+        # unparsable authority ("cannot tell" resolves to refusal, not to
+        # "no") — checked after HttpUrl now, so this never reaches that
+        # check either; HttpUrl's own url_parsing failure makes it not_http.
+        resp = await self._search_one(client, admin_auth_header, "https://[invalid")
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] == "not_http"
+
+    async def test_does_not_flag_an_asset_at_httpurls_own_length_ceiling(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        prefix = "https://example.com/"
+        href = prefix + "a" * (2083 - len(prefix))
+        assert len(href) == 2083
+        resp = await self._search_one(client, admin_auth_header, href)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] is None
+
+    async def test_does_not_flag_a_plain_https_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        resp = await self._search_one(
+            client, admin_auth_header, "https://example.com/data.tif"
+        )
+        assert resp.status_code == 200
+        item = resp.json()["items"][0]
+        # The field is required (no default) rather than optional, so a
+        # client can tell "checked, and clear" from "never checked".
+        assert "data_asset_import_refusal" in item
+        assert item["data_asset_import_refusal"] is None
+
+    async def test_does_not_flag_a_missing_asset(
+        self, client: AsyncClient, admin_auth_header: dict, mock_stac_ssrf
+    ):
+        # No data asset at all is a distinct, pre-existing UI state (the
+        # frontend's own noCogAsset reason) — not an import refusal code.
+        resp = await self._search_one(client, admin_auth_header, None)
+        assert resp.status_code == 200
+        assert resp.json()["items"][0]["data_asset_import_refusal"] is None
+
+
+async def _create_stac_dataset(
+    session,
+    *,
+    created_by,
+    source_url,
+    name="Existing STAC Dataset",
+    origin_uri=None,
+    origin_ref=None,
+):
+    """Insert a Dataset simulating a previously imported STAC item.
+
+    ``origin_uri``/``origin_ref`` default to unset — the shape of a row
+    migration 0036 could not backfill — so callers that want a fully-bound
+    fully bound dataset, or one with a deliberately mismatched pair to
+    reproduce a respelling writer, pass both explicitly.
+    """
+    import uuid as _uuid
+
+    from app.modules.catalog.datasets.domain.models import Dataset, Record
+
+    table_name = f"stac_{_uuid.uuid4().hex[:16]}"
+    record = Record(
+        title=name,
+        summary="STAC import test",
+        visibility="private",
+        record_status="published",
+        created_by=created_by,
+        record_type="raster_dataset",
+    )
+    session.add(record)
+    await session.flush()
+    dataset = Dataset(
+        record_id=record.id,
+        table_name=table_name,
+        source_format="stac",
+        source_url=source_url,
+        source_filename="existing-item",
+        origin_uri=origin_uri,
+        origin_ref=origin_ref,
+    )
+    session.add(dataset)
+    await session.commit()
+    await session.refresh(dataset)
+    return dataset
+
+
+# ---------------------------------------------------------------------------
+# Import endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestStacImport:
+    async def test_import_success(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"test-item-{uuid.uuid4().hex[:8]}",
+                        "collection": "dem-collection",
+                        "title": "Test DEM Import",
+                        "data_asset_href": "https://example.com/data/test.tif",
+                        "bbox": [-1, -1, 1, 1],
+                        "epsg": 4326,
+                        "datetime_start": "2021-06-15T00:00:00Z",
+                        "datetime_end": "2021-06-15T00:00:00Z",
+                        "keywords": ["dem"],
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["created"] == 1
+        assert data["skipped"] == 0
+        assert data["errors"] == 0
+        assert data["results"][0]["status"] == "created"
+        assert data["results"][0]["dataset_id"] is not None
+
+        # No Titiler answered in this environment, so
+        # fetch_cog_info returned None and nobody can show the origin was
+        # contacted — the field stays NULL until a probe settles it. The
+        # contacted case is pinned separately below.
+        detail = await client.get(
+            f"/datasets/{data['results'][0]['dataset_id']}",
+            headers=admin_auth_header,
+        )
+        assert detail.status_code == 200
+        assert detail.json()["last_checked_at"] is None
+        assert detail.json()["source_health"] == "unknown"
+
+    async def test_import_refuses_an_item_too_long_to_store_and_imports_the_rest(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        """An id over the filename column, or an asset link over the URL
+        column, is refused with a code; the rest of the batch imports."""
+        long_id = "l" * 600
+        long_href = "https://example.com/" + "a" * 2000 + ".tif"
+        items = [
+            {
+                "id": long_id,
+                "collection": "dem-collection",
+                "title": "Long id",
+                "data_asset_href": "https://example.com/data/long-id.tif",
+            },
+            {
+                "id": "long-href",
+                "collection": "dem-collection",
+                "title": "Long href",
+                "data_asset_href": long_href,
+            },
+            {
+                "id": f"normal-{uuid.uuid4().hex[:8]}",
+                "collection": "dem-collection",
+                "title": "Normal",
+                "data_asset_href": f"https://example.com/data/{uuid.uuid4().hex}.tif",
+            },
+        ]
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": items,
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert (data["created"], data["errors"]) == (1, 2)
+        by_id = {r["item_id"]: r for r in data["results"]}
+        assert by_id[long_id]["status"] == "error"
+        assert by_id[long_id]["error"] == "too_long"
+        assert by_id["long-href"]["error"] == "too_long"
+        assert by_id[items[2]["id"]]["status"] == "created"
+
+    async def test_an_untitled_long_id_item_searches_and_imports(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        """Search falls back to the item id as the title, which the import
+        model caps at 500, so the derived title is bounded: the batch is
+        accepted, the long id is refused per item and the normal item
+        imports."""
+        import json
+
+        from app.modules.catalog.sources.adapters import stac as stac_adapter
+
+        long_id = "u" * 2048
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            features = [
+                {
+                    "id": id_,
+                    "collection": "dem-collection",
+                    "properties": {},
+                    "links": [],
+                    "assets": {
+                        "data": {
+                            "href": f"https://example.com/data/{n}.tif",
+                            "type": "image/tiff; application=geotiff; "
+                            "profile=cloud-optimized",
+                            "roles": ["data"],
+                        }
+                    },
+                }
+                for n, id_ in enumerate((long_id, "normal-item"))
+            ]
+            raw = json.dumps({"features": features}).encode()
+
+            async def body():
+                yield raw
+
+            return httpx.Response(200, content=body())
+
+        with patch.object(
+            stac_adapter,
+            "_make_client",
+            lambda _credential_header=None: httpx.AsyncClient(
+                transport=httpx.MockTransport(handle)
+            ),
+        ):
+            searched = await stac_adapter.search_stac_items(
+                "https://stac.example.com/v1", limit=5
+            )
+        items = searched["items"]
+        assert items[0]["id"] == long_id
+        assert len(items[0]["title"]) == 500
+        assert items[1]["title"] == "normal-item"
+
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": it["id"],
+                        "collection": it["collection"],
+                        "title": it["title"],
+                        "data_asset_href": it["data_asset_href"],
+                    }
+                    for it in items
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert (data["created"], data["errors"]) == (1, 1), resp.text
+        assert data["results"][0]["error"] == "too_long"
+
+    async def test_import_reports_a_fixed_message_when_an_item_fails(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        """A persistence failure never puts the exception text in the
+        per-item result."""
+        detail = "internal failure text that must stay out of the response"
+        with patch(
+            "app.modules.catalog.sources.stac_router.set_dataset_origin",
+            side_effect=RuntimeError(detail),
+        ):
+            resp = await client.post(
+                "/services/stac/import",
+                json={
+                    "url": "https://stac.example.com/v1",
+                    "items": [
+                        {
+                            "id": f"fails-{uuid.uuid4().hex[:8]}",
+                            "collection": "dem-collection",
+                            "title": "Fails",
+                            "data_asset_href": "https://example.com/data/f.tif",
+                        }
+                    ],
+                    "visibility": "private",
+                },
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["errors"] == 1
+        assert data["results"][0]["status"] == "error"
+        assert detail not in resp.text
+        assert data["results"][0]["error"] == "import_failed"
+
+    async def test_import_refuses_an_off_origin_item_href(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        """The item pointer is what a later credentialed refresh
+        anchors on, so it may not name a host other than the submitted
+        catalog. Search already drops such a link; this refuses it for a
+        client that did not come from there."""
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"off-origin-{uuid.uuid4().hex[:8]}",
+                        "collection": "dem-collection",
+                        "title": "Off-origin pointer",
+                        "data_asset_href": "https://example.com/data/off.tif",
+                        "item_href": "https://mirror.example.net/v1/items/x",
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["created"] == 0
+        assert data["errors"] == 1
+        assert data["results"][0]["status"] == "error"
+        assert "different host" in data["results"][0]["error"]
+
+    async def test_import_records_the_catalog_and_the_auth_marker(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        test_db_session,
+    ):
+        """`url` is the anchor a credentialed refresh reads, and
+        `auth_required` is a boolean the wizard sets when the search that
+        produced these items carried a credential."""
+        from sqlalchemy import select
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"marked-{uuid.uuid4().hex[:8]}",
+                        "collection": "dem-collection",
+                        "title": "Marked import",
+                        "data_asset_href": f"https://example.com/d/{uuid.uuid4().hex}.tif",
+                    }
+                ],
+                "visibility": "private",
+                "catalog_auth_required": True,
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        dataset_id = resp.json()["results"][0]["dataset_id"]
+        dataset = (
+            await test_db_session.execute(
+                select(Dataset).where(Dataset.id == uuid.UUID(dataset_id))
+            )
+        ).scalar_one()
+        assert dataset.origin_ref["url"] == "https://stac.example.com/v1"
+        assert dataset.origin_ref["auth_required"] is True
+
+    async def test_import_leaves_the_marker_absent_by_default(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        test_db_session,
+    ):
+        """True or absent, never False, so an anonymous import's binding is
+        the same shape it was before the key existed."""
+        from sqlalchemy import select
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"plain-{uuid.uuid4().hex[:8]}",
+                        "collection": "dem-collection",
+                        "title": "Plain import",
+                        "data_asset_href": f"https://example.com/d/{uuid.uuid4().hex}.tif",
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        dataset_id = resp.json()["results"][0]["dataset_id"]
+        dataset = (
+            await test_db_session.execute(
+                select(Dataset).where(Dataset.id == uuid.UUID(dataset_id))
+            )
+        ).scalar_one()
+        assert "auth_required" not in dataset.origin_ref
+
+    async def test_import_persists_the_origin_asset_for_generic_clients(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_stac_ssrf,
+    ):
+        """The served STAC item carries a readable COG href.
+
+        Before this, a by-reference import stored no ``dataset_assets`` row,
+        so the item GeoLens re-published exposed exactly one asset — the
+        internal ``raster_tiles`` XYZ template, which renders only in
+        GeoLens's own frontend. A generic STAC client (stac-browser, the
+        QGIS STAC plugin) could discover the item but had no pixel data to
+        read. The import now persists the origin item's primary data asset,
+        and the item endpoint serves it verbatim beside the tiles template,
+        roled ``data`` against the template's ``visual``.
+        """
+        from sqlalchemy import select
+
+        from app.processing.raster.models import DatasetAsset
+
+        cog_href = f"https://example.com/data/origin-{uuid.uuid4().hex[:8]}.tif"
+        cog_type = "image/tiff; application=geotiff; profile=cloud-optimized"
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"origin-asset-{uuid.uuid4().hex[:8]}",
+                        "collection": "dem-collection",
+                        "title": "Origin Asset Import",
+                        "data_asset_href": cog_href,
+                        "data_asset_type": cog_type,
+                        "data_asset_key": "data",
+                        "bbox": [-1, -1, 1, 1],
+                        "keywords": [],
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["created"] == 1
+        dataset_id = resp.json()["results"][0]["dataset_id"]
+
+        # The stored row: the origin COG, roled as the data asset.
+        row = (
+            await test_db_session.execute(
+                select(DatasetAsset).where(
+                    DatasetAsset.dataset_id == uuid.UUID(dataset_id),
+                    DatasetAsset.key == "data",
+                )
+            )
+        ).scalar_one()
+        assert row.href == cog_href
+        assert row.media_type == cog_type
+        assert row.roles == ["data"]
+
+        # The served item, read the way a generic client reads it. The
+        # remote href passes through resolve_asset_url untouched — it is
+        # not managed storage, so neither presigning nor the proxy
+        # refusal applies — and it sits BESIDE the tiles template, each
+        # roled as what it is.
+        item = await client.get(f"/stac/items/{dataset_id}", headers=admin_auth_header)
+        assert item.status_code == 200, item.text
+        assets = item.json()["assets"]
+        assert assets["data"]["href"] == cog_href
+        assert assets["data"]["type"] == cog_type
+        assert assets["data"]["roles"] == ["data"]
+        assert assets["raster_tiles"]["roles"] == ["visual"]
+
+        # And the dataset detail's stac_assets mirror — the surface the
+        # issue observed as null on a by-reference Sentinel-2 dataset.
+        detail = await client.get(f"/datasets/{dataset_id}", headers=admin_auth_header)
+        assert detail.status_code == 200
+        assert detail.json()["stac_assets"]["data"]["href"] == cog_href
+
+    async def test_import_without_a_declared_type_still_persists_the_href(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_stac_ssrf,
+    ):
+        """The type echo is optional, like the other echoes.
+
+        An older client — or an item whose asset declares no ``type`` —
+        still imports, and still gets the pass-through asset; the row simply
+        carries no media type until the first refresh reads one off the live
+        item document.
+        """
+        from sqlalchemy import select
+
+        from app.processing.raster.models import DatasetAsset
+
+        cog_href = f"https://example.com/data/untyped-{uuid.uuid4().hex[:8]}.tif"
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"untyped-{uuid.uuid4().hex[:8]}",
+                        "title": "Untyped Origin Asset",
+                        "data_asset_href": cog_href,
+                        "keywords": [],
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["created"] == 1
+        dataset_id = resp.json()["results"][0]["dataset_id"]
+
+        row = (
+            await test_db_session.execute(
+                select(DatasetAsset).where(
+                    DatasetAsset.dataset_id == uuid.UUID(dataset_id),
+                    DatasetAsset.key == "data",
+                )
+            )
+        ).scalar_one()
+        assert row.href == cog_href
+        assert row.media_type is None
+        assert row.roles == ["data"]
+
+    async def test_import_with_cog_info_stamps_the_contact(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        """Cog info in hand means Titiler reached the COG
+        on GeoLens's behalf — that IS a contact, same contract as
+        _finalize_ingest and the reupload swap."""
+        with patch(
+            "app.modules.catalog.sources.stac_router.fetch_cog_info",
+            new=AsyncMock(
+                return_value={
+                    "band_count": 1,
+                    "dtype": "float32",
+                    "width": 512,
+                    "height": 512,
+                    "nodata": None,
+                    "band_info": None,
+                }
+            ),
+        ):
+            resp = await client.post(
+                "/services/stac/import",
+                json={
+                    "url": "https://stac.example.com/v1",
+                    "items": [
+                        {
+                            "id": f"test-item-{uuid.uuid4().hex[:8]}",
+                            "collection": "dem-collection",
+                            "title": "Contacted STAC Import",
+                            "data_asset_href": "https://example.com/data/c.tif",
+                            "bbox": [-1, -1, 1, 1],
+                            "epsg": 4326,
+                        }
+                    ],
+                    "visibility": "private",
+                },
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["created"] == 1
+
+        detail = await client.get(
+            f"/datasets/{data['results'][0]['dataset_id']}",
+            headers=admin_auth_header,
+        )
+        assert detail.status_code == 200
+        assert detail.json()["last_checked_at"] is not None
+        assert detail.json()["source_health"] == "unknown"
+
+    async def test_import_projects_cog_info_georeferencing_onto_the_asset(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        test_db_session,
+    ):
+        """Fetch_cog_info retrieves crs_wkt for a remote asset
+        the same way it retrieves band_count/dtype, but nothing wrote it onto
+        the raster_assets row. The Titiler probe already runs at import
+        time; this only asks that its answer be kept, the same way its
+        other fields already are.
+
+        This probe result carries no transform, which is the
+        case where res_x/res_y stay NULL. The sibling test below covers the
+        one that does carry it.
+        """
+        from app.modules.catalog.sources.cog_info import _georeferencing
+
+        georeferencing = _georeferencing({"crs": "EPSG:32621"})
+        with patch(
+            "app.modules.catalog.sources.stac_router.fetch_cog_info",
+            new=AsyncMock(
+                return_value={
+                    "band_count": 1,
+                    "dtype": "uint16",
+                    "width": 2658,
+                    "height": 2667,
+                    "nodata": None,
+                    "band_info": None,
+                    **georeferencing,
+                }
+            ),
+        ):
+            resp = await client.post(
+                "/services/stac/import",
+                json={
+                    "url": "https://stac.example.com/v1",
+                    "items": [
+                        {
+                            "id": f"test-item-{uuid.uuid4().hex[:8]}",
+                            "collection": "dem-collection",
+                            "title": "Georeferenced STAC Import",
+                            "data_asset_href": "https://example.com/data/geo.tif",
+                            "bbox": [-1, -1, 1, 1],
+                            "epsg": 32621,
+                        }
+                    ],
+                    "visibility": "private",
+                },
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["created"] == 1
+        dataset_id = data["results"][0]["dataset_id"]
+
+        detail = await client.get(f"/datasets/{dataset_id}", headers=admin_auth_header)
+        assert detail.status_code == 200
+        raster = detail.json()["raster"]
+        # A projected UTM CRS: the probe's facts were stored with its text.
+        assert raster["crs_is_geographic"] is False
+        # A probe that established no transform leaves these NULL rather
+        # than guessing — see the docstring above.
+        assert raster["res_x"] is None
+        assert raster["res_y"] is None
+
+        row = (
+            await test_db_session.execute(
+                text(
+                    "SELECT ra.crs_wkt, ra.crs_is_geographic, ra.crs_has_degree_unit,"
+                    " ra.crs_metres_per_unit FROM catalog.raster_assets ra"
+                    " JOIN catalog.datasets d ON d.id = ra.dataset_id"
+                    " WHERE d.id = :did"
+                ).bindparams(did=uuid.UUID(dataset_id))
+            )
+        ).one()
+        assert tuple(row) == (georeferencing["crs_wkt"], False, False, 1.0)
+
+    async def test_import_records_the_probed_resolution_and_rotation(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        test_db_session,
+    ):
+        """Remote raster rows expose their probed resolution and rotation.
+
+        ``fetch_cog_info`` reads the affine from
+        ``/cog/stac``; this asks that the numbers reach the row and the API,
+        including the rotation flag, which a remote row could previously
+        only report as the column's default ``false``.
+
+        The values are a rotated raster's on purpose: it is the case the
+        envelope-division shortcut would have got wrong. 10.0 is the pixel
+        size of the same 30°-rotated fixture ``test_cog_info.py`` probes —
+        its affine's element 0 is 8.66, and the difference between those two
+        numbers proves that the pixel vector length is used.
+        """
+        with patch(
+            "app.modules.catalog.sources.stac_router.fetch_cog_info",
+            new=AsyncMock(
+                return_value={
+                    "band_count": 1,
+                    "dtype": "uint16",
+                    "width": 2658,
+                    "height": 2667,
+                    "nodata": None,
+                    "band_info": None,
+                    "crs_wkt": None,
+                    "res_x": 10.0,
+                    "res_y": 10.0,
+                    "is_rotated": True,
+                }
+            ),
+        ):
+            resp = await client.post(
+                "/services/stac/import",
+                json={
+                    "url": "https://stac.example.com/v1",
+                    "items": [
+                        {
+                            "id": f"test-item-{uuid.uuid4().hex[:8]}",
+                            "collection": "dem-collection",
+                            "title": "Rotated STAC Import",
+                            "data_asset_href": "https://example.com/data/rot.tif",
+                            "bbox": [-1, -1, 1, 1],
+                            "epsg": 32621,
+                        }
+                    ],
+                    "visibility": "private",
+                },
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 200
+        dataset_id = resp.json()["results"][0]["dataset_id"]
+
+        detail = await client.get(f"/datasets/{dataset_id}", headers=admin_auth_header)
+        assert detail.status_code == 200
+        raster = detail.json()["raster"]
+        assert raster["res_x"] == pytest.approx(10.0)
+        assert raster["res_y"] == pytest.approx(10.0)
+
+        row = (
+            await test_db_session.execute(
+                text(
+                    "SELECT ra.is_rotated FROM catalog.raster_assets ra"
+                    " WHERE ra.dataset_id = :did"
+                ).bindparams(did=uuid.UUID(dataset_id))
+            )
+        ).one()
+        assert row.is_rotated is True
+
+    async def test_import_prefers_the_probed_epsg_over_a_stale_item_declaration(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        test_db_session,
+    ):
+        """The raster row and the dataset's srid follow the probe's CRS, not the item's."""
+        crs_wkt = (
+            'PROJCS["WGS 84 / UTM zone 21N",GEOGCS["WGS 84",'
+            'DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],'
+            'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],'
+            'PROJECTION["Transverse_Mercator"],'
+            'PARAMETER["latitude_of_origin",0],'
+            'PARAMETER["central_meridian",-57],'
+            'PARAMETER["scale_factor",0.9996],'
+            'PARAMETER["false_easting",500000],'
+            'PARAMETER["false_northing",0],'
+            'UNIT["metre",1],AXIS["Easting",EAST],AXIS["Northing",NORTH],'
+            'AUTHORITY["EPSG","32621"]]'
+        )
+        with patch(
+            "app.modules.catalog.sources.stac_router.fetch_cog_info",
+            new=AsyncMock(
+                return_value={
+                    "band_count": 1,
+                    "dtype": "uint16",
+                    "width": 2658,
+                    "height": 2667,
+                    "nodata": None,
+                    "band_info": None,
+                    "crs_wkt": crs_wkt,
+                    "epsg": 32621,
+                }
+            ),
+        ):
+            resp = await client.post(
+                "/services/stac/import",
+                json={
+                    "url": "https://stac.example.com/v1",
+                    "items": [
+                        {
+                            "id": f"test-item-{uuid.uuid4().hex[:8]}",
+                            "collection": "dem-collection",
+                            "title": "Stale item EPSG",
+                            "data_asset_href": "https://example.com/data/stale.tif",
+                            "bbox": [-1, -1, 1, 1],
+                            # Deliberately wrong/stale — the item claims 4326
+                            # while the file the probe actually opened is
+                            # 32621.
+                            "epsg": 4326,
+                        }
+                    ],
+                    "visibility": "private",
+                },
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["created"] == 1
+        dataset_id = data["results"][0]["dataset_id"]
+
+        detail = await client.get(f"/datasets/{dataset_id}", headers=admin_auth_header)
+        assert detail.status_code == 200
+        body = detail.json()
+        assert body["raster"]["epsg"] == 32621
+        assert body["srid"] == 32621
+
+    async def test_import_antimeridian_bbox_stores_two_rings(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+        test_db_session,
+    ):
+        """RFC 7946 §5.2 mandates west > east for a crossing bbox, and
+        the old code fed [170, -20, -170, -15] straight into
+        POLYGON((w s, e s, e n, w n, w s)). That ring is valid but spans longitude
+        -170..170: 1700 deg² on the wrong side of the world instead of the
+        intended 100, missing the Fiji data it was supposed to describe while
+        matching everything else in the -20..-15 latitude band.
+
+        Every other STAC fixture in this file is low-lon; this is the only
+        crossing one.
+        """
+        from geoalchemy2 import WKTElement
+
+        from app.core.geo import extent_to_bbox
+
+        item_id = f"antimeridian-{uuid.uuid4().hex[:8]}"
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": item_id,
+                        "collection": "fiji-collection",
+                        "title": "Fiji Seam Crosser",
+                        "data_asset_href": (f"https://example.com/data/{item_id}.tif"),
+                        # west > east: the spec encoding of a crossing bbox.
+                        "bbox": [170, -20, -170, -15],
+                        "epsg": 4326,
+                        "keywords": [],
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["created"] == 1
+        dataset_id = resp.json()["results"][0]["dataset_id"]
+
+        row = (
+            await test_db_session.execute(
+                text(
+                    "SELECT GeometryType(r.spatial_extent) AS gtype,"
+                    " ST_NumGeometries(r.spatial_extent) AS parts,"
+                    " ST_IsValid(r.spatial_extent) AS valid,"
+                    " ST_XMin(r.spatial_extent) AS xmin,"
+                    " ST_XMax(r.spatial_extent) AS xmax,"
+                    " ST_AsText(r.spatial_extent) AS extent_wkt,"
+                    " ST_Area(r.spatial_extent) AS area,"
+                    " ST_Intersects("
+                    "   r.spatial_extent, ST_MakeEnvelope(177, -19, 179, -16, 4326)"
+                    " ) AS hits_fiji,"
+                    " ST_Intersects("
+                    "   r.spatial_extent, ST_MakeEnvelope(-1, -19, 1, -16, 4326)"
+                    " ) AS hits_south_atlantic,"
+                    " ST_Intersects("
+                    "   r.spatial_extent, ST_MakeEnvelope(1.5, 46.5, 2.5, 47.5, 4326)"
+                    " ) AS hits_france"
+                    " FROM catalog.records r"
+                    " JOIN catalog.datasets d ON d.record_id = r.id"
+                    " WHERE d.id = :did"
+                ).bindparams(did=uuid.UUID(dataset_id))
+            )
+        ).one()
+
+        # Split at the seam into one part per hemisphere, each planar-valid.
+        assert row.gtype == "MULTIPOLYGON"
+        assert row.parts == 2
+        assert row.valid is True
+        # Every vertex stays inside the WGS84 domain.
+        assert row.xmin == -180.0
+        assert row.xmax == 180.0
+        # 10° west of the seam plus 10° east over a 5° band, not the old 1700.
+        assert row.area == pytest.approx(100.0)
+
+        # The served bbox is the spec form the item arrived in — a round trip,
+        # not a globe-spanning -180..180.
+        assert extent_to_bbox(WKTElement(row.extent_wkt, srid=4326)) == [
+            170.0,
+            -20.0,
+            -170.0,
+            -15.0,
+        ]
+
+        # The two assertions that discriminate old from new: the extent now covers
+        # the data it describes, and no longer covers the same latitude band on the
+        # far side of the world. (hits_france was False under the old ring too —
+        # latitude 47 fell outside the band — so it is only a sanity check.)
+        assert row.hits_fiji is True
+        assert row.hits_south_atlantic is False
+        assert row.hits_france is False
+
+        # The dataset payload's own extent_bbox is the RFC 7946 §5.2
+        # spec form too. A monotonic span would flatten this extent into a
+        # globe-spanning pair and make the seam guards unreachable.
+        detail = await client.get(f"/datasets/{dataset_id}", headers=admin_auth_header)
+        assert detail.status_code == 200
+        assert detail.json()["extent_bbox"] == [170.0, -20.0, -170.0, -15.0]
+
+    async def test_import_duplicate_skipped(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        """Also the never-refreshed-dataset regression test.
+
+        The first import writes ``origin_uri`` and ``origin_ref.asset_href``
+        together and nothing touches the binding afterward, so the second
+        import must be caught by the primary origin_ref-keyed branch alone.
+        """
+        item_id = f"dup-test-{uuid.uuid4().hex[:8]}"
+        href = f"https://example.com/data/dup-{uuid.uuid4().hex[:8]}.tif"
+        payload = {
+            "url": "https://stac.example.com/v1",
+            "items": [
+                {
+                    "id": item_id,
+                    "title": "Duplicate Test",
+                    "data_asset_href": href,
+                    "keywords": [],
+                }
+            ],
+            "visibility": "private",
+        }
+
+        # First import — should create
+        resp1 = await client.post(
+            "/services/stac/import", json=payload, headers=admin_auth_header
+        )
+        assert resp1.json()["created"] == 1
+
+        # Second import — same href, should skip
+        payload["items"][0]["id"] = f"dup-test-2-{uuid.uuid4().hex[:8]}"
+        resp2 = await client.post(
+            "/services/stac/import", json=payload, headers=admin_auth_header
+        )
+        assert resp2.json()["skipped"] == 1
+        assert resp2.json()["results"][0]["status"] == "skipped"
+
+    async def test_import_catches_an_unbackfilled_dataset(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_stac_ssrf,
+    ):
+        """A row migration 0036 could not backfill is still caught.
+
+        Neither ``origin_uri`` nor ``origin_ref`` is set — the shape of a row
+        that predates origin binding, so the guard can only catch it through the
+        ``source_url`` fallback branch.
+        """
+        from tests.factories import get_user_id
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        href = f"https://example.com/data/unbackfilled-{uuid.uuid4().hex[:8]}.tif"
+        await _create_stac_dataset(
+            test_db_session,
+            created_by=admin_id,
+            source_url=href,
+            name="Unbackfilled STAC Row",
+        )
+
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"unbackfilled-test-{uuid.uuid4().hex[:8]}",
+                        "title": "Should Be Skipped",
+                        "data_asset_href": href,
+                        "keywords": [],
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.json()["skipped"] == 1
+        assert resp.json()["results"][0]["status"] == "skipped"
+
+    async def test_import_catches_a_respelled_origin_uri(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_stac_ssrf,
+    ):
+        """A respelled origin_uri can no longer open the hole.
+
+        ``origin_ref.asset_href`` names the canonical asset; ``origin_uri``
+        is deliberately a different spelling of the same asset (as a
+        hypothetical future writer might produce). An origin_uri-keyed guard
+        would miss this row; the origin_ref-keyed guard must not.
+        """
+        from tests.factories import get_user_id
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        href = f"https://example.com/data/respelled-{uuid.uuid4().hex[:8]}.tif"
+        await _create_stac_dataset(
+            test_db_session,
+            created_by=admin_id,
+            source_url=href,
+            name="Respelled STAC Pointer",
+            # The respelling: origin_uri drifted to a query-string variant of
+            # the same asset that origin_ref.asset_href still names exactly.
+            origin_uri=f"{href}?rebuilt=true",
+            origin_ref={"kind": "stac", "asset_href": href},
+        )
+
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"respelled-test-{uuid.uuid4().hex[:8]}",
+                        "title": "Should Be Skipped",
+                        "data_asset_href": href,
+                        "keywords": [],
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.json()["skipped"] == 1
+        assert resp.json()["results"][0]["status"] == "skipped"
+
+    async def test_import_invalid_visibility(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+    ):
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": "vis-test",
+                        "title": "Vis Test",
+                        "data_asset_href": "https://example.com/test.tif",
+                        "keywords": [],
+                    }
+                ],
+                "visibility": "INVALID",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+
+    async def test_import_ssrf_blocks_internal_url(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+    ):
+        """Asset URLs pointing to internal networks are rejected per-item."""
+        from app.platform.security import SSRFError
+
+        with patch(
+            "app.modules.catalog.sources.stac_router.validate_url_for_ssrf",
+            side_effect=lambda url: (
+                (_ for _ in ()).throw(
+                    SSRFError(
+                        "URLs targeting private/internal networks are not allowed"
+                    )
+                )
+                if "internal" in url
+                else None
+            ),
+        ):
+            resp = await client.post(
+                "/services/stac/import",
+                json={
+                    "url": "https://stac.example.com/v1",
+                    "items": [
+                        {
+                            "id": "ssrf-test",
+                            "title": "SSRF Test",
+                            "data_asset_href": "http://internal.corp/secret.tif",
+                            "keywords": [],
+                        }
+                    ],
+                    "visibility": "private",
+                },
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["errors"] == 1
+            assert "private" in data["results"][0]["error"].lower()
+
+    async def test_import_unauthenticated(self, client: AsyncClient):
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": "x",
+                        "title": "X",
+                        "data_asset_href": "https://e.com/x.tif",
+                        "keywords": [],
+                    }
+                ],
+                "visibility": "private",
+            },
+        )
+        assert resp.status_code == 401
+
+    async def test_import_empty_items_rejected(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+    ):
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [],
+                "visibility": "private",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Adapter unit tests
+# ---------------------------------------------------------------------------
+
+
+def _streaming_stac_client(payload: dict) -> httpx.AsyncClient:
+    """A real client over a MockTransport that answers every request with *payload*.
+
+    The adapter reads through ``bounded_probe_read``, which streams the body
+    via ``aiter_raw``; a response built from an in-memory body refuses that
+    with ``StreamConsumed``, so the body is served from an async generator.
+    """
+    import json as _json
+
+    raw = _json.dumps(payload).encode()
+
+    async def _chunks():
+        yield raw
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_chunks())
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+
+class TestStacAdapter:
+    """Unit tests for the STAC adapter functions with mocked httpx."""
+
+    async def test_connect_stac_api_success(self):
+        import json as _json
+
+        import httpx
+
+        from app.modules.catalog.sources.adapters.stac import connect_stac_api
+
+        # A real client over a MockTransport, not a
+        # fully-mocked one -- `connect_stac_api` now reads via `client.stream`,
+        # which an `AsyncMock` cannot fake the async-context-manager protocol
+        # of. A content-yielding async generator is what a real transport's
+        # response looks like from the client's side (a plain `json=...`
+        # response is read at construction, so streaming it raises
+        # `StreamConsumed`).
+        raw = _json.dumps(STAC_LANDING).encode()
+
+        async def _chunks():
+            yield raw
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_chunks())
+
+        real_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+        with patch(
+            "app.modules.catalog.sources.adapters.stac._make_client",
+            return_value=real_client,
+        ):
+            result = await connect_stac_api("https://stac.example.com/v1")
+
+        assert result is not None
+        assert result["id"] == "test-catalog"
+        assert result["stac_version"] == "1.0.0"
+
+    async def test_connect_stac_api_not_stac(self):
+        import json as _json
+
+        import httpx
+
+        from app.modules.catalog.sources.adapters.stac import connect_stac_api
+
+        raw = _json.dumps({"type": "html", "content": "not stac"}).encode()
+
+        async def _chunks():
+            yield raw
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=_chunks())
+
+        real_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+        with patch(
+            "app.modules.catalog.sources.adapters.stac._make_client",
+            return_value=real_client,
+        ):
+            result = await connect_stac_api("https://not-stac.example.com")
+
+        assert result is None
+
+    async def test_connect_stac_api_http_error(self):
+        import httpx
+
+        from app.modules.catalog.sources.adapters.stac import connect_stac_api
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            raise httpx.TransportError("Connection refused")
+
+        real_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+        with patch(
+            "app.modules.catalog.sources.adapters.stac._make_client",
+            return_value=real_client,
+        ):
+            result = await connect_stac_api("https://unreachable.example.com")
+
+        assert result is None
+
+    async def test_list_collections(self):
+        from app.modules.catalog.sources.adapters.stac import list_stac_collections
+
+        with patch(
+            "app.modules.catalog.sources.adapters.stac._make_client",
+            return_value=_streaming_stac_client(STAC_COLLECTIONS),
+        ):
+            result = await list_stac_collections("https://stac.example.com/v1")
+
+        assert len(result) == 2
+        assert result[0]["id"] == "dem-collection"
+        assert result[0]["bbox"] == [-180, -90, 180, 90]
+        assert result[1]["id"] == "imagery"
+
+    async def test_search_items(self):
+        from app.modules.catalog.sources.adapters.stac import search_stac_items
+
+        with patch(
+            "app.modules.catalog.sources.adapters.stac._make_client",
+            return_value=_streaming_stac_client(STAC_SEARCH_RESULTS),
+        ):
+            result = await search_stac_items(
+                "https://stac.example.com/v1",
+                collections=["dem-collection"],
+                limit=10,
+            )
+
+        assert result["matched"] == 2
+        assert result["returned"] == 2
+        assert result["items"][0]["id"] == "item-001"
+        assert result["items"][0]["epsg"] == 4326
+        assert result["items"][1]["epsg"] == 4326
+        assert (
+            result["items"][0]["data_asset_href"]
+            == "https://example.com/data/item-001.tif"
+        )
+        assert result["items"][1]["thumbnail_href"] is None
+
+
+class TestStacImportContactSemantics:
+    async def test_any_titiler_failure_stamps_nothing(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_stac_ssrf,
+    ):
+        """A Titiler non-200 is NOT proof the origin was
+        attempted — the extension allowlist rejects some assets before any
+        upstream fetch, and the shapes cannot be told apart without parsing
+        Titiler's error bodies. Only proven contact (info in hand) stamps;
+        the probe settles everything else."""
+        with patch(
+            "app.modules.catalog.sources.stac_router.fetch_cog_info",
+            new=AsyncMock(return_value=None),
+        ):
+            resp = await client.post(
+                "/services/stac/import",
+                json={
+                    "url": "https://stac.example.com/v1",
+                    "items": [
+                        {
+                            "id": f"test-item-{uuid.uuid4().hex[:8]}",
+                            "collection": "dem-collection",
+                            "title": "Upstream-Error STAC Import",
+                            "data_asset_href": "https://example.com/data/u.tif",
+                            "bbox": [-1, -1, 1, 1],
+                            "epsg": 4326,
+                        }
+                    ],
+                    "visibility": "private",
+                },
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["created"] == 1
+
+        detail = await client.get(
+            f"/datasets/{data['results'][0]['dataset_id']}",
+            headers=admin_auth_header,
+        )
+        assert detail.status_code == 200
+        assert detail.json()["last_checked_at"] is None
+        assert detail.json()["source_health"] == "unknown"
+
+
+class TestStacImportProbedCrs:
+    """The CRS Titiler reads off the asset decides what the import stores.
+
+    Titiler's own ``/cog/info`` JSON is mocked, so the real probe parses it.
+    """
+
+    async def _import(self, client, headers, monkeypatch, *, crs: str, epsg: int):
+        from tests.test_cog_info import _TITILER_INFO, _install
+
+        _install(monkeypatch, {**_TITILER_INFO, "crs": crs})
+        href = f"https://example.com/data/{uuid.uuid4().hex[:8]}.tif"
+        resp = await client.post(
+            "/services/stac/import",
+            json={
+                "url": "https://stac.example.com/v1",
+                "items": [
+                    {
+                        "id": f"test-item-{uuid.uuid4().hex[:8]}",
+                        "collection": "dem-collection",
+                        "title": "Probed CRS STAC Import",
+                        "data_asset_href": href,
+                        "bbox": [-1, -1, 1, 1],
+                        "epsg": epsg,
+                    }
+                ],
+                "visibility": "private",
+            },
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        return resp.json(), href
+
+    async def test_a_crs_titiler_cannot_code_refuses_the_item(
+        self, client, admin_auth_header, mock_stac_ssrf, test_db_session, monkeypatch
+    ):
+        """The declared EPSG may name a different projection, so it is not used."""
+        from tests.test_cog_info import _UTM_21N_WKT
+
+        data, href = await self._import(
+            client, admin_auth_header, monkeypatch, crs=_UTM_21N_WKT, epsg=32633
+        )
+
+        assert (data["created"], data["errors"]) == (0, 1)
+        assert data["results"][0]["status"] == "error"
+        assert data["results"][0]["error"] == (
+            "GeoLens imports remote COGs whose CRS has an EPSG code or is OGC "
+            "CRS84, and this item's asset has neither. Reproject the file to an "
+            "EPSG CRS, for example with gdalwarp -t_srs EPSG:<code>, and import "
+            "it again."
+        )
+        stored = await test_db_session.scalar(
+            text("SELECT count(*) FROM catalog.datasets WHERE source_url = :u"),
+            {"u": href},
+        )
+        assert stored == 0
+
+    @pytest.mark.parametrize(
+        "crs",
+        [
+            "http://www.opengis.net/def/crs/OGC/0/CRS84",
+            "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+        ],
+    )
+    async def test_a_crs84_asset_is_stored_as_crs84(
+        self,
+        client,
+        admin_auth_header,
+        mock_stac_ssrf,
+        test_db_session,
+        monkeypatch,
+        crs,
+    ):
+        """Main's CRS84 WKT, longitude first, and no EPSG code on either row."""
+        from tests.test_cog_info import _MAIN_CRS84_WKT
+
+        data, _href = await self._import(
+            client, admin_auth_header, monkeypatch, crs=crs, epsg=4326
+        )
+
+        assert data["created"] == 1
+        row = (
+            await test_db_session.execute(
+                text(
+                    "SELECT ra.crs_wkt, ra.epsg, d.srid FROM catalog.raster_assets ra"
+                    " JOIN catalog.datasets d ON d.id = ra.dataset_id"
+                    " WHERE d.id = :did"
+                ).bindparams(did=uuid.UUID(data["results"][0]["dataset_id"]))
+            )
+        ).one()
+        assert row.crs_wkt == _MAIN_CRS84_WKT[crs]
+        assert (row.epsg, row.srid) == (None, None)

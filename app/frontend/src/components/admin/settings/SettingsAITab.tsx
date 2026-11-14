@@ -1,0 +1,802 @@
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { CheckCircle2, Info, Loader2, XCircle, AlertTriangle, Zap } from 'lucide-react';
+import { SettingsFormActions } from './SettingsFormActions';
+import { BackfillRunStatus } from './BackfillRunStatus';
+import { toast } from 'sonner';
+import { Switch } from '@/components/ui/switch';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Separator } from '@/components/ui/separator';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { Badge } from '@/components/ui/badge';
+import { SettingSourceBadge } from './SettingSourceBadge';
+import { findSetting } from './utils';
+import { useSettingsForm, type ResetHandler } from './useSettingsForm';
+import { useApiKeyStatus } from '@/hooks/use-settings';
+import {
+  useEmbeddingStats,
+  useBackfillEmbeddings,
+  useBackfillJobStatus,
+} from '@/hooks/use-admin';
+import { usePermissions } from '@/hooks/use-permissions';
+import { useAIStatusReader } from '@/hooks/use-ai-status-reader';
+import { useEdition } from '@/hooks/use-edition';
+import { detectEmbeddingDims } from '@/api/settings';
+import type { ClaudePlatform, SettingItem } from '@/api/settings';
+import { probeAIStatus } from '@/api/admin';
+import type { AIProbeCheck, AIProbeReport } from '@/types/api';
+
+interface TabProps {
+  settings: SettingItem[];
+  envOnly: boolean;
+  onSave: (changes: Record<string, unknown>) => void | Promise<boolean>;
+  onReset: ResetHandler;
+  isSaving: boolean;
+  settingsUpdatedAt?: number;
+  saveFailed?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+}
+
+// Product names, so they stay untranslated.
+const CLAUDE_CLOUD_PLATFORM_NAMES: Record<Exclude<ClaudePlatform, 'anthropic'>, string> = {
+  foundry: 'Microsoft Foundry',
+  bedrock: 'Amazon Bedrock',
+  vertex: 'Google Vertex AI',
+};
+
+const AI_FIELDS = [
+  { key: 'ai_enabled', defaultValue: true },
+  { key: 'ai_send_sample_values', defaultValue: true },
+  { key: 'semantic_search_enabled', defaultValue: false },
+  { key: 'max_ai_tokens_per_user_per_day', defaultValue: 0 },
+  { key: 'llm_provider', defaultValue: 'anthropic' },
+  { key: 'llm_model', defaultValue: '' },
+  { key: 'openai_base_url', defaultValue: '' },
+  { key: 'embedding_model', defaultValue: '' },
+  { key: 'embedding_base_url', defaultValue: '' },
+  { key: 'embedding_dims', defaultValue: '0', coerce: String },
+] as const;
+
+export function SettingsAITab({ settings, envOnly, onSave, onReset: submitReset, isSaving, settingsUpdatedAt, saveFailed, onDirtyChange }: TabProps) {
+  const { t } = useTranslation('admin');
+  const { can } = usePermissions();
+  const canManageUsers = can('manage_users');
+  // The shared useAIStatusReader hook keeps ai-status surfaces from drifting
+  // from require_ai_status_reader.
+  const canProbe = useAIStatusReader();
+  // The regeneration after a width or model change asks for every tenant, which
+  // takes the same mode permission: manage_tenants when hosted, manage_users
+  // otherwise.
+  const canRegenerateAfterChange = canProbe;
+  const { isMultiTenant } = useEdition();
+  const { data: keyStatus } = useApiKeyStatus();
+  // Coverage/backfill are manage_users operations in BOTH tenancy modes (see
+  // /admin/embedding-stats + /admin/backfill-embeddings), deliberately NOT
+  // useAIStatusReader. A settings-only operator can configure embeddings
+  // without issuing forbidden operational probes.
+  const { data: embeddingStatsData } = useEmbeddingStats({ enabled: canManageUsers });
+  const embeddingStats = canManageUsers ? embeddingStatsData : undefined;
+  const backfill = useBackfillEmbeddings();
+  // The id of the run this page queued, polled to its terminal state so the
+  // coverage figure above refreshes when it lands.
+  const [backfillJobId, setBackfillJobId] = useState<string | null>(null);
+  const backfillJob = useBackfillJobStatus(backfillJobId);
+  // A run somebody else started counts too, so another operator's click
+  // doesn't buy a 409 the guard has to refuse.
+  const backfillRunning =
+    backfillJob.data?.status === 'pending' ||
+    backfillJob.data?.status === 'running' ||
+    Boolean(embeddingStats?.current_run);
+
+  const { values, setters, dirty, hasDirty, discard, onReset } = useSettingsForm(settings, AI_FIELDS, isSaving, settingsUpdatedAt, saveFailed, submitReset);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [isProbing, setIsProbing] = useState(false);
+  const [probe, setProbe] = useState<AIProbeReport | null>(null);
+
+  // Probe results describe the PERSISTED config — drop them when
+  // the saved settings change underneath us (e.g. after a Save reload).
+  useEffect(() => {
+    setProbe(null);
+  }, [settings]);
+
+  const aiEnabled = values.ai_enabled as boolean;
+  const sendSampleValues = values.ai_send_sample_values as boolean;
+  const maxAiTokensPerDay = values.max_ai_tokens_per_user_per_day as number;
+  const llmProvider = values.llm_provider as string;
+  const llmModel = values.llm_model as string;
+  const openaiBaseUrl = values.openai_base_url as string;
+  const embeddingModel = values.embedding_model as string;
+  const embeddingBaseUrl = values.embedding_base_url as string;
+  const embeddingDims = values.embedding_dims as string;
+  const semanticSearchEnabled = Boolean(values.semantic_search_enabled);
+
+  const handleBackfill = (force = false) => {
+    if (!canManageUsers) return;
+    // The run is queued, not done by the time this resolves: a full
+    // regenerate takes minutes and would hold the request open past the 600s
+    // edge timeout, so there are no counts to report yet. The job id is kept
+    // so the run is tracked to its end.
+    backfill.mutate({ force }, {
+      onSuccess: (data) => {
+        setBackfillJobId(data.job_id);
+        setRegenPending(null);
+        toast.info(t('ai.backfillQueued'));
+      },
+    });
+  };
+
+  const savedDims = findSetting(settings, 'embedding_dims')?.value;
+  const widthEdited = savedDims !== undefined && String(embeddingDims) !== String(savedDims);
+  const widthChangeWipesEmbeddings =
+    Boolean(embeddingStats && embeddingStats.embedded_records > 0) && widthEdited;
+  const [regenerate, setRegenerate] = useState(true);
+  const [regenPending, setRegenPending] = useState<'queue' | 'ai' | null>(null);
+  const [missedTenants, setMissedTenants] = useState(0);
+  const [pending, setPending] = useState<
+    { kind: 'save'; changes: Record<string, unknown> } | { kind: 'reset'; key: string } | null
+  >(null);
+
+  const handleSave = (changes: Record<string, unknown>) => {
+    if ('embedding_dims' in changes || 'embedding_model' in changes) {
+      setRegenerate(true);
+      setPending({ kind: 'save', changes });
+      return;
+    }
+    onSave(changes);
+  };
+
+  const handleReset = (key: string) => {
+    if (key === 'embedding_dims' || key === 'embedding_model') {
+      setRegenerate(true);
+      setPending({ kind: 'reset', key });
+      return;
+    }
+    onReset(key);
+  };
+
+  // A save can toggle AI in the same request; a reset never does.
+  const aiEnabledAfter = (change: NonNullable<typeof pending>) => {
+    const next = change.kind === 'save' ? change.changes.ai_enabled : undefined;
+    return next === undefined ? findSetting(settings, 'ai_enabled')?.value !== false : next !== false;
+  };
+
+  const confirmEmbeddingChange = async () => {
+    if (!pending) return;
+    const current = pending;
+    const queueAfter = regenerate && canRegenerateAfterChange;
+    const aiOff = !aiEnabledAfter(current);
+    setPending(null);
+    const saved = current.kind === 'save' ? await onSave(current.changes) : await onReset(current.key);
+    if (saved === false || !queueAfter) return;
+    // With AI off the backfill skips every record yet finishes as a success,
+    // so queuing it would clear the warning and leave search empty.
+    if (aiOff) {
+      setRegenPending('ai');
+      return;
+    }
+    // The save already succeeded; a run that cannot start leaves the
+    // embeddings to regenerate by hand.
+    queueRegeneration();
+  };
+
+  // The width and model are shared by every tenant of a hosted deployment, so
+  // there the run covers all of them.
+  const queueRegeneration = () => {
+    backfill.mutate({ force: false, allTenants: isMultiTenant }, {
+      onSuccess: (data) => {
+        // A run that was already in flight started before this change, so it
+        // does not regenerate for it; ask for a rerun. Reading another user's
+        // job takes manage_users, so follow it only with that permission.
+        if (data.status === 'already_running') {
+          if (canManageUsers && data.job_id) setBackfillJobId(data.job_id);
+          setRegenPending('queue');
+        } else {
+          setBackfillJobId(data.job_id);
+          setRegenPending(null);
+          toast.info(t('ai.backfillQueued'));
+        }
+        setMissedTenants((data.other_tenants ?? []).filter((run) => run.status !== 'pending').length);
+      },
+      onError: () => setRegenPending('queue'),
+    });
+  };
+
+  const retryRegenerationButton = (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={queueRegeneration}
+      disabled={backfill.isPending || findSetting(settings, 'ai_enabled')?.value === false}
+    >
+      {backfill.isPending && <Loader2 className="me-1.5 h-3 w-3 animate-spin" />}
+      {t('common:actions.retry')}
+    </Button>
+  );
+
+  const dimsSetting = findSetting(settings, 'embedding_dims');
+  // The backend rebuilds against live storage, which may have moved since this
+  // page loaded, so the dialog always opens; only its wording softens.
+  const resetKeepsWidth =
+    pending?.kind === 'reset' &&
+    pending.key === 'embedding_dims' &&
+    dimsSetting?.default_value !== undefined &&
+    dimsSetting.default_value !== null &&
+    String(dimsSetting.default_value) === String(dimsSetting.value);
+  const autoRegenerate = regenerate && canRegenerateAfterChange && pending !== null && aiEnabledAfter(pending);
+  const pendingChangesWidth =
+    pending !== null &&
+    (pending.kind === 'save' ? 'embedding_dims' in pending.changes : pending.key === 'embedding_dims');
+  const handleDetectDims = async () => {
+    setIsDetecting(true);
+    try {
+      const result = await detectEmbeddingDims();
+      setters.embedding_dims(String(result.dimensions));
+      toast.success(t('ai.dimsDetected', { dims: result.dimensions }));
+    } catch {
+      toast.error(t('ai.dimsDetectFailed'));
+    } finally {
+      setIsDetecting(false);
+    }
+  };
+
+  const handleTestConnection = async () => {
+    setIsProbing(true);
+    // Drop previous rows first so a failed retry can't keep
+    // showing stale green results next to only a toast.
+    setProbe(null);
+    try {
+      const result = await probeAIStatus();
+      setProbe(result.probe ?? null);
+    } catch {
+      toast.error(t('ai.testConnectionFailed'));
+    } finally {
+      setIsProbing(false);
+    }
+  };
+
+  const probeRow = (label: string, check: AIProbeCheck) => (
+    <div className="flex items-center gap-2 text-sm">
+      {!check.configured ? (
+        <XCircle className="h-4 w-4 text-muted-foreground" />
+      ) : check.ok ? (
+        <CheckCircle2 className="h-4 w-4 text-success" />
+      ) : (
+        <XCircle className="h-4 w-4 text-destructive" />
+      )}
+      <span>{label}</span>
+      <span className="text-muted-foreground">
+        {!check.configured
+          ? t('ai.keyNotSet')
+          : check.ok
+            ? t('ai.probeOk')
+            : (check.error ?? t('ai.probeFailed'))}
+      </span>
+    </div>
+  );
+
+  const openaiKeyMissing = keyStatus && !keyStatus.openai_configured;
+
+  // Derive dynamic badge labels based on which keys are configured and provider selection
+  const anthropicBadgeLabel = keyStatus?.anthropic_configured
+    ? (llmProvider === 'anthropic' ? t('ai.usedForInference') : t('ai.availableNotSelected'))
+    : null;
+  const openaiUsages: string[] = [];
+  if (keyStatus?.openai_configured) {
+    if (llmProvider === 'openai_compatible') openaiUsages.push(t('ai.inference'));
+    openaiUsages.push(t('ai.embeddings'));
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* --- Inference (LLM) Configuration --- */}
+      <div className="space-y-4">
+        <h3 className="eyebrow mb-4">
+          {t('ai.sectionInference')}
+        </h3>
+
+        <div className="flex items-center justify-between max-w-md">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="ai-toggle">{t('ai.labels.aiEnabled')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'ai_enabled')?.source ?? 'default'} settingKey="ai_enabled" onReset={onReset} />
+            </div>
+            <p className="text-sm text-muted-foreground">{t('settings.general.aiFeaturesDescription')}</p>
+          </div>
+          <Switch
+            id="ai-toggle"
+            checked={aiEnabled}
+            onCheckedChange={setters.ai_enabled}
+            disabled={envOnly}
+          />
+        </div>
+
+        <div className="flex items-center justify-between max-w-md">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="sample-values-toggle">{t('ai.labels.sendSampleValues')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'ai_send_sample_values')?.source ?? 'default'} settingKey="ai_send_sample_values" onReset={onReset} />
+            </div>
+            <p className="text-sm text-muted-foreground">{t('ai.sendSampleValuesDescription')}</p>
+          </div>
+          <Switch
+            id="sample-values-toggle"
+            checked={sendSampleValues}
+            onCheckedChange={setters.ai_send_sample_values}
+            disabled={envOnly}
+          />
+        </div>
+
+        <div className="space-y-2 max-w-md">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="max-ai-tokens-per-day">
+              {t('ai.labels.maxAiTokensPerDay')}
+            </Label>
+            <SettingSourceBadge
+              source={findSetting(settings, 'max_ai_tokens_per_user_per_day')?.source ?? 'default'}
+              settingKey="max_ai_tokens_per_user_per_day"
+              onReset={onReset}
+            />
+          </div>
+          <Input
+            id="max-ai-tokens-per-day"
+            type="number"
+            min={0}
+            className="w-56"
+            value={maxAiTokensPerDay}
+            onChange={(e) => setters.max_ai_tokens_per_user_per_day(Number(e.target.value))}
+            disabled={envOnly}
+          />
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="llm-provider">{t('ai.labels.llmProvider')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'llm_provider')?.source ?? 'default'} settingKey="llm_provider" onReset={onReset} />
+        </div>
+        <Select value={llmProvider} onValueChange={setters.llm_provider} disabled={envOnly}>
+          <SelectTrigger id="llm-provider" className="w-56">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="anthropic">{t('ai.providers.anthropic')}</SelectItem>
+            <SelectItem value="openai_compatible">{t('ai.providers.openaiCompatible')}</SelectItem>
+          </SelectContent>
+        </Select>
+        <p className="text-sm text-muted-foreground">{t('ai.providerDescription')}</p>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="llm-model">{t('ai.labels.model')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'llm_model')?.source ?? 'default'} settingKey="llm_model" onReset={onReset} />
+        </div>
+        <Input
+          id="llm-model"
+          type="text"
+          value={llmModel}
+          onChange={(e) => setters.llm_model(e.target.value)}
+          disabled={envOnly}
+          className="max-w-sm"
+          placeholder={llmProvider === 'anthropic' ? 'claude-sonnet-5-5' : 'gpt-4o'}
+        />
+        <p className="text-sm text-muted-foreground">{t('ai.modelDescription')}</p>
+      </div>
+
+      {llmProvider === 'openai_compatible' && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="openai-base-url">{t('ai.labels.openaiBaseUrl')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'openai_base_url')?.source ?? 'default'} settingKey="openai_base_url" onReset={onReset} />
+          </div>
+          <Input
+            id="openai-base-url"
+            type="text"
+            value={openaiBaseUrl}
+            onChange={(e) => setters.openai_base_url(e.target.value)}
+            disabled={envOnly}
+            placeholder="https://api.openai.com/v1"
+            className="max-w-md"
+          />
+          <p className="text-sm text-muted-foreground">{t('ai.baseUrlDescription')}</p>
+        </div>
+      )}
+
+      <Separator />
+
+      {/* --- Semantic Search & Embeddings --- */}
+      <div>
+        <h3 className="eyebrow mb-4">
+          {t('ai.sectionSemanticSearch')}
+        </h3>
+
+        <div className="space-y-5">
+          {/* Semantic search toggle */}
+          <div className="flex items-center justify-between max-w-md">
+            <div className="space-y-0.5">
+              <Label htmlFor="semantic-toggle">{t('ai.semanticSearch')}</Label>
+              <p className="text-sm text-muted-foreground">{t('ai.semanticSearchDescription')}</p>
+            </div>
+            <Switch
+              id="semantic-toggle"
+              checked={semanticSearchEnabled}
+              onCheckedChange={setters.semantic_search_enabled}
+              disabled={envOnly}
+            />
+          </div>
+
+          {/* Embedding model config */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="embedding-model">{t('ai.labels.embeddingModel')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'embedding_model')?.source ?? 'default'} settingKey="embedding_model" onReset={handleReset} />
+            </div>
+            <Input
+              id="embedding-model"
+              type="text"
+              value={embeddingModel}
+              onChange={(e) => setters.embedding_model(e.target.value)}
+              disabled={envOnly}
+              className="max-w-sm"
+              placeholder="text-embedding-3-small"
+            />
+            <p className="text-sm text-muted-foreground">{t('ai.embeddingModelDescription')}</p>
+          </div>
+
+          {/* Embedding base URL */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="embedding-base-url">{t('ai.labels.embeddingBaseUrl')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'embedding_base_url')?.source ?? 'default'} settingKey="embedding_base_url" onReset={onReset} />
+            </div>
+            <Input
+              id="embedding-base-url"
+              type="text"
+              value={embeddingBaseUrl}
+              onChange={(e) => setters.embedding_base_url(e.target.value)}
+              disabled={envOnly}
+              placeholder="https://api.openai.com/v1"
+              className="max-w-md"
+            />
+            <p className="text-sm text-muted-foreground">{t('ai.embeddingBaseUrlDescription')}</p>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="embedding-dims">{t('ai.labels.embeddingDims')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'embedding_dims')?.source ?? 'default'} settingKey="embedding_dims" onReset={handleReset} />
+            </div>
+            <div className="flex items-center gap-3">
+              <Input
+                id="embedding-dims"
+                type="number"
+                value={embeddingDims}
+                onChange={(e) => setters.embedding_dims(e.target.value)}
+                disabled={envOnly}
+                className="w-32 font-mono tabular-nums"
+                min={1}
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleDetectDims}
+                disabled={isDetecting || envOnly || !keyStatus?.openai_configured}
+              >
+                {isDetecting ? (
+                  <Loader2 className="me-1.5 h-3 w-3 animate-spin" />
+                ) : (
+                  <Zap className="me-1.5 h-3 w-3" />
+                )}
+                {t('ai.detectDims')}
+              </Button>
+            </div>
+            <p className="text-sm text-muted-foreground">{t('ai.embeddingDimsAutoDescription')}</p>
+            {/* Dimension change warning when embeddings exist */}
+            {embeddingStats && widthChangeWipesEmbeddings && (
+              <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3">
+                <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
+                <p className="text-sm text-foreground">
+                  {t('ai.dimsChangeWarning', {
+                    count: embeddingStats.embedded_records,
+                    defaultValue: 'Changing dimensions will make {{count}} existing embedding(s) incompatible. You will need to regenerate all embeddings after saving.',
+                  })}
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* OpenAI key warning */}
+          {openaiKeyMissing && (
+            <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3 max-w-md">
+              <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
+              <p className="text-sm text-foreground">
+                {t('ai.openaiKeyRequired')}
+              </p>
+            </div>
+          )}
+
+          {regenPending !== null && (
+            <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3 max-w-md">
+              <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
+              {!canManageUsers && canRegenerateAfterChange ? (
+                // Without manage_users the coverage buttons are hidden, so the
+                // rerun is offered here; it waits for AI to be saved as enabled.
+                <div className="space-y-2">
+                  <p className="text-sm text-foreground">
+                    {t(regenPending === 'ai' ? 'ai.regenerationPendingAiOffRetry' : 'ai.regenerationPendingRetry')}
+                  </p>
+                  {retryRegenerationButton}
+                </div>
+              ) : (
+                <p className="text-sm text-foreground">{t(regenPending === 'ai' ? 'ai.regenerationPendingAiOff' : 'ai.regenerationPending')}</p>
+              )}
+            </div>
+          )}
+
+          {missedTenants > 0 && canRegenerateAfterChange && (
+            // The coverage buttons queue only this tenant, so the fleet rerun
+            // is offered here.
+            <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3 max-w-md">
+              <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
+              <div className="space-y-2">
+                <p className="text-sm text-foreground">{t('ai.backfillOtherTenantsMissed', { count: missedTenants })}</p>
+                {retryRegenerationButton}
+              </div>
+            </div>
+          )}
+
+          {isMultiTenant && canRegenerateAfterChange && (
+            // The coverage buttons queue only this tenant and need manage_users,
+            // so the fleet-wide run stays available here after a reload.
+            <div className="rounded-lg border p-4 max-w-md space-y-2">
+              <p className="text-sm text-muted-foreground">{t('ai.fleetRegenerateDescription')}</p>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={queueRegeneration}
+                disabled={backfill.isPending || findSetting(settings, 'ai_enabled')?.value === false}
+              >
+                {t('ai.fleetRegenerateAction')}
+              </Button>
+            </div>
+          )}
+
+          {/* Embedding coverage */}
+          {canManageUsers && embeddingStats && (
+            <div className="rounded-lg border p-4 max-w-md space-y-3">
+              <div className="flex items-center justify-between text-sm">
+                <span className="font-medium">{t('ai.embeddingCoverage')}</span>
+                <span className="text-muted-foreground tabular-nums">
+                  {embeddingStats.embedded_records}/{embeddingStats.total_records} ({embeddingStats.coverage_percent}%)
+                </span>
+              </div>
+              <div className="h-2 rounded-full bg-muted overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-primary transition-[width] duration-300 ease-out"
+                  style={{ width: `${embeddingStats.coverage_percent}%` }}
+                />
+              </div>
+              <div className="flex gap-2">
+                {/* The non-force backfill selects on "no vector under the
+                    ACTIVE model", so it covers stale records too. */}
+                {embeddingStats.missing_records > 0 && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1"
+                    onClick={() => handleBackfill(false)}
+                    disabled={backfill.isPending || backfillRunning}
+                  >
+                    {backfill.isPending && backfill.variables?.force === false ? (
+                      <>
+                        <Loader2 className="me-2 h-3 w-3 animate-spin" />
+                        {t('ai.generating')}
+                      </>
+                    ) : (
+                      t('ai.generateMissing')
+                    )}
+                  </Button>
+                )}
+                {/* Stale rows keep this button reachable. After a
+                    model swap embedded_records drops to 0, and Regenerate All
+                    is the only control that clears the superseded vectors. */}
+                {(embeddingStats.embedded_records > 0 || embeddingStats.stale_records > 0) && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1"
+                    onClick={() => handleBackfill(true)}
+                    disabled={backfill.isPending || backfillRunning}
+                  >
+                    {backfill.isPending && backfill.variables?.force === true ? (
+                      <>
+                        <Loader2 className="me-2 h-3 w-3 animate-spin" />
+                        {t('ai.generating')}
+                      </>
+                    ) : (
+                      t('ai.regenerateAll')
+                    )}
+                  </Button>
+                )}
+              </div>
+              {embeddingStats.stale_records > 0 && (
+                <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3">
+                  <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" />
+                  <p className="text-sm text-foreground">
+                    {/* Generate Missing re-embeds these without
+                        touching the records the active model already covers,
+                        so it is the cheaper remedy and named first. It adds
+                        the current-model vector and leaves the superseded row
+                        in place; Regenerate All is what deletes those. */}
+                    {t('ai.staleEmbeddingsWarning', {
+                      count: embeddingStats.stale_records,
+                      defaultValue: '{{count}} embedding(s) were generated by a different model and cannot be used by semantic search. Generate missing embeddings to re-embed just those records, or regenerate all to also delete the superseded vectors.',
+                    })}
+                  </p>
+                </div>
+              )}
+              {embeddingStats.missing_records === 0 && embeddingStats.embedded_records > 0 && (
+                <p className="text-xs text-muted-foreground text-center">{t('ai.allEmbedded')}</p>
+              )}
+              <BackfillRunStatus stats={embeddingStats} />
+            </div>
+          )}
+        </div>
+      </div>
+
+      <Separator />
+
+      {/* --- API Key Status --- */}
+      <div>
+        <h3 className="eyebrow mb-4">
+          {t('ai.sectionApiKeys')}
+        </h3>
+        <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 p-3 max-w-md mb-4">
+          <Info className="h-4 w-4 text-muted-foreground mt-0.5 flex-shrink-0" />
+          <p className="text-sm text-muted-foreground">
+            {t('ai.apiKeysEnvOnlyNote')}
+          </p>
+        </div>
+        {keyStatus && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-sm">
+              {keyStatus.anthropic_configured ? (
+                <CheckCircle2 className="h-4 w-4 text-success" />
+              ) : (
+                <XCircle className="h-4 w-4 text-muted-foreground" />
+              )}
+              <span className={keyStatus.anthropic_configured ? '' : 'text-muted-foreground'}>
+                {keyStatus.anthropic_platform === 'anthropic' ? (
+                  <>ANTHROPIC_API_KEY {keyStatus.anthropic_configured ? t('ai.keyConfigured') : t('ai.keyNotSet')}</>
+                ) : keyStatus.anthropic_configured ? (
+                  t('ai.claudePlatformConfigured', {
+                    platform: CLAUDE_CLOUD_PLATFORM_NAMES[keyStatus.anthropic_platform],
+                  })
+                ) : (
+                  t('ai.claudePlatformNotConfigured', {
+                    platform: CLAUDE_CLOUD_PLATFORM_NAMES[keyStatus.anthropic_platform],
+                  })
+                )}
+              </span>
+              {anthropicBadgeLabel && (
+                <Badge variant="secondary" className="text-xs">{anthropicBadgeLabel}</Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-2 text-sm">
+              {keyStatus.openai_configured ? (
+                <CheckCircle2 className="h-4 w-4 text-success" />
+              ) : (
+                <XCircle className="h-4 w-4 text-muted-foreground" />
+              )}
+              <span className={keyStatus.openai_configured ? '' : 'text-muted-foreground'}>
+                OPENAI_API_KEY {keyStatus.openai_configured ? t('ai.keyConfigured') : t('ai.keyNotSet')}
+              </span>
+              {openaiUsages.length > 0 && (
+                <Badge variant="secondary" className="text-xs">{openaiUsages.join(' + ')}</Badge>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Live probe — a settings-only operator would 403 on the
+            probe endpoint; hide rather than dangle a dead button. */}
+        {canProbe && (
+          <div className="mt-4 space-y-2">
+            {/* The probe resolves PERSISTED settings — block it while
+                the form is dirty so green results can't vouch for unsaved edits. */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleTestConnection}
+              disabled={isProbing || hasDirty}
+            >
+              {isProbing ? (
+                <Loader2 className="me-1.5 h-3 w-3 animate-spin" />
+              ) : (
+                <Zap className="me-1.5 h-3 w-3" />
+              )}
+              {isProbing ? t('ai.testing') : t('ai.testConnection')}
+            </Button>
+            <p className="text-sm text-muted-foreground max-w-md">
+              {hasDirty ? t('ai.testConnectionDirty') : t('ai.testConnectionDescription')}
+            </p>
+            {/* Hide (not clear) while dirty — a Discard restores
+                exactly the config these rows were probed against. */}
+            {probe && !hasDirty && (
+              <div className="space-y-1.5 pt-1">
+                {probeRow(t('ai.inference'), probe.chat)}
+                {probeRow(t('ai.embeddings'), probe.embeddings)}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <Separator />
+
+      <SettingsFormActions dirty={dirty} hasDirty={hasDirty} envOnly={envOnly} isSaving={isSaving} onSave={handleSave} onDiscard={discard} onDirtyChange={onDirtyChange} />
+
+      <AlertDialog open={pending !== null} onOpenChange={(open) => { if (!open) setPending(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t(
+                resetKeepsWidth
+                  ? 'ai.dimsConfirm.titleReset'
+                  : pendingChangesWidth
+                    ? 'ai.dimsConfirm.title'
+                    : 'ai.dimsConfirm.titleModel',
+              )}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                resetKeepsWidth
+                  ? 'ai.dimsConfirm.resetSameWidthDescription'
+                  : pendingChangesWidth
+                    ? `ai.dimsConfirm.description${autoRegenerate ? 'Auto' : ''}`
+                    : pending?.kind === 'reset'
+                      ? `ai.dimsConfirm.resetModelDescription${autoRegenerate ? 'Auto' : ''}`
+                      : `ai.dimsConfirm.modelDescription${autoRegenerate ? 'Auto' : ''}`,
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {canRegenerateAfterChange && pending !== null && aiEnabledAfter(pending) && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="regenerate-after-save"
+                checked={regenerate}
+                onCheckedChange={(checked) => setRegenerate(checked === true)}
+              />
+              <Label htmlFor="regenerate-after-save">{t('ai.dimsConfirm.regenerate')}</Label>
+            </div>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+            <AlertDialogAction variant={resetKeepsWidth ? 'default' : 'destructive'} onClick={confirmEmbeddingChange}>
+              {t(
+                resetKeepsWidth
+                  ? 'ai.dimsConfirm.confirmReset'
+                  : pendingChangesWidth
+                    ? 'ai.dimsConfirm.confirm'
+                    : 'ai.dimsConfirm.confirmModel',
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}

@@ -1,0 +1,210 @@
+"""Unit tests for modality-aware build_assets and unified assets dict.
+
+These are pure unit tests -- no database or fixtures required.
+Uses SimpleNamespace mocks for Dataset and Record objects.
+"""
+
+from types import SimpleNamespace
+
+from app.modules.catalog.search.service import build_assets
+
+
+def _make_dataset(
+    *,
+    record_type: str = "vector_dataset",
+    table_name: str | None = "test_table",
+    dataset_id: str = "00000000-0000-0000-0000-000000000001",
+) -> SimpleNamespace:
+    """Create a minimal mock Dataset with nested record."""
+    record = SimpleNamespace(record_type=record_type)
+    return SimpleNamespace(id=dataset_id, table_name=table_name, record=record)
+
+
+API_URL = "http://localhost:8080/api"
+
+
+class TestRasterTilesAssetVersion:
+    def test_raster_tiles_href_carries_tile_cache_version(self):
+        """The advertised template is versioned so a
+        refetching STAC/OGC client stops sharing the unversioned nginx cache
+        entry after a replace."""
+        ds = _make_dataset(record_type="raster_dataset", table_name=None)
+        ds.tile_cache_version = 7
+        ds.publication_version = 3
+        assets = build_assets(ds, API_URL)
+        assert assets["raster_tiles"]["href"].endswith(".png?v=7&pv=3")
+
+    def test_raster_tiles_href_carries_pv_without_a_version(self):
+        ds = _make_dataset(record_type="raster_dataset", table_name=None)
+        assets = build_assets(ds, API_URL)
+        assert assets["raster_tiles"]["href"].endswith(".png?pv=0")
+
+    def test_vector_tiles_href_carries_the_publication_version(self):
+        """The one tile template here that is never signed, so `pv`
+        is what a shared cache keys its response on."""
+        ds = _make_dataset(record_type="vector_dataset", table_name="parcels")
+        ds.publication_version = 4
+        assets = build_assets(ds, API_URL)
+        assert assets["vector_tiles"]["href"].endswith(".pbf?pv=4")
+
+
+class TestModalityAssets:
+    def test_vector_dataset_has_download_links(self):
+        """Vector datasets should have download links, vector tiles, and OGC features."""
+        ds = _make_dataset(record_type="vector_dataset", table_name="parcels")
+        assets = build_assets(ds, API_URL)
+
+        assert "download_geojson" in assets
+        assert "download_gpkg" in assets
+        assert "download_shp" in assets
+        assert "download_csv" in assets
+        assert "vector_tiles" in assets
+        assert "ogc_features" in assets
+        # Must NOT have raster tiles
+        assert "raster_tiles" not in assets
+
+    def test_vector_dataset_no_table_name(self):
+        """Vector dataset without table_name omits tile/feature assets."""
+        ds = _make_dataset(record_type="vector_dataset", table_name=None)
+        assets = build_assets(ds, API_URL)
+
+        assert "download_geojson" in assets
+        assert "vector_tiles" not in assets
+        assert "ogc_features" not in assets
+
+    def test_raster_dataset_has_raster_tiles(self):
+        """Raster datasets should have raster tiles and no vector assets."""
+        ds = _make_dataset(record_type="raster_dataset")
+        assets = build_assets(ds, API_URL)
+
+        assert "raster_tiles" in assets
+        assert assets["raster_tiles"]["type"] == "image/png"
+        # Must NOT have vector download links
+        assert "download_geojson" not in assets
+        assert "download_gpkg" not in assets
+        assert "download_shp" not in assets
+        assert "download_csv" not in assets
+        assert "vector_tiles" not in assets
+        assert "ogc_features" not in assets
+
+    def test_vrt_dataset_has_raster_tiles(self):
+        """VRT datasets should have raster tiles like raster datasets."""
+        ds = _make_dataset(record_type="vrt_dataset")
+        assets = build_assets(ds, API_URL)
+
+        assert "raster_tiles" in assets
+        assert "download_geojson" not in assets
+        assert "vector_tiles" not in assets
+
+    def test_collection_has_empty_assets(self):
+        """Collection records should return empty assets dict."""
+        ds = _make_dataset(record_type="collection")
+        assets = build_assets(ds, API_URL)
+
+        assert assets == {}
+
+    def test_stac_asset_rows_local_storage_omitted(self):
+        """An unpublished local-storage row is omitted, never a dead /assets/ URL."""
+        ds = _make_dataset(record_type="raster_dataset")
+        stac_rows = [
+            {
+                "key": "data",
+                "href": "/storage/file.tif",
+                "media_type": "image/tiff",
+                "roles": ["data"],
+                "title": "COG",
+                "description": None,
+            },
+        ]
+        assets = build_assets(
+            ds, API_URL, stac_asset_rows=stac_rows, record_status="draft"
+        )
+
+        assert "raster_tiles" in assets
+        assert "data" not in assets
+
+    def test_stac_asset_precedence_local_does_not_override(self):
+        """A local-storage row does not override a computed key, even when published.
+
+        Only the data/thumbnail/overview rows of a published raster resolve to
+        a serving route; any other local row is skipped.
+        """
+        ds = _make_dataset(record_type="raster_dataset")
+        stac_rows = [
+            {
+                "key": "raster_tiles",
+                "href": "/custom/tiles",
+                "media_type": "image/png",
+                "roles": ["visual"],
+                "title": "Custom Tiles",
+                "description": None,
+            },
+        ]
+        assets = build_assets(
+            ds, API_URL, stac_asset_rows=stac_rows, record_status="published"
+        )
+
+        assert assets["raster_tiles"]["title"] == "Raster tiles"
+
+    def test_default_record_type_fallback(self):
+        """When record_type is None, defaults to vector_dataset behavior."""
+        record = SimpleNamespace(record_type=None)
+        ds = SimpleNamespace(
+            id="00000000-0000-0000-0000-000000000001",
+            table_name="test_table",
+            record=record,
+        )
+        assets = build_assets(ds, API_URL)
+
+        assert "download_geojson" in assets
+        assert "raster_tiles" not in assets
+
+
+# Public APP origin (no /api suffix) vs the public API origin.
+APP_URL = "http://localhost:8080"
+
+
+class TestRasterTilesAssetOrigin:
+    """The raster_tiles asset must use the APP origin
+    (/raster-tiles/...), never the /api origin which has no such route.
+    Sibling endpoints (STAC items, OGC records, search) thread public_app_url
+    into build_assets just like PR #315 did for the OGC rel=tiles links.
+    """
+
+    def test_raster_tiles_uses_app_origin_when_provided(self):
+        """raster_tiles href uses public_app_url; NOT /api/raster-tiles."""
+        ds = _make_dataset(record_type="raster_dataset")
+        assets = build_assets(ds, API_URL, public_app_url=APP_URL)
+
+        href = assets["raster_tiles"]["href"]
+        assert "/raster-tiles/" in href
+        # The /api origin has no /raster-tiles route -> must not appear.
+        assert "/api/raster-tiles" not in href
+        assert href.startswith(APP_URL + "/raster-tiles/")
+
+    def test_vrt_raster_tiles_uses_app_origin(self):
+        """VRT datasets get the same app-origin raster_tiles href."""
+        ds = _make_dataset(record_type="vrt_dataset")
+        assets = build_assets(ds, API_URL, public_app_url=APP_URL)
+
+        href = assets["raster_tiles"]["href"]
+        assert "/raster-tiles/" in href
+        assert "/api/raster-tiles" not in href
+
+    def test_raster_tiles_falls_back_to_api_url_when_app_url_omitted(self):
+        """No public_app_url -> falls back to public_api_url (old behavior)."""
+        ds = _make_dataset(record_type="raster_dataset")
+        assets = build_assets(ds, API_URL)
+
+        # Fallback preserves the pre-fix href on the api origin.
+        assert assets["raster_tiles"]["href"].startswith(API_URL + "/raster-tiles/")
+
+    def test_app_url_does_not_affect_vector_assets(self):
+        """public_app_url only steers raster_tiles; vector assets stay on /api."""
+        ds = _make_dataset(record_type="vector_dataset", table_name="parcels")
+        assets = build_assets(ds, API_URL, public_app_url=APP_URL)
+
+        # Vector tiles are correctly served under /api -> keep the api origin.
+        assert assets["vector_tiles"]["href"].startswith(API_URL + "/tiles/")
+        assert assets["ogc_features"]["href"].startswith(API_URL + "/collections/")
+        assert assets["download_geojson"]["href"].startswith(API_URL + "/datasets/")

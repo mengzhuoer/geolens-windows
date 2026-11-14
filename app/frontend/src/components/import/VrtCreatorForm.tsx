@@ -1,0 +1,663 @@
+import { useState, useEffect, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useQuery, useQueries } from '@tanstack/react-query';
+import { AlertCircle, X, Search, Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
+import { apiFetch } from '@/api/client';
+import { searchDatasets } from '@/api/search';
+import { queryKeys } from '@/lib/query-keys';
+import { useDebouncedValue } from '@/hooks/use-debounce';
+import { useCreateVrt } from '@/components/import/hooks/use-ingest';
+import { JobProgress } from '@/components/import/JobProgress';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Badge } from '@/components/ui/badge';
+import { Card, CardContent } from '@/components/ui/card';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
+import { ApiError } from '@/api/client';
+import type { OGCRecordResponse } from '@/types/api';
+import { Textarea } from '@/components/ui/textarea';
+import { formatNumber } from '@/lib/format';
+
+const VRT_MAX_SOURCES = 20;
+
+// Shared by every client-side grid-alignment float comparison in this form,
+// mirroring the backend's _FLOAT_TOL in _check_grid_alignment
+// (backend/app/processing/raster/validation.py).
+const GRID_ALIGNMENT_TOLERANCE = 1e-10;
+
+function floatsAligned(a: number, b: number): boolean {
+  return Math.abs(a - b) <= GRID_ALIGNMENT_TOLERANCE;
+}
+
+type NodataState = 'defined' | 'absent' | 'unknown';
+
+// _check_nodata_consistency compares the backend's authoritative
+// RasterAsset.nodata column, which IS populated for remote COGs. But
+// cog_info.py's band-level stats for a remote COG carry only min/max/mean
+// (service_records.py never puts a `nodata` key on that source's raster:bands
+// entries). A band with no `nodata` key therefore means "unknown", not
+// "absent"; conflating them (as a `!= null` check does) produces a false
+// nodata_inconsistent when a remote-COG source is paired with a locally-probed
+// one. `nodata: null` is the one shape that means "absent"; no
+// OGCRecordProperties field carries a top-level nodata, and if the API adds
+// one, check it here too.
+function nodataState(record: OGCRecordResponse): NodataState {
+  const bands = record.properties['raster:bands'];
+  if (!bands || bands.length === 0) return 'unknown';
+  if (bands.some((b) => b.nodata != null)) return 'defined';
+  if (bands.some((b) => b.nodata === null)) return 'absent';
+  return 'unknown';
+}
+
+type VrtType = 'mosaic' | 'band_stack';
+type ResolutionStrategy = 'finest' | 'coarsest' | 'average';
+
+interface ValidationErrors {
+  [datasetId: string]: string[];
+}
+
+function validateSources(
+  sources: OGCRecordResponse[],
+  vrtType: VrtType,
+): ValidationErrors {
+  if (sources.length < 2) return {};
+  const errors: ValidationErrors = {};
+  const first = sources[0];
+
+  // _check_crs (backend/app/processing/raster/validation.py) picks the
+  // reference CRS as the FIRST source in the list with a known CRS, not
+  // unconditionally sources[0]; a source with no CRS is never the reference.
+  // Using sources[0] would skip every CRS comparison when the first source has
+  // no CRS, even if two LATER sources disagree.
+  const refCrs = sources.find((s) => s.properties.crs)?.properties.crs;
+
+  for (let i = 1; i < sources.length; i++) {
+    const src = sources[i];
+    const errs: string[] = [];
+
+    // CRS check, mirrors _check_crs. Unknown never blocks: the `&&` guard skips
+    // the comparison when either CRS is unknown (same tri-state as
+    // nodataState() below).
+    if (src.properties.crs && refCrs && src.properties.crs !== refCrs) {
+      errs.push('crs_mismatch');
+    }
+
+    if (vrtType === 'mosaic') {
+      // Band count check (mosaic only), mirrors _check_band_count_mosaic. The
+      // backend compares band_count unconditionally (NOT NULL on the
+      // authoritative RasterAsset row re-fetched at creation); here it comes
+      // from OGC search-result properties, which omit the key for legacy
+      // records. Unknown never blocks: this hint skips rather than flags a false
+      // mismatch, and the backend re-runs the check authoritatively before the
+      // VRT is created.
+      if (
+        src.properties.band_count != null &&
+        first.properties.band_count != null &&
+        src.properties.band_count !== first.properties.band_count
+      ) {
+        errs.push('band_count_mismatch');
+      }
+    }
+
+    // Dtype comes from the first band of raster:bands, the shape the API
+    // returns (the serializer emits no flat dtype field).
+    const srcDtype = src.properties['raster:bands']?.[0]?.data_type;
+    const firstDtype = first.properties['raster:bands']?.[0]?.data_type;
+
+    // Mirrors _check_dtype. Unknown never blocks: raster:bands is absent from
+    // OGC search-result properties for sources ingested before band-info
+    // tracking, while the backend's dtype column is non-null. Comparing only
+    // when both sides are known avoids flagging a combination the client can't
+    // see dtype for.
+    if (srcDtype && firstDtype && srcDtype !== firstDtype) {
+      errs.push('dtype_mismatch');
+    }
+
+    // _check_nodata_consistency requires only consistent PRESENCE of nodata, not
+    // equal values, but "present" is judged per source, not inferred from
+    // `!= null` on a single band field: a remote COG's nodata IS defined on the
+    // backend but its band stats carry no `nodata` key (see nodataState()
+    // above). Unknown never blocks: skip and let the backend, which has the
+    // authoritative value, decide.
+    const srcNodataState = nodataState(src);
+    const firstNodataState = nodataState(first);
+    if (
+      srcNodataState !== 'unknown' &&
+      firstNodataState !== 'unknown' &&
+      srcNodataState !== firstNodataState
+    ) {
+      errs.push('nodata_inconsistent');
+    }
+
+    // Band stack grid alignment check, mirrors _check_grid_alignment. Unknown
+    // never blocks: every `!= null` guard below skips its comparison when either
+    // side's dimension/resolution is unknown (same tri-state as nodataState()).
+    if (vrtType === 'band_stack') {
+      const srcShape = src.properties['proj:shape'];
+      const firstShape = first.properties['proj:shape'];
+      // proj:shape is [height, width]; width/height compare exactly, same
+      // as the backend (integer pixel dimensions, no float tolerance).
+      const heightMismatch =
+        srcShape != null && firstShape != null && srcShape[0] !== firstShape[0];
+      const widthMismatch =
+        srcShape != null && firstShape != null && srcShape[1] !== firstShape[1];
+      // The backend compares res_x/res_y with a 1e-10 absolute float tolerance,
+      // not strict equality. gsd is a lossy min(abs(res_x), abs(res_y)): sources
+      // at (res_x=10, res_y=20) and (res_x=10, res_y=30) collapse to the same
+      // gsd=10, so a gsd-only comparison passed a pair _check_grid_alignment
+      // (which compares each axis independently) rejects. Compare each axis.
+      const resXMismatch =
+        src.properties.res_x != null &&
+        first.properties.res_x != null &&
+        !floatsAligned(src.properties.res_x, first.properties.res_x);
+      const resYMismatch =
+        src.properties.res_y != null &&
+        first.properties.res_y != null &&
+        !floatsAligned(src.properties.res_y, first.properties.res_y);
+
+      if (widthMismatch || heightMismatch || resXMismatch || resYMismatch) {
+        errs.push('grid_misaligned');
+      }
+    }
+
+    if (errs.length > 0) {
+      errors[src.id] = errs;
+    }
+  }
+
+  return errors;
+}
+
+function errorMessage(
+  code: string,
+  src: OGCRecordResponse,
+  first: OGCRecordResponse,
+  // Must use the same reference (refCrs, the first source with a KNOWN crs) that
+  // validateSources compares against, not `first`, which can be crs-unset.
+  refCrs: string | null | undefined,
+  t: (key: string, opts?: Record<string, unknown>) => string,
+): string {
+  switch (code) {
+    case 'crs_mismatch':
+      return t('vrt.crsMismatch', { src: src.properties.crs, first: refCrs });
+    case 'band_count_mismatch':
+      return t('vrt.bandMismatch', { src: src.properties.band_count, first: first.properties.band_count });
+    case 'dtype_mismatch':
+      return t('vrt.dtypeMismatch', {
+        src: src.properties['raster:bands']?.[0]?.data_type,
+        first: first.properties['raster:bands']?.[0]?.data_type,
+      });
+    case 'nodata_inconsistent':
+      return t('vrt.nodataMismatch');
+    case 'grid_misaligned':
+      return t('vrt.gridMismatch');
+    default:
+      return code;
+  }
+}
+
+interface VrtCreatorFormProps {
+  initialSourceId?: string;
+  initialSourceIds?: string[];
+  onCancel?: () => void;
+}
+
+export function VrtCreatorForm({ initialSourceId, initialSourceIds, onCancel }: VrtCreatorFormProps) {
+  const { t } = useTranslation('import');
+  const createVrtMutation = useCreateVrt();
+
+  const [vrtType, setVrtType] = useState<VrtType>('mosaic');
+  const [resolutionStrategy, setResolutionStrategy] = useState<ResolutionStrategy>('finest');
+  const [title, setTitle] = useState('');
+  const [summary, setSummary] = useState('');
+  const [selectedSources, setSelectedSources] = useState<OGCRecordResponse[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const debouncedQuery = useDebouncedValue(searchQuery, 300);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const multiInitializedRef = useRef(false);
+  const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Pre-select source from query param
+  const { data: initialSource, isError: initialSourceError } = useQuery({
+    queryKey: queryKeys.ogcRecords.detail(initialSourceId!),
+    queryFn: () =>
+      apiFetch<OGCRecordResponse>(`/collections/datasets/items/${encodeURIComponent(initialSourceId!)}`),
+    enabled: !!initialSourceId,
+  });
+
+  useEffect(() => {
+    if (initialSourceError) toast.error(t('vrt.loadSourceFailed'));
+  }, [initialSourceError, t]);
+
+  useEffect(() => {
+    if (
+      initialSource &&
+      selectedSources.length === 0 &&
+      initialSource.properties.record_type === 'raster_dataset'
+    ) {
+      setSelectedSources([initialSource]);
+    }
+  }, [initialSource]); // eslint-disable-line react-hooks/exhaustive-deps -- reseed only when the initial source changes; the field setters are stable
+
+  // Pre-select multiple sources when initialSourceIds is provided (multi-source flow)
+  const multiSourceQueries = useQueries({
+    queries: (initialSourceIds && !initialSourceId ? initialSourceIds : []).map((id) => ({
+      queryKey: queryKeys.ogcRecords.detail(id),
+      queryFn: () => apiFetch<OGCRecordResponse>(`/collections/datasets/items/${encodeURIComponent(id)}`),
+      enabled: true,
+    })),
+  });
+
+  useEffect(() => {
+    if (!initialSourceIds || initialSourceIds.length === 0 || initialSourceId) return;
+    if (multiInitializedRef.current) return;
+    const allDone = multiSourceQueries.every((q) => q.isSuccess);
+    if (!allDone) return;
+    const rasterSources = multiSourceQueries
+      .map((q) => q.data)
+      .filter((d): d is OGCRecordResponse => !!d && d.properties.record_type === 'raster_dataset');
+    if (rasterSources.length > 0 && selectedSources.length === 0) {
+      multiInitializedRef.current = true;
+      setSelectedSources(rasterSources);
+    }
+  }, [multiSourceQueries, initialSourceIds, initialSourceId]); // eslint-disable-line react-hooks/exhaustive-deps -- react to the query set / initial ids only; the setters are stable
+
+  // Surface multi-source load errors so they aren't silently swallowed
+  const multiSourceErrorCount = multiSourceQueries.filter((q) => q.isError).length;
+  useEffect(() => {
+    if (multiSourceErrorCount > 0) {
+      toast.error(t('vrt.loadSourcesFailed', { count: multiSourceErrorCount }));
+    }
+  }, [multiSourceErrorCount, t]);
+
+  // The search input's blur delay below must not outlive the component:
+  // unmounting inside its 150 ms window would leave the timer queued, and
+  // firing it would call setState on a torn-down tree (in vitest, an unhandled
+  // `window is not defined` from react-dom's scheduler fails the whole run).
+  useEffect(
+    () => () => {
+      if (blurTimerRef.current !== null) clearTimeout(blurTimerRef.current);
+    },
+    []
+  );
+
+  const { data: searchResults, isFetching: isSearchFetching, error: searchError } = useQuery({
+    queryKey: queryKeys.cogSearch.results(debouncedQuery),
+    queryFn: () =>
+      searchDatasets({
+        q: debouncedQuery,
+        record_type: 'raster_dataset',
+        limit: '10',
+      }),
+    enabled: debouncedQuery.length >= 2,
+    // Retrying a rate-limited search would keep the dropdown on its empty
+    // state until the retry also fails.
+    retry: (count, err) => !(err instanceof ApiError && err.status === 429) && count < 1,
+  });
+
+  const filteredResults = useMemo(() => {
+    if (!searchResults) return [];
+    const selectedIds = new Set(selectedSources.map((s) => s.id));
+    return searchResults.features.filter((f) => !selectedIds.has(f.id));
+  }, [searchResults, selectedSources]);
+
+  const validationErrors = useMemo(
+    () => validateSources(selectedSources, vrtType),
+    [selectedSources, vrtType],
+  );
+
+  const hasErrors = Object.keys(validationErrors).length > 0;
+  const isSubmitDisabled =
+    selectedSources.length < 2 ||
+    hasErrors ||
+    title.trim().length === 0 ||
+    createVrtMutation.isPending;
+
+  // The same reference validateSources compares CRS against —
+  // the first source with a KNOWN crs, not necessarily selectedSources[0].
+  const refCrs = selectedSources.find((s) => s.properties.crs)?.properties.crs;
+
+  // validationErrors are also shown as always-visible text (same messages,
+  // deduplicated), so a disabled Create button has a visible reason beyond
+  // the per-source tooltip.
+  const mismatchReasons = hasErrors
+    ? [...new Set(
+        selectedSources.flatMap((source) =>
+          (validationErrors[source.id] ?? []).map((code) =>
+            errorMessage(code, source, selectedSources[0], refCrs, t),
+          ),
+        ),
+      )]
+    : [];
+
+  function resetForm() {
+    setVrtType('mosaic');
+    setResolutionStrategy('finest');
+    setTitle('');
+    setSummary('');
+    setSelectedSources([]);
+    setSearchQuery('');
+    setIsDropdownOpen(false);
+  }
+
+  function handleAddSource(source: OGCRecordResponse) {
+    setSelectedSources((prev) => [...prev, source]);
+    setSearchQuery('');
+    setIsDropdownOpen(false);
+    searchInputRef.current?.focus();
+  }
+
+  function handleRemoveSource(id: string) {
+    setSelectedSources((prev) => prev.filter((s) => s.id !== id));
+  }
+
+  async function handleSubmit() {
+    if (isSubmitDisabled) return;
+
+    try {
+      const result = await createVrtMutation.mutateAsync({
+        source_dataset_ids: selectedSources.map((s) => s.id),
+        vrt_type: vrtType,
+        resolution_strategy: resolutionStrategy,
+        title: title.trim(),
+        summary: summary.trim() || null,
+        visibility: 'private',
+      });
+      setJobId(String(result.job_id));
+    } catch (err) {
+      const message =
+        err instanceof ApiError ? err.message : t('vrt.submitFailed');
+      toast.error(message);
+    }
+  }
+
+  if (jobId) {
+    return (
+      <JobProgress
+        jobId={jobId}
+        onReset={() => {
+          setJobId(null);
+          resetForm();
+        }}
+      />
+    );
+  }
+
+  const firstSource = selectedSources[0];
+
+  return (
+    <TooltipProvider>
+      <div className="space-y-6 max-w-2xl">
+        {/* Mode Selector */}
+        <div className="space-y-2">
+          <ToggleGroup
+            type="single"
+            value={vrtType}
+            onValueChange={(val) => {
+              if (val) setVrtType(val as VrtType);
+            }}
+          >
+            <ToggleGroupItem value="mosaic">{t('vrt.modeMosaic')}</ToggleGroupItem>
+            <ToggleGroupItem value="band_stack">{t('vrt.modeBandStack')}</ToggleGroupItem>
+          </ToggleGroup>
+          <p className="text-sm text-muted-foreground">
+            {vrtType === 'mosaic' ? t('vrt.mosaicHelp') : t('vrt.bandStackHelp')}
+          </p>
+        </div>
+
+        {/* Resolution Strategy (mosaic only) */}
+        {vrtType === 'mosaic' && (
+          <div className="space-y-1.5">
+            <Label>{t('vrt.resolutionStrategy')}</Label>
+            <Select
+              value={resolutionStrategy}
+              onValueChange={(val) => setResolutionStrategy(val as ResolutionStrategy)}
+            >
+              <SelectTrigger className="w-48">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="finest">{t('vrt.resFinest')}</SelectItem>
+                <SelectItem value="coarsest">{t('vrt.resCoarsest')}</SelectItem>
+                <SelectItem value="average">{t('vrt.resAverage')}</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-sm text-muted-foreground">
+              {resolutionStrategy === 'finest' && t('vrt.resFinestHelp')}
+              {resolutionStrategy === 'coarsest' && t('vrt.resCoarsestHelp')}
+              {resolutionStrategy === 'average' && t('vrt.resAverageHelp')}
+            </p>
+          </div>
+        )}
+
+        {/* COG Search Picker */}
+        <div className="space-y-2">
+          <Label>{t('vrt.searchLabel')}</Label>
+          <div className="relative" ref={dropdownRef}>
+            <div className="relative">
+              <Search className="absolute start-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+              <Input
+                ref={searchInputRef}
+                className="ps-8 pe-8"
+                placeholder={t('vrt.searchPlaceholder')}
+                value={searchQuery}
+                disabled={selectedSources.length >= VRT_MAX_SOURCES}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  setIsDropdownOpen(true);
+                }}
+                onFocus={() => {
+                  if (debouncedQuery.length >= 2) setIsDropdownOpen(true);
+                }}
+                onBlur={() => {
+                  // Delay to allow click on dropdown items. Held in a ref and
+                  // cleared on unmount (and before rescheduling) so it can
+                  // never fire into a torn-down tree.
+                  if (blurTimerRef.current !== null) clearTimeout(blurTimerRef.current);
+                  blurTimerRef.current = setTimeout(() => {
+                    blurTimerRef.current = null;
+                    setIsDropdownOpen(false);
+                  }, 150);
+                }}
+              />
+              {isSearchFetching && (
+                <Loader2 className="absolute end-2.5 top-2.5 h-4 w-4 animate-spin text-muted-foreground" />
+              )}
+            </div>
+
+            {/* Search results dropdown */}
+            {isDropdownOpen && debouncedQuery.length >= 2 && (
+              <Card className="absolute z-50 w-full mt-1 shadow-lg">
+                <CardContent className="p-0">
+                  {searchError ? (
+                    <p role="alert" className="text-sm text-destructive px-3 py-2">
+                      {searchError instanceof ApiError && searchError.status === 429
+                        ? t('vrt.searchRateLimited')
+                        : t('vrt.searchError')}
+                    </p>
+                  ) : filteredResults.length === 0 ? (
+                    <p className="px-3 py-2 text-sm text-muted-foreground">
+                      {t('vrt.noResults')}
+                    </p>
+                  ) : (
+                    <ul className="max-h-60 overflow-auto divide-y">
+                      {filteredResults.map((result) => (
+                        <li key={result.id}>
+                          <button
+                            type="button"
+                            className="w-full text-start px-3 py-2 hover:bg-muted/50 transition-colors"
+                            onClick={() => handleAddSource(result)}
+                          >
+                            <div className="font-medium text-sm">{result.properties.title}</div>
+                            <div className="text-xs text-muted-foreground flex gap-3 mt-0.5">
+                              {result.properties.crs && (
+                                <span>{result.properties.crs}</span>
+                              )}
+                              {result.properties.band_count != null && (
+                                <span>{t('vrt.bandCount', { count: result.properties.band_count })}</span>
+                              )}
+                              {result.properties.gsd != null && (
+                                <span>
+                                  {t('vrt.resolutionValue', {
+                                    value: formatNumber(result.properties.gsd, {
+                                      minimumFractionDigits: 4,
+                                      maximumFractionDigits: 4,
+                                    }),
+                                  })}
+                                </span>
+                              )}
+                            </div>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+          </div>
+
+          {/* Source count */}
+          <p className="text-xs text-muted-foreground">
+            {t('vrt.sourceCount', { count: selectedSources.length, max: VRT_MAX_SOURCES })}
+          </p>
+
+          {/* Selected sources list */}
+          {selectedSources.length > 0 && (
+            <ul className="space-y-2">
+              {selectedSources.map((source, index) => {
+                const errs = validationErrors[source.id] ?? [];
+                const hasSourceErrors = errs.length > 0;
+                return (
+                  <li
+                    key={source.id}
+                    className={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm ${hasSourceErrors ? 'border-destructive' : ''}`}
+                  >
+                    <span className="font-mono text-xs text-muted-foreground w-5 shrink-0">
+                      {index + 1}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium truncate">{source.properties.title}</div>
+                      <div className="text-xs text-muted-foreground flex gap-2 mt-0.5">
+                        {source.properties.crs && (
+                          <Badge variant="outline" className="text-xs py-0 h-4">
+                            {source.properties.crs}
+                          </Badge>
+                        )}
+                        {source.properties.band_count != null && (
+                          <span>{t('vrt.bandCount', { count: source.properties.band_count })}</span>
+                        )}
+                      </div>
+                    </div>
+                    {hasSourceErrors && firstSource && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <ul className="text-xs space-y-0.5">
+                            {errs.map((code) => (
+                              <li key={code}>{errorMessage(code, source, firstSource, refCrs, t)}</li>
+                            ))}
+                          </ul>
+                        </TooltipContent>
+                      </Tooltip>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveSource(source.id)}
+                      className="text-muted-foreground hover:text-foreground shrink-0"
+                      aria-label={t('vrt.removeSource', { title: source.properties.title })}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {selectedSources.length < 2 && (
+            <p className="text-xs text-muted-foreground">{t('vrt.minSources')}</p>
+          )}
+
+          {/* Same reasons the per-source tooltip already
+              carries, surfaced as always-visible text. */}
+          {hasErrors && (
+            <div id="vrt-mismatch-reasons" className="space-y-0.5">
+              {mismatchReasons.map((reason) => (
+                <p key={reason} className="text-xs text-destructive">
+                  {reason}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Title */}
+        <div className="space-y-1.5">
+          <Label htmlFor="vrt-title">{t('vrt.titleLabel')}</Label>
+          <Input
+            id="vrt-title"
+            placeholder={t('vrt.titlePlaceholder')}
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+          />
+        </div>
+
+        {/* Summary */}
+        <div className="space-y-1.5">
+          <Label htmlFor="vrt-summary">{t('vrt.summaryLabel')}</Label>
+          <Textarea
+            id="vrt-summary"
+            className="min-h-[80px]"
+            placeholder={t('vrt.summaryPlaceholder')}
+            value={summary}
+            onChange={(e) => setSummary(e.target.value)}
+          />
+        </div>
+
+        {/* Actions */}
+        <div className="flex justify-end gap-2 pt-2">
+          {onCancel && (
+            <Button type="button" variant="outline" onClick={onCancel}>
+              {t('common:cancel')}
+            </Button>
+          )}
+          <Button
+            onClick={handleSubmit}
+            disabled={isSubmitDisabled}
+            aria-describedby={hasErrors ? 'vrt-mismatch-reasons' : undefined}
+          >
+            {createVrtMutation.isPending ? (
+              <>
+                <Loader2 className="me-2 h-4 w-4 animate-spin" />
+                {t('vrt.submitting')}
+              </>
+            ) : (
+              t('vrt.submit')
+            )}
+          </Button>
+        </div>
+      </div>
+    </TooltipProvider>
+  );
+}

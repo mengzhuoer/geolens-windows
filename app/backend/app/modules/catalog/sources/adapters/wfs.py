@@ -1,0 +1,184 @@
+"""WFS GetCapabilities fetching and parsing with safe XML handling.
+
+All parsing uses ``defusedxml.ElementTree``, not stdlib ``xml.etree``: the
+WFS probe accepts user-supplied URLs, so the response is untrusted, and
+defusedxml blocks XXE, billion laughs and decompression bombs.
+
+WFS 1.0/1.1/2.0 use different namespaces and element names for
+FeatureType discovery; the parser walks the tree namespace-agnostic
+(matching by local name) to support all three with one code path.
+
+geometry_type/feature_count are None at probe time (the preview path
+fills them in per layer). WFS layers are always kind='vector' — WFS is a
+vector feature service by OGC spec; raster sources use STAC instead.
+"""
+
+import asyncio
+from dataclasses import replace
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+import defusedxml.ElementTree as ET
+import httpx
+import structlog
+
+from app.core.service_tokens import ServiceCredential, build_credential_header
+from app.core.url_redaction import redact_exception_text
+from app.platform.probe_bounds import bounded_probe_read
+from app.platform.service_endpoints import (
+    DEFAULT_CHECK_TIMEOUT,
+    WFS_XML_ACCEPT,
+    EndpointCheckFailedError,
+)
+
+logger = structlog.stdlib.get_logger(__name__)
+
+# What this adapter is, in the vocabulary ``build_credential_header`` reads.
+# The probe has no stored ``source_format`` — it names its own.
+WFS_SERVICE_FORMAT = "wfs"
+
+
+def parse_wfs_capabilities(xml_text: str | bytes) -> tuple[str, list[dict]]:
+    """Parse WFS GetCapabilities XML.
+
+    Returns (version_string, layers_list); each layer dict has keys: name,
+    title, crs.
+
+    Accepts ``bytes`` so ``ET.fromstring`` honours the document's own
+    ``<?xml encoding="..."?>`` declaration.
+    """
+    root = ET.fromstring(xml_text)
+    version = root.get("version", "unknown")
+
+    layers = []
+
+    for element in root.iter():
+        tag = element.tag.split("}")[-1] if "}" in element.tag else element.tag
+
+        if tag == "FeatureType":
+            name = None
+            title = None
+            crs = None
+
+            for child in element:
+                child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if child_tag == "Name":
+                    name = child.text
+                elif child_tag == "Title":
+                    title = child.text
+                elif child_tag in ("DefaultCRS", "DefaultSRS", "SRS"):
+                    crs = child.text
+
+            if name:
+                layers.append(
+                    {
+                        "name": name,
+                        "title": title or name,
+                        "crs": crs,
+                        "geometry_type": None,
+                        "feature_count": None,
+                        "kind": "vector",
+                    }
+                )
+
+    return version, layers
+
+
+def build_capabilities_url(url: str) -> str:
+    """Build a GetCapabilities URL, preserving existing query params.
+
+    Every caller passes a ``url`` capped upstream, never a value read from a
+    third-party response: the periodic health check passes
+    ``origin_ref["url"]``, persisted from a probe/preview submission capped
+    at 2048 chars (~350 fields of ``a=1&``). That is what makes
+    ``# parse_qs: unbounded`` correct here, as in
+    ``preview.py::_encode_url_for_gdal``. A ``max_num_fields`` bound would
+    raise a ``ValueError`` that callers other than ``_header_auth_probe``
+    don't expect, reaching the health-check route as a bare 500.
+    """
+    parsed = urlparse(url)
+    existing_params = parse_qs(parsed.query)  # parse_qs: unbounded
+
+    existing_params["service"] = ["WFS"]
+    existing_params["request"] = ["GetCapabilities"]
+
+    new_query = urlencode(
+        {k: v[0] for k, v in existing_params.items()},
+    )
+    return urlunparse(parsed._replace(query=new_query))
+
+
+async def probe_wfs(
+    url: str,
+    client: httpx.AsyncClient,
+    credential: ServiceCredential | None = None,
+) -> dict | None:
+    """Probe a URL as a WFS service.
+
+    Fetches GetCapabilities and parses the response. Returns a dict with
+    service_type and layers, or None if not a WFS service.
+
+    The credential becomes a header HERE, keeping ``build_credential_header``
+    the tree's only producer of one. A ValueError from the builder is
+    unreachable over HTTP (the probe door already judged the inputs).
+
+    The whole function runs under ``DEFAULT_CHECK_TIMEOUT``, for the same
+    reason as ``probe_ogcapi``.
+    """
+    try:
+        async with asyncio.timeout(DEFAULT_CHECK_TIMEOUT):
+            return await _probe_wfs_within_deadline(url, client, credential)
+    except TimeoutError:
+        logger.debug("WFS probe: deadline exceeded for %s", url)
+        return None
+
+
+async def _probe_wfs_within_deadline(
+    url: str,
+    client: httpx.AsyncClient,
+    credential: ServiceCredential | None,
+) -> dict | None:
+    capabilities_url = build_capabilities_url(url)
+    request_headers = {}
+    if credential is not None:
+        # A ValueError from the builder propagates rather than becoming "not
+        # a WFS service": another adapter may claim the same URL and carry the
+        # value a different way (e.g. an ArcGIS token, percent-encoded into a
+        # query, legitimately outside the header charset), so whether it's
+        # fatal is the CALLER's decision.
+        pair = build_credential_header(
+            replace(credential, service_format=WFS_SERVICE_FORMAT)
+        )
+        if pair is not None:
+            request_headers[pair[0]] = pair[1]
+
+    try:
+        body, response_headers = await bounded_probe_read(
+            client, capabilities_url, headers=request_headers, accept=WFS_XML_ACCEPT
+        )
+    except (
+        httpx.HTTPStatusError,
+        httpx.TransportError,
+        EndpointCheckFailedError,
+    ) as exc:
+        # This request can carry a credential, and the exception text quotes
+        # the full request URL, so it is redacted before logging.
+        logger.debug("WFS probe failed for %s: %s", url, redact_exception_text(exc))
+        return None
+
+    content_type = response_headers.get("content-type", "")
+    if "text/html" in content_type and "xml" not in content_type:
+        return None
+
+    try:
+        version, layers = parse_wfs_capabilities(body)
+    except ET.ParseError:
+        logger.debug("WFS XML parse failed for %s", url)
+        return None
+
+    if not layers:
+        return None
+
+    return {
+        "service_type": f"WFS {version}",
+        "layers": layers,
+    }

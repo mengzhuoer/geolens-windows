@@ -1,0 +1,66 @@
+"""CRS URI/URN → EPSG integer parser.
+
+Converts URI/URN CRS reference forms emitted by GeoServer and pygeoapi into
+EPSG integer codes. Anchored regexes, known-form allowlist; anything
+unrecognised returns None (default-deny) — do NOT add forms not on this list:
+
+  1. http://www.opengis.net/def/crs/OGC/1.3/CRS84  → 4326
+  2. https://www.opengis.net/def/crs/OGC/1.3/CRS84 → 4326
+  3. http(s)://www.opengis.net/def/crs/EPSG/0/{N}  → {N}
+  4. urn:ogc:def:crs:EPSG::{N}                     → {N}
+  5. urn:ogc:def:crs:OGC:1.3:CRS84                 → 4326
+
+NOT covered: bare "EPSG:N" strings (ogrinfo projjson/WKT extraction) and
+backend-side reprojection (out of scope).
+"""
+
+from __future__ import annotations
+
+import re
+
+
+# Forms 1 + 2: OGC CRS84 via HTTP or HTTPS.
+# Trailing slash is optional; case-sensitive by design (OGC URIs are case-sensitive).
+_RE_OGC_CRS84_HTTP = re.compile(
+    r"^https?://www\.opengis\.net/def/crs/OGC/1\.3/CRS84/?$"
+)
+
+# Form 3: EPSG code via HTTP or HTTPS numeric path segment.
+# Captures the numeric code; rejects non-numeric codes at match time (\d+).
+_RE_EPSG_HTTP = re.compile(r"^https?://www\.opengis\.net/def/crs/EPSG/0/(\d+)/?$")
+
+# Form 4: EPSG URN (WFS 2.0 DefaultCRS and OGC API storageCrs).
+_RE_EPSG_URN = re.compile(r"^urn:ogc:def:crs:EPSG::(\d+)$")
+
+# Form 5: OGC CRS84 URN.
+_RE_OGC_CRS84_URN = re.compile(r"^urn:ogc:def:crs:OGC:1\.3:CRS84$")
+
+
+def parse_crs_uri(value: str | None) -> int | None:
+    """Map a URI/URN-form CRS reference to an EPSG integer code.
+
+    Recognises exactly the forms listed in the module docstring; returns
+    ``None`` for anything else, including ``None``/empty input (default-deny).
+
+    No upper bound on the returned code — downstream PostGIS rejects unknown
+    SRIDs at Find_SRID/ST_Transform time.
+    """
+    if not value:
+        return None
+
+    if _RE_OGC_CRS84_HTTP.match(value):
+        return 4326
+
+    m = _RE_EPSG_HTTP.match(value)
+    if m:
+        return int(m.group(1))
+
+    m = _RE_EPSG_URN.match(value)
+    if m:
+        return int(m.group(1))
+
+    if _RE_OGC_CRS84_URN.match(value):
+        return 4326
+
+    # Unrecognised — preserve null-CRS fallthrough (default-deny)
+    return None

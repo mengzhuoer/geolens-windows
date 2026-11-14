@@ -1,0 +1,250 @@
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useMyApiKeys, useCreateMyApiKey, useRevokeMyApiKey } from '@/hooks/use-api-keys';
+import { formatDate } from '@/lib/format';
+// Shared with admin/ApiKeySection.tsx.
+import { formatLastUsedRelativeTime } from '@/lib/relative-time';
+import { activeDotColor, semanticBadgeColors } from '@/lib/status-colors';
+import { cn } from '@/lib/utils';
+import { apiKeyStatus, expiryPresetToIso, isApiKeyExpired, type ApiKeyExpiryPreset } from '@/lib/api-key-expiry';
+import { useExpiryClock } from '@/hooks/use-expiry-clock';
+import type { MyApiKeyResponse, ApiKeyCreateResponse, ApiKeyScope } from '@/types/api';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { FieldLabel } from '@/components/ui/field-label';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { Loader2, Trash } from 'lucide-react';
+import { ApiKeyRevealDialog } from '@/components/admin/ApiKeyRevealDialog';
+import { ApiKeyScopeBadge } from '@/components/admin/ApiKeyScopeBadge';
+import { ApiKeyScopeSelect } from '@/components/admin/ApiKeyScopeSelect';
+import { ApiKeyExpirySelect } from '@/components/admin/ApiKeyExpirySelect';
+
+
+export function MyApiKeySection() {
+  const { t } = useTranslation();
+  const { data: keys, isLoading } = useMyApiKeys();
+  const createApiKey = useCreateMyApiKey();
+  const revokeApiKey = useRevokeMyApiKey();
+  const now = useExpiryClock(keys?.map((key) => key.expires_at) ?? []);
+
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [keyName, setKeyName] = useState('');
+  const [keyScope, setKeyScope] = useState<ApiKeyScope>('full');
+  const [keyExpiry, setKeyExpiry] = useState<ApiKeyExpiryPreset>('never');
+  const [revealKey, setRevealKey] = useState<ApiKeyCreateResponse | null>(null);
+  const [revokingKey, setRevokingKey] = useState<MyApiKeyResponse | null>(null);
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    if (!keyName.trim()) return;
+
+    try {
+      const result = await createApiKey.mutateAsync({
+        name: keyName.trim(),
+        scope: keyScope,
+        expiresAt: expiryPresetToIso(keyExpiry),
+      });
+      setKeyName('');
+      setKeyScope('full');
+      setKeyExpiry('never');
+      setShowCreateForm(false);
+      setRevealKey(result);
+    } catch {
+      // error displayed via mutation state
+    }
+  }
+
+  async function handleRevoke() {
+    if (!revokingKey) return;
+
+    try {
+      await revokeApiKey.mutateAsync(revokingKey.id);
+      setRevokingKey(null);
+    } catch {
+      // error displayed via mutation state
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        {!showCreateForm && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowCreateForm(true)}
+          >
+            {t('admin:apiKeys.createKey')}
+          </Button>
+        )}
+      </div>
+
+      {showCreateForm && (
+        <form onSubmit={handleCreate} className="flex flex-wrap items-center gap-2">
+          <FieldLabel htmlFor="api-key-name-input">{t('admin:apiKeys.keyName')}</FieldLabel>
+          <Input
+            id="api-key-name-input"
+            value={keyName}
+            onChange={(e) => setKeyName(e.target.value)}
+            placeholder={t('admin:apiKeys.keyName')}
+            className="h-8 min-w-48 flex-1 text-sm"
+            // eslint-disable-next-line jsx-a11y/no-autofocus -- intentional: user just clicked "create" to open this form
+            autoFocus
+          />
+          <ApiKeyScopeSelect
+            value={keyScope}
+            onChange={setKeyScope}
+            disabled={createApiKey.isPending}
+          />
+          <ApiKeyExpirySelect
+            value={keyExpiry}
+            onChange={setKeyExpiry}
+            disabled={createApiKey.isPending}
+          />
+          <Button type="submit" size="sm" disabled={createApiKey.isPending || !keyName.trim()}>
+            {createApiKey.isPending && <Loader2 className="size-4 animate-spin" />}
+            {createApiKey.isPending ? t('admin:apiKeys.creating') : t('create')}
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setShowCreateForm(false);
+              setKeyName('');
+              setKeyScope('full');
+              setKeyExpiry('never');
+            }}
+          >
+            {t('cancel')}
+          </Button>
+        </form>
+      )}
+
+      {createApiKey.error && (
+        <p role="alert" className="text-sm text-destructive">
+          {createApiKey.error instanceof Error ? createApiKey.error.message : t('admin:apiKeys.createError')}
+        </p>
+      )}
+
+      {isLoading && <p className="text-sm text-muted-foreground">{t('admin:apiKeys.loadingKeys')}</p>}
+
+      {!isLoading && (!keys || keys.length === 0) && (
+        <p className="text-sm text-muted-foreground">{t('admin:apiKeys.noKeys')}</p>
+      )}
+
+      {keys && keys.length > 0 && (
+        <div className="space-y-2">
+          {keys.map((key) => {
+            const status = apiKeyStatus(key, now);
+            return (
+            <div
+              key={key.id}
+              className="flex items-center justify-between rounded-md border px-3 py-2 text-sm"
+            >
+              <div className="flex-1 min-w-0 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span className="min-w-0 max-w-full truncate font-medium">{key.name}</span>
+                  {key.fingerprint && (
+                    <code className="text-xs text-muted-foreground">
+                      {key.fingerprint}
+                    </code>
+                  )}
+                  <span
+                    className={`inline-block h-2 w-2 rounded-full ${
+                      activeDotColor[String(status === 'active') as keyof typeof activeDotColor]
+                    }`}
+                    aria-hidden="true"
+                  />
+                  {/* A visible status badge, so state is conveyed as text and not
+                      color alone. The dot stays as a secondary visual cue. */}
+                  <Badge
+                    className={cn(
+                      'px-1.5',
+                      status === 'active' ? semanticBadgeColors.success : semanticBadgeColors.destructive,
+                    )}
+                  >
+                    {t(`admin:apiKeys.${status}`)}
+                  </Badge>
+                  {/* A read-only key is a different credential in
+                      practice; the list has to say which one you are holding. */}
+                  <ApiKeyScopeBadge scope={key.scope} />
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  {t('admin:apiKeys.created', { date: formatDate(key.created_at) })} · {t('admin:apiKeys.lastUsed')} {formatLastUsedRelativeTime(key.last_used_at, t)}
+                  {key.expires_at && (
+                    <>
+                      {' · '}
+                      {t(isApiKeyExpired(key.expires_at, now) ? 'admin:apiKeys.expiredOn' : 'admin:apiKeys.expiresOn', {
+                        date: formatDate(key.expires_at),
+                      })}
+                    </>
+                  )}
+                </div>
+              </div>
+              {key.is_active && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-destructive hover:text-destructive h-8 w-8 shrink-0 p-0"
+                  onClick={() => setRevokingKey(key)}
+                  aria-label={t('admin:apiKeys.revokeDialog.revoke')}
+                >
+                  <Trash className="h-4 w-4" aria-hidden="true" />
+                </Button>
+              )}
+            </div>
+            );
+          })}
+        </div>
+      )}
+
+      {revokeApiKey.error && (
+        <p role="alert" className="text-sm text-destructive">
+          {revokeApiKey.error instanceof Error ? revokeApiKey.error.message : t('admin:apiKeys.revokeError')}
+        </p>
+      )}
+
+      {/* Revoke confirmation dialog */}
+      <AlertDialog open={!!revokingKey} onOpenChange={(open) => !open && setRevokingKey(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('admin:apiKeys.revokeDialog.title')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('admin:apiKeys.revokeDialog.description', { name: revokingKey?.name })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={handleRevoke}
+              disabled={revokeApiKey.isPending}
+            >
+              {revokeApiKey.isPending ? t('admin:apiKeys.revokeDialog.revoking') : t('admin:apiKeys.revokeDialog.revoke')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Reveal dialog for newly created key */}
+      {revealKey && (
+        <ApiKeyRevealDialog
+          apiKey={revealKey}
+          open={!!revealKey}
+          onOpenChange={(open) => !open && setRevealKey(null)}
+        />
+      )}
+    </div>
+  );
+}

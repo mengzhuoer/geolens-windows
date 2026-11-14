@@ -1,0 +1,774 @@
+/* Font imports (must be before tailwindcss) */
+@import '@fontsource-variable/ibm-plex-sans/wght.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+
+/* Framework */
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Dark mode variant */
+@custom-variant dark (&:is(.dark, .dark *));
+
+/* ── Design Tokens ─────────────────────────────────── */
+
+/*
+ * Typography Scale (canonical reference — Tailwind text-* utilities used directly)
+ * --text-xs:  0.75rem  (12px)
+ * --text-sm:  0.875rem (14px)
+ * --text-base: 1rem    (16px)
+ * --text-lg:  1.125rem (18px)
+ * --text-xl:  1.25rem  (20px)
+ * --text-2xl: 1.5rem   (24px)
+ */
+
+:root,
+.light {
+  /* Base radius: cards at 8px, buttons/inputs at 6px. */
+  --radius: 0.5rem;
+
+  /* ─ Primary scale (blue, hue ~250) ─ */
+  --primary-50:  oklch(0.97 0.02 250);
+  --primary-100: oklch(0.93 0.05 250);
+  --primary-200: oklch(0.87 0.09 250);
+  --primary-300: oklch(0.78 0.13 250);
+  --primary-400: oklch(0.70 0.16 250);
+  --primary-500: oklch(0.55 0.18 250);
+  --primary-600: oklch(0.48 0.18 250);
+  --primary-700: oklch(0.46 0.16 250);
+  --primary-800: oklch(0.38 0.13 250);
+  --primary-900: oklch(0.30 0.10 250);
+
+  /* ─ Core palette (light mode — warm atlas paper) ─ */
+  --background: oklch(0.985 0.003 85);
+  --foreground: oklch(0.145 0.005 250);
+  --card: oklch(0.99 0.002 85);
+  --card-foreground: oklch(0.145 0.005 250);
+  --popover: oklch(0.99 0.002 85);
+  --popover-foreground: oklch(0.145 0.005 250);
+  --primary: oklch(0.55 0.18 250);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0.003 85);
+  --secondary-foreground: oklch(0.205 0.005 250);
+  --muted: oklch(0.97 0.003 85);
+  --muted-foreground: oklch(0.45 0.005 250);
+  --accent: oklch(0.97 0.003 85);
+  --accent-foreground: oklch(0.205 0.005 250);
+  /* Darkened from 0.577: text-destructive on a bg-destructive/10 tint measured
+   * 3.89:1 at the stock value. Now 4.95:1 on the /10 tint and 5.96:1 for
+   * white-on-solid (buttons). */
+  --destructive: oklch(0.50 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  /* Measured contrast (OKLCH→sRGB→WCAG):
+     --border 0.88 sits at ~1.4:1 against card/background. Decorative dividers
+     and card edges are not WCAG 1.4.11 "components", so this subtle hairline is
+     kept intentionally for the instrument-panel look; darkening every card edge
+     to 3:1 is a design decision. */
+  --border: oklch(0.88 0.005 85);
+  /* --input IS a 1.4.11 component (form-control boundary), so it is brought to
+     ≥3:1: L 0.65 measures ~3.1:1 vs card and background. */
+  --input: oklch(0.65 0.006 85);
+  /* Focus-ring color; the standard treatment is `ring-2 ring-ring`. */
+  --ring: oklch(0.55 0.18 250);
+
+  /* ─ Surface hierarchy (light mode — warm) ─ */
+  --surface-0: oklch(0.98 0.003 85);
+  --surface-1: oklch(0.99 0.002 85);
+  --surface-2: oklch(0.97 0.004 85);
+  --surface-3: oklch(0.95 0.005 85);
+
+
+  /* ─ Map-native surface tones ─
+     Scoped to the LoginPage brand panel's wireframe-globe illustration, not
+     general surfaces; separate from --surface-* so it can be retuned without
+     shifting app chrome. */
+  --map-paper:  oklch(0.95 0.008 85);
+  --map-street: oklch(0.82 0.004 85);
+  --map-water:  oklch(0.85 0.02 220);
+
+  /* ─ Globe space ─
+     The void behind the sphere on globe-projection maps. No dark-mode
+     counterpart on purpose: space is the same dark in both themes, and a light
+     value makes the globe read as a sticker on white. Below the dark theme's
+     --background (0.145) so the void reads deeper than the chrome, with enough
+     chroma to stay a night sky rather than a black rectangle. */
+  --map-space: oklch(0.13 0.03 265);
+
+  /* ─ Shadow tokens (light mode) ─ */
+  --elevation-xs: 0 1px 1px oklch(0 0 0 / 4%);
+  --elevation-sm: 0 1px 2px oklch(0 0 0 / 5%);
+  --elevation-md: 0 4px 6px -1px oklch(0 0 0 / 7%), 0 2px 4px -2px oklch(0 0 0 / 5%);
+  --elevation-lg: 0 10px 15px -3px oklch(0 0 0 / 8%), 0 4px 6px -4px oklch(0 0 0 / 5%);
+
+  /* ─ Semantic status colors ─
+   * Light fg darkened so text-warning/info/success clear WCAG AA (>=4.5:1) on
+   * card AND soft 10-percent-tint surfaces. Measured ratios: warning 6.01 and
+   * 5.05, info 5.41 and 4.54, success 5.5 and 4.64.
+   * --warning-foreground is DARK in BOTH themes and is reserved for text on a
+   * solid bg-warning fill; as standalone text in dark mode it composites to
+   * ~1:1 (warning-foreground-usage.test.ts enforces this). No component
+   * renders a solid warning fill today; retune the light value (~2.4:1 on
+   * solid warning) before introducing one. */
+  --success: oklch(0.49 0.16 150);
+  --success-foreground: oklch(0.985 0 0);
+  --warning: oklch(0.50 0.13 68);
+  --warning-foreground: oklch(0.28 0.07 46);
+  --info: oklch(0.49 0.13 205);
+  --info-foreground: oklch(0.985 0 0);
+
+  /* ─ Record-type colors (import, catalog badges) ─ */
+  --type-vector: oklch(0.39 0.12 155);
+  --type-vector-bg: oklch(0.94 0.04 155);
+  --type-raster: oklch(0.48 0.15 55);
+  --type-raster-bg: oklch(0.94 0.05 55);
+  --type-table: oklch(0.50 0.10 200);
+  --type-table-bg: oklch(0.94 0.03 200);
+  --type-vrt: oklch(0.50 0.16 300);
+  --type-vrt-bg: oklch(0.94 0.04 300);
+  --type-tiles3d: oklch(0.50 0.15 350);
+  --type-tiles3d-bg: oklch(0.94 0.04 350);
+  --type-pointcloud: oklch(0.47 0.10 110);
+  --type-pointcloud-bg: oklch(0.94 0.04 110);
+
+  /* Synthetic-data badge. Distinct from --type-vrt: that hue marks a record
+     type, this marks provenance. */
+  --synthetic: oklch(0.47 0.17 285);
+  --synthetic-bg: oklch(0.94 0.04 285);
+
+  /* Folder-group type icon. */
+  --type-folder: oklch(0.45 0.10 80);
+  --type-folder-bg: oklch(0.93 0.03 80);
+
+  /* ─ Code snippet syntax tokens ─ */
+  --code-bg: oklch(0.17 0.006 250);
+  --code-chrome: oklch(0.14 0.006 250);
+  --code-chrome-border: oklch(0.22 0.008 250);
+  --code-text: oklch(0.92 0 0);
+  --code-muted: oklch(0.68 0 0);
+  --code-keyword: oklch(0.75 0.17 300);
+  --code-function: oklch(0.78 0.13 220);
+  --code-string: oklch(0.78 0.13 140);
+  --code-number: oklch(0.8 0.14 70);
+  /* L 0.5 measured ~3.3:1 on --code-bg, below AA; 0.6 clears 4.5:1. */
+  --code-comment: oklch(0.6 0.008 250);
+  --code-method-badge: oklch(0.75 0.14 155);
+  --code-method-badge-bg: oklch(0.75 0.14 155 / 15%);
+
+  /* ─ Data visualization categorical palette ─ */
+  --viz-1: oklch(0.55 0.18 250);   /* blue */
+  --viz-2: oklch(0.70 0.17 55);    /* orange */
+  --viz-3: oklch(0.62 0.17 145);   /* green */
+  --viz-4: oklch(0.55 0.18 310);   /* purple */
+  --viz-5: oklch(0.65 0.13 195);   /* teal */
+  --viz-6: oklch(0.65 0.20 5);     /* pink */
+  --viz-7: oklch(0.75 0.16 80);    /* amber */
+  --viz-8: oklch(0.50 0.18 280);   /* indigo */
+
+  /* ─ Sidebar ─ */
+  --sidebar: oklch(0.98 0.003 85);
+  --sidebar-foreground: oklch(0.145 0.005 250);
+  --sidebar-primary: oklch(0.55 0.18 250);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0.003 85);
+  --sidebar-accent-foreground: oklch(0.205 0.005 250);
+  --sidebar-border: oklch(0.92 0.005 85);
+  --sidebar-ring: oklch(0.55 0.18 250);
+
+  /* Motion timing tokens */
+  --motion-fast: 150ms;
+  --motion-base: 250ms;
+}
+
+/* ── Dark Mode Tokens ─────────────────────────────── */
+.dark {
+  /* ─ Primary scale (blue, hue ~250, dark mode adjusted) ─ */
+  --primary-50:  oklch(0.25 0.04 250);
+  --primary-100: oklch(0.30 0.07 250);
+  --primary-200: oklch(0.36 0.10 250);
+  --primary-300: oklch(0.44 0.14 250);
+  --primary-400: oklch(0.54 0.17 250);
+  --primary-500: oklch(0.65 0.18 250);
+  --primary-600: oklch(0.72 0.17 250);
+  --primary-700: oklch(0.80 0.14 250);
+  --primary-800: oklch(0.88 0.09 250);
+  --primary-900: oklch(0.94 0.04 250);
+
+  /* ─ Core palette (dark mode) ─ */
+  --background: oklch(0.145 0.008 250);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.18 0.008 250);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.22 0.010 250);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.72 0.17 250);
+  --primary-foreground: oklch(0.18 0.008 250);
+  --secondary: oklch(0.269 0.008 250);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0.008 250);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0.008 250);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.25 0.05 22);
+  --border: oklch(1 0 0 / 10%);
+  /* 15% white measured ~1.5:1; 38% reaches ~3.3:1 vs the
+     dark card/surface-2, meeting WCAG 1.4.11 for form controls. */
+  --input: oklch(1 0 0 / 38%);
+  --ring: oklch(0.72 0.17 250);
+
+  /* ─ Surface hierarchy (true dark, near-black base) ─ */
+  --surface-0: oklch(0.145 0.008 250);
+  --surface-1: oklch(0.18 0.008 250);
+  --surface-2: oklch(0.22 0.010 250);
+  --surface-3: oklch(0.26 0.012 250);
+
+
+  /* ─ Map-native surface tones (dark mode) ─ */
+  --map-paper:  oklch(0.22 0.010 250);
+  --map-street: oklch(0.32 0.010 250);
+  --map-water:  oklch(0.30 0.04 220);
+
+  /* ─ Shadow tokens (dark mode, 3-5x opacity) ─ */
+  --elevation-xs: 0 1px 1px oklch(0 0 0 / 15%);
+  --elevation-sm: 0 1px 2px oklch(0 0 0 / 20%);
+  --elevation-md: 0 4px 6px -1px oklch(0 0 0 / 30%), 0 2px 4px -2px oklch(0 0 0 / 20%);
+  --elevation-lg: 0 10px 15px -3px oklch(0 0 0 / 35%), 0 4px 6px -4px oklch(0 0 0 / 20%);
+
+  /* ─ Semantic status colors (dark mode) ─ */
+  --success: oklch(0.72 0.17 145);
+  --success-foreground: oklch(0.20 0.05 145);
+  --warning: oklch(0.80 0.16 85);
+  --warning-foreground: oklch(0.28 0.07 46);
+  --info: oklch(0.72 0.14 195);
+  --info-foreground: oklch(0.20 0.05 195);
+
+  /* ─ Record-type colors (dark mode) ─ */
+  --type-vector: oklch(0.72 0.14 155);
+  --type-vector-bg: oklch(0.28 0.06 155);
+  --type-raster: oklch(0.72 0.14 55);
+  --type-raster-bg: oklch(0.28 0.06 55);
+  --type-table: oklch(0.68 0.10 200);
+  --type-table-bg: oklch(0.28 0.04 200);
+  --type-vrt: oklch(0.68 0.15 300);
+  --type-vrt-bg: oklch(0.28 0.06 300);
+  --type-tiles3d: oklch(0.72 0.14 350);
+  --type-tiles3d-bg: oklch(0.28 0.06 350);
+  --type-pointcloud: oklch(0.74 0.13 110);
+  --type-pointcloud-bg: oklch(0.28 0.05 110);
+
+  --synthetic: oklch(0.72 0.15 285);
+  --synthetic-bg: oklch(0.28 0.06 285);
+
+  --type-folder: oklch(0.80 0.13 85);
+  --type-folder-bg: oklch(0.30 0.05 80);
+
+  /* ─ Code snippet syntax tokens (dark mode) ─ */
+  --code-bg: oklch(0.15 0.006 250);
+  --code-chrome: oklch(0.12 0.006 250);
+  --code-chrome-border: oklch(0.20 0.008 250);
+  --code-text: oklch(0.92 0 0);
+  --code-muted: oklch(0.68 0 0);
+  --code-keyword: oklch(0.75 0.17 300);
+  --code-function: oklch(0.78 0.13 220);
+  --code-string: oklch(0.78 0.13 140);
+  --code-number: oklch(0.8 0.14 70);
+  --code-comment: oklch(0.6 0.008 250);
+  --code-method-badge: oklch(0.75 0.14 155);
+  --code-method-badge-bg: oklch(0.75 0.14 155 / 15%);
+
+  /* ─ Data visualization categorical palette (dark mode) ─ */
+  --viz-1: oklch(0.72 0.17 250);   /* blue */
+  --viz-2: oklch(0.76 0.16 55);    /* orange */
+  --viz-3: oklch(0.72 0.16 145);   /* green */
+  --viz-4: oklch(0.65 0.17 310);   /* purple */
+  --viz-5: oklch(0.72 0.12 195);   /* teal */
+  --viz-6: oklch(0.72 0.18 5);     /* pink */
+  --viz-7: oklch(0.80 0.15 80);    /* amber */
+  --viz-8: oklch(0.60 0.17 280);   /* indigo */
+
+  /* ─ Sidebar ─ */
+  --sidebar: oklch(0.13 0.008 250);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.72 0.17 250);
+  --sidebar-primary-foreground: oklch(0.18 0.008 250);
+  --sidebar-accent: oklch(0.269 0.008 250);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.72 0.17 250);
+}
+
+/* ── Theme Bridge ──────────────────────────────────── */
+@theme inline {
+  --font-sans: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Core semantic colors */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Primary scale (bg-primary-50 through bg-primary-900) */
+  --color-primary-50: var(--primary-50);
+  --color-primary-100: var(--primary-100);
+  --color-primary-200: var(--primary-200);
+  --color-primary-300: var(--primary-300);
+  --color-primary-400: var(--primary-400);
+  --color-primary-500: var(--primary-500);
+  --color-primary-600: var(--primary-600);
+  --color-primary-700: var(--primary-700);
+  --color-primary-800: var(--primary-800);
+  --color-primary-900: var(--primary-900);
+
+  /* Surface hierarchy (bg-surface-0 through bg-surface-3) */
+  --color-surface-0: var(--surface-0);
+  --color-surface-1: var(--surface-1);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+
+
+  /* Map-native tones (bg-map-paper, bg-map-street, bg-map-water) */
+  --color-map-paper: var(--map-paper);
+  --color-map-street: var(--map-street);
+  --color-map-water: var(--map-water);
+
+  /* Shadow tokens (shadow-xs, shadow-sm, shadow-md, shadow-lg) */
+  --shadow-xs: var(--elevation-xs);
+  --shadow-sm: var(--elevation-sm);
+  --shadow-md: var(--elevation-md);
+  --shadow-lg: var(--elevation-lg);
+
+  /* Status colors */
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+
+  /* Data visualization palette (bg-viz-1 through bg-viz-8) */
+  --color-viz-1: var(--viz-1);
+  --color-viz-2: var(--viz-2);
+  --color-viz-3: var(--viz-3);
+  --color-viz-4: var(--viz-4);
+  --color-viz-5: var(--viz-5);
+  --color-viz-6: var(--viz-6);
+  --color-viz-7: var(--viz-7);
+  --color-viz-8: var(--viz-8);
+
+  /* Record-type colors (text-type-vector, bg-type-vector-bg, etc.) */
+  --color-type-vector: var(--type-vector);
+  --color-type-vector-bg: var(--type-vector-bg);
+  --color-type-raster: var(--type-raster);
+  --color-type-raster-bg: var(--type-raster-bg);
+  --color-type-table: var(--type-table);
+  --color-type-table-bg: var(--type-table-bg);
+  --color-type-vrt: var(--type-vrt);
+  --color-type-vrt-bg: var(--type-vrt-bg);
+  --color-type-tiles3d: var(--type-tiles3d);
+  --color-type-tiles3d-bg: var(--type-tiles3d-bg);
+  --color-type-pointcloud: var(--type-pointcloud);
+  --color-type-pointcloud-bg: var(--type-pointcloud-bg);
+  --color-synthetic: var(--synthetic);
+  --color-synthetic-bg: var(--synthetic-bg);
+  --color-type-folder: var(--type-folder);
+  --color-type-folder-bg: var(--type-folder-bg);
+
+  /* Typography: micro text (badges, readouts, chips) */
+  --text-2xs: 0.625rem; /* 10px */
+  --text-2xs--line-height: 0.875rem;
+  /* `text-mini` sits between 2xs (10px) and xs (12px). */
+  --text-mini: 0.6875rem; /* 11px */
+  --text-mini--line-height: 1rem;
+
+  /* Animation */
+  --animate-fade-in: fade-in 200ms ease-out both;
+  --animate-shimmer: shimmer 1.5s ease-in-out infinite;
+
+  /* Radius */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  /* Sidebar */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+/* Named selection indicator for dense builder rows and the sidebar rail.
+   This is state communication, not elevation, so keep it separate from the
+   shadow tier and reuse one semantic recipe instead of arbitrary box shadows. */
+@utility selection-inset {
+  --tw-inset-shadow: inset 2px 0 0 var(--primary);
+  box-shadow: var(--tw-inset-shadow), var(--tw-inset-ring-shadow), var(--tw-ring-offset-shadow), var(--tw-ring-shadow), var(--tw-shadow);
+}
+
+/* ── Animations ────────────────────────────────────── */
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* `.eyebrow` is the mono-caps section marker (same treatment as SECTION_EYEBROW
+   on the dataset page). `.readout` is for measured values: counts, EPSG codes,
+   coordinates, timestamps. */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: color-mix(in oklab, var(--foreground) 70%, transparent);
+}
+.readout {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+/* Neatline tick rule: 1px baseline with survey ticks every 16px, used under
+   page and panel headers. Theme-aware via --border. */
+.tick-rule {
+  height: 5px;
+  background-image:
+    repeating-linear-gradient(
+      to right,
+      var(--border) 0,
+      var(--border) 1px,
+      transparent 1px,
+      transparent 16px
+    ),
+    linear-gradient(var(--border), var(--border));
+  background-size: 100% 5px, 100% 1px;
+  background-position: left bottom, left bottom;
+  background-repeat: no-repeat;
+}
+
+/* ── Cartographic Textures ─────────────────────────── */
+.graticule {
+  background-image:
+    linear-gradient(to right, oklch(0.55 0.005 250 / 6%) 1px, transparent 1px),
+    linear-gradient(to bottom, oklch(0.55 0.005 250 / 6%) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+.graticule-fine {
+  background-image:
+    linear-gradient(to right, oklch(0.55 0.005 250 / 5%) 1px, transparent 1px),
+    linear-gradient(to bottom, oklch(0.55 0.005 250 / 5%) 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+/* Subtle branded depth for full-page surfaces (login, public viewers).
+   OKLCH tokens can't be wrapped in hsl(); color-mix(in oklab, …) works in
+   light and dark. */
+.app-surface-gradient {
+  background-image:
+    radial-gradient(circle at top, color-mix(in oklab, var(--primary) 10%, transparent), transparent 42%),
+    linear-gradient(180deg, var(--background), color-mix(in oklab, var(--muted) 45%, var(--background)));
+}
+
+/* ── Base Layer ─────────────────────────────────────── */
+@layer base {
+  /* Anchor jumps and focus scrolling clear the fixed navbar (h-14 + safe area). */
+  html {
+    scroll-padding-top: calc(3.5rem + env(safe-area-inset-top));
+  }
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+}
+
+/* ── MapLibre Control Dark Mode ───────────────────── */
+.dark .maplibregl-ctrl-group {
+  background: oklch(0.269 0.008 250);
+  border-color: oklch(1 0 0 / 10%);
+}
+.dark .maplibregl-ctrl-group button {
+  filter: invert(1) hue-rotate(180deg);
+}
+.dark .maplibregl-ctrl-group button + button {
+  border-top-color: oklch(1 0 0 / 10%);
+}
+/* ── MapLibre Attribution Control ──────────────────── */
+/* Opaque pairs keep attribution readable over tiles and compact-control states. */
+.maplibregl-map .maplibregl-ctrl.maplibregl-ctrl-attrib {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.maplibregl-map .maplibregl-ctrl-attrib a,
+.maplibregl-map .maplibregl-ctrl-attrib a:hover {
+  color: var(--foreground);
+  text-decoration: underline;
+}
+.dark .maplibregl-map .maplibregl-ctrl-attrib-button {
+  filter: invert(1);
+}
+
+html [data-sonner-toaster][data-sonner-theme] {
+  --success-bg: var(--background);
+  --success-border: var(--success);
+  --success-text: var(--success);
+  --info-bg: var(--background);
+  --info-border: var(--info);
+  --info-text: var(--info);
+  --warning-bg: var(--background);
+  --warning-border: var(--warning);
+  --warning-text: var(--warning);
+  --error-bg: var(--background);
+  --error-border: var(--destructive);
+  --error-text: var(--destructive);
+}
+
+/* ── MapLibre Scale Control ────────────────────────── */
+.maplibregl-ctrl-scale {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: var(--foreground);
+  background: var(--background, #fff);
+  opacity: 0.75;
+  border-color: var(--foreground);
+  border-width: 1.5px;
+  padding: 1px 6px;
+  line-height: 14px;
+}
+
+/* BuilderMap NavigationControl offset. The NavigationControl is `top-left`
+ * and the `MapCoordReadout` pill sits at `top-2 right-14`; at an 800px
+ * viewport the map column is ~316px wide and the ~237px pill reaches the
+ * zoom control, overlapping ~20×16 px. A 32px top margin (default 10px) clears
+ * the pill's ~26px bottom edge at every supported width (6px gap at 800px).
+ *
+ * Scoped via `data-builder-canvas="true"` on `BuilderMap`'s outer wrapper so
+ * `ViewerMap` (NavigationControl `top-right`) is unaffected.
+ */
+[data-builder-canvas="true"] .maplibregl-ctrl-top-left {
+  margin-top: 32px;
+}
+
+/* BuilderMap coordinate pill vs. MapToolbar. The centered MapToolbar sits at
+ * `top-3` (12px) + ~32px tall ≈ 44px bottom edge. When the editor flyout
+ * narrows the map column, the right-anchored pill (`top-2 right-14`, z-10)
+ * stretches into the toolbar band and paints over it (z-[5]). Dropping it to
+ * `top-12` (48px) clears the toolbar, matching the PluginHost top-band
+ * convention. Scoped via `data-builder-canvas`; ViewerMap keeps `top-2`.
+ */
+[data-builder-canvas="true"] [data-coord-readout="true"] {
+  top: 3rem;
+}
+
+/* Globe projection: the space behind the sphere. Nothing inside a MapLibre
+ * style can paint the void around a globe: the atmosphere pass returns alpha 0
+ * for rays that miss the planet, the canvas clears transparent, and the
+ * style's `background` layer is clipped to the sphere. What shows through is
+ * the page, so the treatment lives on the map container.
+ *
+ * `applyMapBasemapAppearance` in `map-composition-sync` sets the marker when
+ * basemap_config.projection is `globe` and removes it on mercator.
+ */
+.maplibregl-map[data-globe-space="true"] {
+  background-color: var(--map-space);
+}
+
+/* ── MapLibre Popup Styling ─────────────────────────── */
+/* Scoped under .maplibregl-map so these rules outrank maplibre-gl.css, whose
+   lazily loaded chunk is injected after index.css and would otherwise win with
+   `background: #fff` (light popover text on a white card in dark mode). */
+.maplibregl-map .maplibregl-popup-content {
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: var(--elevation-lg);
+  border-radius: var(--radius);
+}
+
+/* Popup tip (arrow) — all four anchor directions */
+.maplibregl-map .maplibregl-popup-anchor-bottom .maplibregl-popup-tip {
+  border-top-color: var(--popover);
+}
+.maplibregl-map .maplibregl-popup-anchor-top .maplibregl-popup-tip {
+  border-bottom-color: var(--popover);
+}
+.maplibregl-map .maplibregl-popup-anchor-left .maplibregl-popup-tip {
+  border-right-color: var(--popover);
+}
+.maplibregl-map .maplibregl-popup-anchor-right .maplibregl-popup-tip {
+  border-left-color: var(--popover);
+}
+.maplibregl-map .maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip,
+.maplibregl-map .maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip {
+  border-top-color: var(--popover);
+}
+.maplibregl-map .maplibregl-popup-anchor-top-left .maplibregl-popup-tip,
+.maplibregl-map .maplibregl-popup-anchor-top-right .maplibregl-popup-tip {
+  border-bottom-color: var(--popover);
+}
+
+/* Popup close button — 32×32 visible (border-box, so the padding is inside
+   that box); coarse pointers get a ≥44px hit target via the pointer-coarse
+   rule further down. */
+.maplibregl-map .maplibregl-popup-close-button {
+  color: var(--popover-foreground);
+  font-size: 18px;
+  width: 32px;
+  height: 32px;
+  padding: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  inset-inline-end: 2px;
+  top: 2px;
+}
+.maplibregl-map .maplibregl-popup-close-button:hover {
+  background-color: var(--muted);
+}
+
+/* ── Reduced Motion ───────────────────────────────── */
+/* RTL: Mirror directional icons */
+[dir="rtl"] .rtl-mirror {
+  transform: scaleX(-1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── drag polish ───────────────────────────────────────── */
+
+/* DnD insertion line: 2px primary line with bloom shadow at the drop target */
+[data-dnd-over="true"] {
+  border-top: 2px solid var(--primary);
+  border-radius: 9999px;
+  box-shadow: 0 0 0 2px oklch(0.55 0.18 250 / 25%);
+}
+
+/* Hide kebabs on non-dragging rows during drag */
+.dragging-active [data-testid^="stack-row-"] [data-kebab-trigger] {
+  opacity: 0 !important;
+}
+
+/* ── cross-panel drag polish ──────────────────────────── */
+
+/* Hide any .kebab element during catalog→stack drag */
+.dragging-active .kebab {
+  opacity: 0 !important;
+}
+
+/* Cursor-grabbing on html during any drag to prevent flicker */
+html.dragging-active {
+  cursor: grabbing !important;
+}
+
+/* Basemap group drop target — primary-50 tint + left rail */
+[data-basemap-drop-target="true"] {
+  background: var(--primary-50, oklch(0.97 0.02 250));
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+
+/* Folder-group drop target — primary-50 tint + left rail */
+[data-group-drop-target="true"] {
+  background: var(--primary-50, oklch(0.97 0.02 250));
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+
+/* ── coarse-pointer reveal ───────────────────────────── */
+
+/* On touch / hover:none devices the per-row kebabs and catalog drag grips have
+   no hover state to reveal them. Force data-touch-reveal controls to full
+   opacity; scoped to coarse pointers so desktop hover-reveal is unchanged. */
+@media (hover: none), (pointer: coarse) {
+  [data-touch-reveal] {
+    opacity: 1 !important;
+  }
+}
+
+/* Coarse-pointer tap targets: map controls and form fields reach a ~44px hit
+   target; fine-pointer desktop density is unchanged. */
+@media (pointer: coarse) {
+  .maplibregl-ctrl-group button,
+  .maplibregl-popup-close-button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  [data-slot="input"],
+  [data-slot="select-trigger"],
+  textarea,
+  select {
+    min-height: 2.75rem;
+  }
+}
+
+/* Folder group-children wash when parent is drop target */
+/* :has() styles the children container from the common ancestor of the
+   attribute-bearing FolderGroupRowWrapper and the folder-group-children div. */
+div:has(> [data-group-drop-target="true"]) > [id^="folder-group-children"] {
+  background: oklch(0.97 0.02 250 / 60%);
+  border-radius: var(--radius-md);
+}
+
+/* With viewport-fit=cover the page draws under the iOS notch and home
+   indicator; pad full-bleed mobile chrome by env(safe-area-inset-*). */
+@supports (padding: env(safe-area-inset-bottom)) {
+  /* Bottom maplibre controls (attribution + zoom/scale) clear the home indicator. */
+  .maplibregl-ctrl-bottom-right,
+  .maplibregl-ctrl-bottom-left {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  /* Mobile Sheet clears the notch on landscape on both edges, since drawers
+     anchor to either side; env() is non-zero only where there is an unsafe
+     area. Content also clears the home indicator. */
+  [data-slot="sheet-content"] {
+    padding-left: max(
+      var(--sheet-padding-left, 0px),
+      env(safe-area-inset-left)
+    );
+    padding-right: max(
+      var(--sheet-padding-right, 0px),
+      env(safe-area-inset-right)
+    );
+    padding-bottom: max(
+      var(--sheet-padding-bottom, 0px),
+      env(safe-area-inset-bottom)
+    );
+  }
+}

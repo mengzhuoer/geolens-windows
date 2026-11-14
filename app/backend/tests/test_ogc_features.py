@@ -1,0 +1,938 @@
+"""Tests for per-dataset OGC API Features endpoints.
+
+Verifies:
+  - GET /collections lists per-dataset feature collections alongside the "datasets" catalog
+  - GET /collections/{dataset_id} returns OGC collection metadata
+  - GET /collections/{dataset_id}/items returns GeoJSON features with pagination
+  - GET /collections/{dataset_id}/items/{featureId} returns a single feature
+  - Visibility enforcement (private datasets hidden from unauthenticated users)
+  - f parameter validation
+  - Content-Type and Content-Crs headers
+"""
+
+import uuid
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import text
+
+from app.modules.catalog.datasets.domain.models import Dataset, Record
+
+from tests.factories import create_raster_dataset, get_user_id
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _create_test_table_and_dataset(
+    session,
+    *,
+    created_by: uuid.UUID,
+    table_name: str | None = None,
+    visibility: str = "public",
+    geometry_type: str = "POINT",
+    with_features: int = 0,
+) -> Dataset:
+    """Create a PostGIS data table and register it as a dataset.
+
+    If with_features > 0, inserts that many Point features.
+    """
+    if table_name is None:
+        table_name = f"test_ogc_{uuid.uuid4().hex[:8]}"
+
+    await session.execute(
+        text(
+            f"CREATE TABLE IF NOT EXISTS data.{table_name} ("
+            f"gid SERIAL PRIMARY KEY, "
+            f"geom geometry(Point, 4326), "
+            f"geom_4326 geometry(Geometry, 4326), "
+            f"name TEXT, "
+            f"status TEXT)"
+        )
+    )
+    await session.execute(text(f"GRANT SELECT ON data.{table_name} TO geolens_reader"))
+
+    # Insert features if requested
+    for i in range(with_features):
+        lng = -74.0 + (i * 0.01)
+        lat = 40.7 + (i * 0.01)
+        await session.execute(
+            text(
+                f"INSERT INTO data.{table_name} (geom, geom_4326, name, status) VALUES ("
+                f"ST_SetSRID(ST_MakePoint({lng}, {lat}), 4326), "
+                f"ST_SetSRID(ST_MakePoint({lng}, {lat}), 4326), "
+                f":name, :status)"
+            ).bindparams(
+                name=f"Feature {i}", status="active" if i % 2 == 0 else "inactive"
+            )
+        )
+
+    record = Record(
+        title=f"OGC Test Layer {table_name}",
+        summary="Test dataset for OGC Features compliance",
+        theme_category=["test"],
+        visibility=visibility,
+        record_status="published",
+        created_by=created_by,
+    )
+    session.add(record)
+    await session.flush()
+    dataset = Dataset(
+        record_id=record.id,
+        table_name=table_name,
+        srid=4326,
+        geometry_type=geometry_type,
+        feature_count=with_features,
+        column_info=[
+            {"name": "name", "type": "text"},
+            {"name": "status", "type": "text"},
+        ],
+        source_format="created",
+    )
+    session.add(dataset)
+    await session.commit()
+    await session.refresh(dataset)
+    return dataset
+
+
+async def _create_raster_dataset(
+    session,
+    *,
+    created_by: uuid.UUID,
+    visibility: str = "public",
+    record_type: str = "raster_dataset",
+) -> Dataset:
+    """Register a raster/VRT dataset with NO backing PostGIS feature table.
+
+    Raster records carry a table_name (NOT NULL on the model) but no data.<table>
+    is ever created — this is exactly the (#315) bug-trigger condition.
+    """
+    table_name = f"test_ogc_raster_{uuid.uuid4().hex[:8]}"
+    return await create_raster_dataset(
+        session,
+        created_by=created_by,
+        name=f"OGC Test Raster {table_name}",
+        description="Test raster dataset for OGC Features hardening",
+        theme_category=["test"],
+        visibility=visibility,
+        record_type=record_type,
+        table_name=table_name,
+    )
+
+
+async def _create_missing_table_vector_dataset(
+    session,
+    *,
+    created_by: uuid.UUID,
+    visibility: str = "public",
+) -> Dataset:
+    """Register a VECTOR dataset whose backing data.<table> does NOT exist.
+
+    Simulates a cold-evicted / partially-ingested vector dataset: record_type is
+    vector_dataset and geometry_type is set (so the raster/VRT 404 guard does
+    NOT fire), but no data.<table> is created — so a feature query raises
+    ProgrammingError. The OGC handler must convert that to a 503, not a 500.
+    """
+    table_name = f"test_ogc_missing_{uuid.uuid4().hex[:8]}"
+    record = Record(
+        title=f"OGC Missing-Table Vector {table_name}",
+        summary="Test vector dataset with no backing table (503 backstop)",
+        theme_category=["test"],
+        visibility=visibility,
+        record_status="published",
+        record_type="vector_dataset",
+        created_by=created_by,
+    )
+    session.add(record)
+    await session.flush()
+    dataset = Dataset(
+        record_id=record.id,
+        table_name=table_name,
+        srid=4326,
+        geometry_type="POINT",
+        feature_count=None,
+        column_info=[{"name": "name", "type": "text"}],
+        source_format="geojson",
+    )
+    session.add(dataset)
+    await session.commit()
+    await session.refresh(dataset)
+    return dataset
+
+
+async def _cleanup_table(session, table_name: str) -> None:
+    await session.execute(text(f"DROP TABLE IF EXISTS data.{table_name}"))
+    await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def public_dataset(client: AsyncClient, test_db_session):
+    """Create a public dataset with 5 features for testing."""
+    admin_id = await get_user_id(test_db_session, "admin")
+    dataset = await _create_test_table_and_dataset(
+        test_db_session,
+        created_by=admin_id,
+        visibility="public",
+        with_features=5,
+    )
+    yield dataset
+    await _cleanup_table(test_db_session, dataset.table_name)
+
+
+@pytest.fixture
+async def private_dataset(client: AsyncClient, test_db_session):
+    """Create a private dataset for visibility testing."""
+    admin_id = await get_user_id(test_db_session, "admin")
+    dataset = await _create_test_table_and_dataset(
+        test_db_session,
+        created_by=admin_id,
+        visibility="private",
+        with_features=2,
+    )
+    yield dataset
+    await _cleanup_table(test_db_session, dataset.table_name)
+
+
+@pytest.fixture
+async def raster_dataset(client: AsyncClient, test_db_session):
+    """Create a public raster dataset with no backing feature table (#315)."""
+    admin_id = await get_user_id(test_db_session, "admin")
+    dataset = await _create_raster_dataset(
+        test_db_session,
+        created_by=admin_id,
+        visibility="public",
+    )
+    # No data.<table> exists, so nothing to drop on teardown.
+    yield dataset
+
+
+@pytest.fixture
+async def missing_table_vector_dataset(client: AsyncClient, test_db_session):
+    """Create a public VECTOR dataset whose backing table is missing (#315 503)."""
+    admin_id = await get_user_id(test_db_session, "admin")
+    dataset = await _create_missing_table_vector_dataset(
+        test_db_session,
+        created_by=admin_id,
+        visibility="public",
+    )
+    # No data.<table> exists, so nothing to drop on teardown.
+    yield dataset
+
+
+# ---------------------------------------------------------------------------
+# /collections list includes per-dataset feature collections
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_collections_includes_dataset_collections(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """GET /collections includes per-dataset feature collections alongside 'datasets' catalog."""
+    # Test DB persists across the session and accumulates >200 datasets in a
+    # full run, so page through to find the freshly-created public_dataset.
+    page_size = 200
+    offset = 0
+    all_ids: list[str] = []
+    target_entry: dict | None = None
+    while True:
+        resp = await client.get(
+            "/collections", params={"limit": page_size, "offset": offset}
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "collections" in data
+        for entry in data["collections"]:
+            all_ids.append(entry["id"])
+            if entry["id"] == str(public_dataset.id):
+                target_entry = entry
+        if len(data["collections"]) < page_size:
+            break
+        offset += page_size
+
+    # The catalog collection should still be present (always on first page)
+    assert "datasets" in all_ids
+
+    # The per-dataset feature collection should be listed
+    assert target_entry is not None, (
+        f"Expected per-dataset entry for {public_dataset.id}"
+    )
+    assert target_entry["itemType"] == "feature"
+
+
+# ---------------------------------------------------------------------------
+# GET /collections/{dataset_id} - Collection metadata
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_dataset_collection_metadata(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """GET /collections/{dataset_id} returns OGC collection metadata."""
+    resp = await client.get(f"/collections/{public_dataset.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["id"] == str(public_dataset.id)
+    assert data["title"] == public_dataset.record.title
+    assert data["itemType"] == "feature"
+    assert "http://www.opengis.net/def/crs/OGC/1.3/CRS84" in data["crs"]
+
+    # Check links
+    rels = {link["rel"] for link in data["links"]}
+    assert "self" in rels
+    assert "items" in rels
+    assert "root" in rels
+
+    # Content-Type should be application/json
+    assert "application/json" in resp.headers["content-type"]
+
+
+def _tiles_links(data: dict) -> list[dict]:
+    return [link for link in data["links"] if link["rel"] == "tiles"]
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("_init_tile_pool_for_tests")
+async def test_vector_collection_links_its_vector_tile_template(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """A vector collection advertises a templated MVT link on the public API URL."""
+    data = (await client.get(f"/collections/{public_dataset.id}")).json()
+    (link,) = _tiles_links(data)
+    assert link["type"] == "application/vnd.mapbox-vector-tile"
+    assert link["templated"] is True
+    assert link["href"].startswith("http")
+    assert (
+        f"/tiles/data.{public_dataset.table_name}/{{z}}/{{x}}/{{y}}.pbf" in link["href"]
+    )
+    assert f"_v={public_dataset.tile_cache_version}" in link["href"]
+
+    # The template is the real tile route: filled in, it serves the dataset.
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(link["href"])
+    path = parts.path.removeprefix("/api").format(z=0, x=0, y=0)
+    tile = await client.get(f"{path}?{parts.query}")
+    assert tile.status_code in (200, 204)
+
+
+@pytest.mark.anyio
+async def test_a_table_without_geometry_advertises_no_vector_tiles(
+    client: AsyncClient, test_db_session
+):
+    admin_id = await get_user_id(test_db_session, "admin")
+    dataset = await _create_test_table_and_dataset(
+        test_db_session, created_by=admin_id, visibility="public"
+    )
+    try:
+        await test_db_session.execute(
+            text("UPDATE catalog.datasets SET geometry_type = NULL WHERE id = :id"),
+            {"id": dataset.id},
+        )
+        await test_db_session.commit()
+        data = (await client.get(f"/collections/{dataset.id}")).json()
+        assert _tiles_links(data) == []
+    finally:
+        await _cleanup_table(test_db_session, dataset.table_name)
+
+
+@pytest.mark.anyio
+async def test_private_vector_collection_is_hidden_from_anonymous_callers(
+    client: AsyncClient, private_dataset: Dataset, admin_auth_header: dict
+):
+    assert (await client.get(f"/collections/{private_dataset.id}")).status_code == 404
+    data = (
+        await client.get(
+            f"/collections/{private_dataset.id}", headers=admin_auth_header
+        )
+    ).json()
+    assert len(_tiles_links(data)) == 1
+
+
+@pytest.mark.anyio
+async def test_raster_collection_keeps_only_its_raster_tiles_link(
+    client: AsyncClient, raster_dataset: Dataset
+):
+    data = (await client.get(f"/collections/{raster_dataset.id}")).json()
+    (link,) = _tiles_links(data)
+    assert link["type"] == "image/png"
+    assert "templated" not in link
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("_init_tile_pool_for_tests")
+async def test_vector_tile_token_carries_a_working_signed_template(
+    client: AsyncClient, private_dataset: Dataset, admin_auth_header: dict
+):
+    resp = await client.get(
+        f"/tiles/token/{private_dataset.id}/", headers=admin_auth_header
+    )
+    assert resp.status_code == 200, resp.text
+    token = resp.json()
+    template = token["tile_url_template"]
+    assert template.startswith(
+        f"/tiles/data.{private_dataset.table_name}/{{z}}/{{x}}/{{y}}.pbf?"
+    )
+    assert f"sig={token['sig']}" in template
+    # Signed, so an anonymous client can read the private dataset with it.
+    tile = await client.get(template.format(z=0, x=0, y=0))
+    assert tile.status_code in (200, 204)
+
+
+@pytest.mark.anyio
+async def test_collection_not_found(client: AsyncClient):
+    """GET /collections/{nonexistent_uuid} returns 404."""
+    fake_id = uuid.uuid4()
+    resp = await client.get(f"/collections/{fake_id}")
+    assert resp.status_code == 404
+    data = resp.json()
+    assert "detail" in data
+
+
+# ---------------------------------------------------------------------------
+# GET /collections/{dataset_id}/items - Feature items
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_collection_items(client: AsyncClient, public_dataset: Dataset):
+    """GET /collections/{dataset_id}/items returns GeoJSON FeatureCollection."""
+    resp = await client.get(f"/collections/{public_dataset.id}/items")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["type"] == "FeatureCollection"
+    assert "timeStamp" in data
+    assert isinstance(data["numberMatched"], int)
+    assert isinstance(data["numberReturned"], int)
+    assert data["numberMatched"] == 5
+    assert data["numberReturned"] == 5
+
+    # Verify features are GeoJSON Feature objects
+    for feature in data["features"]:
+        assert feature["type"] == "Feature"
+        assert "id" in feature
+        assert "geometry" in feature
+        assert "properties" in feature
+
+    # Verify Content-Type
+    assert "application/geo+json" in resp.headers["content-type"]
+
+    # Verify Content-Crs header
+    assert "Content-Crs" in resp.headers
+    assert "CRS84" in resp.headers["Content-Crs"]
+
+
+@pytest.mark.anyio
+async def test_collection_items_bbox_filter(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """GET /collections/{id}/items?bbox=... filters by bounding box."""
+    # Use a tight bbox around the first feature location (-74.0, 40.7)
+    resp = await client.get(
+        f"/collections/{public_dataset.id}/items",
+        params={"bbox": "-74.01,40.69,-73.99,40.71"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["numberReturned"] >= 1
+    assert data["numberReturned"] < 5  # Not all features in this small bbox
+
+
+@pytest.mark.anyio
+async def test_collection_items_property_filter(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """Non-OGC query params are treated as property filters."""
+    resp = await client.get(
+        f"/collections/{public_dataset.id}/items",
+        params={"status": "active"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    # Features 0, 2, 4 have status="active" (3 out of 5)
+    assert data["numberReturned"] == 3
+    for feature in data["features"]:
+        assert feature["properties"]["status"] == "active"
+
+
+@pytest.mark.anyio
+async def test_collection_items_pagination(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """Items endpoint supports pagination with limit and offset."""
+    # Get first page
+    resp1 = await client.get(
+        f"/collections/{public_dataset.id}/items",
+        params={"limit": 2},
+    )
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+    assert data1["numberReturned"] == 2
+    assert data1["numberMatched"] == 5
+
+    # Should have a "next" link
+    next_link = next((link for link in data1["links"] if link["rel"] == "next"), None)
+    assert next_link is not None, "Missing 'next' pagination link"
+
+    # Get second page
+    resp2 = await client.get(
+        f"/collections/{public_dataset.id}/items",
+        params={"limit": 2, "offset": 2},
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["numberReturned"] == 2
+
+    # Should have both "next" and "prev" links
+    prev_link = next((link for link in data2["links"] if link["rel"] == "prev"), None)
+    assert prev_link is not None, "Missing 'prev' pagination link"
+
+
+@pytest.mark.anyio
+async def test_pagination_links_preserve_include_geometry_false(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """include_geometry=false must survive into the self and
+    next pagination links.
+
+    include_geometry is excluded from property_filters (it's in
+    ogc_reserved) and, before the fix, was never added to active_params
+    either -- so a client opting out of geometry on page 1 silently got it
+    back on page 2 via the rel=next link this endpoint builds.
+    """
+    resp1 = await client.get(
+        f"/collections/{public_dataset.id}/items",
+        params={"limit": 2, "include_geometry": "false"},
+    )
+    assert resp1.status_code == 200
+    data1 = resp1.json()
+    assert all(f["geometry"] is None for f in data1["features"])
+
+    self_link = next((link for link in data1["links"] if link["rel"] == "self"), None)
+    assert self_link is not None
+    assert "include_geometry=false" in self_link["href"]
+
+    next_link = next((link for link in data1["links"] if link["rel"] == "next"), None)
+    assert next_link is not None, "Missing 'next' pagination link"
+    assert "include_geometry=false" in next_link["href"]
+
+    # Follow it: page 2 must still honor the opt-out, not just advertise it.
+    from urllib.parse import urlparse
+
+    parsed = urlparse(next_link["href"])
+    path_and_query = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    resp2 = await client.get(path_and_query)
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["features"], "expected page 2 to have features"
+    assert all(f["geometry"] is None for f in data2["features"])
+
+
+@pytest.mark.anyio
+async def test_collection_items_invalid_bbox(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """Invalid bbox returns 400."""
+    resp = await client.get(
+        f"/collections/{public_dataset.id}/items",
+        params={"bbox": "invalid"},
+    )
+    assert resp.status_code == 400
+    data = resp.json()
+    assert "detail" in data
+
+
+# ---------------------------------------------------------------------------
+# GET /collections/{dataset_id}/items/{featureId} - Single feature
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_single_feature(client: AsyncClient, public_dataset: Dataset):
+    """GET /collections/{id}/items/{featureId} returns a single GeoJSON Feature."""
+    resp = await client.get(f"/collections/{public_dataset.id}/items/1")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["type"] == "Feature"
+    assert data["id"] == 1
+    assert "geometry" in data
+    assert "properties" in data
+
+    # Verify Content-Type and Content-Crs
+    assert "application/geo+json" in resp.headers["content-type"]
+    assert "Content-Crs" in resp.headers
+
+
+@pytest.mark.anyio
+async def test_get_single_feature_not_found(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """GET /collections/{id}/items/99999 returns 404 for non-existent feature."""
+    resp = await client.get(f"/collections/{public_dataset.id}/items/99999")
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# raster/VRT collections have no feature items (must 404, never 500)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_raster_collection_items_returns_404(
+    client: AsyncClient, raster_dataset: Dataset
+):
+    """GET /collections/{raster_id}/items returns 404 problem+json, not a 500.
+
+    Raster datasets have no backing PostGIS table; querying it would raise
+    UndefinedTableError. The guard must short-circuit to a fast 404.
+    """
+    resp = await client.get(f"/collections/{raster_dataset.id}/items")
+    assert resp.status_code == 404
+    assert "application/problem+json" in resp.headers["content-type"]
+    data = resp.json()
+    assert "raster" in data["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_raster_collection_single_item_returns_404(
+    client: AsyncClient, raster_dataset: Dataset
+):
+    """GET /collections/{raster_id}/items/1 returns 404, not a 500."""
+    resp = await client.get(f"/collections/{raster_dataset.id}/items/1")
+    assert resp.status_code == 404
+    assert "application/problem+json" in resp.headers["content-type"]
+    data = resp.json()
+    assert "raster" in data["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_raster_collection_metadata_is_coverage(
+    client: AsyncClient, raster_dataset: Dataset
+):
+    """Raster collection metadata advertises itemType=coverage and omits rel=items."""
+    resp = await client.get(f"/collections/{raster_dataset.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["itemType"] == "coverage"
+    rels = {link["rel"] for link in data["links"]}
+    assert "items" not in rels
+    assert "self" in rels
+
+
+@pytest.mark.anyio
+async def test_raster_collection_metadata_has_tiles_link(
+    client: AsyncClient, raster_dataset: Dataset
+):
+    """(#315) a coverage collection advertises a rel=tiles link so it is not a dead-end."""
+    resp = await client.get(f"/collections/{raster_dataset.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    tiles_link = next((link for link in data["links"] if link["rel"] == "tiles"), None)
+    assert tiles_link is not None, "coverage collection must expose a rel=tiles link"
+    assert tiles_link["type"] == "image/png"
+    assert f"/raster-tiles/{raster_dataset.id}/tiles/" in tiles_link["href"]
+    # tiles are served at the app origin, not /api (which has no such route)
+    assert "/api/raster-tiles/" not in tiles_link["href"]
+    # The advertised template carries the tile cache
+    # version, so a refetching client rolls the shared nginx cache on replace.
+    assert f"?v={raster_dataset.tile_cache_version}" in tiles_link["href"]
+
+
+async def test_collections_list_raster_tiles_link_is_versioned(
+    client: AsyncClient, raster_dataset: Dataset
+):
+    """The collections LIST advertises the same versioned
+    raster template as the collection detail.
+
+    The list defaults to limit=50 with unordered offset
+    pagination, and this worker's shared DB accumulates datasets from sibling
+    tests, so a single-page scan can miss the fixture dataset and the bare
+    next() raised StopIteration inside the coroutine. Page through instead.
+    """
+    entry = None
+    offset = 0
+    while entry is None:
+        resp = await client.get(f"/collections?limit=200&offset={offset}")
+        assert resp.status_code == 200
+        page = resp.json()["collections"]
+        # every page prepends the catalog Records collection; a page holding
+        # only that entry means the dataset pagination is exhausted
+        if len(page) <= 1:
+            break
+        entry = next((c for c in page if c["id"] == str(raster_dataset.id)), None)
+        offset += 200
+    assert entry is not None, "raster fixture dataset absent from /collections"
+    tiles_link = next(link for link in entry["links"] if link["rel"] == "tiles")
+    assert f"/raster-tiles/{raster_dataset.id}/tiles/" in tiles_link["href"]
+    assert f"?v={raster_dataset.tile_cache_version}" in tiles_link["href"]
+
+
+# ---------------------------------------------------------------------------
+# A missing-table VECTOR dataset must 503, never 500
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_missing_table_vector_items_returns_503(
+    client: AsyncClient, missing_table_vector_dataset: Dataset
+):
+    """A vector dataset whose backing table is gone returns 503 on /items, not 500.
+
+    The raster/VRT 404 guard does not fire (record_type=vector_dataset,
+    geometry_type set), so the feature query hits a missing data.<table> and
+    raises ProgrammingError. The handler must convert that to a 503.
+    """
+    resp = await client.get(f"/collections/{missing_table_vector_dataset.id}/items")
+    assert resp.status_code == 503
+    data = resp.json()
+    assert "unavailable" in data["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_missing_table_vector_single_item_returns_503(
+    client: AsyncClient, missing_table_vector_dataset: Dataset
+):
+    """A vector dataset whose backing table is gone returns 503 on a single item, not 500."""
+    resp = await client.get(f"/collections/{missing_table_vector_dataset.id}/items/1")
+    assert resp.status_code == 503
+    data = resp.json()
+    assert "unavailable" in data["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Visibility enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_private_collection_hidden_for_unauthenticated(
+    client: AsyncClient, private_dataset: Dataset
+):
+    """Private dataset returns 404 for unauthenticated users on all OGC endpoints."""
+    # Collection metadata
+    resp = await client.get(f"/collections/{private_dataset.id}")
+    assert resp.status_code == 404
+
+    # Items
+    resp = await client.get(f"/collections/{private_dataset.id}/items")
+    assert resp.status_code == 404
+
+    # Single feature
+    resp = await client.get(f"/collections/{private_dataset.id}/items/1")
+    assert resp.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_private_collection_visible_for_admin(
+    client: AsyncClient, private_dataset: Dataset, admin_auth_header: dict
+):
+    """Admin can access private dataset OGC endpoints."""
+    resp = await client.get(
+        f"/collections/{private_dataset.id}",
+        headers=admin_auth_header,
+    )
+    assert resp.status_code == 200
+
+    resp = await client.get(
+        f"/collections/{private_dataset.id}/items",
+        headers=admin_auth_header,
+    )
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# f parameter validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_f_param_json_accepted(client: AsyncClient, public_dataset: Dataset):
+    """f=json is accepted on collection endpoints."""
+    resp = await client.get(f"/collections/{public_dataset.id}", params={"f": "json"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_f_param_xml_returns_400(client: AsyncClient, public_dataset: Dataset):
+    """f=xml returns 400 on collection endpoints."""
+    resp = await client.get(f"/collections/{public_dataset.id}", params={"f": "xml"})
+    assert resp.status_code == 400
+    data = resp.json()
+    assert "Unsupported format" in data["detail"]
+
+
+# ---------------------------------------------------------------------------
+# OGC conformance: null exclusion, top-level links, self link query params
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_link_objects_omit_null_fields(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """Link objects in /collections/{id} response must not contain null values."""
+    resp = await client.get(f"/collections/{public_dataset.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    for link in data["links"]:
+        for key, value in link.items():
+            assert value is not None, f"Link field '{key}' is null in {link}"
+
+
+@pytest.mark.anyio
+async def test_collections_has_top_level_links(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """GET /collections includes top-level links with self and root rels."""
+    resp = await client.get("/collections")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "links" in data
+    assert isinstance(data["links"], list)
+    assert len(data["links"]) > 0
+
+    rels = {link["rel"] for link in data["links"]}
+    assert "self" in rels, f"Missing 'self' rel in top-level links: {rels}"
+    assert "root" in rels, f"Missing 'root' rel in top-level links: {rels}"
+
+    assert 'rel="self"' in resp.headers["link"]
+    assert 'rel="root"' in resp.headers["link"]
+
+
+@pytest.mark.anyio
+async def test_collections_self_link_preserves_pagination(
+    client: AsyncClient, public_dataset: Dataset
+):
+    resp = await client.get("/collections", params={"offset": 1, "limit": 1})
+    assert resp.status_code == 200
+    self_link = next(link for link in resp.json()["links"] if link["rel"] == "self")
+    assert "offset=1" in self_link["href"]
+    assert "limit=1" in self_link["href"]
+
+
+@pytest.mark.anyio
+async def test_items_self_link_includes_query_params(
+    client: AsyncClient, public_dataset: Dataset
+):
+    """Items self link href includes current limit/offset query params."""
+    # Test with limit only
+    resp = await client.get(
+        f"/collections/{public_dataset.id}/items",
+        params={"limit": 2},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+
+    self_link = next((link for link in data["links"] if link["rel"] == "self"), None)
+    assert self_link is not None, "Missing self link in items response"
+    assert "limit=2" in self_link["href"], (
+        f"limit missing from self link: {self_link['href']}"
+    )
+    assert "offset=0" in self_link["href"], (
+        f"offset missing from self link: {self_link['href']}"
+    )
+    assert 'rel="self"' in resp.headers["link"]
+    assert 'rel="collection"' in resp.headers["link"]
+
+    # Test with bbox
+    resp2 = await client.get(
+        f"/collections/{public_dataset.id}/items",
+        params={"limit": 2, "bbox": "-75,40,-73,41"},
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+
+    self_link2 = next((link for link in data2["links"] if link["rel"] == "self"), None)
+    assert self_link2 is not None, "Missing self link in items response with bbox"
+    # urlencode encodes commas as %2C — check for either form
+    assert "bbox=" in self_link2["href"], (
+        f"bbox missing from self link: {self_link2['href']}"
+    )
+
+
+_CRS84_SPELLINGS = [
+    "http://www.opengis.net/def/crs/OGC/1.3/CRS84",
+    "https://www.opengis.net/def/crs/OGC/1.3/CRS84",
+    "[OGC:CRS84]",
+]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("param", ["crs", "bbox-crs", "filter-crs"])
+@pytest.mark.parametrize("value", _CRS84_SPELLINGS)
+async def test_every_crs84_spelling_is_accepted(
+    client: AsyncClient, public_dataset: Dataset, param: str, value: str
+):
+    params = {param: value}
+    if param == "bbox-crs":
+        params["bbox"] = "-180,-90,180,90"
+    if param == "filter-crs":
+        params["filter"] = "name = 'x'"
+    resp = await client.get(f"/collections/{public_dataset.id}/items", params=params)
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("param", ["crs", "bbox-crs", "filter-crs"])
+@pytest.mark.parametrize(
+    "value",
+    ["EPSG:3857", "http://www.opengis.net/def/crs/EPSG/0/3857", "CRS84"],
+)
+async def test_any_other_crs_is_refused_not_ignored(
+    client: AsyncClient, public_dataset: Dataset, param: str, value: str
+):
+    params = {param: value}
+    if param == "bbox-crs":
+        params["bbox"] = "-8238310,4970072,-8237310,4971072"
+    if param == "filter-crs":
+        params["filter"] = "name = 'x'"
+    resp = await client.get(f"/collections/{public_dataset.id}/items", params=params)
+    assert resp.status_code == 400
+    assert "CRS84" in resp.json()["detail"]
+    assert value in resp.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_the_single_feature_route_refuses_another_crs_too(
+    client: AsyncClient, public_dataset: Dataset
+):
+    first = (await client.get(f"/collections/{public_dataset.id}/items?limit=1")).json()
+    feature_id = first["features"][0]["id"]
+    url = f"/collections/{public_dataset.id}/items/{feature_id}"
+    assert (await client.get(url, params={"crs": "EPSG:3857"})).status_code == 400
+    assert (await client.get(url, params={"crs": "[OGC:CRS84]"})).status_code == 200
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("_init_tile_pool_for_tests")
+async def test_a_geometry_less_dataset_gets_a_token_without_a_tile_template(
+    client: AsyncClient, test_db_session
+):
+    admin_id = await get_user_id(test_db_session, "admin")
+    dataset = await _create_test_table_and_dataset(
+        test_db_session, created_by=admin_id, visibility="public"
+    )
+    try:
+        await test_db_session.execute(
+            text("UPDATE catalog.datasets SET geometry_type = NULL WHERE id = :id"),
+            {"id": dataset.id},
+        )
+        await test_db_session.commit()
+        resp = await client.get(f"/tiles/token/{dataset.id}/")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["tile_url_template"] is None
+    finally:
+        await _cleanup_table(test_db_session, dataset.table_name)

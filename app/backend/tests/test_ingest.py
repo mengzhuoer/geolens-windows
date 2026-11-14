@@ -1,0 +1,1901 @@
+"""Integration tests for ingest endpoints (upload, register) and job status.
+
+These tests run against a real database via httpx ASGITransport. Procrastinate
+task deferral and file saving are mocked to avoid side effects.
+
+Requirements:
+  - Docker database must be running (docker compose up db)
+  - Alembic migrations must be applied
+"""
+
+import shutil
+import uuid
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import select, text
+
+from app.modules.auth.models import User
+from app.platform.jobs.models import IngestJob, commit_attempted_marker
+from tests.conftest import get_auth_header
+from tests.test_service_refresh_1220 import credential_backend  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# Module-scoped autouse mocks
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def mock_ingest_task():
+    """Prevent procrastinate task deferral in all ingest tests.
+
+    The router now delegates all task routing (ingest_file / ingest_raster
+    / ingest_service) to ``queue_ingest_job`` in the service layer. Mock that
+    single entry point so every commit_import path becomes a no-op.
+    """
+    with patch(
+        "app.processing.ingest.router.queue_ingest_job", new_callable=AsyncMock
+    ) as mock_task:
+        yield mock_task
+
+
+@pytest.fixture(autouse=True)
+def mock_file_save(tmp_path: Path):
+    """Save mocked uploads to a temp path so validation sees a real file."""
+    with patch(
+        "app.processing.ingest.router.save_upload_file", new_callable=AsyncMock
+    ) as mock_save:
+        # NOTE: `**_` absorbs production kwargs the mock doesn't model
+        # (e.g. ``max_size_bytes`` added in
+        # commit e11924c3). The tests using this fixture do not exercise
+        # the size-enforcement path, so silently ignoring the kwarg is
+        # the smallest-diff way to keep the mock signature future-proof.
+        async def _save_to_temp(file, job_id: str, **_) -> Path:
+            dest = tmp_path / f"{job_id}_{file.filename}"
+            dest.write_bytes(await file.read())
+            await file.seek(0)
+            return dest
+
+        mock_save.side_effect = _save_to_temp
+        yield mock_save
+
+
+# ---------------------------------------------------------------------------
+# Upload endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class TestUpload:
+    def test_upload_config_never_advertises_standalone_vrt(self):
+        from app.processing.ingest.upload_limits import without_standalone_vrt
+
+        assert without_standalone_vrt(".geojson, .VRT,.tif") == ".geojson,.tif"
+
+    async def test_upload_requires_auth(self, client: AsyncClient):
+        """POST /ingest/upload without token returns 401."""
+        resp = await client.post(
+            "/ingest/upload",
+            files={
+                "file": (
+                    "test.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+        )
+        assert resp.status_code == 401
+
+    async def test_upload_requires_editor_or_admin(
+        self, client: AsyncClient, viewer_auth_header: dict
+    ):
+        """POST /ingest/upload with viewer token returns 403."""
+        resp = await client.post(
+            "/ingest/upload",
+            files={
+                "file": (
+                    "test.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=viewer_auth_header,
+        )
+        assert resp.status_code == 403
+
+    async def test_upload_rejects_bad_extension(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """POST /ingest/upload with a .txt file returns 400."""
+        resp = await client.post(
+            "/ingest/upload",
+            files={"file": ("data.txt", b"some text content", "text/plain")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "disallowed_extension"
+        assert "not allowed" in detail["message"].lower()
+
+    async def test_upload_rejects_standalone_vrt_even_when_configured(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        resp = await client.post(
+            "/ingest/upload",
+            files={"file": ("unsafe.vrt", b"<VRTDataset/>", "application/xml")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail["code"] == "standalone_vrt_not_supported"
+        assert "standalone vrt" in detail["message"].lower()
+
+    async def test_s3_validation_download_failure_deletes_the_staged_source(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_file_save,
+    ):
+        """A failed validation download cannot orphan its just-written S3 key.
+
+        The job row is committed before the upload, so it stays `pending` with
+        nothing bound for the sweep to reap; the staged source is what must go.
+        """
+        source_filename = f"resolve-failure-{uuid.uuid4()}.geojson"
+        storage_key = f"staging/{uuid.uuid4()}/{source_filename}"
+        mock_file_save.side_effect = None
+        mock_file_save.return_value = storage_key
+        storage = AsyncMock()
+
+        with (
+            patch(
+                "app.processing.ingest.router.resolve_file_path",
+                new=AsyncMock(side_effect=RuntimeError("storage unavailable")),
+            ),
+            patch("app.platform.storage.get_storage", return_value=storage),
+        ):
+            response = await client.post(
+                "/ingest/upload",
+                files={
+                    "file": (
+                        source_filename,
+                        b'{"type":"FeatureCollection","features":[]}',
+                        "application/geo+json",
+                    )
+                },
+                headers=admin_auth_header,
+            )
+
+        assert response.status_code == 500
+        storage.delete.assert_awaited_once_with(storage_key)
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.source_filename == source_filename)
+        )
+        job = result.scalar_one_or_none()
+        assert job is not None
+        assert job.status == "pending"
+        assert not job.file_path
+
+    async def test_upload_success(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_ingest_task,
+        mock_file_save,
+        test_db_session,
+    ):
+        """POST /ingest/upload with valid file returns 201 with job_id."""
+        geojson = b'{"type":"FeatureCollection","features":[]}'
+        resp = await client.post(
+            "/ingest/upload",
+            files={"file": ("test.geojson", geojson, "application/json")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert "job_id" in data
+        assert data["status"] == "pending"
+
+        # Verify IngestJob record was created in DB
+        job_id = uuid.UUID(data["job_id"])
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.id == job_id)
+        )
+        job = result.scalar_one_or_none()
+        assert job is not None
+        assert job.status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# CSV upload tests
+# ---------------------------------------------------------------------------
+
+
+class TestCsvUpload:
+    async def test_csv_upload_success(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        mock_ingest_task,
+        mock_file_save,
+        test_db_session,
+    ):
+        """POST /ingest/upload with a valid CSV file returns 201 with job_id."""
+        csv_content = b"id,name,value\n1,Alice,100\n2,Bob,200\n"
+        resp = await client.post(
+            "/ingest/upload",
+            files={"file": ("data.csv", csv_content, "text/csv")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert "job_id" in data
+        assert data["status"] == "pending"
+
+        # Verify IngestJob record was created in DB
+        job_id = uuid.UUID(data["job_id"])
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.id == job_id)
+        )
+        job = result.scalar_one_or_none()
+        assert job is not None
+        assert job.status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Register endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class TestRegister:
+    async def test_register_requires_auth(self, client: AsyncClient):
+        """POST /ingest/register without token returns 401."""
+        resp = await client.post(
+            "/ingest/register/",
+            json={
+                "table_name": "nonexistent",
+                "title": "Test",
+            },
+        )
+        assert resp.status_code == 401
+
+    async def test_register_requires_editor_or_admin(
+        self, client: AsyncClient, viewer_auth_header: dict
+    ):
+        """POST /ingest/register with viewer token returns 403."""
+        resp = await client.post(
+            "/ingest/register/",
+            json={
+                "table_name": "nonexistent",
+                "title": "Test",
+            },
+            headers=viewer_auth_header,
+        )
+        assert resp.status_code == 403
+
+    async def test_register_nonexistent_table(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """POST /ingest/register with a table_name that doesn't exist returns 400."""
+        resp = await client.post(
+            "/ingest/register/",
+            json={
+                "table_name": "totally_nonexistent_table_xyz",
+                "title": "Bad Table",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400
+        assert "does not exist" in resp.json()["detail"].lower()
+
+    async def test_register_table_rejects_sql_injection(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """POST /ingest/register with SQL injection in table_name returns 400."""
+        resp = await client.post(
+            "/ingest/register/",
+            json={
+                "table_name": "test'; DROP TABLE data.users; --",
+                "title": "Exploit",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400
+        assert "invalid table name" in resp.json()["detail"].lower()
+
+    async def test_register_table_rejects_uppercase(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """POST /ingest/register with uppercase table_name returns 400."""
+        resp = await client.post(
+            "/ingest/register/",
+            json={
+                "table_name": "MyTable",
+                "title": "Bad",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400
+        assert "invalid table name" in resp.json()["detail"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Job status endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class TestJobStatus:
+    async def test_job_status_requires_auth(self, client: AsyncClient):
+        """GET /jobs/{id} without token returns 401."""
+        fake_id = str(uuid.uuid4())
+        resp = await client.get(f"/jobs/{fake_id}")
+        assert resp.status_code == 401
+
+    async def test_job_status_not_found(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """GET /jobs/{id} with auth for nonexistent job returns 404."""
+        fake_id = str(uuid.uuid4())
+        resp = await client.get(f"/jobs/{fake_id}", headers=admin_auth_header)
+        assert resp.status_code == 404
+
+    async def test_job_status_success(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """GET /jobs/{id} returns correct status for a job owned by the user."""
+        # Get admin user ID
+        from app.modules.auth.models import User
+
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin_user = result.scalar_one()
+
+        # Create an IngestJob directly in DB
+        job = IngestJob(
+            source_filename="test.geojson",
+            file_path="/tmp/fake.geojson",
+            created_by=admin_user.id,
+            status="complete",
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        resp = await client.get(f"/jobs/{job.id}", headers=admin_auth_header)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == str(job.id)
+        assert data["status"] == "complete"
+
+    async def test_job_status_forbidden_other_user(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Non-creator, non-admin user gets 404 on another user's job."""
+        # Get admin user ID
+        from app.modules.auth.models import User
+
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin_user = result.scalar_one()
+
+        # Create a job as admin
+        job = IngestJob(
+            source_filename="admin_file.geojson",
+            file_path="/tmp/fake.geojson",
+            created_by=admin_user.id,
+            status="pending",
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        # Create an editor user and try to access admin's job
+        unique = uuid.uuid4().hex[:8]
+        username = f"editor_jobtest_{unique}"
+        resp = await client.post(
+            "/admin/users/",
+            json={"username": username, "password": "TestPass1234!", "role": "editor"},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+
+        editor_headers = await get_auth_header(client, username, "TestPass1234!")
+        resp = await client.get(f"/jobs/{job.id}", headers=editor_headers)
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Job not found"
+
+    async def test_job_status_auto_fails_stale_pending(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """GET /jobs/{id} auto-fails a pending job older than 1 hour."""
+        from datetime import datetime, timedelta, timezone
+
+        from app.modules.auth.models import User
+
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin_user = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="stale.geojson",
+            file_path="/tmp/fake.geojson",
+            created_by=admin_user.id,
+            status="pending",
+            # A dispatch was attempted for this row and never
+            # landed, which is the class that keeps reporting `failed` so
+            # /jobs/{id}/retry stays reachable. Without the stamp the row is
+            # an upload nobody committed, and the poll cancels it.
+            user_metadata=commit_attempted_marker(),
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        # Backdate created_at to 2 hours ago
+        job.created_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        await test_db_session.commit()
+
+        resp = await client.get(f"/jobs/{job.id}", headers=admin_auth_header)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "failed"
+        assert "pending" in data["error_message"].lower()
+
+
+class TestJobCleanup:
+    async def test_cleanup_requires_admin(self, client: AsyncClient):
+        """POST /jobs/cleanup/stale without auth returns 401."""
+        resp = await client.post("/jobs/cleanup/stale/")
+        assert resp.status_code == 401
+
+    async def test_cleanup_stale_jobs(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """POST /jobs/cleanup/stale marks old pending jobs as failed."""
+        from datetime import datetime, timedelta, timezone
+
+        from app.modules.auth.models import User
+
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin_user = result.scalar_one()
+
+        # Create a stale pending job (2 hours old)
+        stale_job = IngestJob(
+            source_filename="stale.geojson",
+            created_by=admin_user.id,
+            status="pending",
+            # See the poll test above. `pending_failed` is the
+            # count this asserts, and an unstamped row lands in
+            # `pending_cancelled` instead.
+            user_metadata=commit_attempted_marker(),
+        )
+        test_db_session.add(stale_job)
+        await test_db_session.commit()
+        await test_db_session.refresh(stale_job)
+
+        stale_job.created_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        await test_db_session.commit()
+
+        # Create a fresh pending job (should NOT be cleaned up)
+        fresh_job = IngestJob(
+            source_filename="fresh.geojson",
+            created_by=admin_user.id,
+            status="pending",
+        )
+        test_db_session.add(fresh_job)
+        await test_db_session.commit()
+        await test_db_session.refresh(fresh_job)
+
+        resp = await client.post("/jobs/cleanup/stale/", headers=admin_auth_header)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["pending_failed"] >= 1
+
+        # Verify stale job is failed
+        await test_db_session.refresh(stale_job)
+        assert stale_job.status == "failed"
+
+        # Verify fresh job is still pending
+        await test_db_session.refresh(fresh_job)
+        assert fresh_job.status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# Non-spatial CSV pipeline tests
+# ---------------------------------------------------------------------------
+
+
+class TestCsvNonSpatialPipeline:
+    """End-to-end test for registering a non-spatial table and querying it."""
+
+    @pytest.fixture(autouse=True)
+    def mock_ingest_task(self):
+        """No-op override -- register path does not defer tasks."""
+        yield
+
+    @pytest.fixture(autouse=True)
+    def mock_file_save(self):
+        """No-op override -- register path does not save files."""
+        yield
+
+    async def test_csv_non_spatial_full_pipeline(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """Register a non-spatial table, verify record_type='table', query features."""
+        from sqlalchemy import text
+
+        table_name = "test_csv_nonspatial"
+
+        try:
+            # 1. Create non-spatial table in data schema (gid matches ogr2ogr default)
+            await test_db_session.execute(
+                text(
+                    f"CREATE TABLE data.{table_name} ("
+                    "  gid serial PRIMARY KEY,"
+                    "  name text,"
+                    "  value integer"
+                    ")"
+                )
+            )
+            await test_db_session.execute(
+                text(
+                    f"INSERT INTO data.{table_name} (name, value) VALUES "
+                    "('Alice', 100), ('Bob', 200)"
+                )
+            )
+            await test_db_session.commit()
+
+            # 2. Register via POST /ingest/register
+            resp = await client.post(
+                "/ingest/register/",
+                json={"table_name": table_name, "title": "Test CSV Table"},
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 201, resp.text
+            dataset_id = resp.json()["dataset_id"]
+
+            # 3. GET /datasets/{id} -- verify record_type and geometry_type
+            resp = await client.get(
+                f"/datasets/{dataset_id}",
+                headers=admin_auth_header,
+                follow_redirects=True,
+            )
+            assert resp.status_code == 200, (
+                f"Expected 200, got {resp.status_code}: {resp.text}"
+            )
+            ds = resp.json()
+            assert ds["record_type"] == "table"
+            assert ds["geometry_type"] is None
+
+            # 4. GET /datasets/{id}/features/ -- verify 2 rows returned
+            resp = await client.get(
+                f"/datasets/{dataset_id}/features/",
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 200
+            features = resp.json()
+            assert features["numberMatched"] == 2
+            names = {f["properties"]["name"] for f in features["features"]}
+            assert names == {"Alice", "Bob"}
+
+        finally:
+            # Clean up the test table
+            await test_db_session.execute(
+                text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+            )
+            await test_db_session.commit()
+
+    async def _register_nonspatial_table(
+        self, client, admin_auth_header, test_db_session, table_name, title="Test Table"
+    ):
+        """Helper: create a non-spatial table, register it, return (dataset_id, record_id)."""
+        from sqlalchemy import text
+
+        await test_db_session.execute(
+            text(
+                f"CREATE TABLE data.{table_name} ("
+                "  gid serial PRIMARY KEY,"
+                "  name text,"
+                "  value integer"
+                ")"
+            )
+        )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{table_name} (name, value) VALUES "
+                "('Alice', 100), ('Bob', 200)"
+            )
+        )
+        await test_db_session.commit()
+
+        resp = await client.post(
+            "/ingest/register/",
+            json={"table_name": table_name, "title": title},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201, resp.text
+        dataset_id = resp.json()["dataset_id"]
+
+        resp = await client.get(
+            f"/datasets/{dataset_id}",
+            headers=admin_auth_header,
+            follow_redirects=True,
+        )
+        assert resp.status_code == 200
+        record_id = resp.json()["record_id"]
+
+        return dataset_id, record_id
+
+    @pytest.mark.parametrize(
+        "table_name,title",
+        [
+            ("test_csv_nonspatial_dists", "Test CSV Dists"),
+            ("test_xlsx_nonspatial", "Test XLSX Table"),
+        ],
+    )
+    async def test_non_spatial_distributions(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        table_name: str,
+        title: str,
+    ):
+        """Non-spatial tables should produce only csv download + ogc_features distributions."""
+        from sqlalchemy import text
+
+        try:
+            _, record_id = await self._register_nonspatial_table(
+                client, admin_auth_header, test_db_session, table_name, title
+            )
+
+            resp = await client.get(
+                f"/records/{record_id}/distributions/",
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 200
+            distributions = resp.json()["distributions"]
+
+            dist_types = [
+                (d["distribution_type"], d.get("format")) for d in distributions
+            ]
+            assert ("download", "csv") in dist_types
+            assert ("ogc_features", "geojson") in dist_types
+            assert len(distributions) == 2, (
+                f"Expected 2 distributions, got {len(distributions)}: {dist_types}"
+            )
+            assert ("download", "gpkg") not in dist_types
+            assert ("download", "geojson") not in dist_types
+            assert ("download", "shp") not in dist_types
+            assert ("vector_tiles", "pbf") not in dist_types
+
+        finally:
+            await test_db_session.execute(
+                text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+            )
+            await test_db_session.commit()
+
+    async def test_non_spatial_ogc_items(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """OGC items endpoint returns features with geometry:null for non-spatial dataset."""
+        from sqlalchemy import text
+
+        table_name = "test_nonspatial_ogc"
+
+        try:
+            dataset_id, _ = await self._register_nonspatial_table(
+                client,
+                admin_auth_header,
+                test_db_session,
+                table_name,
+                "Test OGC NonSpatial",
+            )
+
+            resp = await client.get(
+                f"/collections/{dataset_id}/items",
+                headers=admin_auth_header,
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["numberMatched"] == 2
+            for feature in data["features"]:
+                assert feature["geometry"] is None
+
+        finally:
+            await test_db_session.execute(
+                text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+            )
+            await test_db_session.commit()
+
+
+async def _get_admin_id_for_ingest(session):
+    """Helper to get admin user id for these tests."""
+    from tests.factories import get_user_id
+
+    return await get_user_id(session, "admin")
+
+
+# ---------------------------------------------------------------------------
+# A non-spatial ArcGIS service load keeps its attribute columns
+# ---------------------------------------------------------------------------
+
+# An ArcGIS Table layer's query response: attributes, with no geometry.
+_NONSPATIAL_ESRIJSON = """{
+  "objectIdFieldName": "OBJECTID",
+  "fields": [
+    {"name": "OBJECTID", "type": "esriFieldTypeOID", "alias": "OBJECTID"},
+    {"name": "NAME", "type": "esriFieldTypeString", "alias": "NAME", "length": 255},
+    {"name": "SCORE", "type": "esriFieldTypeDouble", "alias": "SCORE"}
+  ],
+  "features": [
+    {"attributes": {"OBJECTID": 1, "NAME": "Alpha", "SCORE": 1.5}},
+    {"attributes": {"OBJECTID": 2, "NAME": "Bravo", "SCORE": 2.5}}
+  ]
+}"""
+
+
+@pytest.mark.skipif(
+    shutil.which("ogr2ogr") is None,
+    reason="ogr2ogr binary not available on host (runs in backend Docker image / CI)",
+)
+@pytest.mark.requires_ogr2ogr
+async def test_nonspatial_arcgis_service_load_keeps_attribute_columns(
+    test_db_session, tmp_path
+):
+    """A non-spatial ArcGIS table keeps its attribute columns, not only gid."""
+    from app.processing.ingest.metadata import get_column_info
+    from app.processing.ingest.ogr import build_pg_conn_str, run_ogr2ogr_service
+
+    fixture = tmp_path / "nonspatial.json"
+    fixture.write_text(_NONSPATIAL_ESRIJSON)
+    table_name = f"tbl_arcgis_ns_{uuid.uuid4().hex[:10]}"
+
+    try:
+        await run_ogr2ogr_service(
+            gdal_source=f"ESRIJSON:{fixture}",
+            layer_name="",
+            table_name=table_name,
+            db_conn_str=build_pg_conn_str(),
+            service_type="arcgis_featureserver",
+            is_non_spatial=True,
+            schema="data",
+        )
+
+        columns = await get_column_info(test_db_session, table_name, schema="data")
+        names = {c["name"] for c in columns}
+        assert names == {"objectid", "name", "score"}
+    finally:
+        await test_db_session.execute(
+            text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+        )
+        await test_db_session.commit()
+
+
+# ---------------------------------------------------------------------------
+# published_at must match the FINAL record_status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_finalize_ingest_non_published_status_has_no_published_at(
+    test_db_session,
+):
+    """create_dataset defaults the record to 'published',
+    so the before_insert hook stamps published_at BEFORE _finalize_ingest
+    overwrites record_status from user_metadata — a manifest/vector ingest
+    finalizing as draft/ready/internal must not keep a bogus publication
+    timestamp."""
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from app.modules.catalog.datasets.domain.models import Dataset
+    from app.processing.ingest.tasks import IngestContext, _finalize_ingest
+    from app.platform.jobs.models import IngestJob
+
+    admin_id = await _get_admin_id_for_ingest(test_db_session)
+
+    async def _run(record_status: str | None) -> tuple[str, object]:
+        user_metadata = {
+            "title": f"Status Stamp {record_status or 'default'}",
+            "visibility": "private",
+        }
+        if record_status is not None:
+            user_metadata["record_status"] = record_status
+        job = IngestJob(
+            source_filename="status.csv",
+            created_by=admin_id,
+            status="running",
+            user_metadata=user_metadata,
+        )
+        test_db_session.add(job)
+        await test_db_session.flush()
+        table_name = f"tbl_status_{_uuid.uuid4().hex[:10]}"
+        await test_db_session.execute(
+            text(
+                f"CREATE TABLE IF NOT EXISTS data.{table_name} "
+                "(gid serial PRIMARY KEY, name text)"
+            )
+        )
+        await test_db_session.commit()
+        await _finalize_ingest(
+            IngestContext(
+                session=test_db_session,
+                job=job,
+                table_name=table_name,
+                user_id=str(admin_id),
+                has_geometry=False,
+                effective_srid=None,
+                source_format="csv",
+                source_filename="status.csv",
+                original_srid=None,
+                user_metadata=user_metadata,
+            )
+        )
+        from sqlalchemy import select
+
+        dataset = (
+            await test_db_session.execute(
+                select(Dataset).where(Dataset.table_name == table_name)
+            )
+        ).scalar_one()
+        return table_name, dataset.record
+
+    tables = []
+    try:
+        table, record = await _run("ready")
+        tables.append(table)
+        assert record.record_status == "ready"
+        assert record.published_at is None, (
+            "non-published ingest kept the before_insert published_at stamp"
+        )
+
+        table, record = await _run(None)  # default -> published
+        tables.append(table)
+        assert record.record_status == "published"
+        assert record.published_at is not None
+    finally:
+        await test_db_session.rollback()
+        async with test_db_session.begin_nested():
+            for table in tables:
+                await test_db_session.execute(
+                    text(f"DROP TABLE IF EXISTS data.{table} CASCADE")
+                )
+
+
+# ---------------------------------------------------------------------------
+# K1 — ingest_file phase helpers (_detect_and_override_geometry, _archive_original_file)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_detect_and_override_geometry_returns_none_when_no_override(
+    test_db_session,
+):
+    """Empty user_metadata → helper is a no-op returning None."""
+    from app.processing.ingest.tasks import _detect_and_override_geometry
+
+    geom_type = await _detect_and_override_geometry(
+        test_db_session,
+        table_name="ignored",
+        user_metadata={},
+        effective_srid=4326,
+    )
+    assert geom_type is None
+
+
+@pytest.mark.anyio
+async def test_detect_and_override_geometry_x_y_constructs_point(test_db_session):
+    """x_column + y_column metadata triggers construct_point_geometry."""
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from app.processing.ingest.tasks import _detect_and_override_geometry
+
+    table_name = f"tst_xygeom_{_uuid.uuid4().hex[:8]}"
+    await test_db_session.execute(
+        text(
+            f"CREATE TABLE data.{table_name} ("
+            "  gid SERIAL PRIMARY KEY,"
+            "  lon DOUBLE PRECISION,"
+            "  lat DOUBLE PRECISION"
+            ")"
+        )
+    )
+    await test_db_session.execute(
+        text(f"INSERT INTO data.{table_name} (lon, lat) VALUES (2.35, 48.85)")
+    )
+    await test_db_session.commit()
+
+    try:
+        geom_type = await _detect_and_override_geometry(
+            test_db_session,
+            table_name=table_name,
+            user_metadata={"x_column": "lon", "y_column": "lat"},
+            effective_srid=4326,
+        )
+        assert geom_type == "Point"
+
+        # Verify a geom column was actually created and populated.
+        col_check = await test_db_session.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='data' AND table_name=:t AND column_name='geom'"
+            ).bindparams(t=table_name)
+        )
+        assert col_check.scalar_one_or_none() == "geom"
+
+        geom_check = await test_db_session.execute(
+            text(f"SELECT ST_AsText(geom) FROM data.{table_name} WHERE gid=1")
+        )
+        wkt = geom_check.scalar_one()
+        assert wkt.startswith("POINT(")
+    finally:
+        await test_db_session.execute(
+            text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+        )
+        await test_db_session.commit()
+
+
+@pytest.mark.anyio
+async def test_detect_and_override_geometry_x_y_non_numeric_x_raises(test_db_session):
+    """A CSV whose X column ogr2ogr typed as text (mixed content) raises
+    'not numbers' rather than letting a bad cast reach the database driver."""
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from app.processing.ingest.tasks import _detect_and_override_geometry
+
+    table_name = f"tst_xytext_{_uuid.uuid4().hex[:8]}"
+    await test_db_session.execute(
+        text(
+            f"CREATE TABLE data.{table_name} ("
+            "  gid SERIAL PRIMARY KEY,"
+            "  lon text,"
+            "  lat text"
+            ")"
+        )
+    )
+    await test_db_session.execute(
+        text(f"INSERT INTO data.{table_name} (lon, lat) VALUES ('west', '40.7')")
+    )
+    await test_db_session.commit()
+
+    try:
+        with pytest.raises(ValueError, match="not numbers"):
+            await _detect_and_override_geometry(
+                test_db_session,
+                table_name=table_name,
+                user_metadata={"x_column": "lon", "y_column": "lat"},
+                effective_srid=4326,
+            )
+    finally:
+        await test_db_session.rollback()
+        await test_db_session.execute(
+            text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+        )
+        await test_db_session.commit()
+
+
+@pytest.mark.anyio
+async def test_detect_and_override_geometry_uppercase_column_names_lowered(
+    test_db_session,
+):
+    """ogr2ogr lowercases column names; helper must match regardless of input case."""
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from app.processing.ingest.tasks import _detect_and_override_geometry
+
+    table_name = f"tst_xyupper_{_uuid.uuid4().hex[:8]}"
+    await test_db_session.execute(
+        text(
+            f"CREATE TABLE data.{table_name} ("
+            "  gid SERIAL PRIMARY KEY,"
+            "  lon DOUBLE PRECISION,"
+            "  lat DOUBLE PRECISION"
+            ")"
+        )
+    )
+    await test_db_session.execute(
+        text(f"INSERT INTO data.{table_name} (lon, lat) VALUES (-0.13, 51.51)")
+    )
+    await test_db_session.commit()
+
+    try:
+        # Uppercase input — helper lowercases before querying.
+        geom_type = await _detect_and_override_geometry(
+            test_db_session,
+            table_name=table_name,
+            user_metadata={"x_column": "LON", "y_column": "LAT"},
+            effective_srid=4326,
+        )
+        assert geom_type == "Point"
+    finally:
+        await test_db_session.execute(
+            text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+        )
+        await test_db_session.commit()
+
+
+@pytest.mark.anyio
+async def test_detect_and_override_geometry_wkt_column_detects_type(test_db_session):
+    """geom_column metadata triggers construct_wkt_geometry and re-detects type."""
+    import uuid as _uuid
+
+    from sqlalchemy import text
+
+    from app.processing.ingest.tasks import _detect_and_override_geometry
+
+    table_name = f"tst_wktgeom_{_uuid.uuid4().hex[:8]}"
+    await test_db_session.execute(
+        text(
+            f"CREATE TABLE data.{table_name} ("
+            "  gid SERIAL PRIMARY KEY,"
+            "  wkt_field TEXT"
+            ")"
+        )
+    )
+    await test_db_session.execute(
+        text(
+            f"INSERT INTO data.{table_name} (wkt_field) "
+            "VALUES ('LINESTRING(0 0, 1 1, 2 2)')"
+        )
+    )
+    await test_db_session.commit()
+
+    try:
+        geom_type = await _detect_and_override_geometry(
+            test_db_session,
+            table_name=table_name,
+            user_metadata={"geom_column": "wkt_field"},
+            effective_srid=4326,
+        )
+        # Re-detected from the constructed column — PostGIS GeometryType()
+        # returns the uppercase short form (LINESTRING/POLYGON/etc).
+        assert geom_type == "LINESTRING"
+    finally:
+        await test_db_session.execute(
+            text(f"DROP TABLE IF EXISTS data.{table_name} CASCADE")
+        )
+        await test_db_session.commit()
+
+
+@pytest.mark.anyio
+async def test_detect_and_override_geometry_empty_strings_treated_as_absent(
+    test_db_session,
+):
+    """Empty strings must not trigger the override path — they mean 'not set'."""
+    from app.processing.ingest.tasks import _detect_and_override_geometry
+
+    geom_type = await _detect_and_override_geometry(
+        test_db_session,
+        table_name="ignored",
+        user_metadata={"x_column": "", "y_column": "", "geom_column": ""},
+        effective_srid=4326,
+    )
+    assert geom_type is None
+
+
+# ---------------------------------------------------------------------------
+# _archive_original_file tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_archive_original_file_success_leaves_user_metadata_untouched(
+    tmp_path, monkeypatch
+):
+    """Happy path: storage.put succeeds, job.user_metadata is NOT mutated."""
+    import uuid as _uuid
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.processing.ingest.tasks import _archive_original_file
+
+    # Create a real file to upload.
+    upload_file = tmp_path / "roads.geojson"
+    upload_file.write_text('{"type":"FeatureCollection","features":[]}')
+
+    put_calls = []
+
+    mock_storage = AsyncMock()
+    mock_storage.put = AsyncMock(side_effect=lambda key, fobj: put_calls.append(key))
+
+    monkeypatch.setattr(
+        "app.processing.ingest.tasks_staging.get_storage", lambda: mock_storage
+    )
+
+    mock_session = AsyncMock()
+    mock_session.commit = AsyncMock()
+
+    job = MagicMock()
+    job.user_metadata = {"title": "Roads", "summary": "test"}
+
+    dataset_id = _uuid.uuid4()
+
+    await _archive_original_file(
+        mock_session,
+        job=job,
+        dataset_id=dataset_id,
+        file_path=str(upload_file),
+    )
+
+    # Storage.put called with expected key format
+    assert len(put_calls) == 1
+    assert put_calls[0] == f"originals/{dataset_id}/roads.geojson"
+
+    # user_metadata untouched on success
+    assert job.user_metadata == {"title": "Roads", "summary": "test"}
+    assert "archive_failed" not in job.user_metadata
+
+
+async def _fail_an_archive(
+    test_db_session, tmp_path, monkeypatch, *, error, metadata, attempt_moves=False
+):
+    """Archive a job's upload into a store whose put raises ``error``.
+
+    With ``attempt_moves`` another attempt takes the job during the put.
+    Returns the job's stored metadata and what its loaded instance shows.
+    """
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy import delete
+
+    import app.core.db as db_module
+    from app.processing.ingest.tasks import _archive_original_file
+
+    upload_file = tmp_path / "cities.csv"
+    upload_file.write_text("name,lat,lng\nParis,48.85,2.35\n")
+
+    async def _put(key, fobj):
+        if attempt_moves:
+            async with db_module.async_session() as other:
+                await other.execute(
+                    text(
+                        "UPDATE catalog.ingest_jobs SET attempt_id = gen_random_uuid() "
+                        "WHERE id = :id"
+                    ),
+                    {"id": job_id},
+                )
+                await other.commit()
+        raise RuntimeError(error)
+
+    mock_storage = AsyncMock()
+    mock_storage.put = _put
+    monkeypatch.setattr(
+        "app.processing.ingest.tasks_staging.get_storage", lambda: mock_storage
+    )
+    job = IngestJob(
+        status="complete",
+        created_by=await _get_admin_id_for_ingest(test_db_session),
+        user_metadata=metadata,
+    )
+    test_db_session.add(job)
+    await test_db_session.flush()
+    job_id = job.id
+    await test_db_session.commit()
+    try:
+        async with db_module.async_session() as session:
+            loaded = await session.get(IngestJob, job_id)
+            archived = await _archive_original_file(
+                session,
+                job=loaded,
+                dataset_id=uuid.uuid4(),
+                file_path=str(upload_file),
+            )
+            assert archived is False
+            shown = loaded.user_metadata
+        async with db_module.async_session() as session:
+            stored = await session.scalar(
+                select(IngestJob.user_metadata).where(IngestJob.id == job_id)
+            )
+        return stored, shown
+    finally:
+        await test_db_session.execute(delete(IngestJob).where(IngestJob.id == job_id))
+        await test_db_session.commit()
+
+
+@pytest.mark.anyio
+async def test_archive_original_file_failure_merges_its_flag_into_the_stored_metadata(
+    test_db_session, tmp_path, monkeypatch
+):
+    """A failed put adds ``archive_failed`` and ``archive_error`` and keeps the rest."""
+    stored, shown = await _fail_an_archive(
+        test_db_session,
+        tmp_path,
+        monkeypatch,
+        error="S3 unreachable",
+        metadata={"title": "Cities"},
+    )
+
+    assert stored["archive_failed"] is True
+    assert "S3 unreachable" in stored["archive_error"]
+    assert stored["title"] == "Cities"
+    assert shown == stored
+
+
+@pytest.mark.anyio
+async def test_archive_original_file_failure_lands_nothing_once_another_attempt_owns_the_job(
+    test_db_session, tmp_path, monkeypatch
+):
+    stored, shown = await _fail_an_archive(
+        test_db_session,
+        tmp_path,
+        monkeypatch,
+        error="S3 unreachable",
+        metadata={"title": "Cities"},
+        attempt_moves=True,
+    )
+
+    assert stored == shown == {"title": "Cities"}
+
+
+@pytest.mark.anyio
+async def test_archive_original_file_commit_failure_does_not_raise(
+    tmp_path, monkeypatch
+):
+    """Regression: commit failure after archive failure must not raise.
+
+    Before fix: if storage.put raised AND then session.commit raised (e.g. a
+    transient pooler drop), the unguarded commit propagated out of the helper
+    and flipped the already-successful ingest into a 'failed' job via the
+    outer task try/except. The dataset was already committed, so Procrastinate
+    would re-run the whole pipeline on retry and produce duplicate datasets.
+
+    After fix: the metadata commit is in its own try/except so commit failures
+    are logged and dropped — the dataset stays successful.
+    """
+    import uuid as _uuid
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.processing.ingest.tasks import _archive_original_file
+
+    upload_file = tmp_path / "fragile.geojson"
+    upload_file.write_text('{"type":"FeatureCollection","features":[]}')
+
+    mock_storage = AsyncMock()
+    mock_storage.put = AsyncMock(side_effect=RuntimeError("S3 unreachable"))
+    monkeypatch.setattr(
+        "app.processing.ingest.tasks_staging.get_storage", lambda: mock_storage
+    )
+
+    mock_session = AsyncMock()
+    # Commit fails — simulate a pooler drop or deadlock.
+    mock_session.commit = AsyncMock(side_effect=RuntimeError("pooler dropped"))
+    mock_session.rollback = AsyncMock()
+
+    job = MagicMock()
+    job.id, job.attempt_id = _uuid.uuid4(), _uuid.uuid4()
+    job.user_metadata = {"title": "Fragile"}
+    dataset_id = _uuid.uuid4()
+
+    # Must NOT raise — both the archive put AND the metadata commit failed.
+    await _archive_original_file(
+        mock_session,
+        job=job,
+        dataset_id=dataset_id,
+        file_path=str(upload_file),
+    )
+
+    # Nothing in memory claims a flag that never persisted.
+    assert job.user_metadata == {"title": "Fragile"}
+    # Rollback was called so the session is clean for the caller.
+    mock_session.rollback.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_archive_original_file_failure_truncates_long_error(
+    test_db_session, tmp_path, monkeypatch
+):
+    """Very long error messages are truncated to 500 chars to avoid JSONB bloat."""
+    stored, _ = await _fail_an_archive(
+        test_db_session, tmp_path, monkeypatch, error="X" * 2000, metadata=None
+    )
+
+    assert stored["archive_failed"] is True
+    assert len(stored["archive_error"]) == 500
+
+
+# ---------------------------------------------------------------------------
+# queue_ingest_job orphan-guard (extension)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["file", "service", "raster"])
+async def test_queue_ingest_job_defer_failure_marks_job_failed(
+    test_db_session, tmp_path, kind
+):
+    """A queue outage at each ingest task fails the committed job and answers 503."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from fastapi import HTTPException
+
+    from app.platform.jobs.models import IngestJob
+    from app.processing.ingest.service import queue_ingest_job
+
+    upload = tmp_path / ("dem.tif" if kind == "raster" else "cities.geojson")
+    upload.write_text('{"type":"FeatureCollection","features":[]}')
+    job = IngestJob(
+        source_filename=upload.name,
+        status="pending",
+        file_path=None if kind == "service" else str(upload),
+        source_url=(
+            "https://example.com/services/arcgis/0" if kind == "service" else None
+        ),
+        source_layer="parcels" if kind == "service" else None,
+        user_metadata={"file_type": "raster"} if kind == "raster" else None,
+    )
+    test_db_session.add(job)
+    await test_db_session.commit()
+    job_id = job.id
+
+    task = MagicMock()
+    task.defer_async = AsyncMock(side_effect=RuntimeError("procrastinate unreachable"))
+    # A small vector file goes to the priority queue through `configure`.
+    task.configure = MagicMock(return_value=task)
+    target = {
+        "file": "ingest_file",
+        "service": "ingest_service",
+        "raster": "ingest_raster",
+    }
+
+    with patch(f"app.processing.ingest.tasks.{target[kind]}", task):
+        with pytest.raises(HTTPException) as exc_info:
+            await queue_ingest_job(job, "user-id", db=test_db_session)
+
+    assert exc_info.value.status_code == 503
+    row = await test_db_session.get(IngestJob, job_id, populate_existing=True)
+    assert row.status == "failed"
+    assert row.error_message == "Failed to queue ingest task (RuntimeError)"
+    assert row.completed_at is not None
+
+
+class TestCommitImportDispatch:
+    """Direct router coverage for POST /ingest/commit/{job_id} (the
+    endpoint had no direct tests before this class)."""
+
+    async def test_vector_job_commits_with_vector_body(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_ingest_task,  # explicit to make the assertion visible
+    ) -> None:
+        """Vector job + vector body -> 202 + queue_ingest_job called."""
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="roads.geojson",
+            file_path="/tmp/fake.geojson",
+            created_by=admin.id,
+            status="pending",
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        resp = await client.post(
+            f"/ingest/commit/{job.id}",
+            json={
+                "title": "Roads",
+                "summary": "Street centerlines",
+                "srid_override": 4326,
+                "x_column": "lon",
+                "y_column": "lat",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 202, resp.text
+        data = resp.json()
+        assert data["job_id"] == str(job.id)
+        assert data["status"] == "pending"
+        assert mock_ingest_task.await_count == 1
+
+    async def test_raster_job_commits_with_raster_body(
+        self, client, admin_auth_header, test_db_session, mock_ingest_task
+    ) -> None:
+        """Raster job + raster body -> 202 + queue_ingest_job called."""
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="dem.tif",
+            file_path="/tmp/fake.tif",
+            created_by=admin.id,
+            status="pending",
+            user_metadata={"file_type": "raster"},  # the raster discriminator
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        resp = await client.post(
+            f"/ingest/commit/{job.id}",
+            json={
+                "title": "Elevation",
+                "compression": "LZW",
+                "resampling": "bilinear",
+                "srid_override": 3857,
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 202, resp.text
+        assert mock_ingest_task.await_count == 1
+        # Verify raster-only fields made it into user_metadata
+        await test_db_session.refresh(job)
+        assert job.user_metadata["compression"] == "LZW"
+        assert job.user_metadata["resampling"] == "bilinear"
+
+    @pytest.mark.parametrize("sent", [True, False])
+    async def test_strict_cog_sent_by_a_caller_reaches_the_worker(
+        self, client, admin_auth_header, test_db_session, mock_ingest_task, sent
+    ) -> None:
+        """``user_metadata["strict_cog"]`` is what the raster tasks read."""
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="dem.tif",
+            file_path="/tmp/fake.tif",
+            created_by=admin.id,
+            status="pending",
+            user_metadata={"file_type": "raster"},
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        resp = await client.post(
+            f"/ingest/commit/{job.id}",
+            json={"title": "Elevation", "strict_cog": sent},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 202, resp.text
+        await test_db_session.refresh(job)
+        assert job.user_metadata["strict_cog"] is sent
+
+    async def test_strict_cog_with_a_rewriting_option_is_refused(
+        self, client, admin_auth_header, test_db_session, mock_ingest_task
+    ) -> None:
+        """The four options are applied by a conversion, so the
+        combination is refused instead of converting behind the flag."""
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="dem.tif",
+            file_path="/tmp/fake.tif",
+            created_by=admin.id,
+            status="pending",
+            user_metadata={"file_type": "raster"},
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        resp = await client.post(
+            f"/ingest/commit/{job.id}",
+            json={"title": "Elevation", "strict_cog": True, "compression": "LZW"},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422, resp.text
+        assert "compression" in resp.text
+        assert mock_ingest_task.await_count == 0
+        await test_db_session.refresh(job)
+        assert job.status == "pending"
+        assert "strict_cog" not in (job.user_metadata or {})
+
+    async def test_a_vector_job_still_commits_the_same_body(
+        self, client, admin_auth_header, test_db_session, mock_ingest_task
+    ) -> None:
+        """The refusal is the raster subclass's, so a vector job
+        keeps dropping the raster fields it was always sent."""
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="roads.geojson",
+            file_path="/tmp/fake.geojson",
+            created_by=admin.id,
+            status="pending",
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        resp = await client.post(
+            f"/ingest/commit/{job.id}",
+            json={
+                "title": "Roads",
+                "strict_cog": True,
+                "compression": "LZW",
+                "srid_override": 3857,
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 202, resp.text
+        await test_db_session.refresh(job)
+        assert job.user_metadata["srid_override"] == 3857
+        assert "strict_cog" not in job.user_metadata
+
+    async def test_service_job_commits_with_service_body(
+        self,
+        client,
+        admin_auth_header,
+        test_db_session,
+        mock_ingest_task,
+        credential_backend,  # noqa: F811
+    ) -> None:
+        """Service job + service body -> 202 + queue_ingest_job called with token kwarg."""
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="TestLayer",
+            source_url="https://example.arcgis.com/FeatureServer/0",  # service discriminator
+            source_layer="0",
+            created_by=admin.id,
+            status="pending",
+            user_metadata={
+                "service_type": "ArcGIS:FeatureServer",
+                "layer_id": 0,
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        # A change (commit f8c91297) added a commit-time
+        # SSRF re-validation of ``job.source_url`` in ``commit_import``
+        # (router.py:640-652) via a LAZY import:
+        #     from app.platform.security import validate_url_for_ssrf
+        # The lazy from-import re-binds the symbol on every call, so the
+        # patch target MUST be the function's defining module (NOT the
+        # router's namespace). The test URL ``example.arcgis.com`` fails
+        # DNS resolution in the test sandbox, which is unrelated to this
+        # test's contract (job-discriminator + token-kwarg dispatch), so
+        # we no-op the gate via AsyncMock.
+        with patch(
+            "app.platform.security.validate_url_for_ssrf",
+            new=AsyncMock(),
+        ):
+            resp = await client.post(
+                f"/ingest/commit/{job.id}",
+                json={
+                    "title": "Federal Grants",
+                    "summary": "Opportunities",
+                    "token": "bearer-abc",
+                },
+                headers=admin_auth_header,
+            )
+        assert resp.status_code == 202, resp.text
+        assert mock_ingest_task.await_count == 1
+        # The credential must be forwarded as a kwarg, not persisted to
+        # metadata. It is a `ServiceCredential` rather than a
+        # bare token, so the queue composes the wire value against the job's
+        # own service format; the flat `token` field still means a bearer one.
+        call_kwargs = mock_ingest_task.await_args.kwargs
+        assert call_kwargs["credential"].token == "bearer-abc"
+        assert call_kwargs["credential"].method == "bearer"
+        await test_db_session.refresh(job)
+        assert "token" not in (job.user_metadata or {})
+        assert "auth" not in (job.user_metadata or {})
+        assert job.user_metadata["service_auth_required"] is True
+
+    async def test_vector_job_with_kitchen_sink_body_silently_ignores_extras(
+        self, client, admin_auth_header, test_db_session, mock_ingest_task
+    ) -> None:
+        """Vector job + kitchen-sink body (mixed vector/raster/service fields) -> 202.
+
+        Regression test: the frontend may send irrelevant fields
+        and the server must silently ignore them, not 422.
+        """
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="mixed.geojson",
+            file_path="/tmp/fake.geojson",
+            created_by=admin.id,
+            status="pending",
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        resp = await client.post(
+            f"/ingest/commit/{job.id}",
+            json={
+                "title": "Mixed",
+                # vector-applicable
+                "x_column": "lon",
+                "y_column": "lat",
+                # raster-only (should be dropped)
+                "compression": "LZW",
+                "resampling": "bilinear",
+                "nodata_override": -9999,
+                # service-only (should be dropped from metadata)
+                "token": "leaked-token",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 202, resp.text
+        assert mock_ingest_task.await_count == 1
+
+        # queue_ingest_job was called with token=None (not "leaked-token")
+        # because vector subclass has no token field and nothing set it.
+        call_kwargs = mock_ingest_task.await_args.kwargs
+        assert call_kwargs.get("token") is None
+
+        # user_metadata does NOT contain the raster-only fields or token
+        await test_db_session.refresh(job)
+        meta = job.user_metadata or {}
+        assert "compression" not in meta
+        assert "resampling" not in meta
+        assert "nodata_override" not in meta
+        assert "token" not in meta
+        assert meta["x_column"] == "lon"
+        assert meta["y_column"] == "lat"
+
+    async def test_commit_missing_title_returns_422(
+        self, client, admin_auth_header, test_db_session, mock_ingest_task
+    ) -> None:
+        """Missing required 'title' returns 422 via the project's Problem
+        Details handler.
+
+        The project overrides FastAPI's default RequestValidationError handler
+        in ``app/ogc/errors.py`` to produce an RFC 7807 Problem Details envelope
+        (``title``, ``status``, ``detail``). Using ``RequestValidationError``
+        (not ``HTTPException(422)``) in the handler refactor ensures the
+        envelope shape is consistent with every other 422 in the API — which
+        is the whole point.
+        """
+        result = await test_db_session.execute(
+            select(User).where(User.username == "admin")
+        )
+        admin = result.scalar_one()
+
+        job = IngestJob(
+            source_filename="f.geojson",
+            file_path="/tmp/fake.geojson",
+            created_by=admin.id,
+            status="pending",
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+
+        resp = await client.post(
+            f"/ingest/commit/{job.id}",
+            json={"summary": "no title"},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        # Project envelope: RFC 7807 Problem Details with flat ``detail`` string
+        assert body["title"] == "Validation Error"
+        assert body["status"] == 422
+        assert "title" in body["detail"]  # e.g. "body.title: Field required"
+        assert "Field required" in body["detail"] or "required" in body["detail"]
+        assert mock_ingest_task.await_count == 0
+
+
+# ---------------------------------------------------------------------------
+# The auth_required marker on a first service import
+# ---------------------------------------------------------------------------
+
+
+class TestServiceImportAuthRequiredMarker:
+    """A token-bearing first import records that the origin wanted one.
+
+    The marker is what lets the refresh door refuse a credential-less refresh
+    of an org-only service instead of answering 202 and failing in the worker
+    half a second later. It is written HERE, at the swap, from the credential
+    the fetch actually used — a request door only ever knows a token was
+    offered, which is a different claim.
+    """
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "worker_token",
+        ["service-token", None],
+        ids=["with_token", "without_token"],
+    )
+    async def test_the_swap_marks_only_a_token_bearing_import(
+        self,
+        client: AsyncClient,  # points app.core.db.async_session at the test DB
+        test_db_session,
+        monkeypatch,
+        worker_token: str | None,
+    ) -> None:
+        from sqlalchemy import text
+
+        import app.core.db as db_module
+        from app.modules.catalog.datasets.domain.models import Dataset
+        from app.processing.ingest import tasks_vector
+        from app.platform.jobs.heartbeat import attempt_scoped_staging_table
+        from tests.factories import get_user_id
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        table_name = f"tbl_svc_{uuid.uuid4().hex[:8]}"
+
+        job = IngestJob(
+            source_filename="Roads",
+            source_url="https://services.example.com/svc/FeatureServer",
+            source_layer="0",
+            created_by=admin_id,
+            status="pending",
+            user_metadata={
+                "title": f"Roads {uuid.uuid4().hex[:6]}",
+                "visibility": "private",
+                "service_type": "ArcGIS FeatureServer",
+                "layer_id": "0",
+                "geometry_type": None,
+                "item_id": "a" * 32,
+                "portal_url": "https://org.maps.arcgis.com",
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+        await test_db_session.refresh(job)
+        attempt_id = job.attempt_id
+        assert attempt_id is not None
+
+        staging = attempt_scoped_staging_table(table_name, attempt_id)
+
+        async def _fake_generate_table_name(*_args, **_kwargs):
+            return table_name, None
+
+        async def _fake_import(_import_fn, _source_layer, **_kwargs) -> None:
+            """Stands in for the whole fetch: just land the staging table."""
+            async with db_module.async_session() as session:
+                await session.execute(text(f'DROP TABLE IF EXISTS data."{staging}"'))
+                await session.execute(
+                    text(
+                        f'CREATE TABLE data."{staging}" '
+                        "(gid serial PRIMARY KEY, name text)"
+                    )
+                )
+                await session.commit()
+
+        async def _noop(*_args, **_kwargs) -> None:
+            return None
+
+        monkeypatch.setattr("app.platform.security.validate_url_for_ssrf", AsyncMock())
+        monkeypatch.setattr(
+            "app.processing.ingest.service.generate_table_name",
+            _fake_generate_table_name,
+        )
+        monkeypatch.setattr(
+            "app.processing.ingest.ogr.build_pg_conn_str", lambda: "PG:"
+        )
+        monkeypatch.setattr(
+            tasks_vector, "_run_service_import_with_wfs_fallback", _fake_import
+        )
+        monkeypatch.setattr(
+            "app.processing.ingest.publish_followups._emit_billing_event", _noop
+        )
+
+        with (
+            patch(
+                "app.processing.ingest.metadata.ensure_geom_column",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "app.processing.ingest.metadata.clip_to_mercator_bounds",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.processing.ingest.metadata.add_4326_column",
+                new_callable=AsyncMock,
+            ),
+            # Mocked so this never touches cluster-global role grants, which
+            # would force the module into the tenancy serialization group for
+            # one assertion about a JSONB key.
+            patch(
+                "app.processing.ingest.metadata.grant_reader_access",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.processing.ingest.metadata.extract_metadata",
+                new_callable=AsyncMock,
+                return_value={
+                    "srid": 4326,
+                    "geometry_type": "POINT",
+                    "feature_count": 3,
+                    "extent_wkt": "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))",
+                    "column_info": [],
+                },
+            ),
+            patch(
+                "app.processing.ingest.metadata.get_sample_values",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.processing.ingest.metadata.refresh_attribute_metadata",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.processing.ingest.metadata.compute_quality_score",
+                new_callable=AsyncMock,
+                return_value={"overall": 90},
+            ),
+        ):
+            try:
+                await tasks_vector.ingest_service.func(
+                    job_id=str(job.id),
+                    attempt_id=str(attempt_id),
+                    source_url="https://services.example.com/svc/FeatureServer",
+                    source_layer="0",
+                    user_id=str(admin_id),
+                    token=worker_token,
+                )
+
+                dataset = (
+                    await test_db_session.execute(
+                        select(Dataset).where(Dataset.table_name == table_name)
+                    )
+                ).scalar_one()
+
+                origin_ref = dataset.origin_ref or {}
+                if worker_token is None:
+                    # Absent, not False: an unauthenticated pull stores the
+                    # exact ref shape it stored before the key existed, which
+                    # is why no backfill is owed for existing rows.
+                    assert "auth_required" not in origin_ref
+                else:
+                    assert origin_ref["auth_required"] is True
+                assert origin_ref["item_id"] == "a" * 32
+                assert origin_ref["portal_url"] == "https://org.maps.arcgis.com"
+                # A boolean, never the credential, anywhere on the row.
+                assert "service-token" not in str(origin_ref)
+                assert "service-token" not in str(dataset.origin_uri)
+            finally:
+                async with db_module.async_session() as session:
+                    # The committed dataset carries the mocked quality score,
+                    # which no dataset listing on this database can serialize.
+                    await session.execute(
+                        text(
+                            "DELETE FROM catalog.records WHERE id IN "
+                            "(SELECT record_id FROM catalog.datasets "
+                            "WHERE table_name = :table_name)"
+                        ),
+                        {"table_name": table_name},
+                    )
+                    await session.execute(
+                        text(f'DROP TABLE IF EXISTS data."{table_name}" CASCADE')
+                    )
+                    await session.execute(
+                        text(f'DROP TABLE IF EXISTS data."{staging}" CASCADE')
+                    )
+                    await session.commit()

@@ -1,0 +1,1122 @@
+"""Intersect/overlay: new geometry from two layers (#956).
+
+One test per acceptance criterion on the issue.
+
+The fixture throughout is a 3x1 bar laid across three side-by-side unit
+squares. It is the shape that separates an overlay from a clip: a clip returns
+ONE feature (the bar trimmed to the union of the zones), an overlay returns
+THREE, each carrying its own zone's attributes.
+
+    +---+---+---+
+    | A | B | C |   mask: three 1x1 zones
+    +---+---+---+
+    #############   source: one 3x1 bar crossing all three
+
+Requirements:
+  - Docker database must be running (docker compose up db)
+"""
+
+import uuid
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from fastapi import HTTPException
+from httpx import AsyncClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.platform.analysis_sql import (
+    INTERSECT_SOURCE_GID_COLUMN,
+    MAX_SOURCE_FEATURES,
+)
+from app.processing.analysis.tasks import _materialize
+
+from tests.factories import get_user_id
+from tests.test_analysis_materialize import _create_job
+from tests.test_analysis_spatial_join import _create_layer
+
+BAR_WKT = "POLYGON((0 0, 3 0, 3 1, 0 1, 0 0))"
+
+
+def _preview_url(dataset_id) -> str:
+    return f"/datasets/{dataset_id}/analysis/preview/"
+
+
+def _materialize_url(dataset_id) -> str:
+    return f"/datasets/{dataset_id}/analysis/materialize/"
+
+
+def _zone_values(count: int = 3) -> str:
+    """``count`` side-by-side unit squares named A, B, C, ..."""
+    return ",".join(
+        f"('{chr(65 + i)}',"
+        f" ST_MakeEnvelope({i}, 0, {i + 1}, 1, 4326),"
+        f" ST_MakeEnvelope({i}, 0, {i + 1}, 1, 4326))"
+        for i in range(count)
+    )
+
+
+async def _create_zones(
+    session: AsyncSession,
+    *,
+    created_by: uuid.UUID,
+    count: int = 3,
+    visibility: str = "public",
+    name_column: str = "zone",
+):
+    zones = await _create_layer(
+        session,
+        created_by=created_by,
+        column_type="Geometry",
+        geometry_type="POLYGON",
+        visibility=visibility,
+        feature_count=count,
+        values_sql=_zone_values(count),
+        column_info=[{"name": name_column, "type": "text"}],
+    )
+    # The shared helper always creates a physical "name" column, and the worker
+    # reads LIVE columns rather than column_info — so without this both layers
+    # would carry "name" and the collision guard would (correctly) reject every
+    # overlay. Rename to whatever this fixture claims in column_info.
+    if name_column != "name":
+        await session.execute(
+            text(
+                f"ALTER TABLE data.{zones.table_name} "  # noqa: S608
+                f"RENAME COLUMN name TO {name_column}"
+            )
+        )
+        await session.commit()
+    return zones
+
+
+async def _create_bar(
+    session: AsyncSession,
+    *,
+    created_by: uuid.UUID,
+    visibility: str = "public",
+    wkt: str = BAR_WKT,
+):
+    bar = await _create_layer(
+        session,
+        created_by=created_by,
+        column_type="Geometry",
+        geometry_type="POLYGON",
+        visibility=visibility,
+        values_sql=(
+            f"('bar', ST_GeomFromText('{wkt}', 4326), ST_GeomFromText('{wkt}', 4326))"
+        ),
+        column_info=[{"name": "parcel", "type": "text"}],
+    )
+    await session.execute(
+        text(
+            f"ALTER TABLE data.{bar.table_name} "  # noqa: S608
+            "RENAME COLUMN name TO parcel"
+        )
+    )
+    await session.commit()
+    return bar
+
+
+class TestPairwiseRows:
+    async def test_one_source_over_three_zones_yields_three_rows(
+        self,
+        test_db_session: AsyncSession,
+    ):
+        """Criterion 3, the one that distinguishes this from clip.
+
+        Clip aggregates every mask piece back to one geometry per source row.
+        An overlay must not: three zones, three rows, each carrying ITS zone's
+        attribute and only its own third of the bar.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        job = await _create_job(test_db_session, admin_id)
+
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(bar.id),
+            user_id=str(admin_id),
+            operation="intersect",
+            title=f"Overlay {uuid.uuid4().hex[:6]}",
+            mask_dataset_id=str(zones.id),
+        )
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        out = await test_db_session.get(Dataset, job.dataset_id)
+        assert out is not None
+        assert out.feature_count == 3
+
+        rows = (
+            await test_db_session.execute(
+                text(
+                    f"SELECT gid, source_gid, parcel, zone, ST_Area(geom_4326)"  # noqa: S608
+                    f" FROM data.{out.table_name} ORDER BY zone"
+                )
+            )
+        ).all()
+        assert [r[3] for r in rows] == ["A", "B", "C"]
+        # Every row traces back to the one source feature...
+        assert {r[1] for r in rows} == {1}
+        assert {r[2] for r in rows} == {"bar"}
+        # ...and each carries a third of the bar, not the whole thing.
+        for row in rows:
+            assert row[4] == 1.0
+
+    async def test_the_output_gid_is_generated_not_the_source_gid(
+        self,
+        test_db_session: AsyncSession,
+    ):
+        """Criterion 2: three rows sharing one source gid would fail the
+        unconditional ADD PRIMARY KEY (gid) outright — the job dies, it is not
+        a subtle data-quality issue. Pinned at materialize, where the ALTER
+        actually runs, not just in a preview."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        job = await _create_job(test_db_session, admin_id)
+
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(bar.id),
+            user_id=str(admin_id),
+            operation="intersect",
+            title=f"Keyed {uuid.uuid4().hex[:6]}",
+            mask_dataset_id=str(zones.id),
+        )
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        out = await test_db_session.get(Dataset, job.dataset_id)
+        gids = (
+            (
+                await test_db_session.execute(
+                    text(f"SELECT gid FROM data.{out.table_name} ORDER BY gid")  # noqa: S608
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert list(gids) == [1, 2, 3], "generated key, contiguous, no duplicates"
+
+        pk_count = (
+            await test_db_session.execute(
+                text(
+                    "SELECT count(*) FROM pg_constraint "
+                    "WHERE conrelid = ('data.' || :t)::regclass AND contype = 'p'"
+                ).bindparams(t=out.table_name)
+            )
+        ).scalar_one()
+        assert pk_count == 1
+
+    async def test_a_mask_polygon_that_subdivides_still_yields_one_row(
+        self,
+        test_db_session: AsyncSession,
+    ):
+        """The trap inside the trap.
+
+        The mask is subdivided into <=256-vertex pieces for the performance
+        reason render_clip_layer_join documents. Grouping by piece instead of
+        by mask FEATURE would silently multiply the output by however many
+        pieces a polygon happened to split into. This zone is a single ~2000-
+        vertex circle, so it definitely subdivides, and it must still produce
+        exactly one output row.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        big = await _create_layer(
+            test_db_session,
+            created_by=admin_id,
+            column_type="Geometry",
+            geometry_type="POLYGON",
+            values_sql=(
+                "('circle',"
+                " ST_Buffer(ST_SetSRID(ST_MakePoint(1.5, 0.5), 4326), 2,"
+                " 'quad_segs=512'),"
+                " ST_Buffer(ST_SetSRID(ST_MakePoint(1.5, 0.5), 4326), 2,"
+                " 'quad_segs=512'))"
+            ),
+            column_info=[{"name": "zone", "type": "text"}],
+        )
+        vertices = (
+            await test_db_session.execute(
+                text(f"SELECT ST_NPoints(geom_4326) FROM data.{big.table_name}")  # noqa: S608
+            )
+        ).scalar_one()
+        assert vertices > 256, "fixture must exceed the subdivide threshold"
+
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        job = await _create_job(test_db_session, admin_id)
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(bar.id),
+            user_id=str(admin_id),
+            operation="intersect",
+            title=f"Subdivided {uuid.uuid4().hex[:6]}",
+            mask_dataset_id=str(big.id),
+        )
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        out = await test_db_session.get(Dataset, job.dataset_id)
+        assert out.feature_count == 1, "one mask FEATURE, one row, however it split"
+
+
+class TestUniqueSourceKey:
+    async def test_a_source_keyed_by_a_unique_gid_overlays_in_preview_and_materialize(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """A source whose gid is unique but not its primary key overlays like any other."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        await test_db_session.execute(
+            text(
+                f"ALTER TABLE data.{bar.table_name} "  # noqa: S608
+                f"DROP CONSTRAINT {bar.table_name}_pkey, ADD UNIQUE (gid)"
+            )
+        )
+        await test_db_session.commit()
+
+        resp = await client.post(
+            _preview_url(bar.id),
+            json={"operation": "intersect", "mask_dataset_id": str(zones.id)},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["feature_count"] == 3
+
+        job = await _create_job(test_db_session, admin_id)
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(bar.id),
+            user_id=str(admin_id),
+            operation="intersect",
+            title=f"Unique {uuid.uuid4().hex[:6]}",
+            mask_dataset_id=str(zones.id),
+        )
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        out = await test_db_session.get(Dataset, job.dataset_id)
+        rows = (
+            await test_db_session.execute(
+                text(
+                    f"SELECT parcel, zone FROM data.{out.table_name} ORDER BY zone"  # noqa: S608
+                )
+            )
+        ).all()
+        assert [tuple(r) for r in rows] == [("bar", "A"), ("bar", "B"), ("bar", "C")]
+
+
+class TestOverlayAttributes:
+    """The overlay's attributes are joined back, not grouped by.
+
+    Only observable at materialize. The preview carries gid and source_gid alone, so it
+    never names an overlay column in a GROUP BY; a unit test on the rendered SQL has the
+    same blind spot, because the statement only breaks when PostgreSQL executes it.
+    """
+
+    async def test_a_json_overlay_column_survives_into_the_output(
+        self,
+        test_db_session: AsyncSession,
+    ):
+        """json and xml have no equality operator, so naming one in a GROUP BY
+        fails the CTAS with SQLSTATE 42883. Both used to make a layer unusable
+        as an overlay; both must now land in the output table with their type
+        and their values intact.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        # Physical columns only. The worker reads LIVE columns, and json is how
+        # nested GeoJSON properties actually arrive on an ingested layer.
+        await test_db_session.execute(
+            text(
+                f"ALTER TABLE data.{zones.table_name} "  # noqa: S608
+                "ADD COLUMN props json, ADD COLUMN doc xml"
+            )
+        )
+        await test_db_session.execute(
+            text(
+                f"UPDATE data.{zones.table_name} SET"  # noqa: S608
+                " props = ('{\"code\": \"' || zone || '\"}')::json,"
+                " doc = ('<z>' || zone || '</z>')::xml"
+            )
+        )
+        await test_db_session.commit()
+        job = await _create_job(test_db_session, admin_id)
+
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(bar.id),
+            user_id=str(admin_id),
+            operation="intersect",
+            title=f"Overlay {uuid.uuid4().hex[:6]}",
+            mask_dataset_id=str(zones.id),
+        )
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        out = await test_db_session.get(Dataset, job.dataset_id)
+        assert out is not None
+
+        # The columns survived AS json and xml — not stringified on the way.
+        types = dict(
+            (
+                await test_db_session.execute(
+                    text(
+                        "SELECT column_name, data_type FROM"
+                        " information_schema.columns WHERE table_schema = 'data'"
+                        " AND table_name = :t"
+                    ).bindparams(t=out.table_name)
+                )
+            ).all()
+        )
+        assert types.get("props") == "json"
+        assert types.get("doc") == "xml"
+
+        rows = (
+            await test_db_session.execute(
+                text(
+                    "SELECT zone, props->>'code', doc::text, source_gid"  # noqa: S608
+                    f" FROM data.{out.table_name} ORDER BY zone"
+                )
+            )
+        ).all()
+        # Three zones, three rows — the count the guard-era test could never
+        # reach, and the same count the plain-text overlay produces.
+        assert len(rows) == 3
+        assert out.feature_count == 3
+        assert [r[0] for r in rows] == ["A", "B", "C"]
+        # Values ride the right row. A join on the wrong key would still
+        # populate the column, so presence alone proves nothing.
+        assert [r[1] for r in rows] == ["A", "B", "C"]
+        assert [r[2] for r in rows] == ["<z>A</z>", "<z>B</z>", "<z>C</z>"]
+        assert {r[3] for r in rows} == {1}
+
+    async def test_the_join_back_does_not_multiply_rows(
+        self,
+        test_db_session: AsyncSession,
+    ):
+        """The fix's central safety claim, as an assertion.
+
+        The aggregate emits one row per (source gid, overlay gid) pair and the
+        outer query joins the overlay table back on its primary key, so the
+        count cannot change. The case that would expose a 1:many join is one
+        overlay feature matched by SEVERAL source features — two half-height
+        bars across three zones is six pairs, each zone looked up twice.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        halves = await _create_layer(
+            test_db_session,
+            created_by=admin_id,
+            column_type="Geometry",
+            geometry_type="POLYGON",
+            feature_count=2,
+            values_sql=(
+                "('lower', ST_MakeEnvelope(0, 0, 3, 0.5, 4326),"
+                " ST_MakeEnvelope(0, 0, 3, 0.5, 4326)),"
+                "('upper', ST_MakeEnvelope(0, 0.5, 3, 1, 4326),"
+                " ST_MakeEnvelope(0, 0.5, 3, 1, 4326))"
+            ),
+            column_info=[{"name": "parcel", "type": "text"}],
+        )
+        await test_db_session.execute(
+            text(
+                f"ALTER TABLE data.{halves.table_name} "  # noqa: S608
+                "RENAME COLUMN name TO parcel"
+            )
+        )
+        # A json column on the overlay, so the count is measured on the shape
+        # the join-back exists for rather than on a plain-text fallback.
+        await test_db_session.execute(
+            text(f"ALTER TABLE data.{zones.table_name} ADD COLUMN props json")  # noqa: S608
+        )
+        await test_db_session.commit()
+        job = await _create_job(test_db_session, admin_id)
+
+        await _materialize(
+            job_id=str(job.id),
+            dataset_id=str(halves.id),
+            user_id=str(admin_id),
+            operation="intersect",
+            title=f"Pairs {uuid.uuid4().hex[:6]}",
+            mask_dataset_id=str(zones.id),
+        )
+        await test_db_session.refresh(job)
+        assert job.status == "complete", job.error_message
+
+        from app.modules.catalog.datasets.domain.models import Dataset
+
+        out = await test_db_session.get(Dataset, job.dataset_id)
+        pairs = (
+            await test_db_session.execute(
+                text(
+                    f"SELECT parcel, zone FROM data.{out.table_name}"  # noqa: S608
+                    " ORDER BY parcel, zone"
+                )
+            )
+        ).all()
+        assert [tuple(p) for p in pairs] == [
+            ("lower", "A"),
+            ("lower", "B"),
+            ("lower", "C"),
+            ("upper", "A"),
+            ("upper", "B"),
+            ("upper", "C"),
+        ]
+        assert out.feature_count == 6
+
+
+class TestPreview:
+    async def test_preview_rows_carry_distinct_generated_gids(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """Criterion 4: preview and materialize must agree on what a row is.
+
+        Selecting the source gid here would show three features all claiming
+        gid 1 — nothing crashes, and the map silently lies about identity.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+
+        resp = await client.post(
+            _preview_url(bar.id),
+            json={"operation": "intersect", "mask_dataset_id": str(zones.id)},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        features = body["geojson"]["features"]
+        assert [f["properties"]["gid"] for f in features] == [1, 2, 3]
+        # ...and each still points back at the source feature it came from.
+        assert {f["properties"][INTERSECT_SOURCE_GID_COLUMN] for f in features} == {1}
+        assert body["feature_count"] == 3
+        # A row-multiplying operation cannot report a source total.
+        assert body["source_feature_count"] is None
+        # The exact pair total rides the same statement as a window column.
+        assert body["match_count"] == 3
+
+    async def test_match_count_is_zero_not_null_when_nothing_overlaps(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """An empty result is an ANSWER, not a failure.
+
+        match_count is null in the contract when the total could not be
+        computed — a timed-out count. intersect's total rides its preview
+        statement as a window column, so with no overlapping pairs there is no
+        row to read it off, and defaulting to null would make "these two
+        layers do not overlap" (an ordinary result) indistinguishable from
+        "the server gave up", and the panel renders those differently.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        # Same shape as the overlapping fixture, parked far away: the query
+        # runs and returns cleanly, it just finds nothing.
+        far = await _create_bar(
+            test_db_session,
+            created_by=admin_id,
+            wkt="POLYGON((100 40, 101 40, 101 41, 100 41, 100 40))",
+        )
+
+        resp = await client.post(
+            _preview_url(far.id),
+            json={"operation": "intersect", "mask_dataset_id": str(zones.id)},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["geojson"]["features"] == []
+        assert body["feature_count"] == 0
+        assert body["match_count"] == 0, "zero pairs is a computed answer"
+        assert body["match_count"] is not None
+
+    async def test_match_count_is_exact_beyond_the_preview_cap(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """The window is computed before the row cap, so the total is the real
+        one even when the feature list is truncated."""
+        from app.modules.catalog.datasets.domain.service import PREVIEW_FEATURE_CAP
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        # 600 zones in a row; the bar crosses the first three, so widen it.
+        zones = await _create_zones(
+            test_db_session, created_by=admin_id, count=PREVIEW_FEATURE_CAP + 100
+        )
+        wide = "POLYGON((0 0, 600 0, 600 1, 0 1, 0 0))"
+        src = await _create_layer(
+            test_db_session,
+            created_by=admin_id,
+            column_type="Geometry",
+            geometry_type="POLYGON",
+            values_sql=(
+                f"('wide', ST_GeomFromText('{wide}', 4326),"
+                f" ST_GeomFromText('{wide}', 4326))"
+            ),
+            column_info=[{"name": "parcel", "type": "text"}],
+        )
+        await test_db_session.execute(
+            text(
+                f"ALTER TABLE data.{src.table_name} "  # noqa: S608
+                "RENAME COLUMN name TO parcel"
+            )
+        )
+        await test_db_session.commit()
+
+        resp = await client.post(
+            _preview_url(src.id),
+            json={"operation": "intersect", "mask_dataset_id": str(zones.id)},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["truncated"] is True
+        assert body["feature_count"] == PREVIEW_FEATURE_CAP
+        assert body["match_count"] == PREVIEW_FEATURE_CAP + 100
+
+
+class TestColumnCollisions:
+    async def test_a_column_in_both_layers_is_rejected_at_enqueue(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """Criterion 5: an overlay carries columns from BOTH inputs, so a
+        same-named column is likely rather than exotic. The CTAS would fail it
+        with an opaque "column specified more than once" after the queue wait;
+        name it at enqueue instead."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        # Both layers call their text column "name".
+        zones = await _create_zones(
+            test_db_session, created_by=admin_id, name_column="name"
+        )
+        bar = await _create_layer(
+            test_db_session,
+            created_by=admin_id,
+            column_type="Geometry",
+            geometry_type="POLYGON",
+            values_sql=(
+                f"('bar', ST_GeomFromText('{BAR_WKT}', 4326),"
+                f" ST_GeomFromText('{BAR_WKT}', 4326))"
+            ),
+            column_info=[{"name": "name", "type": "text"}],
+        )
+
+        resp = await client.post(
+            _materialize_url(bar.id),
+            json={
+                "operation": "intersect",
+                "mask_dataset_id": str(zones.id),
+                "title": "Nope",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+        assert "name" in resp.text
+
+    def test_an_ungroupable_overlay_column_is_admitted_at_enqueue(self):
+        """A json or xml OVERLAY column is accepted.
+
+        json and xml have no equality operator, so naming every carried
+        OVERLAY column in the aggregate's GROUP BY would refuse a real class of
+        layer, since nested GeoJSON properties land as json routinely. The
+        attributes are joined back outside the aggregate, where nothing
+        groups, so the type does not matter.
+
+        Against the validator rather than the endpoint, for the reason the
+        SOURCE-side sibling below spells out: admitting the request means
+        enqueueing, and a 503 from the broker is not evidence about column
+        rules.
+        """
+        from app.modules.catalog.datasets.api.router_analysis import (
+            _validate_intersect_columns,
+        )
+
+        source = SimpleNamespace(column_info=[{"name": "parcel", "type": "text"}])
+        overlay = SimpleNamespace(
+            column_info=[
+                {"name": "zone", "type": "text"},
+                {"name": "props", "type": "json"},
+                {"name": "doc", "type": "xml"},
+            ]
+        )
+        _validate_intersect_columns(source, overlay)
+
+    def test_the_overlay_guards_still_refuse_what_actually_breaks(self):
+        """The other direction of #1099: admitting json admitted only json.
+
+        Each of these still fails the CTAS if it gets through, and none of them
+        is touched by moving the attributes out of the GROUP BY — so a fix that
+        pinned the admission alone would let a wholesale gutting of the guard
+        pass green.
+        """
+        from app.modules.catalog.datasets.api.router_analysis import (
+            _validate_dissolve_by_field,
+            _validate_intersect_columns,
+        )
+
+        source = SimpleNamespace(column_info=[{"name": "zone", "type": "text"}])
+        # A name in both layers: "column specified more than once".
+        with pytest.raises(HTTPException) as excinfo:
+            _validate_intersect_columns(
+                source, SimpleNamespace(column_info=[{"name": "zone", "type": "text"}])
+            )
+        assert "zone" in str(excinfo.value.detail)
+        # A name in the internal alias namespace: an ambiguous reference.
+        with pytest.raises(HTTPException) as excinfo:
+            _validate_intersect_columns(
+                source,
+                SimpleNamespace(column_info=[{"name": "_gl_src_type", "type": "text"}]),
+            )
+        assert "_gl_" in str(excinfo.value.detail)
+        # And dissolve, which shares NON_GROUPABLE_COLUMN_TYPES with the branch
+        # that came out. It really does GROUP BY a user-chosen column, so json
+        # stays fatal there — deleting the shared machinery must not read as
+        # this issue being fixed.
+        with pytest.raises(HTTPException) as excinfo:
+            _validate_dissolve_by_field(
+                SimpleNamespace(column_info=[{"name": "props", "type": "json"}]),
+                "props",
+            )
+        assert "props" in str(excinfo.value.detail)
+
+    async def test_an_overlay_column_in_the_alias_namespace_is_rejected(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """The output guards reserve OUTPUT names only.
+
+        render_intersect_pairs invents internal aliases on the way to that
+        output, and a carried column of the same name lands in the same select
+        list: `SELECT _o.gid AS _gl_mask_gid, "_gl_mask_gid"`. The later
+        reference is then ambiguous and the CTAS fails after the queue wait,
+        quoting a name the user never chose.
+
+        The aliases live in a reserved PREFIX and the prefix is what is
+        rejected, so an alias added to that query later is covered without a
+        list to keep in step.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        zones.column_info = [
+            {"name": "zone", "type": "text"},
+            {"name": "_gl_mask_gid", "type": "integer"},
+        ]
+        await test_db_session.commit()
+
+        resp = await client.post(
+            _materialize_url(bar.id),
+            json={
+                "operation": "intersect",
+                "mask_dataset_id": str(zones.id),
+                "title": "Nope",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+        assert "_gl_" in resp.text
+
+    async def test_the_alias_prefix_guard_runs_again_on_live_columns(
+        self, test_db_session: AsyncSession
+    ):
+        """The worker half, for the re-upload window. Same reasoning as the
+        ungroupable-type recheck below it: the router read a snapshot.
+
+        Driven through _resolve_and_validate_columns rather than the leaf
+        guard. Calling the guard directly proves it rejects a bad list and
+        proves nothing about whether anything hands it one — deleting the call
+        site left such a test green, which is how this test was written the
+        first time.
+        """
+        from app.processing.analysis.tasks import _resolve_and_validate_columns
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        await test_db_session.execute(
+            text(
+                f"ALTER TABLE data.{zones.table_name} "  # noqa: S608
+                f"ADD COLUMN _gl_src_type TEXT"
+            )
+        )
+        await test_db_session.commit()
+
+        with pytest.raises(ValueError) as excinfo:
+            await _resolve_and_validate_columns(
+                test_db_session,
+                schema="data",
+                operation="intersect",
+                src_table_name=bar.table_name,
+                mask_table_name=zones.table_name,
+                join_table_name=None,
+                join_fields=None,
+            )
+        assert "_gl_" in str(excinfo.value)
+
+    async def test_ordinary_overlay_columns_pass_the_alias_guard(
+        self, test_db_session: AsyncSession
+    ):
+        """The negative control, through the same entry point."""
+        from app.processing.analysis.tasks import _resolve_and_validate_columns
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+
+        carry, mask_carry = await _resolve_and_validate_columns(
+            test_db_session,
+            schema="data",
+            operation="intersect",
+            src_table_name=bar.table_name,
+            mask_table_name=zones.table_name,
+            join_table_name=None,
+            join_fields=None,
+        )
+        assert carry == ["parcel"]
+        assert mask_carry == ["zone"]
+
+    async def test_an_overlay_that_stops_being_polygonal_is_caught(
+        self, test_db_session: AsyncSession
+    ):
+        """The polygon requirement is re-applied live.
+
+        The router refuses a non-polygonal mask at enqueue, but a re-upload can
+        turn that layer into points or lines while the job waits — and the swap
+        updates Dataset.geometry_type, so the value the router checked is not
+        the one the CTAS would run against.
+
+        Nothing downstream notices on its own: the mask expression simply
+        matches no rows and the job dies on "Analysis produced no features",
+        which sends the user looking at their own data rather than at the layer
+        that changed underneath them.
+        """
+        from app.modules.catalog.datasets.domain.models import Dataset
+        from app.processing.analysis.tasks import _resolve_layer_table_ref
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        zones.geometry_type = "POINT"
+        await test_db_session.commit()
+
+        with pytest.raises(ValueError) as excinfo:
+            await _resolve_layer_table_ref(
+                test_db_session,
+                Dataset,
+                str(zones.id),
+                "data",
+                label="mask",
+                require_geometry="polygonal",
+            )
+        assert "polygon" in str(excinfo.value).lower()
+
+    async def test_a_polygonal_overlay_passes_the_live_geometry_recheck(
+        self, test_db_session: AsyncSession
+    ):
+        """The negative control, and the guard on the flag: an unchanged
+        polygon layer resolves, and a JOIN layer is not held to this rule at
+        all (a spatial join counts in any direction — see the spatial-join
+        picker, which offers points)."""
+        from app.modules.catalog.datasets.domain.models import Dataset
+        from app.processing.analysis.tasks import _resolve_layer_table_ref
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        ref, name = await _resolve_layer_table_ref(
+            test_db_session,
+            Dataset,
+            str(zones.id),
+            "data",
+            label="mask",
+            require_geometry="polygonal",
+        )
+        assert name == zones.table_name
+
+        zones.geometry_type = "POINT"
+        await test_db_session.commit()
+        # Same layer, same non-polygon type, resolved WITHOUT the flag: fine.
+        await _resolve_layer_table_ref(
+            test_db_session, Dataset, str(zones.id), "data", label="join"
+        )
+
+    # There is no worker-side ungroupable-overlay recheck: the overlay's
+    # attributes never reach a GROUP BY, so a re-upload that introduces a
+    # json column has nothing to break. _ungroupable_type_name's
+    # ARRAY branch (the json[] case) is pinned
+    # by dissolve's live recheck in
+    # test_analysis_materialize.py::test_dissolve_by_a_json_array_field_fails_with_a_clear_message.
+
+    def test_an_ungroupable_SOURCE_column_is_still_allowed(self):
+        """The source side needs no guard.
+
+        A json column on the SOURCE never reaches the GROUP BY: _src.gid is a real
+        table's primary key, so PostgreSQL licenses every other _src column by
+        functional dependency. It pins a different fact from the overlay-side test above
+        — that one is about the join-back, this one about functional dependency, and
+        either could be broken without the other.
+
+        Against the validator rather than the endpoint: enqueueing needs the
+        task queue, so an HTTP assertion here would be reading a 503 from the
+        broker as evidence about column rules.
+        """
+        from types import SimpleNamespace
+
+        from app.modules.catalog.datasets.api.router_analysis import (
+            _validate_intersect_columns,
+        )
+
+        source = SimpleNamespace(
+            column_info=[
+                {"name": "parcel", "type": "text"},
+                {"name": "props", "type": "json"},
+            ]
+        )
+        overlay = SimpleNamespace(column_info=[{"name": "zone", "type": "text"}])
+        _validate_intersect_columns(source, overlay)
+
+        # The overlay side needs no guard either, because its attributes do
+        # not ride through the aggregate. Pinned here because "the source side
+        # is fine" is only half the reason the sides agree.
+        _validate_intersect_columns(overlay, source)
+
+    async def test_a_source_column_named_source_gid_is_rejected(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """The generated column has the same problem as dissolve's
+        source_count."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        bar = await _create_layer(
+            test_db_session,
+            created_by=admin_id,
+            column_type="Geometry",
+            geometry_type="POLYGON",
+            extra_columns="source_gid INTEGER,",
+            values_sql=(
+                f"('bar', 7, ST_GeomFromText('{BAR_WKT}', 4326),"
+                f" ST_GeomFromText('{BAR_WKT}', 4326))"
+            ),
+            column_info=[
+                {"name": "parcel", "type": "text"},
+                {"name": "source_gid", "type": "integer"},
+            ],
+        )
+
+        resp = await client.post(
+            _materialize_url(bar.id),
+            json={
+                "operation": "intersect",
+                "mask_dataset_id": str(zones.id),
+                "title": "Nope",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+        assert INTERSECT_SOURCE_GID_COLUMN in resp.text
+
+
+class TestJobMetadata:
+    """Admin Jobs reads this to diagnose a failed run."""
+
+    def _meta(self, operation: str, **kwargs):
+        from app.modules.catalog.datasets.api.router_analysis import (
+            _build_analysis_job_metadata,
+        )
+        from app.modules.catalog.datasets.domain.schemas import (
+            AnalysisMaterializeRequest,
+        )
+
+        body = AnalysisMaterializeRequest(operation=operation, title="t", **kwargs)
+        return _build_analysis_job_metadata(
+            body, SimpleNamespace(id=uuid.uuid4(), table_name="src")
+        )
+
+    def test_every_operation_that_takes_a_layer_records_it(self):
+        """It was recorded for clip alone. select_by_location and intersect are
+        both driven by a second layer, so a run that failed BECAUSE of that
+        layer — re-uploaded mid-queue, wrong geometry, ungroupable column —
+        showed an operator only the operation, the source and the title."""
+        layer_id = uuid.uuid4()
+        for operation in ("clip", "select_by_location", "intersect"):
+            meta = self._meta(operation, mask_dataset_id=layer_id)
+            assert meta["mask_dataset_id"] == str(layer_id), operation
+
+    def test_the_drawn_marker_stays_where_a_drawn_mask_is_possible(self):
+        """mask_source discriminates drawn from layer, so it belongs only to
+        the operations that accept a drawn mask. intersect rejects one, and a
+        constant dressed as a discriminator is worse than its absence."""
+        layer_id = uuid.uuid4()
+        assert self._meta("clip", mask_dataset_id=layer_id)["mask_source"] == "layer"
+        assert (
+            self._meta("select_by_location", mask_dataset_id=layer_id)["mask_source"]
+            == "layer"
+        )
+        assert "mask_source" not in self._meta("intersect", mask_dataset_id=layer_id)
+
+
+class TestAccessControl:
+    async def test_an_overlay_layer_the_caller_cannot_see_is_a_404(
+        self,
+        client: AsyncClient,
+        editor_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """Criterion 8: Rule 1 applies to BOTH datasets, on preview and
+        materialize alike."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        private_zones = await _create_zones(
+            test_db_session, created_by=admin_id, visibility="private"
+        )
+
+        for url in (_preview_url(bar.id), _materialize_url(bar.id)):
+            resp = await client.post(
+                url,
+                json={
+                    "operation": "intersect",
+                    "mask_dataset_id": str(private_zones.id),
+                    "title": "Nope",
+                },
+                headers=editor_auth_header,
+            )
+            assert resp.status_code == 404, f"{url}: {resp.text}"
+
+
+class TestEnqueueValidation:
+    async def test_oversized_source_rejected_at_enqueue(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """Criterion 6's first half. The router reads MAX_SOURCE_FEATURES with
+        .get(), so a missing key would leave the row-multiplying operation with
+        NO ceiling — the entry existing is half the assertion."""
+        assert "intersect" in MAX_SOURCE_FEATURES
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id)
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+        bar.feature_count = MAX_SOURCE_FEATURES["intersect"] + 1
+        await test_db_session.commit()
+
+        resp = await client.post(
+            _materialize_url(bar.id),
+            json={
+                "operation": "intersect",
+                "mask_dataset_id": str(zones.id),
+                "title": "Too big",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 422
+        assert "too large" in resp.text
+
+    async def test_an_overlay_requires_a_layer(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session: AsyncSession,
+    ):
+        """Layer only: a drawn polygon carries no attributes to overlay with,
+        which would make it an expensive clip. `mask` is not an intersect
+        param, so a drawn one is dropped and the request then fails for want of
+        the layer."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        bar = await _create_bar(test_db_session, created_by=admin_id)
+
+        for body in (
+            {"operation": "intersect"},
+            {
+                "operation": "intersect",
+                "mask": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 0]]],
+                },
+            },
+        ):
+            resp = await client.post(
+                _preview_url(bar.id), json=body, headers=admin_auth_header
+            )
+            assert resp.status_code == 422, resp.text
+
+
+class TestOutputSize:
+    async def test_row_amplification_trips_the_output_ceiling(
+        self,
+        test_db_session: AsyncSession,
+    ):
+        """Criterion 7: the existing output-size tests grow GEOMETRY. This one
+        grows ROW COUNT instead, which is the axis only this operation moves.
+
+        One small source over 200 zones is 200 output rows from 1 input row —
+        the shape no MAX_SOURCE_FEATURES value can bound, and therefore the
+        shape _enforce_output_size has to be the thing that catches.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        zones = await _create_zones(test_db_session, created_by=admin_id, count=200)
+        wide = "POLYGON((0 0, 200 0, 200 1, 0 1, 0 0))"
+        src = await _create_layer(
+            test_db_session,
+            created_by=admin_id,
+            column_type="Geometry",
+            geometry_type="POLYGON",
+            values_sql=(
+                f"('wide', ST_GeomFromText('{wide}', 4326),"
+                f" ST_GeomFromText('{wide}', 4326))"
+            ),
+            column_info=[{"name": "parcel", "type": "text"}],
+        )
+        await test_db_session.execute(
+            text(
+                f"ALTER TABLE data.{src.table_name} "  # noqa: S608
+                "RENAME COLUMN name TO parcel"
+            )
+        )
+        await test_db_session.commit()
+        job = await _create_job(test_db_session, admin_id)
+
+        with patch("app.processing.analysis.tasks.MAX_OUTPUT_BYTES", 1):
+            await _materialize(
+                job_id=str(job.id),
+                dataset_id=str(src.id),
+                user_id=str(admin_id),
+                operation="intersect",
+                title=f"Too big {uuid.uuid4().hex[:6]}",
+                mask_dataset_id=str(zones.id),
+            )
+
+        await test_db_session.refresh(job)
+        assert job.status == "failed"
+        assert job.dataset_id is None

@@ -1,0 +1,649 @@
+import { render, screen } from '@/test/test-utils';
+import userEvent from '@testing-library/user-event';
+import { ImportMetadataForm } from '../ImportMetadataForm';
+
+const settings = vi.hoisted(() => ({ canSetPublic: true }));
+
+vi.mock('@/hooks/use-settings', () => ({
+  useCanSetPublicVisibility: () => settings.canSetPublic,
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, opts?: Record<string, unknown>) => {
+      if (typeof opts?.defaultValue === 'string') return opts.defaultValue;
+      if (opts) return `${key}:${JSON.stringify(opts)}`;
+      return key;
+    },
+  }),
+}));
+
+// The geometry-mode picker is now a Radix Select. jsdom lacks
+// these pointer/scroll APIs Radix calls, and its options mount only once opened.
+beforeAll(() => {
+  Element.prototype.hasPointerCapture = vi.fn(() => false);
+  Element.prototype.setPointerCapture = vi.fn();
+  Element.prototype.releasePointerCapture = vi.fn();
+  Element.prototype.scrollIntoView = vi.fn();
+});
+
+async function selectGeomMode(
+  user: ReturnType<typeof userEvent.setup>,
+  optionText: string,
+) {
+  await user.click(screen.getByLabelText('metadata.geometryMode'));
+  await user.click(await screen.findByRole('option', { name: optionText }));
+}
+
+const defaultProps = {
+  defaultName: 'test-data.csv',
+  detectedCrs: null,
+  onCommit: vi.fn(),
+  isCommitting: false,
+};
+
+const sampleColumns = [
+  { name: 'id', type: 'Integer' },
+  { name: 'Latitude', type: 'Real' },
+  { name: 'Longitude', type: 'Real' },
+  { name: 'name', type: 'String' },
+  { name: 'wkt', type: 'String' },
+];
+
+const detectedLatLng = {
+  x_column: 'Longitude',
+  y_column: 'Latitude',
+  wkt_column: null,
+};
+
+const detectedWkt = {
+  x_column: null,
+  y_column: null,
+  wkt_column: 'wkt',
+};
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+describe('ImportMetadataForm', () => {
+  it('renders basic fields without geometry section when no columns', () => {
+    render(<ImportMetadataForm {...defaultProps} />);
+
+    expect(screen.getByLabelText('metadata.nameLabel')).toHaveValue('test-data');
+    expect(screen.getByLabelText('metadata.descriptionLabel')).toBeInTheDocument();
+    expect(screen.getByLabelText('metadata.visibilityLabel')).toBeInTheDocument();
+    // Geometry section should not appear without previewColumns
+    expect(screen.queryByText('metadata.geometryColumns')).not.toBeInTheDocument();
+  });
+
+  it('strips extension from default name', () => {
+    render(
+      <ImportMetadataForm {...defaultProps} defaultName="my-data.xlsx" />,
+    );
+    expect(screen.getByLabelText('metadata.nameLabel')).toHaveValue('my-data');
+  });
+
+  it('shows geometry section when previewColumns are provided', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+    expect(screen.getByText('metadata.geometryColumns')).toBeInTheDocument();
+  });
+
+  it('does not show geometry section for raster imports', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        isRaster
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+    expect(screen.queryByText('metadata.geometryColumns')).not.toBeInTheDocument();
+  });
+
+  it('shows a read-only embedded geometry state for native geometry sources', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryType="Point"
+        detectedGeometryColumns={null}
+      />,
+    );
+
+    expect(screen.getByText('Using embedded geometry')).toBeInTheDocument();
+    expect(screen.queryByLabelText('metadata.geometryMode')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('metadata.xColumn')).not.toBeInTheDocument();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Geometry mode: auto-detected lat/lng
+  // ---------------------------------------------------------------------------
+
+  it('defaults to auto mode when geometry columns detected', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+    const modeSelect = screen.getByLabelText('metadata.geometryMode');
+    expect(modeSelect).toHaveTextContent('metadata.autoDetected');
+  });
+
+  it('pre-fills x/y dropdowns from detected columns in auto mode', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+    expect(screen.getByLabelText('metadata.xColumn')).toHaveTextContent('Longitude');
+    expect(screen.getByLabelText('metadata.yColumn')).toHaveTextContent('Latitude');
+  });
+
+  it('disables dropdowns in auto mode', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+    expect(screen.getByLabelText('metadata.xColumn')).toBeDisabled();
+    expect(screen.getByLabelText('metadata.yColumn')).toBeDisabled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Geometry mode: WKT auto-detected
+  // ---------------------------------------------------------------------------
+
+  it('defaults to WKT type when only wkt_column detected', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedWkt}
+      />,
+    );
+    const wktRadio = screen.getByRole('radio', { name: 'metadata.wkt' });
+    expect(wktRadio).toBeChecked();
+  });
+
+  it('pre-fills WKT dropdown from detected column', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedWkt}
+      />,
+    );
+    expect(screen.getByLabelText('metadata.wktColumn')).toHaveTextContent('wkt');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Geometry mode: none (no detection)
+  // ---------------------------------------------------------------------------
+
+  it('defaults to none mode when no geometry columns detected', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={null}
+      />,
+    );
+    const modeSelect = screen.getByLabelText('metadata.geometryMode');
+    expect(modeSelect).toHaveTextContent('metadata.nonSpatial');
+  });
+
+  it('hides column selectors in none mode', () => {
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={null}
+      />,
+    );
+    expect(screen.queryByLabelText('metadata.xColumn')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('metadata.yColumn')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('metadata.wktColumn')).not.toBeInTheDocument();
+  });
+
+  // ---------------------------------------------------------------------------
+  // User override: switching modes
+  // ---------------------------------------------------------------------------
+
+  it('enables dropdowns when switching from auto to manual', async () => {
+    const user = userEvent.setup();
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+
+    await selectGeomMode(user, 'metadata.manualOverride');
+
+    expect(screen.getByLabelText('metadata.xColumn')).not.toBeDisabled();
+    expect(screen.getByLabelText('metadata.yColumn')).not.toBeDisabled();
+  });
+
+  it('hides geometry selectors when switching to none mode', async () => {
+    const user = userEvent.setup();
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+
+    await selectGeomMode(user, 'metadata.nonSpatial');
+
+    expect(screen.queryByLabelText('metadata.xColumn')).not.toBeInTheDocument();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Form submission
+  // ---------------------------------------------------------------------------
+
+  it('submits with lat/lng columns in auto mode', async () => {
+    const onCommit = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        onCommit={onCommit}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+
+    expect(onCommit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'test-data',
+        x_column: 'Longitude',
+        y_column: 'Latitude',
+      }),
+    );
+    expect(onCommit.mock.calls[0][0]).not.toHaveProperty('geom_column');
+  });
+
+  it('submits with WKT column', async () => {
+    const onCommit = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        onCommit={onCommit}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedWkt}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+
+    expect(onCommit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: 'test-data',
+        geom_column: 'wkt',
+      }),
+    );
+    expect(onCommit.mock.calls[0][0]).not.toHaveProperty('x_column');
+  });
+
+  it('submits without geometry columns in none mode', async () => {
+    const onCommit = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        onCommit={onCommit}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={null}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+
+    expect(onCommit).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'test-data' }),
+    );
+    const call = onCommit.mock.calls[0][0];
+    expect(call).not.toHaveProperty('x_column');
+    expect(call).not.toHaveProperty('y_column');
+    expect(call).not.toHaveProperty('geom_column');
+  });
+
+  it.each(['__none__', 'col:x', 'none'])(
+    'lets a source column named %s be picked as the X column',
+    async (columnName) => {
+      const onCommit = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ImportMetadataForm
+          {...defaultProps}
+          onCommit={onCommit}
+          previewColumns={[...sampleColumns, { name: columnName, type: 'Real' }]}
+          detectedGeometryColumns={detectedLatLng}
+        />,
+      );
+      await selectGeomMode(user, 'metadata.manualOverride');
+      await user.click(screen.getByLabelText('metadata.xColumn'));
+      await user.click(await screen.findByRole('option', { name: columnName }));
+      await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+
+      expect(onCommit).toHaveBeenCalledWith(
+        expect.objectContaining({ x_column: columnName }),
+      );
+    },
+  );
+
+  it('submits with manual column selection override', async () => {
+    const onCommit = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        onCommit={onCommit}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+
+    // Switch to manual mode
+    await selectGeomMode(user, 'metadata.manualOverride');
+
+    // Change x column to id (numeric)
+    await user.click(screen.getByLabelText('metadata.xColumn'));
+    await user.click(await screen.findByRole('option', { name: 'id' }));
+
+    await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+
+    expect(onCommit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        x_column: 'id',
+        y_column: 'Latitude',
+      }),
+    );
+  });
+
+  it('submits native geometry sources without override columns', async () => {
+    const onCommit = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        onCommit={onCommit}
+        previewColumns={sampleColumns}
+        detectedGeometryType="Point"
+        detectedGeometryColumns={null}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+
+    const call = onCommit.mock.calls[0][0];
+    expect(call).toEqual(expect.objectContaining({ title: 'test-data' }));
+    expect(call).not.toHaveProperty('x_column');
+    expect(call).not.toHaveProperty('y_column');
+    expect(call).not.toHaveProperty('geom_column');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Button state
+  // ---------------------------------------------------------------------------
+
+  it('disables submit button when committing', () => {
+    render(
+      <ImportMetadataForm {...defaultProps} isCommitting />,
+    );
+    expect(screen.getByRole('button')).toBeDisabled();
+  });
+
+  it('disables submit button when name is empty', async () => {
+    const user = userEvent.setup();
+    render(<ImportMetadataForm {...defaultProps} />);
+
+    const nameInput = screen.getByLabelText('metadata.nameLabel');
+    await user.clear(nameInput);
+
+    expect(screen.getByRole('button', { name: 'metadata.importDataset' })).toBeDisabled();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Dropdown population
+  // ---------------------------------------------------------------------------
+
+  it('populates x/y dropdowns with numeric columns only', async () => {
+    const user = userEvent.setup();
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={{ x_column: null, y_column: null, wkt_column: null }}
+      />,
+    );
+
+    // Mode is 'none' because no columns were detected — switch to manual to reveal dropdowns.
+    await selectGeomMode(user, 'metadata.manualOverride');
+
+    await user.click(screen.getByLabelText('metadata.xColumn'));
+    const options = (await screen.findAllByRole('option')).map((o) => o.textContent);
+    // Numeric columns (Integer, Real) should be present
+    expect(options).toContain('id');
+    expect(options).toContain('Latitude');
+    expect(options).toContain('Longitude');
+    // String columns must be excluded from the numeric filter
+    expect(options).not.toContain('name');
+    expect(options).not.toContain('wkt');
+  });
+
+  it('populates WKT dropdown with string columns only', async () => {
+    const user = userEvent.setup();
+    render(
+      <ImportMetadataForm
+        {...defaultProps}
+        previewColumns={sampleColumns}
+        detectedGeometryColumns={detectedLatLng}
+      />,
+    );
+
+    // Switch to manual mode
+    await selectGeomMode(user, 'metadata.manualOverride');
+    // Switch to WKT type
+    await user.click(screen.getByRole('radio', { name: 'metadata.wkt' }));
+
+    await user.click(screen.getByLabelText('metadata.wktColumn'));
+    // Should have: --, name, wkt (string columns + placeholder)
+    const optionValues = (await screen.findAllByRole('option')).map((o) => o.textContent);
+    expect(optionValues).toContain('name');
+    expect(optionValues).toContain('wkt');
+    expect(optionValues).not.toContain('id');
+    expect(optionValues).not.toContain('Latitude');
+  });
+
+  // ---------------------------------------------------------------------------
+  // CRS Override auto-hide
+  // ---------------------------------------------------------------------------
+
+  describe('CRS Override field visibility (D-08)', () => {
+    it('hides the CRS input when detectedCrs is non-null', () => {
+      render(<ImportMetadataForm {...defaultProps} detectedCrs={4326} />);
+      // The editable CRS input must not be present when probe carried a CRS
+      expect(
+        screen.queryByRole('spinbutton', { name: /crs/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('shows CRS input when detectedCrs is null (escape hatch preserved)', () => {
+      render(<ImportMetadataForm {...defaultProps} detectedCrs={null} />);
+      // Editable input must be present for the null-CRS fallthrough case
+      expect(
+        screen.getByLabelText('metadata.crsLabel'),
+      ).toBeInTheDocument();
+    });
+
+    it('shows a non-editable confirmation when detectedCrs is non-null', () => {
+      render(<ImportMetadataForm {...defaultProps} detectedCrs={4326} />);
+      // Option B: a confirmation line conveying "Detected CRS: EPSG:4326"
+      expect(screen.getByText(/EPSG:4326/)).toBeInTheDocument();
+    });
+
+    it('srid_override is null in commit when CRS input is hidden', async () => {
+      const onCommit = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ImportMetadataForm
+          {...defaultProps}
+          onCommit={onCommit}
+          detectedCrs={4326}
+        />,
+      );
+      await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+      expect(onCommit).toHaveBeenCalledWith(
+        expect.objectContaining({ srid_override: null }),
+      );
+    });
+
+    it('offers a 3D Tiles tileset no CRS at all and commits it without an override', async () => {
+      const onCommit = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ImportMetadataForm
+          {...defaultProps}
+          defaultName="campus.zip"
+          onCommit={onCommit}
+          detectedCrs={null}
+          isTileset
+        />,
+      );
+
+      expect(screen.queryByText('metadata.crsLabel')).not.toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+      expect(onCommit).toHaveBeenCalledWith(
+        expect.objectContaining({ title: 'campus', srid_override: null }),
+      );
+    });
+  });
+
+  describe('resuming an attempted request', () => {
+    it('shows the attempted vector request and resubmits it unchanged', async () => {
+      const onCommit = vi.fn();
+      const user = userEvent.setup();
+      const attempted = {
+        title: 'Edited roads',
+        summary: 'Survey notes',
+        visibility: 'public',
+        srid_override: 3857,
+        x_column: 'id',
+        y_column: 'Latitude',
+      };
+      render(
+        <ImportMetadataForm
+          {...defaultProps}
+          onCommit={onCommit}
+          previewColumns={sampleColumns}
+          detectedGeometryColumns={detectedLatLng}
+          initialRequest={attempted}
+        />,
+      );
+
+      expect(screen.getByLabelText('metadata.nameLabel')).toHaveValue('Edited roads');
+      expect(screen.getByLabelText('metadata.descriptionLabel')).toHaveValue('Survey notes');
+      expect(screen.getByLabelText('metadata.crsLabel')).toHaveValue(3857);
+      expect(screen.getByLabelText('metadata.xColumn')).toHaveTextContent('id');
+      await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+      expect(onCommit).toHaveBeenCalledWith(attempted);
+    });
+
+    it('resubmits attempted raster options unchanged', async () => {
+      const onCommit = vi.fn();
+      const user = userEvent.setup();
+      const attempted = {
+        title: 'Elevation',
+        summary: null,
+        visibility: 'private',
+        srid_override: null,
+        temporal_start: '2024-01-01',
+        temporal_end: '2024-12-31',
+        compression: 'ZSTD',
+        resampling: 'bilinear',
+        nodata_override: '-9999',
+      };
+      render(
+        <ImportMetadataForm
+          {...defaultProps}
+          defaultName="dem.tif"
+          onCommit={onCommit}
+          isRaster
+          initialRequest={attempted}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+      expect(onCommit).toHaveBeenCalledWith(attempted);
+    });
+  });
+
+  describe('visibility choices', () => {
+    beforeEach(() => {
+      settings.canSetPublic = true;
+    });
+
+    async function openVisibility(user: ReturnType<typeof userEvent.setup>) {
+      await user.click(screen.getByLabelText('metadata.visibilityLabel'));
+      return screen.findAllByRole('option');
+    }
+
+    it('offers private, internal and public in that order', async () => {
+      render(<ImportMetadataForm {...defaultProps} />);
+      const options = await openVisibility(userEvent.setup());
+
+      expect(options.map((o) => o.textContent)).toEqual([
+        'metadata.visibilityPrivate',
+        'metadata.visibilityInternal',
+        'metadata.visibilityPublic',
+      ]);
+    });
+
+    it('keeps internal when public is restricted', async () => {
+      settings.canSetPublic = false;
+      render(<ImportMetadataForm {...defaultProps} />);
+      const options = await openVisibility(userEvent.setup());
+
+      expect(options.map((o) => o.textContent)).toEqual([
+        'metadata.visibilityPrivate',
+        'metadata.visibilityInternal',
+      ]);
+    });
+
+    it('sends the internal choice with the commit request', async () => {
+      const onCommit = vi.fn();
+      const user = userEvent.setup();
+      render(<ImportMetadataForm {...defaultProps} onCommit={onCommit} />);
+      await openVisibility(user);
+      await user.click(screen.getByRole('option', { name: 'metadata.visibilityInternal' }));
+      await user.click(screen.getByRole('button', { name: 'metadata.importDataset' }));
+
+      expect(onCommit).toHaveBeenCalledWith(expect.objectContaining({ visibility: 'internal' }));
+    });
+  });
+});

@@ -1,0 +1,951 @@
+"""Integration tests for auth flow, RBAC, and admin user management.
+
+These tests run against a real database via httpx ASGITransport. The FastAPI
+app's lifespan handler seeds roles and an initial admin user on startup.
+
+Requirements:
+  - Docker database must be running (docker compose up db)
+  - Alembic migrations must be applied
+
+If the database is not available, tests will fail with a connection error.
+"""
+
+import uuid
+from unittest.mock import AsyncMock
+
+from httpx import AsyncClient
+
+from app.api.main import app
+from app.modules.auth.router import REGISTRATION_ENABLED
+from app.core.config import settings
+from tests.conftest import get_auth_header
+
+# Admin credentials from settings (geolens_admin_username/password)
+ADMIN_USER = settings.geolens_admin_username
+ADMIN_PASS = settings.geolens_admin_password.get_secret_value()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _create_user_via_admin(
+    client: AsyncClient,
+    admin_headers: dict,
+    username: str,
+    password: str = "TestPass1234!",
+    role: str = "viewer",
+    email: str | None = None,
+) -> dict:
+    """Create a user through the admin endpoint and return the response JSON."""
+    body = {"username": username, "password": password, "role": role}
+    if email is not None:
+        body["email"] = email
+    resp = await client.post("/admin/users/", json=body, headers=admin_headers)
+    assert resp.status_code == 201, f"Create user failed: {resp.text}"
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Registration tests
+# ---------------------------------------------------------------------------
+
+
+class TestRegistration:
+    async def test_register_when_enabled(self, client: AsyncClient, monkeypatch):
+        """Registration creates a pending user when REGISTRATION_ENABLED=true."""
+        monkeypatch.setattr(
+            REGISTRATION_ENABLED,
+            "get_uncached",
+            AsyncMock(return_value=True),
+        )
+
+        unique = uuid.uuid4().hex[:8]
+        resp = await client.post(
+            "/auth/register/",
+            json={"username": f"reguser_{unique}", "password": "SecurePass123!"},
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert "message" in data
+        assert "awaiting" in data["message"].lower()
+
+    async def test_register_when_disabled(self, client: AsyncClient):
+        """Registration is blocked when registration is disabled (default)."""
+        resp = await client.post(
+            "/auth/register/",
+            json={"username": "shouldfail", "password": "SecurePass123!"},
+        )
+        assert resp.status_code == 403
+
+    async def test_register_duplicate_username(self, client: AsyncClient, monkeypatch):
+        """Duplicate username returns the same 201 pending-approval response.
+
+        Updated from the old contract (409 Conflict) to the uniform response that
+        prevents username enumeration — the caller cannot distinguish a collision
+        from a genuine new registration.
+        """
+        monkeypatch.setattr(
+            REGISTRATION_ENABLED,
+            "get_uncached",
+            AsyncMock(return_value=True),
+        )
+
+        unique = uuid.uuid4().hex[:8]
+        username = f"dupuser_{unique}"
+        # First registration
+        resp1 = await client.post(
+            "/auth/register/",
+            json={"username": username, "password": "SecurePass123!"},
+        )
+        assert resp1.status_code == 201
+
+        # Second registration with same username — must be uniform
+        resp2 = await client.post(
+            "/auth/register/",
+            json={"username": username, "password": "SecurePass123!"},
+        )
+        assert resp2.status_code == 201
+        data = resp2.json()
+        assert "message" in data
+        assert "awaiting" in data["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Login tests
+# ---------------------------------------------------------------------------
+
+
+class TestLogin:
+    async def test_login_success(self, client: AsyncClient):
+        """Seeded admin user can log in and receives a JWT token."""
+        resp = await client.post(
+            "/auth/login",
+            data={"username": ADMIN_USER, "password": ADMIN_PASS},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "access_token" in data
+        assert data["token_type"] == "bearer"
+
+    async def test_openapi_token_url_matches_the_proxied_login_path(
+        self, client: AsyncClient
+    ):
+        """The advertised tokenUrl is the login path behind the `/api` proxy.
+
+        The test client reaches the app under both paths, so the published value
+        is what guards deployments; the POST only shows that path works.
+        """
+        app.openapi_schema = None
+        spec = app.openapi()
+        flows = spec["components"]["securitySchemes"]["OAuth2PasswordBearer"]["flows"]
+        token_url = flows["password"]["tokenUrl"]
+        assert token_url == "/api/auth/login"
+
+        resp = await client.post(
+            token_url,
+            data={"username": ADMIN_USER, "password": ADMIN_PASS},
+        )
+        assert resp.status_code == 200
+        assert "access_token" in resp.json()
+
+    async def test_login_sets_last_login_at(self, client: AsyncClient):
+        """Successful login populates last_login_at on the user profile."""
+        # Login
+        resp = await client.post(
+            "/auth/login",
+            data={"username": ADMIN_USER, "password": ADMIN_PASS},
+        )
+        assert resp.status_code == 200
+        token = resp.json()["access_token"]
+
+        # Check /auth/me for last_login_at
+        headers = {"Authorization": f"Bearer {token}"}
+        me_resp = await client.get("/auth/me/", headers=headers)
+        assert me_resp.status_code == 200
+        assert me_resp.json()["last_login_at"] is not None
+
+    async def test_login_wrong_password(self, client: AsyncClient):
+        """Wrong password returns 401."""
+        resp = await client.post(
+            "/auth/login",
+            data={"username": ADMIN_USER, "password": "wrongpassword"},
+        )
+        assert resp.status_code == 401
+
+    async def test_login_nonexistent_user(self, client: AsyncClient):
+        """Nonexistent username returns 401."""
+        resp = await client.post(
+            "/auth/login",
+            data={"username": "nonexistent_user_xyz", "password": "anypass123"},
+        )
+        assert resp.status_code == 401
+
+    async def test_login_deactivated_user(self, client: AsyncClient):
+        """Deactivated user cannot log in (returns 403 Account not active)."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        # Create a user, then deactivate them
+        unique = uuid.uuid4().hex[:8]
+        username = f"deactuser_{unique}"
+        user_data = await _create_user_via_admin(
+            client, admin_headers, username=username, password="TestPass1234!"
+        )
+        user_id = user_data["id"]
+
+        # Deactivate
+        resp = await client.post(
+            f"/admin/users/{user_id}/deactivate/", headers=admin_headers
+        )
+        assert resp.status_code == 200
+
+        # Try to log in -- deactivated users get 403
+        resp = await client.post(
+            "/auth/login",
+            data={"username": username, "password": "TestPass1234!"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Account not active"
+
+
+# ---------------------------------------------------------------------------
+# Login/logout audit tests (fix #1230)
+# ---------------------------------------------------------------------------
+
+
+class TestLoginAudit:
+    """Password login success/failure and logout were invisible in the audit
+    trail before #1230 -- only the OAuth path emitted login events."""
+
+    async def test_login_success_creates_audit_log(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """A successful password login writes a user.login.success row."""
+        resp = await client.post(
+            "/auth/login",
+            data={"username": ADMIN_USER, "password": ADMIN_PASS},
+        )
+        assert resp.status_code == 200
+
+        log_resp = await client.get(
+            "/admin/audit-logs/",
+            params={"action": "user.login.success"},
+            headers=admin_auth_header,
+        )
+        assert log_resp.status_code == 200
+        data = log_resp.json()
+        assert data["total"] >= 1
+        assert any(log["username"] == ADMIN_USER for log in data["logs"])
+
+    async def test_login_failure_creates_audit_log(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """A wrong password writes a user.login.failure row.
+
+        user_id must be None: LocalAuthProvider deliberately does not
+        disclose whether the username exists, and the audit row must not
+        either. The submitted password must never appear in details.
+        """
+        resp = await client.post(
+            "/auth/login",
+            data={"username": ADMIN_USER, "password": "definitely-the-wrong-password"},
+        )
+        assert resp.status_code == 401
+
+        # Scope to rows for OUR attempted
+        # username rather than indexing logs[0] -- under pytest -n concurrent
+        # writes, a sibling test's own login.failure row can otherwise land
+        # "first" in this query's ordering.
+        log_resp = await client.get(
+            "/admin/audit-logs/",
+            params={"action": "user.login.failure", "limit": 200},
+            headers=admin_auth_header,
+        )
+        assert log_resp.status_code == 200
+        matches = [
+            log
+            for log in log_resp.json()["logs"]
+            if (log["details"] or {}).get("username") == ADMIN_USER
+        ]
+        assert len(matches) >= 1
+        for entry in matches:
+            assert entry["user_id"] is None
+            assert "password" not in (entry["details"] or {})
+
+    async def test_login_failure_nonexistent_user_creates_audit_log(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """A login attempt for a username that does not exist is also audited."""
+        unique_username = f"nonexistent_user_audit_{uuid.uuid4().hex[:8]}"
+        resp = await client.post(
+            "/auth/login",
+            data={"username": unique_username, "password": "anypass123"},
+        )
+        assert resp.status_code == 401
+
+        # search filters on action/resource_type/username-of-a-known-user, not
+        # JSONB details, so filter client-side on the attempted username.
+        log_resp = await client.get(
+            "/admin/audit-logs/",
+            params={"action": "user.login.failure", "limit": 200},
+            headers=admin_auth_header,
+        )
+        assert log_resp.status_code == 200
+        logs = log_resp.json()["logs"]
+        assert any(
+            (log["details"] or {}).get("username") == unique_username for log in logs
+        )
+
+    async def test_login_deactivated_user_creates_audit_log(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """Denial paths past credential-check are also
+        audited, not just AuthenticationError -- a deactivated account trying
+        to log in is exactly the kind of attempt an operator needs to see.
+        """
+        unique = uuid.uuid4().hex[:8]
+        username = f"deactaudit_{unique}"
+        user_data = await _create_user_via_admin(
+            client, admin_auth_header, username=username, password="TestPass1234!"
+        )
+        resp = await client.post(
+            f"/admin/users/{user_data['id']}/deactivate/", headers=admin_auth_header
+        )
+        assert resp.status_code == 200
+
+        resp = await client.post(
+            "/auth/login",
+            data={"username": username, "password": "TestPass1234!"},
+        )
+        assert resp.status_code == 403
+
+        log_resp = await client.get(
+            "/admin/audit-logs/",
+            params={"action": "user.login.failure", "limit": 200},
+            headers=admin_auth_header,
+        )
+        assert log_resp.status_code == 200
+        logs = log_resp.json()["logs"]
+        entries = [log for log in logs if log["user_id"] == user_data["id"]]
+        assert len(entries) >= 1
+        assert entries[0]["details"]["reason"] == "account_not_active"
+
+    async def test_login_pending_user_creates_audit_log(
+        self, client: AsyncClient, admin_auth_header: dict, monkeypatch
+    ):
+        """The pending_approval denial path
+        writes an audit log -- mirrors test_login_deactivated_user_creates_
+        audit_log for the sibling denial branch.
+        """
+        monkeypatch.setattr(
+            REGISTRATION_ENABLED,
+            "get_uncached",
+            AsyncMock(return_value=True),
+        )
+        unique = uuid.uuid4().hex[:8]
+        username = f"pendaudit_{unique}"
+        password = "TestPass1234!"
+        reg_resp = await client.post(
+            "/auth/register/",
+            json={"username": username, "password": password},
+        )
+        assert reg_resp.status_code == 201
+
+        list_resp = await client.get(
+            "/admin/users/?status=pending",
+            headers=admin_auth_header,
+        )
+        assert list_resp.status_code == 200
+        pending_user = next(
+            u for u in list_resp.json()["users"] if u["username"] == username
+        )
+
+        resp = await client.post(
+            "/auth/login",
+            data={"username": username, "password": password},
+        )
+        assert resp.status_code == 403
+
+        log_resp = await client.get(
+            "/admin/audit-logs/",
+            params={"action": "user.login.failure", "limit": 200},
+            headers=admin_auth_header,
+        )
+        assert log_resp.status_code == 200
+        logs = log_resp.json()["logs"]
+        entries = [log for log in logs if log["user_id"] == pending_user["id"]]
+        assert len(entries) >= 1
+        assert entries[0]["details"]["reason"] == "pending_approval"
+
+    async def test_login_disallowed_domain_creates_audit_log(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """The email_domain_not_allowed
+        denial path writes an audit log. Mirrors
+        test_domain_enforcement.py::test_disallowed_domain_login_rejected,
+        with an audit-log assertion added.
+        """
+        unique = uuid.uuid4().hex[:8]
+        username = f"domainaudit_{unique}"
+        password = "TestPass1234!"
+        disallowed_email = f"{username}@evil.example.net"
+        create_resp = await client.post(
+            "/admin/users/",
+            json={
+                "username": username,
+                "password": password,
+                "email": disallowed_email,
+                "role": "viewer",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        user_id = create_resp.json()["id"]
+
+        settings_resp = await client.put(
+            "/settings/",
+            json={"settings": {"allowed_email_domains": ["allowed.example.com"]}},
+            headers=admin_auth_header,
+        )
+        assert settings_resp.status_code == 200
+        try:
+            resp = await client.post(
+                "/auth/login",
+                data={"username": username, "password": password},
+            )
+            assert resp.status_code == 403
+
+            log_resp = await client.get(
+                "/admin/audit-logs/",
+                params={"action": "user.login.failure", "limit": 200},
+                headers=admin_auth_header,
+            )
+            assert log_resp.status_code == 200
+            logs = log_resp.json()["logs"]
+            entries = [log for log in logs if log["user_id"] == user_id]
+            assert len(entries) >= 1
+            assert entries[0]["details"]["reason"] == "email_domain_not_allowed"
+        finally:
+            await client.put(
+                "/settings/",
+                json={"settings": {"allowed_email_domains": []}},
+                headers=admin_auth_header,
+            )
+
+    async def test_login_oauth_only_user_creates_audit_log_not_500(
+        self, client: AsyncClient, admin_auth_header: dict, test_db_session
+    ):
+        """An OAuth-created user has password_hash=
+        None (oauth/service.py never sets one). Submitting the password form
+        for that username used to hand pwdlib an empty-string "hash" it
+        can't parse, raising UnknownHashError uncaught -- a 500 instead of
+        401, and no user.login.failure row (the router only catches
+        AuthenticationError). Must behave exactly like any other wrong-
+        password attempt: 401 + an audited failure with no user_id.
+        """
+        from app.modules.auth.models import User
+
+        unique = uuid.uuid4().hex[:8]
+        username = f"oauthonly_{unique}"
+        oauth_user = User(
+            username=username,
+            email=f"{username}@example.com",
+            password_hash=None,
+            auth_provider="oauth",
+            status="active",
+            is_active=True,
+        )
+        test_db_session.add(oauth_user)
+        await test_db_session.commit()
+
+        resp = await client.post(
+            "/auth/login",
+            data={"username": username, "password": "whatever-password-123"},
+        )
+        assert resp.status_code == 401, resp.text
+
+        log_resp = await client.get(
+            "/admin/audit-logs/",
+            params={"action": "user.login.failure", "limit": 200},
+            headers=admin_auth_header,
+        )
+        assert log_resp.status_code == 200
+        matches = [
+            log
+            for log in log_resp.json()["logs"]
+            if (log["details"] or {}).get("username") == username
+        ]
+        assert len(matches) >= 1
+        assert matches[0]["user_id"] is None
+
+    async def test_login_failure_truncates_long_username(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """OAuth2PasswordRequestForm applies no length
+        limit to username, so a failed login must not persist an unbounded
+        string in details -- bound it to User.username's own width (150).
+        """
+        oversized_username = "x" * 5000
+        resp = await client.post(
+            "/auth/login",
+            data={"username": oversized_username, "password": "anypass123"},
+        )
+        assert resp.status_code == 401
+
+        log_resp = await client.get(
+            "/admin/audit-logs/",
+            params={"action": "user.login.failure", "limit": 200},
+            headers=admin_auth_header,
+        )
+        assert log_resp.status_code == 200
+        logs = log_resp.json()["logs"]
+        matches = [
+            log
+            for log in logs
+            if (log["details"] or {}).get("username", "").startswith("xxxx")
+        ]
+        assert len(matches) >= 1
+        assert len(matches[0]["details"]["username"]) <= 150
+
+    async def test_logout_creates_audit_log(
+        self, client: AsyncClient, admin_auth_header: dict
+    ):
+        """POST /auth/logout writes a user.logout row.
+
+        Logout revokes the token that authorized the call, so the
+        follow-up admin query needs a freshly minted token.
+        """
+        resp = await client.post("/auth/logout", headers=admin_auth_header)
+        assert resp.status_code == 204
+
+        fresh_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+        log_resp = await client.get(
+            "/admin/audit-logs/",
+            params={"action": "user.logout"},
+            headers=fresh_headers,
+        )
+        assert log_resp.status_code == 200
+        assert log_resp.json()["total"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Token / me tests
+# ---------------------------------------------------------------------------
+
+
+class TestPublicConfig:
+    async def test_config_exposes_auth_methods_field(self, client: AsyncClient):
+        """GET /auth/config/ surfaces AuthExtension.get_auth_methods() so the
+        login page can render conditional sign-in options without needing
+        admin OAuthProvider access. Community returns []; enterprise overlays
+        contribute methods (e.g. ['saml'])."""
+        resp = await client.get("/auth/config/")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "auth_methods" in data
+        assert isinstance(data["auth_methods"], list)
+        # Community default: DefaultAuthExtension contributes nothing.
+        assert data["auth_methods"] == []
+
+    async def test_config_hides_staged_banner_text(self, client: AsyncClient):
+        """A staged (disabled) announcement must not leak through the
+        unauthenticated /auth/config endpoint (#553): banner_text is blanked
+        unless banner_enabled is true."""
+        headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+        try:
+            resp = await client.put(
+                "/settings/",
+                json={
+                    "settings": {
+                        "banner_enabled": False,
+                        "banner_text": "staged secret",
+                    }
+                },
+                headers=headers,
+            )
+            assert resp.status_code == 200
+
+            resp = await client.get("/auth/config/")
+            data = resp.json()
+            assert data["banner_enabled"] is False
+            assert data["banner_text"] == ""
+
+            resp = await client.put(
+                "/settings/",
+                json={"settings": {"banner_enabled": True}},
+                headers=headers,
+            )
+            assert resp.status_code == 200
+
+            resp = await client.get("/auth/config/")
+            data = resp.json()
+            assert data["banner_enabled"] is True
+            assert data["banner_text"] == "staged secret"
+        finally:
+            await client.put(
+                "/settings/",
+                json={"settings": {"banner_enabled": False, "banner_text": ""}},
+                headers=headers,
+            )
+
+
+class TestTokenMe:
+    async def test_me_with_valid_token(self, client: AsyncClient):
+        """GET /auth/me returns user profile with roles when authenticated."""
+        headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+        resp = await client.get("/auth/me/", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["username"] == ADMIN_USER
+        assert "admin" in data["roles"]
+        assert data["is_active"] is True
+        assert "last_login_at" in data
+
+    async def test_me_without_token(self, client: AsyncClient):
+        """GET /auth/me without Authorization header returns 401."""
+        resp = await client.get("/auth/me/")
+        assert resp.status_code == 401
+
+    async def test_me_with_invalid_token(self, client: AsyncClient):
+        """GET /auth/me with garbage token returns 401."""
+        resp = await client.get(
+            "/auth/me/", headers={"Authorization": "Bearer garbage.token.here"}
+        )
+        assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# RBAC tests
+# ---------------------------------------------------------------------------
+
+
+class TestRBAC:
+    async def test_admin_can_access_admin_endpoints(self, client: AsyncClient):
+        """Admin user can access /admin/users."""
+        headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+        resp = await client.get("/admin/users/", headers=headers)
+        assert resp.status_code == 200
+
+    async def test_viewer_cannot_access_admin_endpoints(self, client: AsyncClient):
+        """Viewer user gets 403 on /admin/users."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        unique = uuid.uuid4().hex[:8]
+        username = f"viewer_{unique}"
+        await _create_user_via_admin(
+            client,
+            admin_headers,
+            username=username,
+            password="TestPass1234!",
+            role="viewer",
+        )
+
+        viewer_headers = await get_auth_header(client, username, "TestPass1234!")
+        resp = await client.get("/admin/users/", headers=viewer_headers)
+        assert resp.status_code == 403
+
+    # Google-signup users receive the 'editor' role
+    # (set via provider.default_role). Verify they cannot reach admin or
+    # settings management endpoints.
+    async def test_editor_cannot_access_admin_endpoints(self, client: AsyncClient):
+        """Editor user gets 403 on /admin/users and /settings/oauth-providers/."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        unique = uuid.uuid4().hex[:8]
+        username = f"editor_{unique}"
+        await _create_user_via_admin(
+            client,
+            admin_headers,
+            username=username,
+            password="TestPass1234!",
+            role="editor",
+        )
+
+        editor_headers = await get_auth_header(client, username, "TestPass1234!")
+        # manage_users gate
+        resp = await client.get("/admin/users/", headers=editor_headers)
+        assert resp.status_code == 403
+        # manage_settings gate — editors must not be able to register a malicious IdP
+        resp2 = await client.get("/settings/oauth-providers/", headers=editor_headers)
+        assert resp2.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Admin user names endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestAdminUserNames:
+    async def test_returns_id_and_username(self, client: AsyncClient):
+        """GET /admin/users/names returns lightweight user list."""
+        headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+        resp = await client.get("/admin/users/names/", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list)
+        assert len(data) >= 1
+        # Check shape
+        item = data[0]
+        assert "id" in item
+        assert "username" in item
+        # Should not include heavy fields
+        assert "password_hash" not in item
+        assert "roles" not in item
+        assert "email" not in item
+
+    async def test_requires_admin(self, client: AsyncClient):
+        """Viewer cannot access /admin/users/names."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+        unique = uuid.uuid4().hex[:8]
+        await _create_user_via_admin(
+            client, admin_headers, username=f"viewer_{unique}", role="viewer"
+        )
+        viewer_headers = await get_auth_header(
+            client, f"viewer_{unique}", "TestPass1234!"
+        )
+        resp = await client.get("/admin/users/names/", headers=viewer_headers)
+        assert resp.status_code == 403
+
+    async def test_unauthenticated(self, client: AsyncClient):
+        """Unauthenticated request returns 401."""
+        resp = await client.get("/admin/users/names/")
+        assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Admin user management tests
+# ---------------------------------------------------------------------------
+
+
+class TestAdminUserManagement:
+    async def test_admin_create_user(self, client: AsyncClient):
+        """Admin can create a user with a specified role."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        unique = uuid.uuid4().hex[:8]
+        username = f"newuser_{unique}"
+        resp = await client.post(
+            "/admin/users/",
+            json={
+                "username": username,
+                "password": "TestPass1234!",
+                "role": "editor",
+                "email": f"{username}@test.com",
+            },
+            headers=admin_headers,
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["username"] == username
+        assert "editor" in data["roles"]
+        assert data["email"] == f"{username}@test.com"
+        assert data["is_active"] is True
+
+    async def test_admin_deactivate_user(self, client: AsyncClient):
+        """Admin can deactivate a user."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        unique = uuid.uuid4().hex[:8]
+        username = f"todeact_{unique}"
+        user_data = await _create_user_via_admin(
+            client, admin_headers, username=username
+        )
+        user_id = user_data["id"]
+
+        resp = await client.post(
+            f"/admin/users/{user_id}/deactivate/", headers=admin_headers
+        )
+        assert resp.status_code == 200
+        assert resp.json()["is_active"] is False
+
+    async def test_admin_list_users(self, client: AsyncClient):
+        """Admin can list users with pagination."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        resp = await client.get("/admin/users/", headers=admin_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "users" in data
+        assert "total" in data
+        assert isinstance(data["users"], list)
+        assert data["total"] >= 1  # At least the admin user
+
+    async def test_admin_get_user(self, client: AsyncClient):
+        """Admin can get a specific user by ID."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        unique = uuid.uuid4().hex[:8]
+        username = f"getuser_{unique}"
+        user_data = await _create_user_via_admin(
+            client, admin_headers, username=username
+        )
+        user_id = user_data["id"]
+
+        resp = await client.get(f"/admin/users/{user_id}", headers=admin_headers)
+        assert resp.status_code == 200
+        assert resp.json()["username"] == username
+
+    async def test_admin_update_user_role(self, client: AsyncClient):
+        """Admin can change a user's role."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        unique = uuid.uuid4().hex[:8]
+        username = f"rolechange_{unique}"
+        user_data = await _create_user_via_admin(
+            client, admin_headers, username=username, role="viewer"
+        )
+        user_id = user_data["id"]
+        assert "viewer" in user_data["roles"]
+
+        resp = await client.patch(
+            f"/admin/users/{user_id}",
+            json={"role": "editor"},
+            headers=admin_headers,
+        )
+        assert resp.status_code == 200
+        assert "editor" in resp.json()["roles"]
+
+    async def test_admin_get_nonexistent_user_returns_404(self, client: AsyncClient):
+        """Getting a nonexistent user returns 404."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+        fake_id = str(uuid.uuid4())
+        resp = await client.get(f"/admin/users/{fake_id}", headers=admin_headers)
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Admin approve / reject user tests
+# ---------------------------------------------------------------------------
+
+
+class TestAdminApproveReject:
+    async def test_admin_approve_pending_user(self, client: AsyncClient, monkeypatch):
+        """Admin can approve a pending user via POST /admin/users/{id}/approve/."""
+        from app.modules.auth.router import REGISTRATION_ENABLED
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            REGISTRATION_ENABLED,
+            "get_uncached",
+            AsyncMock(return_value=True),
+        )
+
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        # Register a pending user
+        unique = uuid.uuid4().hex[:8]
+        username = f"pendapprove_{unique}"
+        reg_resp = await client.post(
+            "/auth/register/",
+            json={"username": username, "password": "SecurePass123!"},
+        )
+        assert reg_resp.status_code == 201
+
+        # Find the user via admin list
+        list_resp = await client.get(
+            "/admin/users/?status=pending",
+            headers=admin_headers,
+        )
+        assert list_resp.status_code == 200
+        users = list_resp.json()["users"]
+        pending_user = next(u for u in users if u["username"] == username)
+        user_id = pending_user["id"]
+
+        # Approve with viewer role
+        approve_resp = await client.post(
+            f"/admin/users/{user_id}/approve/",
+            json={"role": "viewer"},
+            headers=admin_headers,
+        )
+        assert approve_resp.status_code == 200
+        data = approve_resp.json()
+        assert data["status"] == "active"
+        assert data["is_active"] is True
+        assert "viewer" in data["roles"]
+
+    async def test_admin_reject_pending_user(self, client: AsyncClient, monkeypatch):
+        """Admin can reject a pending user via POST /admin/users/{id}/reject/."""
+        from app.modules.auth.router import REGISTRATION_ENABLED
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            REGISTRATION_ENABLED,
+            "get_uncached",
+            AsyncMock(return_value=True),
+        )
+
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        # Register a pending user
+        unique = uuid.uuid4().hex[:8]
+        username = f"pendreject_{unique}"
+        reg_resp = await client.post(
+            "/auth/register/",
+            json={"username": username, "password": "SecurePass123!"},
+        )
+        assert reg_resp.status_code == 201
+
+        # Find the user
+        list_resp = await client.get(
+            "/admin/users/?status=pending",
+            headers=admin_headers,
+        )
+        assert list_resp.status_code == 200
+        users = list_resp.json()["users"]
+        pending_user = next(u for u in users if u["username"] == username)
+        user_id = pending_user["id"]
+
+        # Reject (hard-delete)
+        reject_resp = await client.post(
+            f"/admin/users/{user_id}/reject/",
+            headers=admin_headers,
+        )
+        assert reject_resp.status_code == 204
+
+        # Confirm user is gone
+        get_resp = await client.get(
+            f"/admin/users/{user_id}",
+            headers=admin_headers,
+        )
+        assert get_resp.status_code == 404
+
+    async def test_approve_forbidden_for_non_admin(self, client: AsyncClient):
+        """Non-admin user cannot approve a pending user (returns 403)."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        # Create a viewer
+        unique = uuid.uuid4().hex[:8]
+        viewer_username = f"viewer_{unique}"
+        await _create_user_via_admin(
+            client, admin_headers, username=viewer_username, role="viewer"
+        )
+        viewer_headers = await get_auth_header(client, viewer_username, "TestPass1234!")
+
+        # Viewer tries to approve a user (use a fake ID — auth check happens first)
+        fake_id = str(uuid.uuid4())
+        resp = await client.post(
+            f"/admin/users/{fake_id}/approve/",
+            json={"role": "viewer"},
+            headers=viewer_headers,
+        )
+        assert resp.status_code == 403
+
+    async def test_reject_forbidden_for_non_admin(self, client: AsyncClient):
+        """Non-admin user cannot reject a pending user (returns 403)."""
+        admin_headers = await get_auth_header(client, ADMIN_USER, ADMIN_PASS)
+
+        # Create an editor
+        unique = uuid.uuid4().hex[:8]
+        editor_username = f"editor_{unique}"
+        await _create_user_via_admin(
+            client, admin_headers, username=editor_username, role="editor"
+        )
+        editor_headers = await get_auth_header(client, editor_username, "TestPass1234!")
+
+        fake_id = str(uuid.uuid4())
+        resp = await client.post(
+            f"/admin/users/{fake_id}/reject/",
+            headers=editor_headers,
+        )
+        assert resp.status_code == 403

@@ -1,0 +1,353 @@
+import { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { ChevronRight } from 'lucide-react';
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible';
+import { Slider } from '@/components/ui/slider';
+import { Button } from '@/components/ui/button';
+import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
+import { cn } from '@/lib/utils';
+import { MAP_COLORS } from '@/lib/map-colors';
+import { StyleColorPicker } from '@/components/builder/StyleColorPicker';
+import { InlineDeleteConfirm } from '@/components/builder/row-chrome';
+import { formatNumber } from '@/lib/format';
+
+// There is no DETAIL LEVEL control: no consumer implements sublayer
+// detail-level style mutation.
+//
+// STROKE + CASING + ZOOM sections persist through
+// MapBasemapConfig.sublayer_overrides jsonb. Backend schema: SublayerOverride
+// in backend/app/modules/catalog/maps/schemas.py. MapLibre style mutation:
+// applySublayerOverrides in frontend/src/lib/builder/basemap-style-mutation.ts.
+// All 6 callback props are optional so callers that haven't wired them still
+// work.
+
+interface BasemapSublayerEditorSceneProps {
+  sublayerId: string;
+  sublayerName: string;
+  // Live props:
+  opacity: number;
+  onOpacityChange: (opacity: number) => void;
+  onResetSublayer: () => void;
+  // Live props for the STROKE, CASING and ZOOM sections:
+  strokeColor?: string;          // hex #RRGGBB or undefined (= use default)
+  strokeWidth?: number;          // 0..20
+  casingColor?: string;
+  casingWidth?: number;          // 0..20
+  minZoom?: number;              // 0..24
+  maxZoom?: number;              // 0..24
+  onStrokeColorChange?: (color: string) => void;
+  onStrokeWidthChange?: (width: number) => void;
+  onCasingColorChange?: (color: string) => void;
+  onCasingWidthChange?: (width: number) => void;
+  onMinZoomChange?: (zoom: number) => void;
+  onMaxZoomChange?: (zoom: number) => void;
+}
+
+interface BasemapSublayerEditorFooterProps {
+  onBackToBasemap: () => void;
+}
+
+export function BasemapSublayerEditorScene({
+  sublayerId,
+  sublayerName,
+  opacity,
+  onOpacityChange,
+  onResetSublayer,
+  strokeColor,
+  strokeWidth,
+  casingColor,
+  casingWidth,
+  minZoom,
+  maxZoom,
+  onStrokeColorChange,
+  onStrokeWidthChange,
+  onCasingColorChange,
+  onCasingWidthChange,
+  onMinZoomChange,
+  onMaxZoomChange,
+}: BasemapSublayerEditorSceneProps) {
+  const { t } = useTranslation('builder');
+  const [resetOpen, setResetOpen] = useState(false);
+  const [confirmingReset, setConfirmingReset] = useState(false);
+  // The inline confirm owns focus (autofocused Cancel), so both
+  // exits must hand focus back to the reappearing "Reset to default" button
+  // instead of <body> — the focus return StackRow's delete confirm does.
+  // rAF: the button remounts on the state flip, so it does not exist yet at
+  // onConfirm/onCancel time.
+  const resetButtonRef = useRef<HTMLButtonElement>(null);
+  const focusResetButton = () =>
+    requestAnimationFrame(() => resetButtonRef.current?.focus());
+
+  // Reset confirmingReset and resetOpen when sublayerId changes: basemap
+  // sublayer navigation reuses the same component instance (LayerEditorPanel's
+  // key={expandedLayerId} only covers top-level layers), so without resetting
+  // resetOpen, navigating from sublayer A with the RESET collapsible open would
+  // render sublayer B pre-expanded.
+  useEffect(() => {
+    setConfirmingReset(false);
+    setResetOpen(false);
+  }, [sublayerId]);
+
+  const safeOpacity = typeof opacity === 'number' && Number.isFinite(opacity) ? opacity : 1;
+  const formattedStrokeWidth = `${formatNumber(strokeWidth ?? 0, {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  })}px`;
+  const formattedCasingWidth = `${formatNumber(casingWidth ?? 0, {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  })}px`;
+
+  // STROKE/CASING only mutate line sublayers in applyOverrideToLayer
+  // (stroke_color/width require layerType==='line'; casing requires a 'casing'
+  // line sibling). Roads and boundaries are line layers; labels (symbol) and
+  // buildings (fill-extrusion) are not, so those sections would be no-op
+  // controls that persist junk override fields. Gate on the sublayer kind;
+  // matches both the override keys ('road'/'boundary') and the builder sublayer
+  // ids ('basemap:roads'/'basemap:boundaries').
+  const supportsStrokeAndCasing = /road|boundar/i.test(sublayerId);
+
+  return (
+    <>
+      {/* 1. STROKE section (roads/boundaries only) */}
+      {supportsStrokeAndCasing && (
+      <section className="border-b">
+        <div className="px-4 py-2">
+          <p className="text-2xs font-semibold uppercase tracking-[0.08em] text-muted-foreground mb-2">
+            {t('basemapSublayer.strokeLabel', { defaultValue: 'STROKE' })}
+          </p>
+          <div className="space-y-3">
+            <StyleColorPicker
+              label={t('basemapSublayer.strokeColor', { defaultValue: 'Color' })}
+              color={strokeColor ?? MAP_COLORS.basemapSublayer.stroke}
+              onChange={(hex) => onStrokeColorChange?.(hex)}
+            />
+            <div className="grid grid-cols-[auto_1fr_auto] gap-2 items-center">
+              <Label className="text-xs text-muted-foreground w-20 shrink-0">
+                {t('basemapSublayer.strokeWidth', { defaultValue: 'Width' })}
+              </Label>
+              <Slider
+                aria-label={t('basemapSublayer.strokeWidthLabel', { defaultValue: 'Stroke width' })}
+                aria-valuetext={formattedStrokeWidth}
+                value={[strokeWidth ?? 0]}
+                min={0}
+                max={20}
+                step={0.5}
+                onValueChange={([v]) => onStrokeWidthChange?.(v ?? 0)}
+              />
+              <span className="text-xs tabular-nums text-muted-foreground w-12 shrink-0 text-end">
+                {formattedStrokeWidth}
+              </span>
+            </div>
+          </div>
+        </div>
+      </section>
+      )}
+
+      {/* 2. CASING section (roads/boundaries only) */}
+      {supportsStrokeAndCasing && (
+      <section className="border-b">
+        <div className="px-4 py-2">
+          <p className="text-2xs font-semibold uppercase tracking-[0.08em] text-muted-foreground mb-2">
+            {t('basemapSublayer.casingLabel', { defaultValue: 'CASING' })}
+          </p>
+          <div className="space-y-3">
+            <StyleColorPicker
+              label={t('basemapSublayer.casingColor', { defaultValue: 'Casing color' })}
+              color={casingColor ?? MAP_COLORS.basemapSublayer.casing}
+              onChange={(hex) => onCasingColorChange?.(hex)}
+            />
+            <div className="grid grid-cols-[auto_1fr_auto] gap-2 items-center">
+              <Label className="text-xs text-muted-foreground w-20 shrink-0">
+                {t('basemapSublayer.casingWidth', { defaultValue: 'Width' })}
+              </Label>
+              <Slider
+                aria-label={t('basemapSublayer.casingWidthLabel', { defaultValue: 'Casing width' })}
+                aria-valuetext={formattedCasingWidth}
+                value={[casingWidth ?? 0]}
+                min={0}
+                max={20}
+                step={0.5}
+                onValueChange={([v]) => onCasingWidthChange?.(v ?? 0)}
+              />
+              <span className="text-xs tabular-nums text-muted-foreground w-12 shrink-0 text-end">
+                {formattedCasingWidth}
+              </span>
+            </div>
+          </div>
+        </div>
+      </section>
+      )}
+
+      {/* 3. ZOOM RANGE section */}
+      <section className="border-b">
+        <div className="px-4 py-2">
+          <p className="text-2xs font-semibold uppercase tracking-[0.08em] text-muted-foreground mb-2">
+            {t('basemapSublayer.zoomLabel', { defaultValue: 'ZOOM RANGE' })}
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-1">
+              <Label htmlFor={`${sublayerId}-minzoom`} className="text-xs text-muted-foreground">
+                {t('layerEditor.visibility.minZoom', { defaultValue: 'Minimum zoom' })}
+              </Label>
+              <Input
+                id={`${sublayerId}-minzoom`}
+                type="number"
+                min={0}
+                max={24}
+                step={0.5}
+                value={minZoom ?? 0}
+                onChange={(e) => {
+                  // Number('') === 0 is finite — clearing the field must reset
+                  // the clamp (0), not pass through as an accidental bound.
+                  const v = e.target.value === '' ? 0 : Number(e.target.value);
+                  if (!Number.isFinite(v)) return;
+                  onMinZoomChange?.(Math.min(24, Math.max(0, v)));
+                }}
+                className="h-8 text-xs"
+                aria-label={t('layerEditor.visibility.minZoom', { defaultValue: 'Minimum zoom' })}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor={`${sublayerId}-maxzoom`} className="text-xs text-muted-foreground">
+                {t('layerEditor.visibility.maxZoom', { defaultValue: 'Maximum zoom' })}
+              </Label>
+              <Input
+                id={`${sublayerId}-maxzoom`}
+                type="number"
+                min={0}
+                max={24}
+                step={0.5}
+                value={maxZoom ?? 22}
+                onChange={(e) => {
+                  // Number('') === 0 is finite: clearing max-zoom must reset
+                  // the clamp (22), not write 0 and hide the sublayer at every
+                  // zoom.
+                  const v = e.target.value === '' ? 22 : Number(e.target.value);
+                  if (!Number.isFinite(v)) return;
+                  onMaxZoomChange?.(Math.min(24, Math.max(0, v)));
+                }}
+                className="h-8 text-xs"
+                aria-label={t('layerEditor.visibility.maxZoom', { defaultValue: 'Maximum zoom' })}
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* 4. Visibility section: opacity only */}
+      <section className="border-b">
+        <div className="px-4 py-2">
+          <p className="text-2xs font-semibold uppercase tracking-[0.08em] text-muted-foreground mb-2">
+            {t('layerEditor.section.visibility', { defaultValue: 'Visibility' })}
+          </p>
+          <div className="space-y-3">
+            {/* Opacity slider */}
+            <div className="space-y-1">
+              <Label className="text-xs text-muted-foreground">
+                {t('layerEditor.visibility.opacity', { defaultValue: 'Opacity' })}
+              </Label>
+              <Slider
+                aria-label={t('layerEditor.visibility.opacity', { defaultValue: 'Opacity' })}
+                aria-valuetext={`${Math.round(safeOpacity * 100)}%`}
+                value={[safeOpacity]}
+                min={0}
+                max={1}
+                step={0.05}
+                className="w-full"
+                onValueChange={([value]) => {
+                  onOpacityChange(Number((value ?? safeOpacity).toFixed(2)));
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* 5. Reset section, collapsed by default */}
+      <Collapsible
+        open={resetOpen}
+        onOpenChange={(open) => {
+          setResetOpen(open);
+          if (!open) setConfirmingReset(false); // restore initial state on close
+        }}
+      >
+        <CollapsibleTrigger asChild>
+          <button
+            type="button"
+            className="flex w-full items-center gap-2 px-4 py-2 hover:bg-[var(--surface-2,theme(colors.muted.DEFAULT))] border-b"
+          >
+            <ChevronRight
+              className={cn(
+                'h-4 w-4 shrink-0 transition-transform duration-[--motion-fast]',
+                resetOpen ? 'rotate-90' : 'rtl-mirror',
+              )}
+              aria-hidden="true"
+            />
+            <span className="text-2xs font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+              {t('basemapSublayer.resetLabel', { defaultValue: 'RESET' })}
+            </span>
+            {!resetOpen && (
+              <span className="ms-auto text-xs text-muted-foreground">
+                {t('basemapSublayer.resetHint', { defaultValue: 'Reset to preset default' })}
+              </span>
+            )}
+          </button>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="px-4 py-2 border-b">
+            {!confirmingReset ? (
+              <Button
+                ref={resetButtonRef}
+                type="button"
+                variant="ghost"
+                className="w-full"
+                onClick={() => setConfirmingReset(true)}
+              >
+                {t('basemapSublayer.resetAction', { defaultValue: 'Reset to default' })}
+              </Button>
+            ) : (
+              // Shared builder-wide inline confirm — safe action left,
+              // destructive right, cancel autofocused.
+              <InlineDeleteConfirm
+                confirmId="confirm-reset-title"
+                message={t('basemapSublayer.resetConfirmMessage', {
+                  sublayer: sublayerName,
+                  defaultValue: 'This will remove all custom appearance for {{sublayer}}.',
+                })}
+                confirmLabel={t('basemapSublayer.resetConfirmAction', { defaultValue: 'Reset' })}
+                cancelLabel={t('basemapSublayer.resetConfirmCancel', { defaultValue: 'Keep customization' })}
+                onConfirm={() => {
+                  onResetSublayer();
+                  setConfirmingReset(false);
+                  focusResetButton();
+                }}
+                onCancel={() => {
+                  setConfirmingReset(false);
+                  focusResetButton();
+                }}
+                className="mx-0 mb-0"
+              />
+            )}
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
+    </>
+  );
+}
+
+export function BasemapSublayerEditorFooter({ onBackToBasemap }: BasemapSublayerEditorFooterProps) {
+  const { t } = useTranslation('builder');
+  return (
+    <div>
+      <Button type="button" variant="ghost" className="w-full" onClick={onBackToBasemap}>
+        {t('basemapSublayer.footerBack', { defaultValue: 'Back to basemap' })}
+      </Button>
+    </div>
+  );
+}

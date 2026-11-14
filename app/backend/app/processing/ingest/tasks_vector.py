@@ -1,0 +1,1215 @@
+"""Procrastinate task definitions for vector file and service ingestion."""
+
+import asyncio
+import uuid
+from contextlib import suppress
+from datetime import datetime, timezone
+
+import structlog
+from sqlalchemy import or_, select, text, update
+from sqlalchemy.exc import DBAPIError
+
+from app.core.db.tenant_session import tenant_task
+from app.core.failure_reason import FixedReason
+from app.core.url_redaction import scrub_secret_from_exception
+from app.platform.dataset_origin import portal_link_fields, service_layer_identity
+from app.platform.jobs import ledger
+from app.platform.jobs.heartbeat import (
+    JOB_ERROR_WRITE_TIMEOUT_MS,
+    attempt_scoped_staging_table,
+    claim_job_attempt_and_start_heartbeat,
+    log_job_error_write_failure,
+    require_ingest_job_update,
+    resolve_ingest_attempt_or_skip,
+    stop_ingest_job_heartbeat,
+)
+from app.platform.arcgis_native_types import column_casts_from_meta
+from app.processing.ingest.arcgis_column_types import apply_arcgis_column_casts
+from app.processing.ingest.metadata import _qtable
+from app.processing.ingest.publish_followups import run_publish_followups
+from app.processing.ingest.source_format import derive_source_format
+from app.processing.ingest.tasks_common import (
+    IngestContext,
+    cleanup_step,
+    _append_job_warning,
+    _bind_task_log_context,
+    _current_tenant_schema,
+    _detect_and_override_geometry,
+    _finalize_ingest,
+    _job_phase_session,
+    _resolve_effective_srid,
+    _run_service_import_with_wfs_fallback,
+    purge_token_on_failure,
+    SourceURLRefused,
+    rename_pkey_to_match_table,
+    resolve_service_type,
+    task_app,
+)
+from app.processing.ingest.tasks_staging import (
+    _archive_original_file,
+    _cleanup_staging_on_failure,
+    _validate_upload_file_safety,
+    layer_to_load,
+    source_columns_for,
+)
+from app.platform.jobs.models import IngestJob, owned_presigned_staging_key
+from app.processing.ingest.uploaded_source import UploadedSource
+
+
+_SERVICE_IMPORT_INITIAL_PROGRESS = 0.1
+_SERVICE_IMPORT_HEARTBEAT_INTERVAL_SECONDS = 5.0
+_SERVICE_IMPORT_HEARTBEAT_INCREMENT = 0.05
+_SERVICE_IMPORT_HEARTBEAT_MAX_PROGRESS = 0.65
+# Bound each heartbeat transaction inside PostgreSQL so a blocked commit
+# releases its connection instead of exhausting the pool.
+_SERVICE_IMPORT_HEARTBEAT_TICK_DB_TIMEOUT_SECONDS = 3.0
+# This outer timeout covers failures before PostgreSQL can apply its limits,
+# such as a connection stalled by a network partition.
+_SERVICE_IMPORT_HEARTBEAT_DRAIN_TIMEOUT_SECONDS = 10.0
+_ARCGIS_SERVICE_IMPORT_CHUNK_SIZE = 2000
+
+
+async def _publish_attempt_staging_table(
+    session,
+    *,
+    job_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    staging_table: str,
+    live_table: str,
+) -> None:
+    """Publish one attempt's physical table while holding its job-row lease."""
+    await require_ingest_job_update(
+        session,
+        job_id,
+        attempt_id,
+        values={"heartbeat_at": datetime.now(timezone.utc)},
+    )
+    await session.execute(
+        text(
+            f"ALTER TABLE {_qtable(staging_table, schema=_current_tenant_schema())} "
+            f'RENAME TO "{live_table}"'
+        )
+    )
+    # RENAME TO keeps the staging-era pkey name; fix it while we hold the lock.
+    await rename_pkey_to_match_table(session, live_table)
+
+
+async def _drop_attempt_staging_table(staging_table: str) -> None:
+    """Best-effort cleanup limited to the caller's attempt-owned table."""
+    if not staging_table:
+        return
+
+    from app.core.db import async_session
+
+    try:
+        async with async_session() as session:
+            await session.execute(
+                text(
+                    f"DROP TABLE IF EXISTS "
+                    f"{_qtable(staging_table, schema=_current_tenant_schema())} CASCADE"
+                )
+            )
+            await session.commit()
+    except Exception:  # broad: cleanup must not mask the ingest result
+        structlog.get_logger().warning(
+            "attempt_staging_cleanup_failed",
+            staging_table=staging_table,
+            exc_info=True,
+        )
+
+
+async def _service_import_heartbeat_tick(
+    job_uuid: uuid.UUID, attempt_id: uuid.UUID
+) -> bool:
+    """One heartbeat write: open a session, advance progress, commit, close.
+
+    Returns ``False`` when the caller's loop must stop (job vanished, or
+    moved off the step this heartbeat belongs to), ``True`` otherwise. A
+    separate function so the caller can ``shield`` the whole tick.
+
+    The timeouts go into ``_job_phase_session`` rather than being set after
+    entering it, so they also cover the helper's own SELECT, which can stall
+    behind a lock the later UPDATE would never see. A blocked commit then
+    raises inside Postgres within seconds and the helper's rollback releases
+    the connection.
+
+    The SELECT is a snapshot, not a lock. A tick that stalls past the
+    caller's drain (say, before reaching Postgres) keeps running in the
+    background while ``_finalize_ingest`` may commit ``complete`` or a retry
+    may rotate ``attempt_id``. So the UPDATE re-checks every fact in its
+    WHERE clause (same attempt, still "running"/"ogr2ogr", progress still
+    below the new value); zero rows means the job moved on.
+    """
+    _timeout_ms = int(_SERVICE_IMPORT_HEARTBEAT_TICK_DB_TIMEOUT_SECONDS * 1000)
+    async with _job_phase_session(
+        job_uuid,
+        phase="service_import_heartbeat",
+        attempt_id=attempt_id,
+        lock_and_statement_timeout_ms=_timeout_ms,
+    ) as (session, job):
+        if job is None:
+            return False
+        if job.status != "running" or job.current_step != "ogr2ogr":
+            return False
+
+        existing_progress = (
+            job.progress
+            if job.progress is not None
+            else _SERVICE_IMPORT_INITIAL_PROGRESS
+        )
+        next_progress = min(
+            _SERVICE_IMPORT_HEARTBEAT_MAX_PROGRESS,
+            existing_progress + _SERVICE_IMPORT_HEARTBEAT_INCREMENT,
+        )
+        if next_progress <= existing_progress:
+            return True
+
+        result = await session.execute(
+            update(IngestJob)
+            .where(
+                IngestJob.id == job_uuid,
+                IngestJob.attempt_id == attempt_id,
+                IngestJob.status == "running",
+                IngestJob.current_step == "ogr2ogr",
+                or_(
+                    IngestJob.progress.is_(None),
+                    IngestJob.progress < next_progress,
+                ),
+            )
+            .values(progress=next_progress)
+        )
+        await session.commit()
+        if not result.rowcount:  # type: ignore[attr-defined]
+            structlog.get_logger().debug(
+                "service_import_heartbeat_tick_stale",
+                job_id=str(job_uuid),
+                attempt_id=str(attempt_id),
+            )
+        return True
+
+
+async def _heartbeat_service_import_progress(
+    job_uuid: uuid.UUID, attempt_id: uuid.UUID
+) -> None:
+    """Advance service-ingest progress while GDAL loads remote features.
+
+    Each tick runs under ``asyncio.shield`` so the caller's ``.cancel()``
+    can only land at the ``asyncio.sleep``, never mid-connect/write/close on
+    the tick's own session. A cancel inside asyncpg's connection teardown
+    leaves the connection outliving its coroutine, surfacing later against
+    unrelated work as ``ConnectionError: unexpected connection_lost()
+    call``. Shielding costs at most one tick of extra shutdown latency.
+
+    The tick's DB-side timeouts are the primary bound; the
+    ``_SERVICE_IMPORT_HEARTBEAT_DRAIN_TIMEOUT_SECONDS`` drain only covers a
+    connection stuck before it reaches Postgres. Even then the tick is not
+    cancelled: the caller moves on while it finishes in the background,
+    since the import's result never reads the progress back.
+    """
+    while True:
+        await asyncio.sleep(_SERVICE_IMPORT_HEARTBEAT_INTERVAL_SECONDS)
+        tick = asyncio.ensure_future(
+            _service_import_heartbeat_tick(job_uuid, attempt_id)
+        )
+        try:
+            try:
+                keep_going = await asyncio.shield(tick)
+            except asyncio.CancelledError:
+                # Give an already-open tick bounded time to close its connection.
+                # Shielding stops this wait without cancelling the tick itself.
+                if not tick.done():
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(tick),
+                            timeout=_SERVICE_IMPORT_HEARTBEAT_DRAIN_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        # The database timeout did not engage, usually because
+                        # the connection never reached PostgreSQL.
+                        structlog.get_logger().warning(
+                            "service_import_heartbeat_drain_timed_out",
+                            job_id=str(job_uuid),
+                            timeout=_SERVICE_IMPORT_HEARTBEAT_DRAIN_TIMEOUT_SECONDS,
+                        )
+                    except BaseException:  # broad: draining an already-shielded tick's own connection cleanup; whatever it raises must not replace the pending cancellation `raise` below
+                        pass
+                raise
+        except Exception:  # broad: best-effort heartbeat must not fail ingest
+            # Heartbeat progress is best-effort and must not mask ingest work.
+            structlog.get_logger().warning(
+                "service_import_progress_heartbeat_failed",
+                job_id=str(job_uuid),
+                exc_info=True,
+            )
+            continue
+
+        if not keep_going:
+            return
+
+
+async def _write_service_import_progress(
+    job_uuid: uuid.UUID,
+    attempt_id: uuid.UUID,
+    *,
+    imported_rows: int,
+    feature_count: int,
+) -> None:
+    if feature_count <= 0:
+        return
+
+    completed_ratio = min(1.0, imported_rows / feature_count)
+    next_progress = min(
+        _SERVICE_IMPORT_HEARTBEAT_MAX_PROGRESS,
+        _SERVICE_IMPORT_INITIAL_PROGRESS
+        + (_SERVICE_IMPORT_HEARTBEAT_MAX_PROGRESS - _SERVICE_IMPORT_INITIAL_PROGRESS)
+        * completed_ratio,
+    )
+
+    async with _job_phase_session(
+        job_uuid, phase="service_import_chunk_progress", attempt_id=attempt_id
+    ) as (
+        session,
+        job,
+    ):
+        if job is None:
+            return
+        if job.status != "running" or job.current_step != "ogr2ogr":
+            return
+        existing_progress = (
+            job.progress
+            if job.progress is not None
+            else _SERVICE_IMPORT_INITIAL_PROGRESS
+        )
+        if next_progress <= existing_progress:
+            return
+        job.progress = next_progress
+        await session.commit()
+
+
+def _refuse_truncated_arcgis_fetch(
+    feature_count: int | None,
+    max_record_count: int | None,
+    supports_pagination: bool,
+    *,
+    reviews_unknown_count: bool,
+) -> None:
+    """Raise when one ArcGIS fetch from a server that can't page could stop short.
+
+    ``reviews_unknown_count`` is whether the caller holds a fetch with no
+    source count for review before publishing it, as a refresh does.
+    """
+    if supports_pagination is True:
+        return
+    from app.processing.ingest.ogr import IngestionError
+
+    if feature_count is None and not reviews_unknown_count:
+        raise IngestionError(
+            "GeoLens couldn't read this ArcGIS layer's feature count, and the "
+            "server doesn't report that it can page through results, so it "
+            "can't confirm that one request would return the whole layer. "
+            "Try again later."
+        )
+    if (
+        feature_count is not None
+        and max_record_count is not None
+        and feature_count > max_record_count
+    ):
+        raise IngestionError(
+            f"This ArcGIS layer has {feature_count} features but the server "
+            f"returns at most {max_record_count} per request and can't page "
+            "through the rest, so GeoLens can't import it completely."
+        )
+
+
+def _record_arcgis_order_field(job, order_field: str | None) -> None:
+    """Store the order field an ArcGIS fetch used as the job's ``object_id_field``.
+
+    A later refresh orders by this when it can't read the layer's own JSON.
+    """
+    job.user_metadata = {**(job.user_metadata or {}), "object_id_field": order_field}
+
+
+async def _fetch_arcgis_import_page_info(
+    source_url: str,
+    layer_id: int | str | None,
+    token: str | None,
+    fallback_order_field: str | None = None,
+) -> tuple[int | None, int | None, bool, str | None]:
+    if layer_id is None:
+        return None, None, False, fallback_order_field
+
+    from app.modules.catalog.sources.adapters.arcgis import (
+        ArcGISTokenError,
+        fetch_arcgis_feature_count,
+        fetch_arcgis_pagination_info,
+    )
+    from app.core.url_redaction import redact_exception_text
+    from app.platform.security import CredentialRedirectError, make_safe_client
+
+    # A failed count must not discard what the layer metadata already said.
+    max_record_count, supports_pagination = None, False
+    order_field = fallback_order_field
+    try:
+        async with make_safe_client(timeout=30.0) as client:
+            (
+                max_record_count,
+                supports_pagination,
+                order_field,
+            ) = await fetch_arcgis_pagination_info(
+                source_url,
+                layer_id,
+                client,
+                token=token,
+                fallback_order_field=fallback_order_field,
+            )
+            feature_count = await fetch_arcgis_feature_count(
+                source_url, layer_id, client, token=token
+            )
+            return feature_count, max_record_count, supports_pagination, order_field
+    except (ArcGISTokenError, CredentialRedirectError):
+        # GDAL would follow the same redirect with the token in its URL.
+        raise
+    except Exception as exc:  # broad: count is an optimization; import can fall back
+        structlog.get_logger().warning(
+            "arcgis_import_page_info_fetch_failed",
+            source_url=source_url,
+            layer_id=str(layer_id),
+            error=redact_exception_text(exc),
+        )
+        return None, max_record_count, supports_pagination, order_field
+
+
+async def _fetch_arcgis_field_labels(
+    source_url: str, layer_id: int | str | None, token: str | None
+) -> dict | None:
+    """The layer's current field labels, or None when they can't be read.
+
+    None leaves the stored labels alone: a refresh must neither fail nor drop
+    them because this read did.
+    """
+    if layer_id is None:
+        return None
+    from app.modules.catalog.sources.adapters.arcgis import fetch_arcgis_field_labels
+    from app.core.url_redaction import redact_exception_text
+    from app.platform.security import make_safe_client
+
+    try:
+        async with make_safe_client(timeout=30.0) as client:
+            return await fetch_arcgis_field_labels(source_url, layer_id, client, token)
+    except (
+        Exception
+    ) as exc:  # broad: labels are optional; the refresh must not fail on them
+        structlog.get_logger().warning(
+            "arcgis_field_labels_fetch_failed",
+            source_url=source_url,
+            layer_id=str(layer_id),
+            error=redact_exception_text(exc),
+        )
+        return None
+
+
+async def _fetch_arcgis_layer_meta_or_none(
+    source_url: str, layer_id: int | str | None, token: str | None
+) -> dict | None:
+    """The ArcGIS layer JSON, or None when unreadable.
+
+    Column casts and the Z flag are optional enrichments: None leaves text
+    columns as text and imports 2D, so a failed metadata read must not fail
+    the import.
+    """
+    if layer_id is None:
+        return None
+    from app.modules.catalog.sources.adapters.arcgis import (
+        ArcGISTokenError,
+        fetch_arcgis_layer_meta,
+    )
+    from app.core.url_redaction import redact_exception_text
+    from app.platform.security import CredentialRedirectError, make_safe_client
+
+    try:
+        async with make_safe_client(timeout=30.0) as client:
+            return await fetch_arcgis_layer_meta(
+                source_url.rstrip("/"), str(layer_id).strip("/"), client, token
+            )
+    except (ArcGISTokenError, CredentialRedirectError):
+        # GDAL would follow the same redirect with the token in its URL.
+        raise
+    except (
+        Exception
+    ) as exc:  # broad: casts and Z are optional; the import falls back to text and 2D
+        structlog.get_logger().warning(
+            "arcgis_column_casts_fetch_failed",
+            source_url=source_url,
+            layer_id=str(layer_id),
+            error=redact_exception_text(exc),
+        )
+        return None
+
+
+def arcgis_meta_import_facts(
+    meta: dict | None,
+) -> tuple[dict[str, str] | None, bool]:
+    """Column casts and whether the fetch must ask for Z, from the layer JSON."""
+    if meta is None:
+        return None, False
+    return column_casts_from_meta(meta), meta.get("hasZ") is True
+
+
+@task_app.task(queue="ingest", retry=0, aliases=["app.ingest.tasks.ingest_file"])
+@tenant_task
+async def ingest_file(
+    job_id: str,
+    file_path: str,
+    user_id: str,
+    attempt_id: str | None = None,
+    **kwargs,
+) -> None:
+    """Background task: run ogr2ogr, extract metadata, register dataset.
+
+    Full pipeline:
+    1. Update job status to running
+    2. Run ogrinfo to detect CRS
+    3. Run ogr2ogr to load file into PostGIS
+    4. Add geom_4326 column via ST_Transform
+    5. Grant geolens_reader SELECT access
+    6. Extract metadata (extent, columns, row count, geometry type)
+    7. Create Dataset record in catalog
+    8. Update job status to complete
+    9. Clean up staging file
+
+    Keep sessions closed during ``run_ogr2ogr``: holding one across the
+    subprocess can leave the next database operation raising ``MissingGreenlet``.
+    """
+    _bind_task_log_context(task_name="ingest_file", job_id=job_id)
+    from app.processing.ingest.ogr import build_pg_conn_str, run_ogr2ogr, run_ogrinfo
+    from app.processing.ingest.service import generate_table_name
+
+    resolved = await resolve_ingest_attempt_or_skip(
+        job_id, attempt_id, task_label="ingest"
+    )
+    if resolved is None:
+        return
+    job_uuid, attempt_uuid = resolved
+    original_file_path = file_path
+    final_status: str = "pending"
+    # Set when the original isn't archived, leaving the upload its only copy.
+    archive_failed = False
+    staging_table_name = ""
+    heartbeat_task: asyncio.Task[None] | None = None
+
+    try:
+        # Phase 1: load the job, mark it running, validate it, detect the CRS
+        # and generate the table name, snapshotting what phase 2 needs so
+        # ogr2ogr runs with no session open.
+        async with _job_phase_session(
+            job_uuid, phase="phase1", attempt_id=attempt_uuid
+        ) as (session, job):
+            if job is None:
+                return
+
+            # Update the job and its validating step in the same commit.
+            heartbeat_task = await claim_job_attempt_and_start_heartbeat(
+                session, job_uuid, attempt_uuid, job=job, current_step="validating"
+            )
+            if heartbeat_task is None:
+                return
+
+            from app.processing.ingest.service import resolve_file_path
+
+            file_path = await resolve_file_path(file_path, job_id)
+
+            # Validate file content and safety before ogr2ogr.
+            try:
+                await _validate_upload_file_safety(
+                    session,
+                    file_path=file_path,
+                    source_filename=job.source_filename,
+                )
+            except ValueError as exc:
+                await ledger.fail(session, job_uuid, attempt_uuid, reason=exc)
+                await session.commit()
+                # Let final cleanup distinguish staging from the only managed
+                # copy, which must survive validation failure for a retry.
+                final_status = "failed"
+                return
+
+            um = job.user_metadata or {}
+            srid_override = um.get("srid_override")
+            layer_name = um.get("layer_name")
+            source_filename = job.source_filename
+
+            # 2. Detect CRS via ogrinfo
+            info = await run_ogrinfo(
+                file_path, layer_name=layer_name, original_filename=source_filename
+            )
+            layer_name = layer_to_load(info, layer_name)
+            srid = info.get("srid")
+            geometry_type = info.get("geometry_type")
+            has_geometry = geometry_type is not None
+
+            # CSV and GeoJSON default to EPSG:4326; non-spatial files need no
+            # CRS.
+            from app.processing.ingest.tasks_common import ASSUMES_4326_SUFFIXES
+
+            assumes_4326 = file_path.lower().endswith(ASSUMES_4326_SUFFIXES)
+            if (
+                has_geometry
+                and srid is None
+                and not assumes_4326
+                and srid_override is None
+            ):
+                await ledger.fail(
+                    session,
+                    job_uuid,
+                    attempt_uuid,
+                    reason=FixedReason(
+                        "Missing CRS: no coordinate system detected. "
+                        "Ensure the file includes CRS information "
+                        "(e.g., .prj file for Shapefiles).",
+                        code="missing_crs",
+                    ),
+                )
+                await session.commit()
+                final_status = "failed"
+                return
+
+            # 3. Generate table name
+            dataset_name = um.get("title") or source_filename or "dataset"
+            table_name, collision_warning = await generate_table_name(
+                dataset_name, session
+            )
+            staging_table_name = attempt_scoped_staging_table(table_name, attempt_uuid)
+            if collision_warning:
+                job.user_metadata = {
+                    **(job.user_metadata or {}),
+                    "collision_warning": collision_warning,
+                }
+                await session.commit()
+
+        # No session open: ogr2ogr writes through its own libpq connection,
+        # and a session held across the subprocess can corrupt SQLAlchemy's
+        # greenlet bridge.
+        db_conn_str = build_pg_conn_str()
+
+        # User-specified geometry columns. ``_detect_and_override_geometry``
+        # re-derives the column values from ``um``; only the flag is needed.
+        user_wants_geom = bool(
+            ((um.get("x_column") or "") and (um.get("y_column") or ""))
+            or (um.get("geom_column") or "")
+        )
+
+        # With an override, import as non-spatial and construct geometry
+        # afterwards, so it holds even where GDAL would auto-detect geometry.
+        ogr_geometry_type = None if user_wants_geom else geometry_type
+        effective_srid = _resolve_effective_srid(
+            detected_srid=srid,
+            srid_override=srid_override,
+        )
+
+        # Committed before the long subprocess so the UI sees the transition
+        # even if ogr2ogr hangs or raises.
+        async with _job_phase_session(
+            job_uuid, phase="progress_write_ogr2ogr", attempt_id=attempt_uuid
+        ) as (
+            _progress_session,
+            _progress_job,
+        ):
+            if _progress_job is not None:
+                _progress_job.current_step = "ogr2ogr"
+                _progress_job.progress = 0.1
+                await _progress_session.commit()
+
+        await run_ogr2ogr(
+            file_path,
+            staging_table_name,
+            db_conn_str,
+            source_srid=srid,
+            geometry_type=ogr_geometry_type,
+            layer_name=layer_name,
+            schema=_current_tenant_schema(),
+            effective_srid=effective_srid,
+            original_filename=source_filename,
+        )
+
+        # Resolve before phase 2: ZIP inspection reads the central directory.
+        source_format = await asyncio.to_thread(
+            derive_source_format, file_path, layer_name
+        )
+
+        # Finalize in a fresh session using the snapshotted job attributes.
+        # Requiring running status fences out attempts already failed by a sweep.
+        async with _job_phase_session(
+            job_uuid,
+            phase="phase2",
+            attempt_id=attempt_uuid,
+            require_status="running",
+        ) as (session, job):
+            if job is None:
+                return
+
+            # This progress signal shares the finalization transaction; the
+            # earlier ogr2ogr write is the durable checkpoint.
+            job.current_step = "finalize"
+            job.progress = 0.7
+
+            # 3a. Rename source columns that collide with GeoLens-internal
+            #     names (gid, geom, geometry, geom_4326, fid, ogc_fid), before
+            #     the geometry override and _finalize_ingest add theirs.
+            from app.processing.ingest.metadata import rename_reserved_columns
+
+            reserved_renames = await rename_reserved_columns(
+                session, staging_table_name, schema=_current_tenant_schema()
+            )
+            if reserved_renames:
+                from app.processing.ingest.warnings import (
+                    make_reserved_rename_warning,
+                )
+
+                _append_job_warning(job, make_reserved_rename_warning(reserved_renames))
+
+            # 3b. Shapefile-only: DBF 10-char truncation collisions, from the
+            #     ogrinfo column list.
+            if source_format == "shapefile":
+                from app.processing.ingest.metadata import (
+                    detect_dbf_truncation_collisions,
+                )
+                from app.processing.ingest.ogr import run_ogrinfo_preview
+                from app.processing.ingest.warnings import (
+                    make_dbf_truncation_warning,
+                )
+
+                preview_cols = info.get("columns") or []
+                if not preview_cols:
+                    preview_info = await run_ogrinfo_preview(
+                        file_path, sample_limit=0, layer_name=layer_name
+                    )
+                    preview_cols = preview_info.get("columns") or []
+                dbf_collisions = detect_dbf_truncation_collisions(preview_cols)
+                if dbf_collisions:
+                    _append_job_warning(
+                        job, make_dbf_truncation_warning(dbf_collisions)
+                    )
+                    structlog.get_logger().warning(
+                        "Shapefile DBF 10-char truncation collision detected",
+                        table=staging_table_name,
+                        collisions=dbf_collisions,
+                    )
+
+            if user_wants_geom:
+                override_geom_type = await _detect_and_override_geometry(
+                    session,
+                    table_name=staging_table_name,
+                    user_metadata=um,
+                    effective_srid=effective_srid,
+                    renamed_columns=reserved_renames,
+                )
+                if override_geom_type is not None:
+                    has_geometry = True
+                    geometry_type = override_geom_type
+
+            # ogr2ogr writes only to an attempt-owned physical table. Acquire
+            # the job row under the attempt predicate before publishing it;
+            # the rename and _finalize_ingest's terminal update commit in the
+            # same transaction, so a stale worker can never expose its table.
+            await _publish_attempt_staging_table(
+                session,
+                job_id=job_uuid,
+                attempt_id=attempt_uuid,
+                staging_table=staging_table_name,
+                live_table=table_name,
+            )
+
+            # 5-9. Shared post-ogr2ogr pipeline
+            dataset = await _finalize_ingest(
+                IngestContext(
+                    session=session,
+                    job=job,
+                    table_name=table_name,
+                    user_id=user_id,
+                    has_geometry=has_geometry,
+                    effective_srid=effective_srid,
+                    source_format=source_format,
+                    source_filename=source_filename,
+                    original_srid=srid,
+                    user_metadata=um,
+                    attempt_id=attempt_uuid,
+                    # No file_hash: only the re-upload path computes it, and the
+                    # allowlist omits absent keys.
+                    origin_ref={
+                        "filename": source_filename,
+                        **portal_link_fields(um),
+                    },
+                    archive_from=file_path,
+                    source_columns=source_columns_for(info, layer_name),
+                )
+            )
+
+            # A dataset delete locks its jobs' rows before it reaps originals/
+            # after its commit, so a write made holding this one is reaped too.
+            # Without the row the archive stays owed, and the upload with it.
+            holds_job_row = await session.scalar(
+                select(IngestJob.id)
+                .where(IngestJob.id == job_uuid, IngestJob.dataset_id == dataset.id)
+                .with_for_update(skip_locked=True)
+            )
+            archive_failed = holds_job_row is None or not await _archive_original_file(
+                session,
+                job=job,
+                dataset_id=dataset.id,
+                file_path=file_path,
+            )
+
+            final_status = "complete"
+
+    except (
+        Exception
+    ) as exc:  # broad: pipeline spans GDAL/PostGIS/S3/FS — any step can fail
+        # Record failure in a fresh session and emit the shared notification.
+        # A concurrently deleted job has no row left to update.
+        try:
+            async with _job_phase_session(
+                job_uuid,
+                phase="error_write",
+                attempt_id=attempt_uuid,
+                lock_and_statement_timeout_ms=JOB_ERROR_WRITE_TIMEOUT_MS,
+            ) as (
+                err_session,
+                err_job,
+            ):
+                if err_job is not None:
+                    await _cleanup_staging_on_failure(
+                        err_session,
+                        staging_table=staging_table_name,
+                        job=err_job,
+                        exc=exc,
+                        task_name="ingest_file",
+                        attempt_id=attempt_uuid,
+                    )
+                else:
+                    structlog.get_logger().exception(
+                        "Ingest task failed",
+                        job_id=job_id,
+                        task="ingest_file",
+                    )
+        except DBAPIError as write_failure:
+            # The budget covers the helper's own load, so an expiry there
+            # arrives here. Swallowed: the cause below is the task's outcome.
+            log_job_error_write_failure(
+                write_failure, job_id=job_id, task="ingest_file"
+            )
+        finally:
+            # The `finally` reapers gate on this, and the bounded error write
+            # above can raise past a positional assignment.
+            final_status = "failed"
+        raise
+    finally:
+        async with cleanup_step("ingest_file heartbeat", job_id=job_id):
+            await stop_ingest_job_heartbeat(heartbeat_task)
+        async with cleanup_step("ingest_file staging table", job_id=job_id):
+            await _drop_attempt_staging_table(staging_table_name)
+        # Unknown ownership keeps shared input for a later retention pass.
+        is_fan_out_child = True
+        owned_staging_key: str | None = None
+        try:
+            async with _job_phase_session(
+                job_uuid, phase="cleanup_check", attempt_id=attempt_uuid
+            ) as (
+                _check_session,
+                _check_job,
+            ):
+                if _check_job is not None:
+                    is_fan_out_child = bool(
+                        (_check_job.user_metadata or {}).get("fan_out_parent_id")
+                    )
+                    owned_staging_key = owned_presigned_staging_key(
+                        _check_job.id,
+                        _check_job.user_metadata,
+                        _check_job.file_path,
+                    )
+        except Exception:  # broad: cleanup decision is best-effort, never block completion on this query
+            is_fan_out_child = True
+
+        await UploadedSource(
+            job_id=job_id,
+            original_path=original_file_path,
+            local_path=file_path,
+            owned_presigned_key=owned_staging_key,
+            shared=is_fan_out_child,
+        ).release_import(
+            final_status=final_status, archive_confirmed=not archive_failed
+        )
+        # After the task's own archive, which the follow-ups then only confirm.
+        if final_status == "complete":
+            async with cleanup_step("ingest_file follow-ups", job_id=job_id):
+                await run_publish_followups(job_uuid, attempt_id=attempt_uuid)
+
+
+@task_app.task(
+    queue="ingest",
+    retry=0,
+    # The context gives the task its own queue-row id, so a terminal failure
+    # can strip the raw token out of its own kwargs.
+    pass_context=True,
+    aliases=["app.ingest.tasks.ingest_service"],
+)
+@tenant_task
+@purge_token_on_failure
+async def ingest_service(
+    job_id: str,
+    source_url: str,
+    source_layer: str,
+    user_id: str,
+    attempt_id: str | None = None,
+    token: str | None = None,
+    credential_ref: str | None = None,
+    **kwargs,
+) -> None:
+    """Background task: import a remote service layer via ogr2ogr.
+
+    ``credential_ref`` is a one-use reference redeemed exactly once below.
+    ``token`` is accepted only for a job an earlier release queued with the
+    token as an argument; no current door sends one. See
+    ``resolve_worker_credential``.
+
+    Pipeline: update job to running; determine service type; build GDAL
+    source and run ogr2ogr; post-process (clip, geom_4326, grants,
+    metadata, samples); create Dataset record; compute quality score;
+    update job to complete.
+
+    The session uses the same two-phase split as ``ingest_file``: closed
+    before the ogr2ogr subprocess, reopened for finalization.
+    """
+    _bind_task_log_context(task_name="ingest_service", job_id=job_id)
+    from app.platform.security import (
+        SSRFError,
+        validate_url_for_ssrf,
+    )
+    from app.platform.extensions import get_processing_port
+    from app.processing.ingest.ogr import build_pg_conn_str, run_ogr2ogr_service
+    from app.processing.ingest.service import generate_table_name
+    from app.platform.refresh.credentials import resolve_worker_credential
+
+    # Revalidated at fetch time: the commit route's check covers the
+    # preview-to-commit TOCTOU, but manifest jobs skip that route, and every
+    # service fetch should see fresh DNS.
+    try:
+        await validate_url_for_ssrf(source_url)
+    except SSRFError as exc:
+        raise SourceURLRefused(
+            f"source_url failed safety check at worker fetch time: {exc}"
+        ) from exc
+
+    port = get_processing_port()
+    resolved = await resolve_ingest_attempt_or_skip(
+        job_id, attempt_id, task_label="ingest"
+    )
+    if resolved is None:
+        return
+    job_uuid, attempt_uuid = resolved
+    staging_table_name = ""
+    heartbeat_task: asyncio.Task[None] | None = None
+
+    try:
+        # Phase 1: load the job, mark it running, generate the table name and
+        # snapshot what phase 2 needs.
+        async with _job_phase_session(
+            job_uuid, phase="phase1", attempt_id=attempt_uuid
+        ) as (session, job):
+            if job is None:
+                return
+
+            heartbeat_task = await claim_job_attempt_and_start_heartbeat(
+                session, job_uuid, attempt_uuid, job=job, current_step="validating"
+            )
+            if heartbeat_task is None:
+                return
+
+            # 2. Determine service type from job metadata
+            um = job.user_metadata or {}
+            service_type_raw = um.get("service_type", "")
+            layer_id = um.get("layer_id")
+            service_type, source_format = resolve_service_type(service_type_raw)
+
+            # A layer the preview found no geometry type for imports without
+            # geometry-specific ogr2ogr flags, keeping its attribute columns.
+            _preview_geom_type = um.get("geometry_type")
+            is_non_spatial = _preview_geom_type is None
+
+            # 3. Resolve service parameters
+            object_id_field = um.get("object_id_field") or None
+
+            # 4. Generate table name
+            source_filename = job.source_filename
+            dataset_name = um.get("title") or source_filename or "dataset"
+            table_name, collision_warning = await generate_table_name(
+                dataset_name, session
+            )
+            staging_table_name = attempt_scoped_staging_table(table_name, attempt_uuid)
+            if collision_warning:
+                job.user_metadata = {
+                    **(job.user_metadata or {}),
+                    "collision_warning": collision_warning,
+                }
+                await session.commit()
+
+        # Redeemed after phase 1: a single-use secret is spent only on an
+        # attempt that will run (the claim returns None for a superseded one),
+        # and the failure write is fenced on `status == 'running'`, which
+        # phase 1 sets, so an earlier `credential_expired` would go unrecorded
+        # until the stale sweep. Outside the session, so the store round trip
+        # holds no DB session open.
+        token = await resolve_worker_credential(token, credential_ref)
+
+        db_conn_str = build_pg_conn_str()
+
+        # Committed before the long remote-service fetch, as in ingest_file.
+        async with _job_phase_session(
+            job_uuid, phase="progress_write_ogr2ogr", attempt_id=attempt_uuid
+        ) as (
+            _progress_session,
+            _progress_job,
+        ):
+            if _progress_job is not None:
+                _progress_job.current_step = "ogr2ogr"
+                _progress_job.progress = _SERVICE_IMPORT_INITIAL_PROGRESS
+                await _progress_session.commit()
+
+        arcgis_order_field: str | None = None
+        column_casts, return_z = None, False
+        if service_type == "arcgis_featureserver":
+            column_casts, return_z = arcgis_meta_import_facts(
+                await _fetch_arcgis_layer_meta_or_none(source_url, layer_id, token)
+            )
+
+        # Retry WFS namespaces through the shared helper.
+        async def _do_import(layer_name: str) -> None:
+            nonlocal arcgis_order_field
+            feature_count = max_record_count = None
+            page_size = _ARCGIS_SERVICE_IMPORT_CHUNK_SIZE
+            supports_pagination = False
+            pagination_order_field = None
+            if service_type == "arcgis_featureserver":
+                (
+                    feature_count,
+                    max_record_count,
+                    supports_pagination,
+                    pagination_order_field,
+                ) = await _fetch_arcgis_import_page_info(
+                    source_url, layer_id, token, fallback_order_field=object_id_field
+                )
+                arcgis_order_field = pagination_order_field
+                if max_record_count is not None:
+                    page_size = max(1, min(page_size, max_record_count))
+
+            if (
+                service_type == "arcgis_featureserver"
+                and supports_pagination
+                and pagination_order_field is not None
+                and feature_count is not None
+                and feature_count > page_size
+            ):
+                # The shared guarded loop also serves refreshes; this import
+                # supplies its per-page progress callback.
+                async def _publish_page_progress(
+                    imported_rows: int, total: int
+                ) -> None:
+                    await _write_service_import_progress(
+                        job_uuid,
+                        attempt_uuid,
+                        imported_rows=imported_rows,
+                        feature_count=total,
+                    )
+
+                from app.processing.ingest.tasks_common import (
+                    run_paged_arcgis_service_fetch,
+                )
+
+                await run_paged_arcgis_service_fetch(
+                    service_type_raw=service_type_raw,
+                    service_type=service_type,
+                    source_url=source_url,
+                    layer_name=layer_name,
+                    layer_id=layer_id,
+                    token=token,
+                    staging_table=staging_table_name,
+                    db_conn_str=db_conn_str,
+                    schema=_current_tenant_schema(),
+                    feature_count=feature_count,
+                    page_size=page_size,
+                    order_field=pagination_order_field,
+                    is_non_spatial=is_non_spatial,
+                    on_page=_publish_page_progress,
+                    return_z=return_z,
+                )
+                return
+
+            if service_type == "arcgis_featureserver":
+                _refuse_truncated_arcgis_fetch(
+                    feature_count,
+                    max_record_count,
+                    supports_pagination,
+                    reviews_unknown_count=False,
+                )
+            _src, _layer = port.build_gdal_source(
+                service_type_raw,
+                source_url,
+                layer_name,
+                layer_id,
+                token=token,
+                order_field=pagination_order_field,
+                return_z=return_z,
+            )
+            await run_ogr2ogr_service(
+                _src,
+                _layer,
+                staging_table_name,
+                db_conn_str,
+                service_type,
+                token=token,
+                is_non_spatial=is_non_spatial,
+                schema=_current_tenant_schema(),
+                keep_z=return_z,
+            )
+
+        service_progress_task = asyncio.create_task(
+            _heartbeat_service_import_progress(job_uuid, attempt_uuid)
+        )
+        try:
+            await _run_service_import_with_wfs_fallback(
+                _do_import, source_layer, token=token
+            )
+        finally:
+            async with cleanup_step("ingest_service progress heartbeat", job_id=job_id):
+                service_progress_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await service_progress_task
+
+        # Requiring running status fences finalization against a failed attempt.
+        async with _job_phase_session(
+            job_uuid,
+            phase="phase2",
+            attempt_id=attempt_uuid,
+            require_status="running",
+        ) as (session, job):
+            if job is None:
+                return
+
+            # Finalization owns the transaction, including this progress write.
+            job.current_step = "finalize"
+            job.progress = 0.7
+            if service_type == "arcgis_featureserver":
+                _record_arcgis_order_field(job, arcgis_order_field)
+
+            # 4a. Rename source columns that collide with GeoLens-internal
+            #     names, before _finalize_ingest adds its own.
+            from app.processing.ingest.metadata import rename_reserved_columns
+
+            reserved_renames = await rename_reserved_columns(
+                session, staging_table_name, schema=_current_tenant_schema()
+            )
+            if reserved_renames:
+                from app.processing.ingest.warnings import (
+                    make_reserved_rename_warning,
+                )
+
+                _append_job_warning(job, make_reserved_rename_warning(reserved_renames))
+
+            await apply_arcgis_column_casts(
+                session,
+                staging_table_name,
+                column_casts,
+                schema=_current_tenant_schema(),
+            )
+
+            # 5-8. Shared post-ogr2ogr pipeline
+            dataset_source_url = (
+                f"{source_url}/{layer_id}" if layer_id is not None else source_url
+            )
+            await _publish_attempt_staging_table(
+                session,
+                job_id=job_uuid,
+                attempt_id=attempt_uuid,
+                staging_table=staging_table_name,
+                live_table=table_name,
+            )
+            await _finalize_ingest(
+                IngestContext(
+                    session=session,
+                    job=job,
+                    table_name=table_name,
+                    user_id=user_id,
+                    has_geometry=False if is_non_spatial else None,
+                    effective_srid=None if is_non_spatial else 4326,
+                    source_format=source_format,
+                    source_filename=source_filename,
+                    original_srid=None,
+                    user_metadata=um,
+                    source_url=dataset_source_url,
+                    attempt_id=attempt_uuid,
+                    # Keep the base URL and service-specific layer identifier
+                    # separate so refresh can reconstruct the source after the
+                    # ingest job expires.
+                    origin_ref={
+                        "service_type": source_format,
+                        "url": source_url,
+                        "layer_id": service_layer_identity(
+                            source_format,
+                            layer_id=layer_id,
+                            layer_name=source_layer,
+                        ),
+                        # This records token use, not proof that the origin
+                        # requires authentication; refresh probes without a
+                        # token before refusing.
+                        "auth_required": True if token else None,
+                        **portal_link_fields(um),
+                    },
+                )
+            )
+
+    except Exception as exc:  # broad: PostGIS/DB ingest can fail at any step; mark job failed and re-raise
+        # Scrub the exact claimed token from any echoed error; pattern-based
+        # redaction cannot recognize arbitrary secret values. Mutated in place
+        # so the exception class survives the bare re-raise. The helper below
+        # adds pattern-based redaction.
+        scrub_secret_from_exception(exc, token)
+        try:
+            async with _job_phase_session(
+                job_uuid,
+                phase="error_write",
+                attempt_id=attempt_uuid,
+                lock_and_statement_timeout_ms=JOB_ERROR_WRITE_TIMEOUT_MS,
+            ) as (
+                err_session,
+                err_job,
+            ):
+                if err_job is not None:
+                    await _cleanup_staging_on_failure(
+                        err_session,
+                        staging_table=staging_table_name,
+                        job=err_job,
+                        exc=exc,
+                        task_name="ingest_service",
+                        attempt_id=attempt_uuid,
+                    )
+                else:
+                    structlog.get_logger().exception(
+                        "Ingest task failed",
+                        job_id=job_id,
+                        task="ingest_service",
+                    )
+        except DBAPIError as write_failure:
+            # The budget covers the helper's own load, so an expiry there
+            # arrives here. Swallowed: the cause below is the task's outcome.
+            log_job_error_write_failure(
+                write_failure, job_id=job_id, task="ingest_service"
+            )
+        raise
+    finally:
+        # `purge_token_on_failure`, the decorator around this task, must see
+        # the exception `ingest_service` raised, not one from a cleanup step.
+        async with cleanup_step("ingest_service heartbeat", job_id=job_id):
+            await stop_ingest_job_heartbeat(heartbeat_task)
+        async with cleanup_step("ingest_service staging table", job_id=job_id):
+            await _drop_attempt_staging_table(staging_table_name)
+    async with cleanup_step("ingest_service follow-ups", job_id=job_id):
+        await run_publish_followups(job_uuid, attempt_id=attempt_uuid)

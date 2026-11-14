@@ -1,0 +1,283 @@
+"""Round-trip tests for 0012_type_embedding_vector (#449 codex findings).
+
+Tests
+-----
+A: with an empty table and EMBEDDING_DIMS=768, the migration types the column
+   vector(768) and builds the HNSW index (the empty-table fallback
+   must honor the configured dimension, not a hardcoded 1536).
+B: with EMBEDDING_DIMS=3072 (legal config, over pgvector's 2000-dim HNSW
+   limit), the upgrade still exits 0, types the column vector(3072), and
+   skips the index instead of failing.
+C: with mixed-dimension rows (stale 1536-dim next to current 768-dim), the
+   configured dimension wins over max(stored) and the regenerable cache is
+   cleared before the bounded-lock type transition.
+D: explicit config beats UNIFORM stale rows too — all-512-dim rows with
+   EMBEDDING_DIMS=768 type the column vector(768).
+E: uniform stored rows beat only the built-in default — all-768-dim rows
+   with nothing configured select vector(768), then the cache is cleared.
+F: a deliberate EMBEDDING_DIMS=1536 (equal to the default) still counts as
+   explicit and beats uniform stale 768-dim rows.
+
+Notes
+-----
+- Shells out to ``alembic`` via subprocess (the real alembic.ini / env.py
+  stack) with EMBEDDING_DIMS injected into the subprocess env; observes
+  committed DDL through AUTOCOMMIT async queries.
+- Each test truncates catalog.record_embeddings first (embeddings are a
+  regenerable cache) to force the empty-table fallback, and restores the
+  default vector(1536) + index state in a finally block.
+- Run with:
+    cd backend && set -a && source ../.env.test && set +a
+    uv run pytest tests/test_embedding_vector_migration.py -x -q
+"""
+
+import subprocess
+
+import pytest
+import sqlalchemy as sa
+from tests.alembic_helpers import (
+    enterprise_migrations_present,
+    fresh_query as _fresh_query,
+    run_alembic as _run_alembic,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_PRE_TYPED_REVISION = "0011_allow_generic_geometry_type"
+
+
+async def _embedding_column_type() -> str:
+    rows = await _fresh_query(
+        "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+        "WHERE attrelid = 'catalog.record_embeddings'::regclass "
+        "AND attname = 'embedding'"
+    )
+    return rows[0][0]
+
+
+async def _hnsw_index_exists() -> bool:
+    rows = await _fresh_query(
+        "SELECT 1 FROM pg_indexes WHERE schemaname = 'catalog' "
+        "AND indexname = 'ix_record_embeddings_hnsw'"
+    )
+    return bool(rows)
+
+
+async def _hnsw_index_is_valid() -> bool:
+    rows = await _fresh_query(
+        "SELECT idx.indisvalid AND idx.indisready "
+        "FROM pg_index AS idx "
+        "JOIN pg_class AS cls ON cls.oid = idx.indexrelid "
+        "JOIN pg_namespace AS ns ON ns.oid = cls.relnamespace "
+        "WHERE ns.nspname = 'catalog' "
+        "AND cls.relname = 'ix_record_embeddings_hnsw'"
+    )
+    return bool(rows and rows[0][0])
+
+
+_SKIP_UNDER_OVERLAY = pytest.mark.skipif(
+    enterprise_migrations_present(),
+    reason="OSS migration test; multi-head under enterprise overlay — "
+    "runs in the no-overlay Pytest Parallel Isolation job instead.",
+)
+
+
+_TEST_RECORD_TITLE = "embedding-vector-migration-test"
+
+
+async def _insert_untyped_embedding_rows(dims_list: list[int]) -> None:
+    """Seed one embedding row per requested dimension (untyped column only).
+
+    Creates a minimal parent record per row to satisfy the records FK; the
+    rows are cleaned up by _restore_default_head's TRUNCATE + record delete.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.config import settings
+
+    engine = create_async_engine(
+        settings.test_database_url, isolation_level="AUTOCOMMIT"
+    )
+    try:
+        async with engine.connect() as conn:
+            for d in dims_list:
+                rid = (
+                    await conn.execute(
+                        sa.text(
+                            "INSERT INTO catalog.records (title, visibility, record_status) "
+                            "VALUES (:t, 'private', 'active') RETURNING id"
+                        ),
+                        {"t": _TEST_RECORD_TITLE},
+                    )
+                ).scalar_one()
+                await conn.execute(
+                    sa.text(
+                        "INSERT INTO catalog.record_embeddings "
+                        "(record_id, embedding, model_name, content_hash) "
+                        "VALUES (:rid, CAST(:v AS vector), 'test-model', 'x')"
+                    ),
+                    {"rid": rid, "v": "[" + ",".join(["0"] * d) + "]"},
+                )
+    finally:
+        await engine.dispose()
+
+
+async def _retype_via_migration(dims: str) -> subprocess.CompletedProcess:
+    """Downgrade below 0012, empty the table, re-upgrade with EMBEDDING_DIMS set."""
+    r = _run_alembic("downgrade", _PRE_TYPED_REVISION)
+    assert r.returncode == 0, f"downgrade failed: {r.stderr}"
+    await _fresh_query("TRUNCATE catalog.record_embeddings")
+    await _fresh_query("DELETE FROM catalog.app_settings WHERE key = 'embedding_dims'")
+    return _run_alembic("upgrade", "head", extra_env={"EMBEDDING_DIMS": dims})
+
+
+async def _restore_default_head() -> None:
+    """Back to the suite's expected state: head, vector(1536), index present."""
+    r = _run_alembic("downgrade", _PRE_TYPED_REVISION)
+    assert r.returncode == 0, f"restore downgrade failed: {r.stderr}"
+    await _fresh_query("TRUNCATE catalog.record_embeddings")
+    await _fresh_query(
+        f"DELETE FROM catalog.records WHERE title = '{_TEST_RECORD_TITLE}'"
+    )
+    r = _run_alembic("upgrade", "head")
+    assert r.returncode == 0, f"restore upgrade failed: {r.stderr}"
+    assert await _embedding_column_type() == "vector(1536)"
+    assert await _hnsw_index_exists()
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestEmbeddingVectorMigrationDims:
+    async def test_env_dims_honored_on_empty_table(self):
+        """EMBEDDING_DIMS=768 types the column vector(768)."""
+        try:
+            r = await _retype_via_migration("768")
+            assert r.returncode == 0, f"upgrade failed: {r.stderr}"
+            assert await _embedding_column_type() == "vector(768)"
+            assert await _hnsw_index_exists(), "HNSW should exist at 768 dims"
+            assert await _hnsw_index_is_valid(), "HNSW must be ready and valid"
+        finally:
+            await _restore_default_head()
+
+    async def test_large_dims_skip_hnsw_instead_of_failing(self):
+        """3072 dims types the column but skips HNSW
+        (pgvector rejects HNSW over 2000 dims) instead of failing the upgrade."""
+        try:
+            r = await _retype_via_migration("3072")
+            assert r.returncode == 0, (
+                f"upgrade must succeed at 3072 dims by skipping HNSW: {r.stderr}"
+            )
+            assert await _embedding_column_type() == "vector(3072)"
+            assert not await _hnsw_index_exists(), (
+                "HNSW must be skipped above pgvector's 2000-dim limit"
+            )
+        finally:
+            await _restore_default_head()
+
+    async def test_mixed_dims_prefer_configured_dimension(self):
+        """When stored rows disagree (stale
+        1536-dim next to current 768-dim), the configured dimension wins over
+        max(stored) — otherwise the current model's rows get deleted and its
+        future inserts fail against the stale-typed column."""
+        try:
+            r = _run_alembic("downgrade", _PRE_TYPED_REVISION)
+            assert r.returncode == 0, f"downgrade failed: {r.stderr}"
+            await _fresh_query("TRUNCATE catalog.record_embeddings")
+            await _fresh_query(
+                "DELETE FROM catalog.app_settings WHERE key = 'embedding_dims'"
+            )
+            await _insert_untyped_embedding_rows([1536, 768])
+
+            r = _run_alembic("upgrade", "head", extra_env={"EMBEDDING_DIMS": "768"})
+            assert r.returncode == 0, f"upgrade failed: {r.stderr}"
+            assert await _embedding_column_type() == "vector(768)"
+            rows = await _fresh_query("SELECT count(*) FROM catalog.record_embeddings")
+            assert rows[0][0] == 0, "the regenerable embedding cache must be cleared"
+        finally:
+            await _restore_default_head()
+
+    async def test_explicit_config_beats_uniform_stale_rows(self):
+        """Rows that ALL carry a superseded
+        model's dimension must not pin the column — explicit config wins."""
+        try:
+            r = _run_alembic("downgrade", _PRE_TYPED_REVISION)
+            assert r.returncode == 0, f"downgrade failed: {r.stderr}"
+            await _fresh_query("TRUNCATE catalog.record_embeddings")
+            await _fresh_query(
+                "DELETE FROM catalog.app_settings WHERE key = 'embedding_dims'"
+            )
+            await _insert_untyped_embedding_rows([512, 512])
+
+            r = _run_alembic("upgrade", "head", extra_env={"EMBEDDING_DIMS": "768"})
+            assert r.returncode == 0, f"upgrade failed: {r.stderr}"
+            assert await _embedding_column_type() == "vector(768)"
+            rows = await _fresh_query("SELECT count(*) FROM catalog.record_embeddings")
+            assert rows[0][0] == 0, "stale rows should be deleted, not kept"
+        finally:
+            await _restore_default_head()
+
+    async def test_uniform_stored_rows_beat_builtin_default(self):
+        """Uniform stored rows choose the dimension before the cache is cleared."""
+        try:
+            r = _run_alembic("downgrade", _PRE_TYPED_REVISION)
+            assert r.returncode == 0, f"downgrade failed: {r.stderr}"
+            await _fresh_query("TRUNCATE catalog.record_embeddings")
+            await _fresh_query(
+                "DELETE FROM catalog.app_settings WHERE key = 'embedding_dims'"
+            )
+            await _insert_untyped_embedding_rows([768, 768])
+
+            r = _run_alembic("upgrade", "head")
+            assert r.returncode == 0, f"upgrade failed: {r.stderr}"
+            assert await _embedding_column_type() == "vector(768)"
+            rows = await _fresh_query("SELECT count(*) FROM catalog.record_embeddings")
+            assert rows[0][0] == 0, "the bounded-lock transition clears cached rows"
+        finally:
+            await _restore_default_head()
+
+    async def test_explicit_default_value_still_beats_stored_rows(self):
+        """EMBEDDING_DIMS=1536 set deliberately
+        equals the frozen fallback, but the exported variable's presence makes
+        it explicit — it must beat uniform stale 768-dim rows."""
+        try:
+            r = _run_alembic("downgrade", _PRE_TYPED_REVISION)
+            assert r.returncode == 0, f"downgrade failed: {r.stderr}"
+            await _fresh_query("TRUNCATE catalog.record_embeddings")
+            await _fresh_query(
+                "DELETE FROM catalog.app_settings WHERE key = 'embedding_dims'"
+            )
+            await _insert_untyped_embedding_rows([768, 768])
+
+            r = _run_alembic("upgrade", "head", extra_env={"EMBEDDING_DIMS": "1536"})
+            assert r.returncode == 0, f"upgrade failed: {r.stderr}"
+            assert await _embedding_column_type() == "vector(1536)"
+            rows = await _fresh_query("SELECT count(*) FROM catalog.record_embeddings")
+            assert rows[0][0] == 0, "stale 768-dim rows should be deleted"
+        finally:
+            await _restore_default_head()
+
+    async def test_already_typed_column_resumes_at_concurrent_index_build(self):
+        """A retry after the committed type transition recreates only the index."""
+        try:
+            r = _run_alembic("downgrade", _PRE_TYPED_REVISION)
+            assert r.returncode == 0, f"downgrade failed: {r.stderr}"
+            await _fresh_query("TRUNCATE catalog.record_embeddings")
+            await _fresh_query(
+                "ALTER TABLE catalog.record_embeddings "
+                "ALTER COLUMN embedding TYPE vector(768) "
+                "USING embedding::vector(768)"
+            )
+            await _fresh_query("DROP INDEX IF EXISTS catalog.ix_record_embeddings_hnsw")
+
+            r = _run_alembic("upgrade", "head")
+            assert r.returncode == 0, f"resumed upgrade failed: {r.stderr}"
+            assert await _embedding_column_type() == "vector(768)"
+            assert await _hnsw_index_is_valid()
+        finally:
+            await _restore_default_head()

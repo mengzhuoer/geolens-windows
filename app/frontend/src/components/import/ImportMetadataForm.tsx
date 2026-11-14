@@ -1,0 +1,533 @@
+import { useId, useRef, useMemo, useState } from 'react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { useTranslation } from 'react-i18next';
+import { useCanSetPublicVisibility } from '@/hooks/use-settings';
+import { Loader2 } from 'lucide-react';
+import type { CommitImportRequest, RasterPreviewResponse } from '@/types/api';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { getGeometryTypeLabel } from '@/i18n/labels';
+import { stripExtension } from './utils';
+
+type GeometryMode = 'auto' | 'manual' | 'none';
+type GeometryType = 'latlng' | 'wkt';
+
+interface ImportMetadataFormProps {
+  defaultName: string;
+  detectedCrs: number | null;
+  onCommit: (metadata: CommitImportRequest) => void;
+  isCommitting: boolean;
+  /** A previously attempted request to start from instead of the preview defaults. */
+  initialRequest?: CommitImportRequest | null;
+  isRaster?: boolean;
+  /** A 3D Tiles tileset keeps its own coordinates, so it takes no CRS override. */
+  isTileset?: boolean;
+  isPointCloud?: boolean;
+  previewData?: RasterPreviewResponse;
+  previewColumns?: { name: string; type: string }[];
+  detectedGeometryType?: string | null;
+  detectedGeometryColumns?: {
+    x_column: string | null;
+    y_column: string | null;
+    wkt_column: string | null;
+  } | null;
+}
+
+// No `restricted`, as in RegisterForm. Import offers private, internal and
+// public; group sharing belongs to the dataset Access tab.
+// Radix Select cannot hold an empty-string value. Real columns are prefixed so
+// no source field name can equal the "no column" placeholder.
+const NO_COLUMN = 'none';
+const encodeColumn = (name: string) => (name ? `col:${name}` : NO_COLUMN);
+const decodeColumn = (value: string) => (value.startsWith('col:') ? value.slice(4) : '');
+
+const VISIBILITY_OPTIONS = [
+  { value: 'private', labelKey: 'metadata.visibilityPrivate' },
+  { value: 'internal', labelKey: 'metadata.visibilityInternal' },
+  { value: 'public', labelKey: 'metadata.visibilityPublic' },
+];
+
+const COMPRESSION_OPTIONS = ['DEFLATE', 'ZSTD', 'LZW', 'JPEG', 'WEBP', 'LERC'];
+const RESAMPLING_OPTIONS = [
+  'auto',
+  'nearest',
+  'bilinear',
+  'cubic',
+  'cubicspline',
+  'lanczos',
+  'average',
+  'mode',
+];
+
+export function ImportMetadataForm({
+  defaultName,
+  detectedCrs,
+  onCommit,
+  isCommitting,
+  initialRequest,
+  isRaster = false,
+  isTileset = false,
+  isPointCloud = false,
+  previewData,
+  previewColumns,
+  detectedGeometryType,
+  detectedGeometryColumns,
+}: ImportMetadataFormProps) {
+  const { t } = useTranslation('import');
+  const formId = useId();
+  const fieldId = (field: string) => `${formId}-${field}`;
+  // Hide the Public option when the restrict_public_visibility
+  // instance setting caps non-admins at non-public (server enforces via 403).
+  const canSetPublic = useCanSetPublicVisibility();
+  const visibilityOptions = canSetPublic
+    ? VISIBILITY_OPTIONS
+    : VISIBILITY_OPTIONS.filter((opt) => opt.value !== 'public');
+  const [name, setName] = useState(initialRequest?.title ?? stripExtension(defaultName));
+  const [description, setDescription] = useState(initialRequest?.summary ?? '');
+  const [visibility, setVisibility] = useState(initialRequest?.visibility ?? 'private');
+  const [sridOverride, setSridOverride] = useState(initialRequest?.srid_override?.toString() ?? '');
+
+  const hasDetected =
+    detectedGeometryColumns &&
+    (detectedGeometryColumns.x_column || detectedGeometryColumns.wkt_column);
+  const [geomMode, setGeomMode] = useState<GeometryMode>(() => {
+    if (!initialRequest) return hasDetected ? 'auto' : 'none';
+    const { x_column, y_column, geom_column } = initialRequest;
+    if (!x_column && !geom_column) return 'none';
+    const matchesDetected = geom_column
+      ? geom_column === detectedGeometryColumns?.wkt_column
+      : x_column === detectedGeometryColumns?.x_column && y_column === detectedGeometryColumns?.y_column;
+    return hasDetected && matchesDetected ? 'auto' : 'manual';
+  });
+  const [geomType, setGeomType] = useState<GeometryType>(() => {
+    if (initialRequest?.geom_column) return 'wkt';
+    if (initialRequest?.x_column) return 'latlng';
+    return detectedGeometryColumns?.wkt_column && !detectedGeometryColumns?.x_column
+      ? 'wkt'
+      : 'latlng';
+  });
+  const [xColumn, setXColumn] = useState(
+    initialRequest?.x_column ?? detectedGeometryColumns?.x_column ?? '',
+  );
+  const [yColumn, setYColumn] = useState(
+    initialRequest?.y_column ?? detectedGeometryColumns?.y_column ?? '',
+  );
+  const [wktColumn, setWktColumn] = useState(
+    initialRequest?.geom_column ?? detectedGeometryColumns?.wkt_column ?? '',
+  );
+
+  // Columns eligible for Lat/Lng selection: numeric types preferred,
+  // but include auto-detected columns even if GDAL typed them as String
+  // (common with CSV where AUTODETECT_TYPE may not be applied).
+  const numericColumns = useMemo(() => {
+    const numeric = (previewColumns ?? []).filter((c) =>
+      ['Real', 'Integer', 'Integer64'].includes(c.type),
+    );
+    if (numeric.length > 0) return numeric;
+    // Fallback: if no numeric columns exist but auto-detected columns were
+    // identified, show all columns so the user can select them manually.
+    if (detectedGeometryColumns?.x_column || detectedGeometryColumns?.y_column) {
+      return previewColumns ?? [];
+    }
+    return numeric;
+  }, [previewColumns, detectedGeometryColumns]);
+  const stringColumns = (previewColumns ?? []).filter(
+    (c) => c.type === 'String',
+  );
+  const hasEmbeddedGeometry = Boolean(detectedGeometryType);
+  const showEmbeddedGeometrySection = !isRaster && hasEmbeddedGeometry;
+  const showGeomSection =
+    !isRaster && !hasEmbeddedGeometry && previewColumns && previewColumns.length > 0;
+
+  const [temporalStart, setTemporalStart] = useState(
+    initialRequest ? (initialRequest.temporal_start ?? '') : (previewData?.temporal_start ?? ''),
+  );
+  const [temporalEnd, setTemporalEnd] = useState(initialRequest?.temporal_end ?? '');
+  const [compression, setCompression] = useState(initialRequest?.compression ?? 'DEFLATE');
+  const [resampling, setResampling] = useState(initialRequest?.resampling ?? 'auto');
+  const [nodataOverride, setNodataOverride] = useState(initialRequest?.nodata_override?.toString() ?? '');
+
+  const submittingRef = useRef(false);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (submittingRef.current) return;
+    submittingRef.current = true;
+    // Reset after the commit callback completes (or fails)
+    queueMicrotask(() => { submittingRef.current = false; });
+
+    const request: CommitImportRequest = {
+      title: name.trim(),
+      summary: description.trim() || null,
+      visibility,
+      srid_override: sridOverride.trim()
+        ? parseInt(sridOverride.trim(), 10)
+        : null,
+    };
+
+    if (showGeomSection && geomMode !== 'none') {
+      if (geomType === 'latlng' && xColumn && yColumn) {
+        request.x_column = xColumn;
+        request.y_column = yColumn;
+      } else if (geomType === 'wkt' && wktColumn) {
+        request.geom_column = wktColumn;
+      }
+    }
+
+    if (isRaster) {
+      request.temporal_start = temporalStart || null;
+      request.temporal_end = temporalEnd || null;
+      request.compression = compression !== 'DEFLATE' ? compression : null;
+      request.resampling = resampling !== 'auto' ? resampling : null;
+      request.nodata_override = nodataOverride.trim()
+        ? nodataOverride.trim()
+        : null;
+    }
+
+    onCommit(request);
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle level={2}>{t('metadata.title')}</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div className="space-y-2">
+            <Label htmlFor={fieldId('import-name')}>{t('metadata.nameLabel')}</Label>
+            <Input
+              id={fieldId('import-name')}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor={fieldId('import-description')}>{t('metadata.descriptionLabel')}</Label>
+            <Input
+              id={fieldId('import-description')}
+              placeholder={t('metadata.descriptionPlaceholder')}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor={fieldId('import-visibility')}>{t('metadata.visibilityLabel')}</Label>
+            {/* Native <select> → themed ui/select. */}
+            <Select value={visibility} onValueChange={setVisibility}>
+              <SelectTrigger id={fieldId('import-visibility')} className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {visibilityOptions.map((opt) => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {t(opt.labelKey)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* CRS Override
+              When detectedCrs is non-null (probe resolved the CRS automatically),
+              hide the editable override input and show a read-only confirmation
+              instead.  When detectedCrs is null (unrecognised URI, true-unknown,
+              or probe-CRS-not-available), the manual input stays visible as an
+              escape hatch so the user can still supply an EPSG override. */}
+          {isTileset || isPointCloud ? null : detectedCrs ? (
+            <div className="space-y-2">
+              <Label>{t('metadata.crsLabel')}</Label>
+              <p className="text-sm text-muted-foreground">
+                {t('metadata.crsDetected', {
+                  crs: detectedCrs,
+                  defaultValue: `Detected CRS: EPSG:${detectedCrs} (auto-detected — no override needed)`,
+                })}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <Label htmlFor={fieldId('import-crs')}>{t('metadata.crsLabel')}</Label>
+              <Input
+                id={fieldId('import-crs')}
+                type="number"
+                placeholder={t('metadata.crsPlaceholderEmpty')}
+                value={sridOverride}
+                onChange={(e) => setSridOverride(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('metadata.crsHelpText')}
+              </p>
+            </div>
+          )}
+
+          {showEmbeddedGeometrySection && (
+            <div className="space-y-3 rounded-md border border-success/30 bg-success/5 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-sm font-medium">
+                  {t('metadata.geometryColumns')}
+                </p>
+                <Badge variant="outline" className="border-success/40 bg-background/80">
+                  {detectedGeometryType
+                    ? getGeometryTypeLabel(t, detectedGeometryType)
+                    : t('preview.unknown')}
+                </Badge>
+              </div>
+              <div className="space-y-1">
+                <p className="text-sm font-medium">
+                  {t('metadata.embeddedGeometry', {
+                    defaultValue: 'Using embedded geometry',
+                  })}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {t('metadata.embeddedGeometryHelp', {
+                    defaultValue: 'This source already includes native geometry, so GeoLens will keep it during import.',
+                  })}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {showGeomSection && (
+            <div className="space-y-3 rounded-md border p-3">
+              <p className="text-sm font-medium">
+                {t('metadata.geometryColumns')}
+              </p>
+
+              <div className="space-y-1">
+                <Label htmlFor={fieldId('geom-mode')}>
+                  {t('metadata.geometryMode')}
+                </Label>
+                {/* Native <select> → themed ui/select. */}
+                <Select
+                  value={geomMode}
+                  onValueChange={(v) => setGeomMode(v as GeometryMode)}
+                >
+                  <SelectTrigger id={fieldId('geom-mode')} className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {hasDetected && (
+                      <SelectItem value="auto">{t('metadata.autoDetected')}</SelectItem>
+                    )}
+                    <SelectItem value="manual">{t('metadata.manualOverride')}</SelectItem>
+                    <SelectItem value="none">{t('metadata.nonSpatial')}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {geomMode !== 'none' && (
+                <>
+                  <div className="flex gap-4">
+                    <label className="flex items-center gap-1.5 text-sm">
+                      <input
+                        type="radio"
+                        name={fieldId('geom-type')}
+                        value="latlng"
+                        checked={geomType === 'latlng'}
+                        onChange={() => setGeomType('latlng')}
+                      />
+                      {t('metadata.latLng')}
+                    </label>
+                    <label className="flex items-center gap-1.5 text-sm">
+                      <input
+                        type="radio"
+                        name={fieldId('geom-type')}
+                        value="wkt"
+                        checked={geomType === 'wkt'}
+                        onChange={() => setGeomType('wkt')}
+                      />
+                      {t('metadata.wkt')}
+                    </label>
+                  </div>
+
+                  {geomType === 'latlng' ? (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <Label htmlFor={fieldId('x-column')}>
+                          {t('metadata.xColumn')}
+                        </Label>
+                        <Select
+                          value={encodeColumn(xColumn)}
+                          onValueChange={(v) => setXColumn(decodeColumn(v))}
+                          disabled={geomMode === 'auto'}
+                        >
+                          <SelectTrigger id={fieldId('x-column')} className="w-full">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NO_COLUMN}>--</SelectItem>
+                            {numericColumns.map((c) => (
+                              <SelectItem key={c.name} value={encodeColumn(c.name)}>
+                                {c.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor={fieldId('y-column')}>
+                          {t('metadata.yColumn')}
+                        </Label>
+                        <Select
+                          value={encodeColumn(yColumn)}
+                          onValueChange={(v) => setYColumn(decodeColumn(v))}
+                          disabled={geomMode === 'auto'}
+                        >
+                          <SelectTrigger id={fieldId('y-column')} className="w-full">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={NO_COLUMN}>--</SelectItem>
+                            {numericColumns.map((c) => (
+                              <SelectItem key={c.name} value={encodeColumn(c.name)}>
+                                {c.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-1">
+                      <Label htmlFor={fieldId('wkt-column')}>
+                        {t('metadata.wktColumn')}
+                      </Label>
+                      <Select
+                        value={encodeColumn(wktColumn)}
+                        onValueChange={(v) => setWktColumn(decodeColumn(v))}
+                        disabled={geomMode === 'auto'}
+                      >
+                        <SelectTrigger id={fieldId('wkt-column')} className="w-full">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={NO_COLUMN}>--</SelectItem>
+                          {stringColumns.map((c) => (
+                            <SelectItem key={c.name} value={encodeColumn(c.name)}>
+                              {c.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {isRaster && (
+            <>
+              {/* Temporal dates */}
+              <div className="space-y-2">
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <Label htmlFor={fieldId('temporal-start')}>
+                      {t('metadata.temporalStartLabel')}
+                    </Label>
+                    <Input
+                      id={fieldId('temporal-start')}
+                      type="date"
+                      value={temporalStart}
+                      onChange={(e) => setTemporalStart(e.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor={fieldId('temporal-end')}>
+                      {t('metadata.temporalEndLabel')}
+                    </Label>
+                    <Input
+                      id={fieldId('temporal-end')}
+                      type="date"
+                      value={temporalEnd}
+                      onChange={(e) => setTemporalEnd(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t('metadata.temporalHelpText')}
+                </p>
+              </div>
+
+              {/* Advanced GDAL Options */}
+              <div className="space-y-3 rounded-md border p-3">
+                <p className="text-sm font-medium text-muted-foreground">
+                  {t('metadata.advancedOptions')}
+                </p>
+
+                <div className="space-y-1">
+                  <Label htmlFor={fieldId('compression')}>
+                    {t('metadata.compressionLabel')}
+                  </Label>
+                  {/* Native <select> → themed ui/select. */}
+                  <Select value={compression} onValueChange={setCompression}>
+                    <SelectTrigger id={fieldId('compression')} className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {COMPRESSION_OPTIONS.map((opt) => (
+                        <SelectItem key={opt} value={opt}>{opt}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    {t('metadata.compressionHelp')}
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <Label htmlFor={fieldId('resampling')}>
+                    {t('metadata.resamplingLabel')}
+                  </Label>
+                  {/* Native <select> → themed ui/select. */}
+                  <Select value={resampling} onValueChange={setResampling}>
+                    <SelectTrigger id={fieldId('resampling')} className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {RESAMPLING_OPTIONS.map((opt) => (
+                        <SelectItem key={opt} value={opt}>
+                          {opt === 'auto' ? `(${opt})` : opt}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    {t('metadata.resamplingHelp')}
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <Label htmlFor={fieldId('nodata-override')}>
+                    {t('metadata.nodataLabel')}
+                  </Label>
+                  <Input
+                    id={fieldId('nodata-override')}
+                    type="text"
+                    placeholder=""
+                    value={nodataOverride}
+                    onChange={(e) => setNodataOverride(e.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {t('metadata.nodataHelp')}
+                  </p>
+                </div>
+              </div>
+            </>
+          )}
+
+          <Button type="submit" disabled={isCommitting || !name.trim()}>
+            {isCommitting && <Loader2 className="size-4 animate-spin" />}
+            {isCommitting ? t('metadata.importing') : t('metadata.importDataset')}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}

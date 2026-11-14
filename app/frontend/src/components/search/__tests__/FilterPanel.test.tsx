@@ -1,0 +1,287 @@
+import { act, fireEvent, render, screen } from '@/test/test-utils';
+import { FilterPanel } from '../FilterPanel';
+import { useSearchStore } from '@/stores/search-store';
+
+// Mock useFacets to return known counts
+const mockFacets = {
+  record_type: { vector_dataset: 10, raster_dataset: 5, vrt_dataset: 0, table: 1, collection: 3 },
+};
+
+vi.mock('@/components/search/hooks/use-search', () => ({
+  useFacets: () => ({ data: mockFacets, isLoading: false }),
+  useCatalogSummary: () => ({ data: undefined, isLoading: false }),
+}));
+
+// Mock SavedSearches to avoid auth complexity
+vi.mock('../SavedSearches', () => ({
+  SaveSearchButton: () => null,
+}));
+
+// Mock BboxMapPicker to avoid map loading
+vi.mock('../BboxMapPicker', () => ({
+  BboxMapPicker: () => <div>mock-map</div>,
+}));
+
+describe('FilterPanel', () => {
+  afterEach(() => {
+    useSearchStore.getState().resetFilters();
+  });
+
+  it('renders badge text with counts from useFacets', () => {
+    render(<FilterPanel totalResults={18} allTypesTotal={18} />);
+
+    // All shows the result total (18), not the dataset-facet sum (16).
+    expect(screen.getByText(/All.*\(18\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Vector.*\(10\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Raster.*\(5\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Table.*\(1\)/)).toBeInTheDocument();
+  });
+
+  it('shows the result total on All when it exceeds the dataset facet sum', () => {
+    render(<FilterPanel totalResults={4} allTypesTotal={4} />);
+
+    expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('4');
+    expect(screen.getByRole('radio', { name: /Vector/ })).toHaveTextContent('10');
+  });
+
+  it('falls back to the facet sum while the All total is unavailable', () => {
+    render(<FilterPanel totalResults={5} />);
+
+    expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('16');
+  });
+
+  it('shows a zero All total even when the facets are positive', () => {
+    render(<FilterPanel totalResults={undefined} allTypesTotal={0} />);
+
+    expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('0');
+    expect(screen.getByRole('radio', { name: /All/ })).not.toHaveTextContent('16');
+  });
+
+  it.each(['toolbar', 'rail'] as const)('shows All with an empty facet map for a collection-only or zero total (%s)', (desktopLayout) => {
+    const counts = mockFacets.record_type as Record<string, number>;
+    const saved = { ...counts };
+    for (const k of Object.keys(counts)) delete counts[k];
+    try {
+      const { rerender } = render(<FilterPanel totalResults={2} allTypesTotal={2} showMobile={false} desktopLayout={desktopLayout} />);
+      expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('2');
+
+      rerender(<FilterPanel totalResults={undefined} allTypesTotal={0} showMobile={false} desktopLayout={desktopLayout} />);
+      expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('0');
+    } finally {
+      Object.assign(counts, saved);
+    }
+  });
+
+  it('disables badges with count of 0', () => {
+    render(<FilterPanel totalResults={18} />);
+
+    // Virtual Raster has count 0, its toggle button should be disabled
+    const vrtButtons = screen.getAllByRole('radio').filter(
+      (el) => el.textContent?.includes('Virtual Raster') && el.textContent?.includes('(0)'),
+    );
+    expect(vrtButtons.length).toBeGreaterThan(0);
+    expect(vrtButtons[0]).toBeDisabled();
+  });
+
+  it.each(['toolbar', 'rail'] as const)('offers a 3D Tiles toggle, counted in All, when the catalog holds tilesets (%s)', (desktopLayout) => {
+    const counts = mockFacets.record_type as Record<string, number>;
+    counts.tiles3d_dataset = 2;
+    try {
+      render(<FilterPanel totalResults={18} allTypesTotal={18} showMobile={false} desktopLayout={desktopLayout} />);
+
+      expect(screen.getByRole('radio', { name: /3D Tiles/ })).toHaveTextContent('2');
+      expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('18');
+    } finally {
+      delete counts.tiles3d_dataset;
+    }
+  });
+
+  it.each(['toolbar', 'rail'] as const)('shows no 3D Tiles toggle when the catalog holds no tilesets (%s)', (desktopLayout) => {
+    render(<FilterPanel totalResults={18} showMobile={false} desktopLayout={desktopLayout} />);
+
+    expect(screen.queryByRole('radio', { name: /3D Tiles/ })).not.toBeInTheDocument();
+  });
+
+  it.each(['toolbar', 'rail'] as const)('offers a Point cloud toggle, counted in All, when the catalog holds point clouds (%s)', (desktopLayout) => {
+    const counts = mockFacets.record_type as Record<string, number>;
+    counts.pointcloud_dataset = 2;
+    try {
+      render(<FilterPanel totalResults={18} allTypesTotal={18} showMobile={false} desktopLayout={desktopLayout} />);
+
+      expect(screen.getByRole('radio', { name: /Point cloud/ })).toHaveTextContent('2');
+      expect(screen.getByRole('radio', { name: /All/ })).toHaveTextContent('18');
+    } finally {
+      delete counts.pointcloud_dataset;
+    }
+  });
+
+  it.each(['toolbar', 'rail'] as const)('shows no Point cloud toggle when the catalog holds no point clouds (%s)', (desktopLayout) => {
+    render(<FilterPanel totalResults={18} showMobile={false} desktopLayout={desktopLayout} />);
+
+    expect(screen.queryByRole('radio', { name: /Point cloud/ })).not.toBeInTheDocument();
+  });
+
+  it('does not show collection as a record type toggle', () => {
+    render(<FilterPanel totalResults={15} />);
+
+    // Collections should not appear as a toggle group item
+    const radios = screen.getAllByRole('radio');
+    const collectionRadio = radios.find((el) => el.textContent?.includes('Collections'));
+    expect(collectionRadio).toBeUndefined();
+  });
+
+  it('does not render secondary filter row when no record type is selected', () => {
+    render(<FilterPanel totalResults={18} />);
+
+    expect(screen.queryByTestId('secondary-filter-row')).not.toBeInTheDocument();
+  });
+
+  it('does not render secondary filter row for raster type when no org/crs available', () => {
+    useSearchStore.getState().setFilter('record_type', 'raster_dataset');
+    render(<FilterPanel totalResults={5} />);
+
+    expect(screen.queryByTestId('secondary-filter-row')).not.toBeInTheDocument();
+  });
+
+  it('does not render secondary filter row for table type when no table-specific secondary filters are available', () => {
+    useSearchStore.getState().setFilter('record_type', 'table');
+    render(<FilterPanel totalResults={1} />);
+
+    expect(screen.queryByTestId('secondary-filter-row')).not.toBeInTheDocument();
+  });
+
+  it('renders secondary filter row with Vector filters label when vector type selected', () => {
+    useSearchStore.getState().setFilter('record_type', 'vector_dataset');
+    render(<FilterPanel totalResults={10} />);
+
+    const secondaryRow = screen.getByTestId('secondary-filter-row');
+    expect(secondaryRow).toBeInTheDocument();
+    expect(secondaryRow).toHaveTextContent(/Vector.*filters/);
+  });
+
+  it('keeps active specialist refinements visible while advanced rail filters are collapsed', () => {
+    act(() => {
+      useSearchStore.getState().setFilter('record_type', 'vector_dataset');
+      useSearchStore.getState().setFilter('geometry_type', 'POINT');
+    });
+    render(<FilterPanel totalResults={10} showMobile={false} desktopLayout="rail" />);
+
+    expect(screen.getByText('Dataset filters')).toBeInTheDocument();
+    expect(screen.getByText('Active refinements')).toBeInTheDocument();
+    expect(screen.getByText('Point')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Advanced filters' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('Geometry Type')).not.toBeInTheDocument();
+  });
+
+  it('expands specialist rail controls without clearing their active values', () => {
+    act(() => {
+      useSearchStore.getState().setFilter('record_type', 'vector_dataset');
+      useSearchStore.getState().setFilter('geometry_type', 'POINT');
+    });
+    render(<FilterPanel totalResults={10} showMobile={false} desktopLayout="rail" />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Advanced filters' }));
+
+    expect(screen.getByRole('button', { name: 'Advanced filters' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Geometry Type')).toBeInTheDocument();
+    expect(screen.getAllByText('Point')).not.toHaveLength(0);
+    expect(useSearchStore.getState().geometry_type).toBe('POINT');
+  });
+});
+
+// The uncommitted date-range draft
+// (localDateFrom/localDateTo) used to survive an identity change, so
+// clicking the still-open popover's Apply afterward repopulated the
+// (now cleared) store and URL with the previous identity's typed dates.
+describe('FilterPanel identity reset (fix #1761 review round 4)', () => {
+  afterEach(() => {
+    useSearchStore.getState().resetFilters();
+  });
+
+  // Radix Popover portals its content to document.body, outside render()'s
+  // own container, so query the document rather than the container.
+  function getDateInputs() {
+    return Array.from(document.querySelectorAll<HTMLInputElement>('input[type="date"]'));
+  }
+
+  it('clears an uncommitted date draft and closes the popover when identity changes', () => {
+    render(<FilterPanel totalResults={10} showMobile={false} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Date Added/i }));
+    const [fromInput] = getDateInputs();
+    fireEvent.change(fromInput, { target: { value: '2024-01-01' } });
+    expect(getDateInputs()[0]).toHaveValue('2024-01-01');
+    // Still uncommitted: date_from in the store is untouched.
+    expect(useSearchStore.getState().date_from).toBe('');
+
+    // Identity changes (the auth choke point's identity-change branch)
+    // WITHOUT the user clicking Apply.
+    act(() => {
+      useSearchStore.getState().clearIdentityScopedFilters();
+    });
+
+    // Popover closed: Apply is no longer reachable with the stale draft.
+    expect(screen.queryByRole('button', { name: /Apply/i })).not.toBeInTheDocument();
+
+    // Reopening shows the cleared value, not the stale draft.
+    fireEvent.click(screen.getByRole('button', { name: /Date Added/i }));
+    expect(getDateInputs()[0]).toHaveValue('');
+  });
+
+  // spatialPanelOpen was originally
+  // classified as a kept presentation preference, but it gates whether
+  // SpatialFilterPanel is mounted, and that component holds its own
+  // uncommitted pendingBbox/predicate draft — the same class of bug as the
+  // date draft above, just reached through onApply instead of directly.
+  // Left open across an identity change, Apply would write the previous
+  // identity's drawn area into the just-cleared store.
+  it('renders the selected area as a button beside its remove control, not nested', () => {
+    useSearchStore.getState().setFilter('bbox', '-10,-10,10,10');
+    render(<FilterPanel totalResults={10} showMobile={false} />);
+
+    const area = screen.getByRole('button', { name: 'Area selected' });
+    expect(area.querySelector('button')).toBeNull();
+    expect(area.closest('[role="button"]')).toBeNull();
+    fireEvent.click(area);
+    expect(useSearchStore.getState().spatialPanelOpen).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: /remove.*area selected/i }));
+    expect(useSearchStore.getState().bbox).toBe('');
+  });
+
+  it('closes the spatial filter panel on identity change', () => {
+    render(<FilterPanel totalResults={10} showMobile={false} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /^Location$/i }));
+    expect(useSearchStore.getState().spatialPanelOpen).toBe(true);
+
+    act(() => {
+      useSearchStore.getState().clearIdentityScopedFilters();
+    });
+
+    expect(useSearchStore.getState().spatialPanelOpen).toBe(false);
+  });
+
+  // The date-range and temporal-extent popovers paired a bare
+  // <label> (no htmlFor) with a sibling <Input>, so the two date fields in
+  // each popover announced as unnamed. Both popovers are closed at mount
+  // and portal to document.body, so the axe gate structurally cannot reach
+  // them — this pins the accessible name directly instead.
+  it('names the "From" and "To" date inputs in the date-range popover (#1778)', () => {
+    render(<FilterPanel totalResults={10} showMobile={false} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Date Added/i }));
+
+    expect(screen.getByLabelText('From')).toBeInTheDocument();
+    expect(screen.getByLabelText('To')).toBeInTheDocument();
+  });
+
+  it('names the "From" and "To" date inputs in the temporal-extent popover (#1778)', () => {
+    render(<FilterPanel totalResults={10} showMobile={false} />);
+
+    fireEvent.click(screen.getByRole('button', { name: /Dates covered by the data/i }));
+
+    expect(screen.getByLabelText('From')).toBeInTheDocument();
+    expect(screen.getByLabelText('To')).toBeInTheDocument();
+  });
+});

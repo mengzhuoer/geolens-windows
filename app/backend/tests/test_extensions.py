@@ -1,0 +1,570 @@
+"""Tests for the extension registry, protocols, and defaults."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("_clean_registry")
+
+
+class TestLoadExtensions:
+    def test_load_extensions_empty(self):
+        """load_extensions() with no enterprise package populates empty registry."""
+        from app.platform.extensions import _extensions, load_extensions
+
+        load_extensions()
+
+        from app.platform.extensions import _loaded as loaded_after
+
+        assert loaded_after is True
+        assert len(_extensions) == 0
+
+    def test_load_extensions_with_mock_entry_point(self):
+        """Mock entry_points to return a callable, verify it registers."""
+        from app.platform.extensions import _extensions, load_extensions
+        from app.platform.extensions.version import EXTENSION_API_VERSION
+
+        mock_ep = MagicMock()
+        mock_ep.name = "test_ext"
+
+        def _loader(registry: dict):
+            registry["test_ext"] = "loaded"
+
+        _loader.EXTENSION_API_VERSION = EXTENSION_API_VERSION
+        mock_ep.load.return_value = _loader
+
+        with patch("app.platform.extensions.entry_points", return_value=[mock_ep]):
+            load_extensions()
+
+        assert "test_ext" in _extensions
+        assert _extensions["test_ext"] == "loaded"
+
+    def test_load_extensions_handles_failure(self, caplog):
+        """Mock entry_point that raises, verify warning and other extensions still load."""
+        from app.platform.extensions import _extensions, load_extensions
+        from app.platform.extensions.version import EXTENSION_API_VERSION
+
+        bad_ep = MagicMock()
+        bad_ep.name = "bad_ext"
+        bad_ep.load.side_effect = Exception("boom")
+
+        good_ep = MagicMock()
+        good_ep.name = "good_ext"
+
+        def _loader(registry: dict):
+            registry["good_ext"] = "ok"
+
+        _loader.EXTENSION_API_VERSION = EXTENSION_API_VERSION
+        good_ep.load.return_value = _loader
+
+        with patch(
+            "app.platform.extensions.entry_points", return_value=[bad_ep, good_ep]
+        ):
+            load_extensions()
+
+        # Good extension loaded despite bad one failing
+        assert "good_ext" in _extensions
+        assert "bad_ext" not in _extensions
+
+
+class TestRegistryHelpers:
+    def test_get_extension_missing(self):
+        """get_extension('nonexistent') returns None."""
+        from app.platform.extensions import get_extension, load_extensions
+
+        load_extensions()
+        assert get_extension("nonexistent") is None
+
+    def test_has_extension(self):
+        """has_extension returns True/False correctly."""
+        from app.platform.extensions import _extensions, has_extension, load_extensions
+
+        load_extensions()
+        assert has_extension("foo") is False
+        _extensions["foo"] = "bar"
+        assert has_extension("foo") is True
+
+    def test_list_extensions(self):
+        """list_extensions returns list of registered extension names."""
+        from app.platform.extensions import (
+            _extensions,
+            list_extensions,
+            load_extensions,
+        )
+
+        load_extensions()
+        assert list_extensions() == []
+        _extensions["alpha"] = 1
+        _extensions["beta"] = 2
+        assert sorted(list_extensions()) == ["alpha", "beta"]
+
+
+class TestExtensionRouters:
+    def test_get_extension_routers_empty(self):
+        """get_extension_routers() returns empty list when no extensions loaded."""
+        from app.platform.extensions import get_extension_routers, load_extensions
+
+        load_extensions()
+        assert get_extension_routers() == []
+
+    def test_get_extension_routers_populated(self):
+        """get_extension_routers() returns routers registered by extensions."""
+        from app.platform.extensions import get_extension_routers, load_extensions
+        from app.platform.extensions.version import EXTENSION_API_VERSION
+
+        mock_router = MagicMock(name="fake_router")
+        mock_ep = MagicMock()
+        mock_ep.name = "test_ext"
+
+        def _loader(registry: dict):
+            registry["_routers"] = [mock_router]
+
+        _loader.EXTENSION_API_VERSION = EXTENSION_API_VERSION
+        mock_ep.load.return_value = _loader
+
+        with patch("app.platform.extensions.entry_points", return_value=[mock_ep]):
+            load_extensions()
+
+        routers = get_extension_routers()
+        assert len(routers) == 1
+        assert routers[0] is mock_router
+
+    def test_get_extension_routers_clears_on_reload(self):
+        """Calling load_extensions() twice clears previous routers."""
+        from app.platform.extensions import get_extension_routers, load_extensions
+        from app.platform.extensions.version import EXTENSION_API_VERSION
+
+        mock_router = MagicMock(name="fake_router")
+        mock_ep = MagicMock()
+        mock_ep.name = "test_ext"
+
+        def _loader(registry: dict):
+            registry["_routers"] = [mock_router]
+
+        _loader.EXTENSION_API_VERSION = EXTENSION_API_VERSION
+        mock_ep.load.return_value = _loader
+
+        with patch("app.platform.extensions.entry_points", return_value=[mock_ep]):
+            load_extensions()
+        assert len(get_extension_routers()) == 1
+
+        # Reload with no extensions — routers should be empty
+        with patch("app.platform.extensions.entry_points", return_value=[]):
+            load_extensions()
+        assert get_extension_routers() == []
+
+
+class TestProtocolDefaults:
+    def test_protocol_defaults(self):
+        """Default implementations are runtime_checkable instances of their protocols."""
+        from app.platform.extensions.defaults import (
+            DefaultAuthExtension,
+            DefaultBrandingExtension,
+        )
+        from app.platform.extensions.protocols import (
+            AuthExtension,
+            BrandingExtension,
+        )
+
+        assert isinstance(DefaultBrandingExtension(), BrandingExtension)
+        assert isinstance(DefaultAuthExtension(), AuthExtension)
+
+    def test_branding_default_shows_badge(self):
+        """DefaultBrandingExtension.get_branding_defaults() returns show_badge=True."""
+        from app.platform.extensions.defaults import DefaultBrandingExtension
+
+        result = DefaultBrandingExtension().get_branding_defaults()
+        assert result == {"show_badge": True}
+
+    def test_auth_default_methods(self):
+        """DefaultAuthExtension.get_auth_methods() returns empty list."""
+        from app.platform.extensions.defaults import DefaultAuthExtension
+
+        assert DefaultAuthExtension().get_auth_methods() == []
+
+    def test_pre_pr_import_surface_is_intact(self):
+        """The #836 split must not shrink the importable surface.
+
+        Computed mechanically: the runtime-importable public names of
+        ``app.platform.extensions`` (package root), ``.defaults``, and
+        ``.protocols`` were AST-diffed against origin/main; every name present
+        pre-split must import from its old path and be the SAME object as the
+        canonical symbol. Extend this list rather than letting a review round
+        find the next stripped name.
+        """
+        import importlib
+
+        surface = [
+            # (legacy import path, name, canonical module, canonical name)
+            (
+                "app.platform.extensions.defaults",
+                "defer_async_with_tenant",
+                "app.core.db.tenant_session",
+                "defer_async_with_tenant",
+            ),
+            (
+                "app.platform.extensions.defaults",
+                "model_safe_tool_result",
+                "app.platform.ai_tool_payloads",
+                "model_safe_tool_result",
+            ),
+        ]
+        for legacy_module, name, canonical_module, canonical_name in surface:
+            legacy = getattr(importlib.import_module(legacy_module), name, None)
+            assert legacy is not None, (
+                f"{legacy_module}.{name} was importable before #836 and must "
+                "stay importable until the next EXTENSION_API_VERSION bump"
+            )
+            canonical = getattr(
+                importlib.import_module(canonical_module), canonical_name
+            )
+            assert legacy is canonical, (
+                f"{legacy_module}.{name} is not the canonical "
+                f"{canonical_module}.{canonical_name}"
+            )
+
+    def test_pre_pr_wildcard_surface_is_intact(self):
+        """Pin the ``import *`` surface of the facade.
+
+        The pre-split defaults.py had NO ``__all__``, so a wildcard import
+        exported every public module-level name — all seventeen Default*
+        classes plus the two incidental helper bindings. The facade's
+        ``__all__`` must keep every one of them wildcard-visible; a name
+        importable directly but absent from ``__all__`` still NameErrors a
+        star-importing overlay into a silent load_extensions() skip.
+        """
+        import app.platform.extensions.defaults as defaults_facade
+
+        pre_split_wildcard_names = {
+            "DefaultAnthropicProvider",
+            "DefaultAuditSink",
+            "DefaultAuthExtension",
+            "DefaultBillingExtension",
+            "DefaultBrandingExtension",
+            "DefaultCatalogPort",
+            "DefaultConnectorExtension",
+            "DefaultDataServingExtension",
+            "DefaultEntitlementPort",
+            "DefaultIdentityExtension",
+            "DefaultNotificationSink",
+            "DefaultOpenAICompatibleProvider",
+            "DefaultOpenAIEmbeddingProvider",
+            "DefaultPermissionExtension",
+            "DefaultProcessingPort",
+            "DefaultWorkflowExtension",
+            "defer_async_with_tenant",
+            "model_safe_tool_result",
+        }
+        missing = pre_split_wildcard_names - set(defaults_facade.__all__)
+        assert not missing, (
+            "facade __all__ dropped pre-split wildcard-visible names "
+            f"(silent star-import regression): {sorted(missing)}"
+        )
+
+
+class TestGetIdentityExtension:
+    """Tests for the get_identity_extension() typed accessor."""
+
+    def test_get_identity_extension_returns_default_when_unregistered(self):
+        """No enterprise overlay registered -> returns DefaultIdentityExtension."""
+        from app.platform.extensions import get_identity_extension
+        from app.platform.extensions.defaults import DefaultIdentityExtension
+
+        ext = get_identity_extension()
+
+        assert isinstance(ext, DefaultIdentityExtension)
+
+    def test_get_identity_extension_returns_registered_when_present(self):
+        """An overlay registered under 'identity' is returned by the accessor."""
+        from app.platform.extensions import _extensions, get_identity_extension
+
+        sentinel = object()
+        _extensions["identity"] = sentinel
+
+        ext = get_identity_extension()
+
+        assert ext is sentinel
+
+    @pytest.mark.asyncio
+    async def test_default_identity_extension_resolve_returns_none(self):
+        """DefaultIdentityExtension.resolve_identity_from_token returns None for any input.
+
+        The method MUST be async — calling `await` on it
+        must not raise TypeError. Enterprise auth overlays rely on this
+        contract for their DB-lookup wire-in.
+        """
+        from app.platform.extensions.defaults import DefaultIdentityExtension
+
+        ext = DefaultIdentityExtension()
+        result = await ext.resolve_identity_from_token("any-token", None, None)
+
+        assert result is None
+
+
+class TestSlotConflictGuard:
+    """Tests for the wrap-recognition guard refinement.
+
+    TDD RED: these tests will fail until _run_loader_with_slot_guard is updated
+    to recognize the __slot_inner__ marker.
+    """
+
+    def _make_loader(self, key: str, val: object):
+        """Build a minimal loader callable that writes registry[key] = val."""
+        from app.platform.extensions.version import EXTENSION_API_VERSION
+
+        def loader(registry: dict) -> None:
+            registry[key] = val
+
+        loader.EXTENSION_API_VERSION = EXTENSION_API_VERSION
+        return loader
+
+    def test_bare_replace_still_raises_slot_conflict(self):
+        """A second overlay writing a bare different object to an owned single-slot
+        key MUST raise ExtensionSlotConflictError (existing behavior preserved)."""
+        from app.platform.extensions import (
+            ExtensionSlotConflictError,
+            load_extensions,
+        )
+
+        first_val = object()
+        second_val = object()  # bare — no __slot_inner__
+
+        first_ep = MagicMock()
+        first_ep.name = "overlay_first"
+        first_loader = self._make_loader("permission", first_val)
+        first_ep.load.return_value = first_loader
+
+        second_ep = MagicMock()
+        second_ep.name = "overlay_second"
+        second_loader = self._make_loader("permission", second_val)
+        second_ep.load.return_value = second_loader
+
+        with patch(
+            "app.platform.extensions.entry_points",
+            return_value=[first_ep, second_ep],
+        ):
+            with pytest.raises(ExtensionSlotConflictError):
+                load_extensions()
+
+    def test_wrapper_with_slot_inner_is_allowed(self):
+        """A second overlay writing a wrapper whose __slot_inner__ IS the prior
+        instance MUST NOT raise — the sanctioned wrap path must be allowed."""
+        from app.platform.extensions import _extensions, load_extensions
+
+        first_val = object()
+
+        class Wrapper:
+            def __init__(self, inner: object) -> None:
+                self.__slot_inner__ = inner
+
+        first_ep = MagicMock()
+        first_ep.name = "overlay_first"
+        first_ep.load.return_value = self._make_loader("permission", first_val)
+
+        wrapper_val = Wrapper(inner=first_val)
+
+        second_ep = MagicMock()
+        second_ep.name = "overlay_second"
+        second_ep.load.return_value = self._make_loader("permission", wrapper_val)
+
+        with patch(
+            "app.platform.extensions.entry_points",
+            return_value=[first_ep, second_ep],
+        ):
+            load_extensions()  # must NOT raise
+
+        # Slot holds the wrapper
+        assert _extensions["permission"] is wrapper_val
+        # Wrapper carries the first instance
+        assert _extensions["permission"].__slot_inner__ is first_val
+
+    def test_wrapper_inner_pointing_to_different_object_raises(self):
+        """A wrapper whose __slot_inner__ points to a DIFFERENT object (not the
+        actual prior value) is treated the same as a bare replace and MUST raise."""
+        from app.platform.extensions import ExtensionSlotConflictError, load_extensions
+
+        first_val = object()
+        unrelated = object()  # NOT first_val
+
+        class FakeWrapper:
+            def __init__(self) -> None:
+                self.__slot_inner__ = unrelated  # points elsewhere, not prior
+
+        second_val = FakeWrapper()
+
+        first_ep = MagicMock()
+        first_ep.name = "overlay_first"
+        first_ep.load.return_value = self._make_loader("permission", first_val)
+
+        second_ep = MagicMock()
+        second_ep.name = "overlay_second"
+        second_ep.load.return_value = self._make_loader("permission", second_val)
+
+        with patch(
+            "app.platform.extensions.entry_points",
+            return_value=[first_ep, second_ep],
+        ):
+            with pytest.raises(ExtensionSlotConflictError):
+                load_extensions()
+
+    def test_additive_slots_always_exempt(self):
+        """Additive-slot keys (billing_extensions, _routers, etc.) are always
+        exempt from the slot-conflict guard, even without __slot_inner__."""
+        from app.platform.extensions import _extensions, load_extensions
+        from app.platform.extensions.version import EXTENSION_API_VERSION
+
+        def first_loader(registry: dict) -> None:
+            registry.setdefault("billing_extensions", []).append("first")
+
+        first_loader.EXTENSION_API_VERSION = EXTENSION_API_VERSION
+
+        def second_loader(registry: dict) -> None:
+            registry.setdefault("billing_extensions", []).append("second")
+
+        second_loader.EXTENSION_API_VERSION = EXTENSION_API_VERSION
+
+        first_ep = MagicMock()
+        first_ep.name = "overlay_first"
+        first_ep.load.return_value = first_loader
+
+        second_ep = MagicMock()
+        second_ep.name = "overlay_second"
+        second_ep.load.return_value = second_loader
+
+        with patch(
+            "app.platform.extensions.entry_points",
+            return_value=[first_ep, second_ep],
+        ):
+            load_extensions()  # must NOT raise
+
+        # Both values accumulated
+        assert "billing_extensions" in _extensions
+        assert _extensions["billing_extensions"] == ["first", "second"]
+
+    def test_first_claim_is_allowed(self):
+        """First overlay writing a single-slot key with no prior value is always allowed."""
+        from app.platform.extensions import _extensions, load_extensions
+
+        val = object()
+
+        ep = MagicMock()
+        ep.name = "overlay_only"
+        ep.load.return_value = self._make_loader("permission", val)
+
+        with patch("app.platform.extensions.entry_points", return_value=[ep]):
+            load_extensions()
+
+        assert _extensions["permission"] is val
+
+    def test_idempotent_same_object_is_allowed(self):
+        """If a loader writes the SAME object instance to a single-slot key that
+        it already holds (idempotent re-registration), no error is raised."""
+        from app.platform.extensions import _extensions, load_extensions
+        from app.platform.extensions.version import EXTENSION_API_VERSION
+
+        val = object()
+
+        def loader(registry: dict) -> None:
+            # Write the same object twice (idempotent)
+            registry["permission"] = val
+            registry["permission"] = val
+
+        loader.EXTENSION_API_VERSION = EXTENSION_API_VERSION
+
+        ep = MagicMock()
+        ep.name = "overlay_only"
+        ep.load.return_value = loader
+
+        with patch("app.platform.extensions.entry_points", return_value=[ep]):
+            load_extensions()  # must NOT raise
+
+        assert _extensions["permission"] is val
+
+
+class TestProtocolOverlayDispatch:
+    """Tests for the get_*_extension() typed accessors' overlay-dispatch behavior.
+
+    The BrandingExtension and
+    AuthExtension Protocol seams previously had only OSS-side
+    default-shape tests (TestProtocolDefaults above). These tests lock the
+    overlay-dispatch boundary so a regression where the accessor accidentally
+    returns the default while a fake overlay is registered fails loudly.
+
+    Pattern mirrors test_get_identity_extension_returns_registered_when_present
+    (line 226+) — same try/finally teardown discipline, same sentinel
+    assertion shape, same single-class-per-Protocol grouping.
+    """
+
+    def test_branding_extension_overlay_dispatch(self):
+        """A registered overlay under 'branding' is returned by the accessor.
+
+        Mirrors the IdentityExtension dispatch test (line 226+).
+        """
+        from app.platform.extensions import _extensions, get_branding_extension
+        from app.platform.extensions.defaults import DefaultBrandingExtension
+
+        class FakeBrandingOverlay:
+            def get_branding_defaults(self) -> dict:
+                return {"show_badge": False, "_test_sentinel": "branding-overlay"}
+
+        # Sanity: pre-condition is the OSS default
+        assert isinstance(get_branding_extension(), DefaultBrandingExtension)
+
+        # Register the fake overlay
+        previous = _extensions.get("branding")
+        _extensions["branding"] = FakeBrandingOverlay()
+        try:
+            ext = get_branding_extension()
+            assert isinstance(ext, FakeBrandingOverlay), (
+                "get_branding_extension() did not return the registered overlay"
+            )
+            # Sentinel proves the fake's method runs (not the default's)
+            assert (
+                ext.get_branding_defaults().get("_test_sentinel") == "branding-overlay"
+            )
+        finally:
+            if previous is None:
+                _extensions.pop("branding", None)
+            else:
+                _extensions["branding"] = previous
+
+        # Post-condition: registry is restored
+        assert isinstance(get_branding_extension(), DefaultBrandingExtension)
+
+    def test_auth_extension_overlay_dispatch(self):
+        """A registered overlay under 'auth' is returned by the accessor.
+
+        Mirrors the IdentityExtension dispatch test (line 226+).
+        """
+        from app.platform.extensions import _extensions, get_auth_extension
+        from app.platform.extensions.defaults import DefaultAuthExtension
+
+        class FakeAuthOverlay:
+            def get_auth_methods(self) -> list[str]:
+                return ["test-overlay-method", "_test_sentinel"]
+
+        # Sanity: pre-condition is the OSS default
+        assert isinstance(get_auth_extension(), DefaultAuthExtension)
+
+        # Register the fake overlay
+        previous = _extensions.get("auth")
+        _extensions["auth"] = FakeAuthOverlay()
+        try:
+            ext = get_auth_extension()
+            assert isinstance(ext, FakeAuthOverlay), (
+                "get_auth_extension() did not return the registered overlay"
+            )
+            # Sentinel proves the fake's method runs (not the default's [])
+            methods = ext.get_auth_methods()
+            assert "test-overlay-method" in methods
+            assert "_test_sentinel" in methods
+        finally:
+            if previous is None:
+                _extensions.pop("auth", None)
+            else:
+                _extensions["auth"] = previous
+
+        # Post-condition: registry is restored
+        assert isinstance(get_auth_extension(), DefaultAuthExtension)

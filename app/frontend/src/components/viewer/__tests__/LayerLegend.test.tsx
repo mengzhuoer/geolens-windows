@@ -1,0 +1,495 @@
+import { fireEvent, render, screen, within } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { LayerLegend } from '../LayerLegend';
+import { MAP_COLORS } from '@/lib/map-colors';
+import type { DrawnLayer } from '@/components/map/legend-facts';
+import { SAVED_LAYERS, toSharedLayer } from '@/test/fixtures/saved-layers';
+import type { MapLayerResponse, MapTerrainConfig, SharedLayerResponse } from '@/types/api';
+
+function layer(overrides: Partial<SharedLayerResponse> = {}): SharedLayerResponse {
+  return {
+    dataset_id: 'dataset-1',
+    id: 'layer-1',
+    dataset_name: 'Earthquakes',
+    display_name: 'Earthquakes (M5+)',
+    table_name: 'quakes',
+    geometry_type: 'POINT',
+    column_info: null,
+    sort_order: 0,
+    visible: true,
+    show_in_legend: true,
+    opacity: 0.85,
+    paint: {
+      'circle-radius': [
+        'interpolate',
+        ['linear'],
+        ['coalesce', ['to-number', ['get', 'mag']], 0],
+        5,
+        4,
+        6,
+        8,
+        7,
+        14,
+        8,
+        22,
+        9,
+        30,
+      ],
+      'circle-color': [
+        'interpolate',
+        ['linear'],
+        ['coalesce', ['to-number', ['get', 'depth_km']], 0],
+        0,
+        '#fde725',
+        50,
+        '#f39c12',
+        200,
+        '#e74c3c',
+        700,
+        '#7d3c98',
+      ],
+    },
+    layout: {},
+    filter: null,
+    label_config: null,
+    popup_config: null,
+    style_config: {
+      mode: 'graduated',
+      column: 'mag',
+      target: 'radius',
+      classCount: 4,
+      ramp: 'YlOrRd',
+      colors: ['#fde725', '#f39c12', '#e74c3c', '#7d3c98'],
+      breaks: [6, 7, 8, 9],
+      sizes: [4, 8, 14, 22, 30],
+      sizeLabel: 'Magnitude',
+      colorLabel: 'Depth (km)',
+    },
+    tile_url: '/tiles/quakes/{z}/{x}/{y}.pbf',
+    ...overrides,
+  };
+}
+
+describe('LayerLegend', () => {
+  it('shows a raster icon, not a colored point swatch, for raster layers', () => {
+    // Regression: raster layers (no vector fill) were given the #6366f1 default
+    // color + a point swatch. They should render a raster icon like the builder.
+    const rasterLayer = layer({
+      id: 'raster-1',
+      display_name: 'Sentinel-2 scene 1',
+      layer_type: 'raster_geolens',
+      dataset_record_type: 'raster_dataset',
+      // geometry_type stays 'POINT' (as real raster layers report) so the bug —
+      // a purple circle swatch — is what we assert is gone.
+      paint: {},
+      style_config: null,
+    });
+
+    const { container } = render(
+      <LayerLegend
+        layers={[rasterLayer]}
+        visibleLayers={new Set(['raster-1'])}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Sentinel-2 scene 1')).toBeInTheDocument();
+    expect(container.querySelector('[fill="#6366f1"]')).toBeNull();
+    expect(container.querySelector('circle[fill="#6366f1"]')).toBeNull();
+  });
+
+  it('uses stable layer keys for duplicate sort orders', () => {
+    const onToggleVisibility = vi.fn();
+    render(
+      <LayerLegend
+        layers={[
+          layer({ id: 'layer-a', display_name: 'First copy', sort_order: 0 }),
+          layer({ id: 'layer-b', display_name: 'Second copy', sort_order: 0 }),
+        ]}
+        visibleLayers={new Set(['layer-a', 'layer-b'])}
+        onToggleVisibility={onToggleVisibility}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide Second copy' }));
+
+    expect(onToggleVisibility).toHaveBeenCalledWith('layer-b');
+  });
+});
+
+describe('LayerLegend notes under an entry', () => {
+  function renderLegend(saved: MapLayerResponse[], drawn?: ReadonlyMap<string, DrawnLayer>) {
+    render(
+      <LayerLegend
+        layers={saved.map(toSharedLayer)}
+        visibleLayers={new Set(saved.map((layer) => layer.id))}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+        drawn={drawn}
+      />,
+    );
+  }
+  const clusters = [SAVED_LAYERS.boundedCluster, SAVED_LAYERS.serverCluster, SAVED_LAYERS.fallbackCluster];
+  const entry = (name: string) => within(screen.getByText(name).closest('li')!);
+
+  it('says a layer is a sample while a capped tile is in view, and clears when none is', () => {
+    const note = 'Showing a sample at this zoom. Zoom in to see all features.';
+    const quakes = layer();
+    const legend = (drawn: ReadonlyMap<string, DrawnLayer>) => (
+      <LayerLegend
+        layers={[quakes]}
+        visibleLayers={new Set([quakes.id])}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+        drawn={drawn}
+      />
+    );
+    const { rerender } = render(legend(new Map([[quakes.id, { drawsAs: 'circle', sampled: true }]])));
+
+    expect(entry('Earthquakes (M5+)').getByText(note)).toBeInTheDocument();
+
+    rerender(legend(new Map([[quakes.id, { drawsAs: 'circle' }]])));
+
+    expect(screen.queryByText(note)).not.toBeInTheDocument();
+  });
+
+  it('names each cluster by its saved strategy when the map has reported nothing', () => {
+    renderLegend(clusters);
+
+    expect(entry('Bike racks').getByText('Bounded cluster')).toBeInTheDocument();
+    expect(entry('Street trees').getByText('Server cluster')).toBeInTheDocument();
+    expect(entry('Survey points').getByText('Point fallback')).toBeInTheDocument();
+  });
+
+  it('explains the cluster circle colours with their point counts', () => {
+    renderLegend(clusters);
+
+    const trees = entry('Street trees');
+    expect(trees.getByText('Points per cluster')).toBeInTheDocument();
+    expect(trees.getByText('< 100')).toBeInTheDocument();
+    expect(trees.getByText('\u2265 100')).toBeInTheDocument();
+    expect(entry('Bike racks').queryByText('Points per cluster')).not.toBeInTheDocument();
+    expect(entry('Survey points').queryByText('Points per cluster')).not.toBeInTheDocument();
+  });
+
+  it('draws the cluster swatches with the cluster circle stroke', () => {
+    renderLegend([SAVED_LAYERS.serverCluster]);
+
+    const circle = entry('Street trees').getByText('< 100').closest('li')!.querySelector('circle');
+    expect(circle).toHaveAttribute('fill', '#bbf7d0');
+    expect(circle).toHaveAttribute('stroke', MAP_COLORS.cluster.stroke);
+  });
+
+  it('drops the cluster counts when the map drew single points', () => {
+    renderLegend(clusters, new Map([[SAVED_LAYERS.serverCluster.id, { drawsAs: 'circle' }]]));
+
+    expect(entry('Street trees').queryByText('Points per cluster')).not.toBeInTheDocument();
+  });
+
+  it('names a bounded cluster the map drew as single points a point fallback', () => {
+    renderLegend(clusters, new Map([
+      [SAVED_LAYERS.boundedCluster.id, { drawsAs: 'circle' }],
+      [SAVED_LAYERS.serverCluster.id, { drawsAs: 'cluster' }],
+    ]));
+
+    expect(entry('Bike racks').getByText('Point fallback')).toBeInTheDocument();
+    expect(entry('Street trees').getByText('Server cluster')).toBeInTheDocument();
+  });
+
+  it('names the column a heatmap is weighted by', () => {
+    renderLegend([SAVED_LAYERS.heatmapByRamp]);
+
+    expect(screen.getByText('Weighted by: severity')).toBeInTheDocument();
+  });
+
+  it('names the column a rising weight ramp scales, and says it is scaled', () => {
+    const { heatmapByRamp } = SAVED_LAYERS;
+    const weight = ['interpolate', ['linear'], ['to-number', ['get', 'mag'], 0], 2.5, 0.05, 8, 1];
+    renderLegend([{ ...heatmapByRamp, paint: { ...heatmapByRamp.paint, 'heatmap-weight': weight } }]);
+
+    expect(screen.getByText('Weighted by: mag (scaled)')).toBeInTheDocument();
+  });
+
+  it('names no weight column for a heatmap with a constant weight', () => {
+    const { heatmapByRamp } = SAVED_LAYERS;
+    renderLegend([{ ...heatmapByRamp, paint: { ...heatmapByRamp.paint, 'heatmap-weight': 1 } }]);
+
+    expect(screen.getByText('Low')).toBeInTheDocument();
+    expect(screen.queryByText(/Weighted by/)).not.toBeInTheDocument();
+  });
+});
+
+describe('LayerLegend terrain consistency (Fix 1)', () => {
+  const activeTerrain: MapTerrainConfig = {
+    enabled: true,
+    source_dataset_id: 'dem-1',
+    exaggeration: 1.5,
+  };
+
+  function demLayer(overrides: Partial<SharedLayerResponse> = {}): SharedLayerResponse {
+    return {
+      dataset_id: 'dem-1',
+      id: 'dem-layer',
+      dataset_name: 'Elevation',
+      display_name: 'Elevation',
+      table_name: 'dem',
+      geometry_type: null,
+      column_info: null,
+      sort_order: 1,
+      visible: true,
+      opacity: 1,
+      paint: {},
+      layout: {},
+      filter: null,
+      label_config: null,
+      popup_config: null,
+      style_config: null,
+      tile_url: null,
+      is_dem: true,
+      // Must be terrain-capable (raster_dataset) so the synthetic
+      // entry's backing-layer check (isTerrainCapableDemLayer) passes.
+      dataset_record_type: 'raster_dataset',
+      ...overrides,
+    } as SharedLayerResponse;
+  }
+
+  function vectorLayer(overrides: Partial<SharedLayerResponse> = {}): SharedLayerResponse {
+    return {
+      dataset_id: 'roads-1',
+      id: 'roads',
+      dataset_name: 'Roads',
+      display_name: 'Roads',
+      table_name: 'roads',
+      geometry_type: 'LINESTRING',
+      column_info: null,
+      sort_order: 0,
+      visible: true,
+      opacity: 1,
+      paint: { 'line-color': '#333333' },
+      layout: {},
+      filter: null,
+      label_config: null,
+      popup_config: null,
+      style_config: null,
+      tile_url: null,
+      is_dem: false,
+      ...overrides,
+    } as SharedLayerResponse;
+  }
+
+  it('shows the terrain-mode DEM only as the synthetic entry, not a per-layer row (D-02)', () => {
+    render(
+      <LayerLegend
+        layers={[
+          vectorLayer(),
+          demLayer({ display_name: 'Elevation (terrain)', style_config: { render_mode: 'terrain' } as SharedLayerResponse['style_config'] }),
+        ]}
+        visibleLayers={new Set(['roads', 'dem-layer'])}
+        terrainConfig={activeTerrain}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Roads')).toBeInTheDocument();
+    // The DEM name shows exactly once, inside the synthetic terrain
+    // entry — never as a second per-layer row for a render_mode:"terrain" DEM.
+    const nameEl = screen.getByText('Elevation (terrain)');
+    expect(screen.getByTestId('legend-terrain-synthetic')).toContainElement(nameEl);
+  });
+
+  it('shows exactly one synthetic terrain entry carrying the DEM name when terrain_config is active (D-01)', () => {
+    render(
+      <LayerLegend
+        layers={[
+          vectorLayer(),
+          demLayer({ style_config: { render_mode: 'terrain' } as SharedLayerResponse['style_config'] }),
+        ]}
+        visibleLayers={new Set(['roads', 'dem-layer'])}
+        terrainConfig={activeTerrain}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByTestId('legend-terrain-synthetic')).toHaveLength(1);
+    // Keeps the bound DEM's identity ("Elevation") instead of a
+    // generic "3D terrain" row.
+    expect(screen.getByText('Elevation')).toBeInTheDocument();
+  });
+
+  it('does NOT show the synthetic entry when terrain is inactive', () => {
+    render(
+      <LayerLegend
+        layers={[vectorLayer()]}
+        visibleLayers={new Set(['roads'])}
+        terrainConfig={null}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId('legend-terrain-synthetic')).not.toBeInTheDocument();
+  });
+
+  // A dangling terrain_config (enabled + source, NO backing DEM
+  // layer) must NOT render a phantom synthetic entry in the viewer either.
+  it('does NOT show the synthetic entry for a dangling terrain_config (no backing DEM layer)', () => {
+    render(
+      <LayerLegend
+        layers={[vectorLayer()]}
+        visibleLayers={new Set(['roads'])}
+        terrainConfig={activeTerrain}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId('legend-terrain-synthetic')).not.toBeInTheDocument();
+    expect(screen.getByText('Roads')).toBeInTheDocument();
+  });
+
+  it('pins the synthetic terrain entry ABOVE per-layer entries (A1 position assertion)', () => {
+    render(
+      <LayerLegend
+        layers={[
+          vectorLayer(),
+          demLayer({ style_config: { render_mode: 'terrain' } as SharedLayerResponse['style_config'] }),
+        ]}
+        visibleLayers={new Set(['roads', 'dem-layer'])}
+        terrainConfig={activeTerrain}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    const synthetic = screen.getByTestId('legend-terrain-synthetic');
+    const roads = screen.getByText('Roads');
+    expect(
+      synthetic.compareDocumentPosition(roads) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // Synthetic <li> is the first child of the legend list.
+    expect(synthetic.parentElement?.firstElementChild).toBe(synthetic);
+  });
+
+  it('keeps a painting hillshade-mode relief DEM layer as a normal entry (D-03)', () => {
+    render(
+      <LayerLegend
+        layers={[
+          demLayer({
+            id: 'dem-hillshade',
+            display_name: 'Hillshade relief',
+            style_config: { render_mode: 'hillshade' } as SharedLayerResponse['style_config'],
+          }),
+        ]}
+        visibleLayers={new Set(['dem-hillshade'])}
+        terrainConfig={activeTerrain}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Hillshade relief')).toBeInTheDocument();
+  });
+
+  // Dedup: when the terrain SOURCE DEM is shown as a visible hillshade entry of
+  // the same dataset (the Matterhorn swissALTI3D case), suppress the synthetic
+  // "3D terrain" entry so the legend doesn't list one DEM twice.
+  it('drops the synthetic entry when the source DEM is shown as a visible hillshade layer', () => {
+    render(
+      <LayerLegend
+        layers={[
+          demLayer({
+            id: 'dem-hillshade',
+            display_name: 'swissALTI3D relief',
+            style_config: { render_mode: 'hillshade' } as SharedLayerResponse['style_config'],
+          }),
+        ]}
+        visibleLayers={new Set(['dem-hillshade'])}
+        terrainConfig={activeTerrain}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('swissALTI3D relief')).toBeInTheDocument();
+    expect(screen.queryByTestId('legend-terrain-synthetic')).not.toBeInTheDocument();
+    expect(screen.queryByText('3D terrain')).not.toBeInTheDocument();
+  });
+
+  // The viewer keeps toggled-off layers in the list, and live-hiding the
+  // bound DEM DISABLES terrain (useViewerTerrain honors visibleLayers), so the
+  // synthetic entry must disappear with it — a "3D terrain" row for a mesh
+  // that no longer renders is a phantom. The DEM keeps its own toggled-off
+  // per-layer row so the user can re-show it.
+  it('drops the synthetic entry when the source DEM is live-toggled off', () => {
+    render(
+      <LayerLegend
+        layers={[
+          demLayer({
+            id: 'dem-hillshade',
+            display_name: 'swissALTI3D relief',
+            style_config: { render_mode: 'hillshade' } as SharedLayerResponse['style_config'],
+          }),
+        ]}
+        visibleLayers={new Set()} /* source layer toggled OFF */
+        terrainConfig={activeTerrain}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId('legend-terrain-synthetic')).not.toBeInTheDocument();
+    // The DEM's own row survives as the re-show affordance.
+    expect(screen.getByText('swissALTI3D relief')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show swissALTI3D relief' })).toBeInTheDocument();
+  });
+
+  // Icon parity — the legend renders the SAME glyph chip as the
+  // builder layer stack (⛰ for a hillshade-mode DEM row, ◬ for the synthetic
+  // terrain entry), not divergent lucide icons.
+  it('renders stack-parity glyph chips for DEM rows and the synthetic terrain entry', () => {
+    render(
+      <LayerLegend
+        layers={[
+          demLayer({
+            id: 'dem-terrain-only',
+            display_name: 'Terrain source',
+            layer_type: 'raster_geolens',
+            style_config: { render_mode: 'terrain' } as SharedLayerResponse['style_config'],
+          }),
+          demLayer({
+            id: 'dem-hillshade',
+            dataset_id: 'other-dem',
+            display_name: 'Shaded relief',
+            layer_type: 'raster_geolens',
+            style_config: { render_mode: 'hillshade' } as SharedLayerResponse['style_config'],
+          }),
+        ]}
+        visibleLayers={new Set(['dem-terrain-only', 'dem-hillshade'])}
+        terrainConfig={activeTerrain}
+        onToggleVisibility={vi.fn()}
+        isOpen
+        onToggle={vi.fn()}
+      />,
+    );
+
+    const synthetic = screen.getByTestId('legend-terrain-synthetic');
+    expect(within(synthetic).getByText('◬')).toBeInTheDocument();
+    expect(screen.getByText('⛰')).toBeInTheDocument();
+  });
+});

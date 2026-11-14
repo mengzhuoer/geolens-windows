@@ -1,0 +1,1478 @@
+import { act, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { render } from '@/test/test-utils';
+import { useRefreshDataset } from '@/components/dataset/hooks/use-dataset';
+import { ApiError } from '@/api/client';
+import { translateApiErrorDetail } from '@/lib/error-map';
+import { arcgisSignIn } from '@/api/arcgis-signin';
+import { REFRESHABLE_ORIGINS, SourceRefreshAction } from '../SourceRefreshAction';
+import type { DatasetRefreshWatch } from '@/components/dataset/hooks/use-dataset';
+import type { DatasetResponse } from '@/types/api';
+
+// Radix Select needs these pointer/scroll APIs, which jsdom lacks.
+beforeAll(() => {
+  Element.prototype.hasPointerCapture = vi.fn(() => false);
+  Element.prototype.setPointerCapture = vi.fn();
+  Element.prototype.releasePointerCapture = vi.fn();
+  Element.prototype.scrollIntoView = vi.fn();
+});
+
+async function chooseOption(
+  user: ReturnType<typeof userEvent.setup>,
+  trigger: HTMLElement,
+  name: string,
+) {
+  await user.click(trigger);
+  await user.click(await screen.findByRole('option', { name }));
+}
+
+// SourceRefreshAction no longer owns run-tracking
+// (that moved to useDatasetRefreshWatch, mounted at the page level so it
+// survives a tab switch away from "sources" — see use-dataset.ts). This
+// component only dispatches and reports the run_id to a `watch` prop, so
+// useDatasetRefreshRuns no longer needs mocking here at all.
+vi.mock('@/components/dataset/hooks/use-dataset', () => ({
+  useRefreshDataset: vi.fn(),
+}));
+
+// The sign-in endpoint, mocked against its contract
+// (portal_url/username/password in, token/expires_at out) rather than a
+// live backend.
+vi.mock('@/api/arcgis-signin', () => ({
+  arcgisSignIn: vi.fn(),
+}));
+
+vi.mock('sonner', () => ({
+  toast: { success: vi.fn(), error: vi.fn() },
+}));
+
+// Mirrors the mock convention DatasetPage's own
+// tests use (DatasetPage.edit-affordances.test.tsx) for this same store.
+const drawingStoreState = vi.hoisted(() => ({
+  selectedFeature: null as { gid: number; tdId: string; properties: Record<string, unknown> } | null,
+  isEditDirty: false,
+  targetDatasetId: null as string | null,
+}));
+
+vi.mock('@/stores/drawing-store', () => ({
+  useDrawingStore: (selector: (state: typeof drawingStoreState) => unknown) =>
+    selector(drawingStoreState),
+}));
+
+const mockUseRefreshDataset = vi.mocked(useRefreshDataset);
+const mockArcgisSignIn = vi.mocked(arcgisSignIn);
+const mutateAsync = vi.fn();
+const trackDispatchedRun = vi.fn();
+
+function makeDataset(overrides: Partial<DatasetResponse> = {}): DatasetResponse {
+  return {
+    id: 'dataset-1',
+    record_id: 'record-1',
+    table_name: 'roads',
+    has_generic_geometry: false,
+    title: 'Roads',
+    summary: null,
+    srid: 4326,
+    geometry_type: 'LineString',
+    feature_count: 42,
+    extent_bbox: null,
+    column_info: null,
+    license: null,
+    attribution: null,
+    source_organization: null,
+    data_vintage_start: null,
+    data_vintage_end: null,
+    source_format: 'wfs',
+    source_filename: null,
+    tile_columns: null,
+    original_srid: 4326,
+    visibility: 'public',
+    created_by: 'user-1',
+    created_by_display: 'editor-user',
+    created_at: '2026-03-01T00:00:00Z',
+    updated_at: '2026-03-01T00:00:00Z',
+    last_edited_by_display: null,
+    last_edited_at: null,
+    record_status: 'published',
+    lineage_summary: null,
+    update_frequency: null,
+    usage_constraints: null,
+    access_constraints: null,
+    sensitivity_classification: null,
+    theme_category: null,
+    owner_org: null,
+    published_at: null,
+    updated_by: null,
+    current_version: 1,
+    source_url: null,
+    origin: 'service',
+    origin_uri: null,
+    origin_ref: null,
+    last_refreshed_at: null,
+    last_checked_at: null,
+    source_health: 'healthy',
+    source_health_detail: null,
+    schema_drift_status: 'none',
+    source_freshness: 'fresh',
+    quality_statement: null,
+    collections: null,
+    record_type: 'vector_dataset',
+    raster: null,
+    ...overrides,
+  };
+}
+
+function makeWatch(overrides: Partial<DatasetRefreshWatch> = {}): DatasetRefreshWatch {
+  return {
+    latestRun: undefined,
+    isBusy: false,
+    trackDispatchedRun,
+    ...overrides,
+  };
+}
+
+async function openDialog(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole('button', { name: 'Refresh from source' }));
+  await screen.findByRole('dialog');
+}
+
+describe('SourceRefreshAction', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUseRefreshDataset.mockReturnValue({
+      mutateAsync,
+      isPending: false,
+    } as unknown as ReturnType<typeof useRefreshDataset>);
+    drawingStoreState.selectedFeature = null;
+    drawingStoreState.isEditDirty = false;
+    drawingStoreState.targetDatasetId = null;
+  });
+
+  // The plain bearer-only field is now ArcGIS-only; a
+  // 'service'-origin WFS/OGC API Features dataset gets the four-way
+  // credential method select instead (ServiceCredentialBlock).
+  it('opens a confirm dialog with a credential method select for a service origin', async () => {
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    await openDialog(user);
+
+    expect(screen.getByLabelText('Authentication')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start refresh' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+  });
+
+  // This is a request-only service token, not a login credential.
+  // autoComplete="off" alone does not stop Chrome from offering a saved
+  // password on a password-type field, so every password manager needs an
+  // explicit opt-out.
+  it('opts every password manager out of the bearer token field', async () => {
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    await openDialog(user);
+    await chooseOption(user, screen.getByLabelText('Authentication'), 'Bearer token');
+
+    const input = screen.getByLabelText('Bearer token');
+    expect(input).toHaveAttribute('autocomplete', 'new-password');
+    expect(input).toHaveAttribute('data-1p-ignore');
+    expect(input).toHaveAttribute('data-lpignore', 'true');
+    expect(input).toHaveAttribute('data-bwignore');
+  });
+
+  // _dispatch_postgis_refresh() rejects ANY
+  // nonempty token with 422 credential_not_applicable — a registered table
+  // needs no service credential. Offering the field here invites a
+  // guaranteed failure, so it must not render for this origin.
+  it('does not offer a token field for a postgis origin', async () => {
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset({ origin: 'postgis' })} watch={makeWatch()} />);
+
+    await openDialog(user);
+
+    expect(screen.queryByLabelText('Access token (optional)')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start refresh' })).toBeInTheDocument();
+  });
+
+  it('dispatches a postgis refresh with no token, since none was ever offered', async () => {
+    mutateAsync.mockResolvedValue({
+      run_id: 'run-1',
+      job_id: 'job-1',
+      dataset_id: 'dataset-1',
+      origin_kind: 'postgis',
+      trigger: 'api',
+      status: 'pending',
+      message: 'Refresh queued from the registered table',
+    });
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset({ origin: 'postgis' })} watch={makeWatch()} />);
+
+    await openDialog(user);
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    await waitFor(() => {
+      expect(mutateAsync).toHaveBeenCalledWith({ datasetId: 'dataset-1', token: undefined });
+    });
+  });
+
+  it('dispatches the refresh, closes the dialog, reports the run to the watch, and clears the credential from rendered output and state', async () => {
+    mutateAsync.mockResolvedValue({
+      run_id: 'run-42',
+      job_id: 'job-42',
+      dataset_id: 'dataset-1',
+      origin_kind: 'service',
+      trigger: 'api',
+      status: 'pending',
+      message: 'Refresh queued from the stored source',
+    });
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    await openDialog(user);
+    const secretToken = 'super-secret-token-value';
+    await chooseOption(user, screen.getByLabelText('Authentication'), 'Bearer token');
+    await user.type(screen.getByLabelText('Bearer token'), secretToken);
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    expect(mutateAsync).toHaveBeenCalledWith({
+      datasetId: 'dataset-1',
+      token: undefined,
+      auth: { method: 'bearer', token: secretToken },
+    });
+    // The component no longer tracks the dispatched
+    // run itself — it must hand the run_id to the page-level watch instead.
+    expect(trackDispatchedRun).toHaveBeenCalledWith('run-42');
+    // The credential must not survive anywhere reachable from the DOM once
+    // the request has been dispatched — not in a toast, not in the closed
+    // dialog's last-known markup.
+    expect(document.body.textContent).not.toContain(secretToken);
+    expect(screen.queryByDisplayValue(secretToken)).not.toBeInTheDocument();
+
+    // Reopening proves the field was reset in component state, not just
+    // hidden by the dialog closing (and by ServiceCredentialBlock's own
+    // remount, since Radix unmounts DialogContent on close).
+    await openDialog(user);
+    expect(screen.getByLabelText('Authentication')).toHaveTextContent('No authentication');
+  });
+
+  it('clears a blocked-run acceptance after its retry is queued', async () => {
+    mutateAsync.mockResolvedValue({
+      run_id: 'run-43',
+      job_id: 'job-43',
+      dataset_id: 'dataset-1',
+      origin_kind: 'service',
+      trigger: 'api',
+      status: 'pending',
+      message: 'Refresh queued from the stored source',
+    });
+    const onAcceptHandled = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <SourceRefreshAction
+        dataset={makeDataset()}
+        watch={makeWatch()}
+        acceptBlockedRun={{ id: "blocked-run-1" }}
+        onAcceptHandled={onAcceptHandled}
+      />,
+    );
+
+    await screen.findByRole('dialog');
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    await waitFor(() => expect(onAcceptHandled).toHaveBeenCalledOnce());
+    expect(mutateAsync).toHaveBeenCalledWith({
+      datasetId: 'dataset-1',
+      token: undefined,
+      auth: undefined,
+      acceptBlockedRunId: 'blocked-run-1',
+    });
+  });
+
+  it('preserves the blocked run’s strong ArcGIS verification policy on review retry', async () => {
+    mutateAsync.mockResolvedValue({
+      run_id: 'run-44',
+      job_id: 'job-44',
+      dataset_id: 'dataset-1',
+      origin_kind: 'service',
+      trigger: 'api',
+      status: 'pending',
+      message: 'Refresh queued from the stored source',
+    });
+    const user = userEvent.setup();
+    render(
+      <SourceRefreshAction
+        dataset={makeDataset()}
+        watch={makeWatch()}
+        acceptBlockedRun={{ id: 'blocked-run-strong', verificationPolicy: 'arcgis_id_set_v1' }}
+      />,
+    );
+
+    await screen.findByRole('dialog');
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledWith({
+      datasetId: 'dataset-1',
+      token: undefined,
+      auth: undefined,
+      acceptBlockedRunId: 'blocked-run-strong',
+      verificationPolicy: 'arcgis_id_set_v1',
+    }));
+  });
+
+  it('publishes a held-back file replacement without a credential or a refresh button', async () => {
+    mutateAsync.mockResolvedValue({
+      run_id: 'run-45',
+      job_id: 'job-45',
+      dataset_id: 'dataset-1',
+      origin_kind: 'upload',
+      trigger: 'manual',
+      status: 'pending',
+      message: 'Accepted replacement queued',
+    });
+    const user = userEvent.setup();
+    render(
+      <SourceRefreshAction
+        dataset={makeDataset({ origin: 'upload', source_format: 'geojson' })}
+        watch={makeWatch()}
+        showTrigger={false}
+        acceptBlockedRun={{ id: 'blocked-upload', upload: true }}
+      />,
+    );
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveTextContent('Publish the reviewed replacement');
+    expect(screen.queryByRole('button', { name: 'Refresh from source' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Access token (optional)')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Publish replacement' }));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledWith({
+      datasetId: 'dataset-1',
+      token: undefined,
+      auth: undefined,
+      acceptBlockedRunId: 'blocked-upload',
+    }));
+    expect(trackDispatchedRun).toHaveBeenCalledWith('run-45');
+  });
+
+  it('sends no token when the field is left blank', async () => {
+    mutateAsync.mockResolvedValue({
+      run_id: 'run-1',
+      job_id: 'job-1',
+      dataset_id: 'dataset-1',
+      origin_kind: 'postgis',
+      trigger: 'api',
+      status: 'pending',
+      message: 'Refresh queued from the registered table',
+    });
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    await openDialog(user);
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    await waitFor(() => {
+      expect(mutateAsync).toHaveBeenCalledWith({ datasetId: 'dataset-1', token: undefined });
+    });
+  });
+
+  it('clears a typed credential on cancel without submitting it', async () => {
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    await openDialog(user);
+    await chooseOption(user, screen.getByLabelText('Authentication'), 'Bearer token');
+    await user.type(screen.getByLabelText('Bearer token'), 'abandoned-token');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(trackDispatchedRun).not.toHaveBeenCalled();
+    await openDialog(user);
+    expect(screen.getByLabelText('Authentication')).toHaveTextContent('No authentication');
+  });
+
+  // `serviceAuth` used to be cleared unconditionally
+  // before every request, win or lose. ServiceCredentialBlock is
+  // uncontrolled for its own fields (it only calls back when THEY change),
+  // so a failed submission left the block still showing the typed
+  // credential while the parent's copy of it had already gone back to
+  // undefined -- a same-click retry, with the form visually unchanged,
+  // silently sent `auth: undefined`. Pins that a retry after a non-422
+  // refusal (dialog stays open, no field is touched) resends the identical
+  // credential rather than dropping it.
+  it('resends the same credential on retry after a failed refresh, without the user retyping it', async () => {
+    mutateAsync
+      .mockRejectedValueOnce(new ApiError('A refresh is already running for this dataset. Wait for it to finish, then try again.', 409))
+      .mockResolvedValueOnce({
+        run_id: 'run-10',
+        job_id: 'job-10',
+        dataset_id: 'dataset-1',
+        origin_kind: 'service',
+        trigger: 'api',
+        status: 'pending',
+        message: 'Refresh queued from the stored source',
+      });
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset({ source_format: 'wfs' })} watch={makeWatch()} />);
+
+    await openDialog(user);
+    await chooseOption(user, screen.getByLabelText('Authentication'), 'Username and password');
+    await user.type(screen.getByLabelText('Username', { exact: true }), 'alice');
+    await user.type(screen.getByLabelText('Password', { exact: true }), 'hunter2');
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync).toHaveBeenNthCalledWith(1, {
+      datasetId: 'dataset-1',
+      token: undefined,
+      auth: { method: 'basic', username: 'alice', password: 'hunter2' },
+    });
+
+    // The dialog stays open on this (non-422) refusal, and the credential
+    // block still shows exactly what was typed — nothing prompted the user
+    // to retype anything.
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByLabelText('Username', { exact: true })).toHaveValue('alice');
+    expect(screen.getByLabelText('Password', { exact: true })).toHaveValue('hunter2');
+
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(2));
+    expect(mutateAsync).toHaveBeenNthCalledWith(2, {
+      datasetId: 'dataset-1',
+      token: undefined,
+      auth: { method: 'basic', username: 'alice', password: 'hunter2' },
+    });
+  });
+
+  it.each([
+    [
+      'dataset_busy',
+      'A refresh is already running for this dataset. Wait for it to finish, then try again.',
+    ],
+    [
+      'origin_changed',
+      "This dataset's source changed while the refresh was being queued. Review the source and try again.",
+    ],
+    [
+      'credential_store_unavailable',
+      "This install can't stage a service credential right now. Refreshing without a token still works for public sources.",
+    ],
+  ])('renders the %s refusal as a distinct inline message, not a toast', async (_code, message) => {
+    const { toast } = await import('sonner');
+    mutateAsync.mockRejectedValue(new ApiError(message, 409));
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    await openDialog(user);
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    // The dialog stays open on failure — the user can fix and retry (e.g.
+    // origin_changed) without losing the flow.
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(trackDispatchedRun).not.toHaveBeenCalled();
+  });
+
+  it('shows the dynamic token-policy text for invalid_service_token without a static fallback', async () => {
+    mutateAsync.mockRejectedValue(
+      new ApiError(
+        'The token was rejected: This service requires a base64url token (letters, digits, "-", "_").',
+        422,
+      ),
+    );
+    const user = userEvent.setup();
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    await openDialog(user);
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    expect(
+      await screen.findByText(
+        'The token was rejected: This service requires a base64url token (letters, digits, "-", "_").',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('disables the trigger and explains why when watch.isBusy is true', () => {
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch({ isBusy: true })} />);
+
+    expect(screen.getByRole('button', { name: 'Refresh from source' })).toBeDisabled();
+    expect(
+      screen.getByText('A refresh is already in progress. See refresh history below.'),
+    ).toBeInTheDocument();
+  });
+
+  // DatasetMap stays
+  // mounted above DetailPanel regardless of tab, so a feature selection
+  // survives a switch to the Source tab. The hazard does not need an
+  // in-progress edit — handleDeleteFeature acts on a merely-selected
+  // feature immediately, and a later save would too — so the guard blocks
+  // on SELECTION presence, not edit dirtiness. isEditDirty is irrelevant to
+  // the gate; both values are exercised below to prove that.
+  it('disables the trigger and explains why for a dirty, selected feature edit on this dataset', () => {
+    drawingStoreState.selectedFeature = { gid: 7, tdId: 'td-7', properties: {} };
+    drawingStoreState.isEditDirty = true;
+    drawingStoreState.targetDatasetId = 'dataset-1';
+
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    expect(screen.getByRole('button', { name: 'Refresh from source' })).toBeDisabled();
+    expect(
+      screen.getByText('Finish editing or deselect the feature before refreshing.'),
+    ).toBeInTheDocument();
+  });
+
+  it('also disables for a feature that is merely selected, with no unsaved edit', () => {
+    // The completion of the round-6 fix: a clean selection retains the
+    // pre-refresh GID just as much as a dirty one, and delete acts on a
+    // selection with no dirtiness required at all.
+    drawingStoreState.selectedFeature = { gid: 7, tdId: 'td-7', properties: {} };
+    drawingStoreState.isEditDirty = false;
+    drawingStoreState.targetDatasetId = 'dataset-1';
+
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    expect(screen.getByRole('button', { name: 'Refresh from source' })).toBeDisabled();
+    expect(
+      screen.getByText('Finish editing or deselect the feature before refreshing.'),
+    ).toBeInTheDocument();
+  });
+
+  it('does not open a blocked-run retry while a feature is selected', async () => {
+    drawingStoreState.selectedFeature = { gid: 7, tdId: 'td-7', properties: {} };
+    drawingStoreState.targetDatasetId = 'dataset-1';
+    const onAcceptHandled = vi.fn();
+
+    render(
+      <SourceRefreshAction
+        dataset={makeDataset()}
+        watch={makeWatch()}
+        acceptBlockedRun={{ id: "run-blocked" }}
+        onAcceptHandled={onAcceptHandled}
+      />,
+    );
+
+    await waitFor(() => expect(onAcceptHandled).toHaveBeenCalled());
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it('does not open a blocked-run retry while another refresh is busy', async () => {
+    const onAcceptHandled = vi.fn();
+
+    render(
+      <SourceRefreshAction
+        dataset={makeDataset()}
+        watch={makeWatch({ isBusy: true })}
+        acceptBlockedRun={{ id: "run-blocked" }}
+        onAcceptHandled={onAcceptHandled}
+      />,
+    );
+
+    await waitFor(() => expect(onAcceptHandled).toHaveBeenCalled());
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the busy state before confirming a blocked-run retry', async () => {
+    const user = userEvent.setup();
+    const onAcceptHandled = vi.fn();
+    const { rerender } = render(
+      <SourceRefreshAction
+        dataset={makeDataset()}
+        watch={makeWatch()}
+        acceptBlockedRun={{ id: "run-blocked" }}
+        onAcceptHandled={onAcceptHandled}
+      />,
+    );
+    await screen.findByRole('dialog');
+
+    rerender(
+      <SourceRefreshAction
+        dataset={makeDataset()}
+        watch={makeWatch({ isBusy: true })}
+        acceptBlockedRun={{ id: "run-blocked" }}
+        onAcceptHandled={onAcceptHandled}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('rechecks the feature selection before confirming a blocked-run retry', async () => {
+    const user = userEvent.setup();
+    const onAcceptHandled = vi.fn();
+    const { rerender } = render(
+      <SourceRefreshAction
+        dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+        watch={makeWatch()}
+        acceptBlockedRun={{ id: "run-blocked" }}
+        onAcceptHandled={onAcceptHandled}
+      />,
+    );
+    await screen.findByRole('dialog');
+    await user.type(screen.getByLabelText('Access token (optional)'), 'abandoned-token');
+
+    drawingStoreState.selectedFeature = { gid: 7, tdId: 'td-7', properties: {} };
+    drawingStoreState.targetDatasetId = 'dataset-1';
+    rerender(
+      <SourceRefreshAction
+        dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+        watch={makeWatch()}
+        acceptBlockedRun={{ id: "run-blocked" }}
+        onAcceptHandled={onAcceptHandled}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+    drawingStoreState.selectedFeature = null;
+    drawingStoreState.targetDatasetId = null;
+    rerender(
+      <SourceRefreshAction
+        dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+        watch={makeWatch()}
+      />,
+    );
+    await openDialog(user);
+    expect(screen.getByLabelText('Access token (optional)')).toHaveValue('');
+  });
+
+  it('does not block on a feature selection that belongs to a different dataset', () => {
+    drawingStoreState.selectedFeature = { gid: 7, tdId: 'td-7', properties: {} };
+    drawingStoreState.isEditDirty = true;
+    drawingStoreState.targetDatasetId = 'a-different-dataset';
+
+    render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    expect(screen.getByRole('button', { name: 'Refresh from source' })).not.toBeDisabled();
+  });
+
+  it('re-enables once the feature is saved, deselected, or discarded (selection cleared)', () => {
+    drawingStoreState.selectedFeature = { gid: 7, tdId: 'td-7', properties: {} };
+    drawingStoreState.isEditDirty = true;
+    drawingStoreState.targetDatasetId = 'dataset-1';
+
+    const { rerender } = render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+    expect(screen.getByRole('button', { name: 'Refresh from source' })).toBeDisabled();
+
+    // Mirrors what a save, deselect, or discard does to the store:
+    // clearSelectedFeature resets both selectedFeature and isEditDirty.
+    drawingStoreState.selectedFeature = null;
+    drawingStoreState.isEditDirty = false;
+    rerender(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    expect(screen.getByRole('button', { name: 'Refresh from source' })).not.toBeDisabled();
+    expect(
+      screen.queryByText('Finish editing or deselect the feature before refreshing.'),
+    ).not.toBeInTheDocument();
+  });
+
+  // The whole point of lifting tracking into a
+  // page-level watch — a dispatch that resolves AFTER the user has already
+  // switched away from the Source tab (unmounting this component) must
+  // still reach the watch, since it is the caller's (not this component's)
+  // state that has to survive.
+  it('reports the dispatched run to the watch even if this component unmounts before the request resolves', async () => {
+    let resolveMutation!: (value: {
+      run_id: string;
+      job_id: string;
+      dataset_id: string;
+      origin_kind: string;
+      trigger: string;
+      status: string;
+      message: string;
+    }) => void;
+    mutateAsync.mockReturnValue(
+      new Promise((resolve) => {
+        resolveMutation = resolve;
+      }),
+    );
+    const user = userEvent.setup();
+    const { unmount } = render(<SourceRefreshAction dataset={makeDataset()} watch={makeWatch()} />);
+
+    await openDialog(user);
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    // Simulate a tab switch away from Source while the request is in flight.
+    unmount();
+    expect(trackDispatchedRun).not.toHaveBeenCalled();
+
+    resolveMutation({
+      run_id: 'run-slow',
+      job_id: 'job-slow',
+      dataset_id: 'dataset-1',
+      origin_kind: 'service',
+      trigger: 'api',
+      status: 'pending',
+      message: 'Refresh queued from the stored source',
+    });
+
+    await waitFor(() => {
+      expect(trackDispatchedRun).toHaveBeenCalledWith('run-slow');
+    });
+  });
+
+  // The refresh door's own 422 detail. The
+  // `message` field is a diagnostic sentence aimed at an API client, not UI
+  // copy -- it must never reach the DOM, and this suite pins that alongside
+  // the credential prompt it triggers instead.
+  const RAW_SERVICE_TOKEN_MESSAGE =
+    "This dataset's source needed a service token the last time it was imported or refreshed, and this request carries none. Send the token again in the request body's `token` field; tokens are request-only and are never stored between runs. If the source is public now, re-import it through the re-upload dialog without a token to clear the requirement.";
+
+  function serviceTokenRequiredError() {
+    return new ApiError('service_token_required', 422, {
+      code: 'service_token_required',
+      message: RAW_SERVICE_TOKEN_MESSAGE,
+    });
+  }
+
+  // ArcgisCredentialBlock now renders
+  // `ApiError.message` directly rather than mapping `code` to its own copy
+  // (see the component's module comment). This mock has to match what the
+  // REAL apiFetch would have produced, so it runs the same detail through
+  // the same shared `translateApiErrorDetail` (error-map.ts) that A2's
+  // codes are mapped in -- not a hand-copied string that could silently
+  // drift from A2's actual wording the next time it changes.
+  function arcgisSigninError(code: string, status: number, rawMessage = 'raw diagnostic text, never rendered') {
+    const body = { code, message: rawMessage };
+    return new ApiError(translateApiErrorDetail(body, status), status, body);
+  }
+
+  // The ArcGIS credential block now schedules a clear
+  // for `expires_at` minus a safety margin, so any test that mints a token
+  // without exercising expiry itself needs an `expires_at` safely in the
+  // future relative to whenever the suite actually runs -- a fixed literal
+  // date goes stale (and the timer fires almost immediately, wiping the
+  // "Signed in" state before an assertion ever sees it).
+  const FAR_FUTURE_EXPIRY = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+  it('explains a refused http credential without pointing at a URL field', async () => {
+    mutateAsync.mockRejectedValue(
+      new ApiError('credential_over_http', 422, {
+        code: 'credential_over_http',
+        message: 'raw diagnostic text, never rendered',
+        field: 'url',
+      }),
+    );
+    const user = userEvent.setup();
+    render(
+      <SourceRefreshAction
+        dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+        watch={makeWatch()}
+      />,
+    );
+
+    await openDialog(user);
+    await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+    expect(
+      await screen.findByText(/Re-import the data from the service's https:\/\/ address/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('raw diagnostic text, never rendered')).not.toBeInTheDocument();
+  });
+
+  describe('service_token_required credential prompt', () => {
+    it('keeps the dialog open on the 422 and never echoes the raw response text into the DOM', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      const user = userEvent.setup();
+      render(<SourceRefreshAction dataset={makeDataset({ source_format: 'wfs' })} watch={makeWatch()} />);
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+      await screen.findByText(
+        'This source refused the refresh outright because it needs a credential. Send it again below.',
+      );
+      expect(screen.getByRole('dialog')).toBeInTheDocument();
+      expect(document.body.textContent).not.toContain(RAW_SERVICE_TOKEN_MESSAGE);
+    });
+
+    it('shows the ArcGIS sign-in taxonomy for an arcgis_featureserver origin, not the WFS escape hatch', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+      expect(await screen.findByLabelText('Authentication method')).toBeInTheDocument();
+      expect(
+        screen.queryByText(/refused the refresh outright/i),
+      ).not.toBeInTheDocument();
+    });
+
+    it('shows the outright-refusal copy and the re-upload escape hatch for a WFS origin, not the ArcGIS select', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      const user = userEvent.setup();
+      render(<SourceRefreshAction dataset={makeDataset({ source_format: 'wfs' })} watch={makeWatch()} />);
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+      expect(
+        await screen.findByText(
+          'This source refused the refresh outright because it needs a credential. Send it again below.',
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          'If the source is public now, re-import it through the Re-Upload dialog with no credential to clear this requirement.',
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByLabelText('Authentication method')).not.toBeInTheDocument();
+    });
+
+    it('sends the freshly typed token on retry after a WFS refusal', async () => {
+      mutateAsync
+        .mockRejectedValueOnce(serviceTokenRequiredError())
+        .mockResolvedValueOnce({
+          run_id: 'run-7',
+          job_id: 'job-7',
+          dataset_id: 'dataset-1',
+          origin_kind: 'service',
+          trigger: 'api',
+          status: 'pending',
+          message: 'Refresh queued from the stored source',
+        });
+      const user = userEvent.setup();
+      render(<SourceRefreshAction dataset={makeDataset({ source_format: 'wfs' })} watch={makeWatch()} />);
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      await screen.findByText(
+        'This source refused the refresh outright because it needs a credential. Send it again below.',
+      );
+
+      await chooseOption(user, screen.getByLabelText('Authentication'), 'Bearer token');
+      await user.type(screen.getByLabelText('Bearer token'), 'fresh-bearer-token');
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+      await waitFor(() => {
+        expect(mutateAsync).toHaveBeenLastCalledWith({
+          datasetId: 'dataset-1',
+          token: undefined,
+          auth: { method: 'bearer', token: 'fresh-bearer-token' },
+        });
+      });
+    });
+
+    it('mints an ArcGIS token via sign-in, clears the password once it lands, and sends the token on retry', async () => {
+      mutateAsync
+        .mockRejectedValueOnce(serviceTokenRequiredError())
+        .mockResolvedValueOnce({
+          run_id: 'run-9',
+          job_id: 'job-9',
+          dataset_id: 'dataset-1',
+          origin_kind: 'service',
+          trigger: 'api',
+          status: 'pending',
+          message: 'Refresh queued from the stored source',
+        });
+      mockArcgisSignIn.mockResolvedValue({
+        token: 'minted-token-xyz',
+        expires_at: FAR_FUTURE_EXPIRY,
+      });
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'hunter2');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+      await screen.findByText('Signed in. The refresh will use this token.');
+      expect(mockArcgisSignIn).toHaveBeenCalledWith({
+        portal_url: 'https://myorg.maps.arcgis.com',
+        username: 'alice',
+        password: 'hunter2',
+      });
+      expect(screen.getByLabelText('Password')).toHaveValue('');
+
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+      await waitFor(() => {
+        expect(mutateAsync).toHaveBeenLastCalledWith({
+          datasetId: 'dataset-1',
+          token: 'minted-token-xyz',
+        });
+      });
+    });
+
+    // ArcGISSignInRequest does not strip
+    // whitespace and PortalSignIn.mint forwards the value unchanged, so a
+    // pasted username with leading/trailing whitespace would burn one of
+    // the account's limited sign-in attempts on a value that could never
+    // match. A whitespace-only value must never submit at all.
+    it('trims the username before sending it, and refuses a whitespace-only one', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      mockArcgisSignIn.mockResolvedValue({ token: 'minted-token', expires_at: FAR_FUTURE_EXPIRY });
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      const usernameInput = screen.getByLabelText('Username');
+      const signInButton = screen.getByRole('button', { name: 'Sign in' });
+
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Password'), 'hunter2');
+
+      await user.type(usernameInput, '   ');
+      expect(signInButton).toBeDisabled();
+
+      await user.clear(usernameInput);
+      await user.type(usernameInput, '  alice  ');
+      expect(signInButton).not.toBeDisabled();
+      await user.click(signInButton);
+
+      await waitFor(() => {
+        expect(mockArcgisSignIn).toHaveBeenCalledWith({
+          portal_url: 'https://myorg.maps.arcgis.com',
+          username: 'alice',
+          password: 'hunter2',
+        });
+      });
+      expect(mockArcgisSignIn).not.toHaveBeenCalledWith(
+        expect.objectContaining({ username: '  alice  ' }),
+      );
+    });
+
+    // "Start refresh" clears the parent's `token`
+    // state before awaiting the refresh request, win or lose. Before this
+    // fix, the credential block's own `signedIn` flag did not know that --
+    // a rejected refresh left it still claiming "Signed in" while the next
+    // retry silently submitted no token at all.
+    it('reverts to its own sign-in state, with no token, after a rejected refresh that follows a mint', async () => {
+      const remoteError = new ApiError('Remote service returned an error', 503);
+      mutateAsync
+        .mockRejectedValueOnce(serviceTokenRequiredError())
+        .mockRejectedValueOnce(remoteError)
+        .mockRejectedValue(remoteError);
+      mockArcgisSignIn.mockResolvedValue({
+        token: 'minted-token-xyz',
+        expires_at: FAR_FUTURE_EXPIRY,
+      });
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'hunter2');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+      await screen.findByText('Signed in. The refresh will use this token.');
+
+      // The refresh itself is refused (a transient 503 here; an invalid or
+      // expired token on the origin's own side reads the same way to this
+      // dialog). The dialog stays open on any refusal.
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+      await waitFor(() => {
+        expect(
+          screen.queryByText('Signed in. The refresh will use this token.'),
+        ).not.toBeInTheDocument();
+      });
+      // Still offering the sign-in method -- not reset to the taxonomy's
+      // default -- but with nothing left to submit.
+      expect(screen.getByLabelText('Authentication method')).toHaveTextContent('Sign in with username and password');
+
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      await waitFor(() => {
+        expect(mutateAsync).toHaveBeenLastCalledWith({ datasetId: 'dataset-1', token: undefined });
+      });
+    });
+
+    it('maps a rejected ArcGIS sign-in to this component\'s own copy, never the raw response, and never auto-retries', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      mockArcgisSignIn.mockRejectedValue(arcgisSigninError('arcgis_signin_rejected', 400, 'raw'));
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'wrong-password');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+      expect(
+        await screen.findByText(translateApiErrorDetail({ code: 'arcgis_signin_rejected' }, 400)),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('raw')).not.toBeInTheDocument();
+      // Exactly one attempt: nothing in this component retries a rejected
+      // sign-in automatically (a retry loop can lock the
+      // customer's real ArcGIS account).
+      expect(mockArcgisSignIn).toHaveBeenCalledTimes(1);
+    });
+
+    // A rejected sign-in used to leave the
+    // password sitting in state and in the controlled input until the
+    // user edited it or closed the dialog -- contradicting this block's
+    // own request-scoped credential lifetime, and letting a second click
+    // resend the very password ArcGIS just rejected, which matters under
+    // its five-attempts lockout. Counterfactual: without the fix, the
+    // password assertion below fails and the button stays enabled.
+    it('clears the password after a rejected sign-in, so a second click cannot resubmit it', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      mockArcgisSignIn.mockRejectedValue(arcgisSigninError('arcgis_signin_rejected', 400, 'raw'));
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'wrong-password');
+      const signInButton = screen.getByRole('button', { name: 'Sign in' });
+      await user.click(signInButton);
+
+      await screen.findByText(translateApiErrorDetail({ code: 'arcgis_signin_rejected' }, 400));
+
+      // Password cleared the instant the rejected attempt settled.
+      expect(screen.getByLabelText('Password')).toHaveValue('');
+      // A second click with nothing re-typed cannot submit: the button
+      // requires a non-empty password, same as portal URL and username.
+      expect(signInButton).toBeDisabled();
+      expect(mockArcgisSignIn).toHaveBeenCalledTimes(1);
+
+      // Typing a genuinely new password is what it takes to try again --
+      // and that new value, not the rejected one, is what goes out.
+      await user.type(screen.getByLabelText('Password'), 'new-password');
+      expect(signInButton).not.toBeDisabled();
+      await user.click(signInButton);
+
+      await waitFor(() => {
+        expect(mockArcgisSignIn).toHaveBeenCalledTimes(2);
+      });
+      expect(mockArcgisSignIn).toHaveBeenLastCalledWith({
+        portal_url: 'https://myorg.maps.arcgis.com',
+        username: 'alice',
+        password: 'new-password',
+      });
+    });
+
+    // Post-#1758-merge: the merged endpoint (arcgis_signin.py,
+    // signin_guard.py) ships three caller-facing codes beyond the four this
+    // map originally covered. Confirmed against the merged source directly.
+    it.each([
+      ['arcgis_portal_not_https', 422],
+      ['arcgis_portal_host_invalid', 422],
+      ['arcgis_signin_in_progress', 409],
+    ])('maps the %s sign-in refusal to its own copy', async (code, status) => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      mockArcgisSignIn.mockRejectedValue(arcgisSigninError(code, status));
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'hunter2');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+      expect(
+        await screen.findByText(translateApiErrorDetail({ code }, status)),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('raw diagnostic text, never rendered')).not.toBeInTheDocument();
+    });
+
+    // ArcGISSignInRequest rejects input -- a
+    // scheme-less portal URL, one carrying credentials, an overlong field --
+    // before the route runs. That is a FastAPI/pydantic validation array in
+    // err.body, not this endpoint's {code, message} shape, so it has no
+    // `.code` and must not fall through to the generic "could not reach the
+    // portal" copy: the request never reached the network.
+    it('shows the client-translated validation message for input the endpoint rejects before the route runs', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      mockArcgisSignIn.mockRejectedValue(
+        new ApiError('portal_url: value is not a valid URL', 422, [
+          { loc: ['body', 'portal_url'], msg: 'value is not a valid URL', type: 'value_error' },
+        ]),
+      );
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      await user.type(screen.getByLabelText('Portal URL'), 'not-a-url');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'hunter2');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+      expect(await screen.findByText('portal_url: value is not a valid URL')).toBeInTheDocument();
+      // Never the generic fallback: this never reached the network.
+      expect(
+        screen.queryByText('Could not reach the portal. Check the URL and try again.'),
+      ).not.toBeInTheDocument();
+    });
+
+    // A late arcgisSignIn response landing after
+    // the dialog (and this credential block, which SourceRefreshAction
+    // unmounts on close) is dismissed must not resurrect a token the user
+    // already dismissed.
+    it('drops a late ArcGIS sign-in response after the dialog is closed, leaving no token behind', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      let resolveSignIn!: (value: { token: string; expires_at: string }) => void;
+      mockArcgisSignIn.mockReturnValue(
+        new Promise((resolve) => {
+          resolveSignIn = resolve;
+        }),
+      );
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'hunter2');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+      // Dismiss the dialog while the sign-in is still in flight. This
+      // unmounts ArcgisCredentialBlock (SourceRefreshAction renders it
+      // conditionally on `serviceTokenRequired`, which handleOpenChange
+      // resets to false on close).
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+      // The response lands after close.
+      await act(async () => {
+        resolveSignIn({ token: 'late-minted-token', expires_at: FAR_FUTURE_EXPIRY });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      await openDialog(user);
+      expect(screen.getByLabelText('Access token (optional)')).toHaveValue('');
+    });
+
+    // A token minted for one set of credentials
+    // must not survive editing those credentials or a rejected retry.
+    it('clears a previously minted token as soon as a sign-in field changes, before any new attempt', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      mockArcgisSignIn.mockResolvedValue({
+        token: 'first-token',
+        expires_at: FAR_FUTURE_EXPIRY,
+      });
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'hunter2');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+      await screen.findByText('Signed in. The refresh will use this token.');
+
+      // Edit a field but do NOT attempt sign-in again -- the field-change
+      // handler itself, not only the next attempt's start, must drop the
+      // token that no longer describes what's typed.
+      await user.type(screen.getByLabelText('Username'), 'x');
+      expect(
+        screen.queryByText('Signed in. The refresh will use this token.'),
+      ).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+      await waitFor(() => {
+        expect(mutateAsync).toHaveBeenLastCalledWith({ datasetId: 'dataset-1', token: undefined });
+      });
+    });
+
+    it('clears a previously minted token once a sign-in field changes, so a rejected retry submits nothing', async () => {
+      mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+      mockArcgisSignIn
+        .mockResolvedValueOnce({ token: 'first-token', expires_at: FAR_FUTURE_EXPIRY })
+        .mockRejectedValueOnce(arcgisSigninError('arcgis_signin_rejected', 400, 'raw'));
+      const user = userEvent.setup();
+      render(
+        <SourceRefreshAction
+          dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+          watch={makeWatch()}
+        />,
+      );
+
+      await openDialog(user);
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+      const methodSelect = await screen.findByLabelText('Authentication method');
+      await chooseOption(user, methodSelect, 'Sign in with username and password');
+      await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+      await user.type(screen.getByLabelText('Username'), 'alice');
+      await user.type(screen.getByLabelText('Password'), 'hunter2');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+      await screen.findByText('Signed in. The refresh will use this token.');
+
+      // Editing a field after a successful mint invalidates that token --
+      // the fields no longer describe the account it was minted for.
+      await user.clear(screen.getByLabelText('Username'));
+      await user.type(screen.getByLabelText('Username'), 'bob');
+      await user.type(screen.getByLabelText('Password'), 'wrong-password');
+      await user.click(screen.getByRole('button', { name: 'Sign in' }));
+
+      await screen.findByText(translateApiErrorDetail({ code: 'arcgis_signin_rejected' }, 400));
+
+      await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+      await waitFor(() => {
+        expect(mutateAsync).toHaveBeenLastCalledWith({ datasetId: 'dataset-1', token: undefined });
+      });
+    });
+
+    // The refresh door only stages a credential and
+    // queues the worker, so a dialog left open past the minted token's
+    // lifetime would otherwise submit one already dead on the wire, and
+    // the failure would only surface later in the background.
+    describe('ArcGIS token expiry', () => {
+      afterEach(() => {
+        vi.useRealTimers();
+      });
+
+      async function signInSuccessfully(user: ReturnType<typeof userEvent.setup>, expiresAt: string) {
+        mockArcgisSignIn.mockResolvedValue({ token: 'short-lived-token', expires_at: expiresAt });
+        await openDialog(user);
+        await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+        const methodSelect = await screen.findByLabelText('Authentication method');
+        await chooseOption(user, methodSelect, 'Sign in with username and password');
+        await user.type(screen.getByLabelText('Portal URL'), 'https://myorg.maps.arcgis.com');
+        await user.type(screen.getByLabelText('Username'), 'alice');
+        await user.type(screen.getByLabelText('Password'), 'hunter2');
+        await user.click(screen.getByRole('button', { name: 'Sign in' }));
+        await screen.findByText('Signed in. The refresh will use this token.');
+      }
+
+      it('expires a minted token while the dialog stays open, clearing it and swapping the copy', async () => {
+        mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+        // shouldAdvanceTime
+        // keeps the mocked arcgisSignIn promise progressing while fake
+        // timers also control the scheduled expiry; delay: null keeps
+        // userEvent synchronous under them.
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        const user = userEvent.setup({ delay: null });
+        render(
+          <SourceRefreshAction
+            dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+            watch={makeWatch()}
+          />,
+        );
+
+        await signInSuccessfully(user, new Date(Date.now() + 60_000).toISOString());
+
+        // Past expires_at minus the 30s safety margin, but before the raw
+        // expiry itself -- proves the margin, not just the raw timestamp,
+        // drives the clear.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(31_000);
+        });
+
+        expect(
+          screen.queryByText('Signed in. The refresh will use this token.'),
+        ).not.toBeInTheDocument();
+        expect(
+          await screen.findByText('The token expired. Sign in again to continue.'),
+        ).toBeInTheDocument();
+
+        await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+        await waitFor(() => {
+          expect(mutateAsync).toHaveBeenLastCalledWith({ datasetId: 'dataset-1', token: undefined });
+        });
+      });
+
+      it('clears the scheduled expiry timer when the dialog closes, so it never fires', async () => {
+        mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        const user = userEvent.setup({ delay: null });
+        const setTimeoutSpy = vi.spyOn(global, 'setTimeout');
+        const clearTimeoutSpy = vi.spyOn(global, 'clearTimeout');
+        render(
+          <SourceRefreshAction
+            dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+            watch={makeWatch()}
+          />,
+        );
+
+        // A long-lived token so the expiry timer's delay (minutes) is
+        // unambiguous against whatever short-delay timers userEvent/jsdom
+        // themselves schedule under fake timers.
+        await signInSuccessfully(user, new Date(Date.now() + 60 * 60 * 1000).toISOString());
+
+        const expiryTimerCallIndex = setTimeoutSpy.mock.calls.findIndex(
+          ([, delay]) => typeof delay === 'number' && delay > 10_000,
+        );
+        expect(expiryTimerCallIndex).toBeGreaterThanOrEqual(0);
+        const expiryTimerId = setTimeoutSpy.mock.results[expiryTimerCallIndex]?.value;
+
+        await user.click(screen.getByRole('button', { name: 'Cancel' }));
+        // Not just "cleared something" -- cleared THIS timer specifically.
+        expect(clearTimeoutSpy).toHaveBeenCalledWith(expiryTimerId);
+
+        // Advancing well past the original expiry raises nothing further --
+        // the block that owned the timer is gone.
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
+        });
+      });
+
+      // The scheduled timer and the render-triggered belt
+      // effect are both suspended exactly like any other browser timer by a
+      // backgrounded tab or a system sleep. This proves the submit path
+      // catches an already-expired token on its own, without either of
+      // those ever getting a chance to run -- the clock is moved past
+      // expiry directly, and no fake timer is ever advanced.
+      it('recognizes an already-expired token synchronously at submit time, even if the scheduled timer never fires', async () => {
+        mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        const user = userEvent.setup({ delay: null });
+        render(
+          <SourceRefreshAction
+            dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+            watch={makeWatch()}
+          />,
+        );
+
+        await signInSuccessfully(user, new Date(Date.now() + 60_000).toISOString());
+
+        // Jump the clock past expiry. Deliberately NOT vi.advanceTimersByTimeAsync:
+        // the scheduled expiry timer must never fire in this test.
+        vi.setSystemTime(Date.now() + 61_000);
+
+        await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+        // The original 422 dispatch is the only call mutateAsync ever sees --
+        // the stale token is never submitted.
+        expect(mutateAsync).toHaveBeenCalledTimes(1);
+        expect(
+          await screen.findByText('The token expired. Sign in again to continue.'),
+        ).toBeInTheDocument();
+      });
+
+      // The synchronous guard used to compare
+      // against the raw expires_at, while the scheduled timer retires the
+      // token 30s early. A tab resuming inside that last 30-second window
+      // -- past the margin cutoff but before the real expiry -- used to
+      // pass the (unmargined) guard and let handleConfirm submit a
+      // credential this component had already decided was retired.
+      it('refuses a token still inside the 30s safety margin, not just past its real expiry', async () => {
+        mutateAsync.mockRejectedValue(serviceTokenRequiredError());
+        vi.useFakeTimers({ shouldAdvanceTime: true });
+        const user = userEvent.setup({ delay: null });
+        render(
+          <SourceRefreshAction
+            dataset={makeDataset({ source_format: 'arcgis_featureserver' })}
+            watch={makeWatch()}
+          />,
+        );
+
+        await signInSuccessfully(user, new Date(Date.now() + 60_000).toISOString());
+
+        // 35s elapsed: past the 30s-early margin cutoff (retires at 30s)
+        // but still short of the token's real expiry (60s). Deliberately
+        // NOT vi.advanceTimersByTimeAsync: the scheduled timer, set for
+        // ~30s from now, must never fire in this test either.
+        vi.setSystemTime(Date.now() + 35_000);
+
+        await user.click(screen.getByRole('button', { name: 'Start refresh' }));
+
+        expect(mutateAsync).toHaveBeenCalledTimes(1);
+        expect(
+          await screen.findByText('The token expired. Sign in again to continue.'),
+        ).toBeInTheDocument();
+      });
+    });
+  });
+});
+
+describe('REFRESHABLE_ORIGINS', () => {
+  it('mirrors the refresh door dispatch table — the three kinds with a strategy', () => {
+    // router_refresh.py routes every origin it does
+    // not name through _resolve_service_origin(), which refuses upload and
+    // created with 409 refresh_not_applicable. This is the value DetailPanel
+    // gates on; a widened set here without a matching backend strategy would
+    // show the "Refresh from source" control for origins the backend refuses.
+    // Stac gained one.
+    expect([...REFRESHABLE_ORIGINS].sort()).toEqual(['postgis', 'service', 'stac']);
+  });
+});

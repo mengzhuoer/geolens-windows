@@ -1,0 +1,285 @@
+import { useTranslation } from 'react-i18next';
+import { AlertTriangle } from 'lucide-react';
+import { Switch } from '@/components/ui/switch';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { SettingSourceBadge } from './SettingSourceBadge';
+import { SettingsFormActions } from './SettingsFormActions';
+import { findSetting } from './utils';
+import { useSettingsForm, type ResetHandler } from './useSettingsForm';
+import type { SettingItem } from '@/api/settings';
+
+interface TabProps {
+  settings: SettingItem[];
+  envOnly: boolean;
+  onSave: (changes: Record<string, unknown>) => void;
+  onReset: ResetHandler;
+  isSaving: boolean;
+  settingsUpdatedAt?: number;
+  saveFailed?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+}
+
+const FIELDS = [
+  { key: 'require_metadata_for_publish', defaultValue: false },
+  { key: 'enable_dataset_editing', defaultValue: false },
+  { key: 'restrict_public_visibility', defaultValue: false },
+  { key: 'banner_enabled', defaultValue: false },
+  { key: 'banner_text', defaultValue: '' },
+  { key: 'banner_color', defaultValue: 'warning' },
+  { key: 'public_app_url', defaultValue: '' },
+  { key: 'public_api_url', defaultValue: '' },
+  { key: 'privacy_url', defaultValue: '' },
+  { key: 'log_level', defaultValue: 'INFO' },
+  { key: 'log_json', defaultValue: false },
+  { key: 'audit_retention_days', defaultValue: '', coerce: (v: unknown) => (v == null ? '' : String(v)) },
+] as const;
+
+const AUDIT_RETENTION_MIN_DAYS = 90;
+const AUDIT_RETENTION_MAX_DAYS = 36500;
+const AUDIT_RETENTION_COMPLIANCE_DAYS = 365;
+
+/** An empty field keeps audit records forever; the API stores that as null. */
+function parseRetentionDays(raw: string): number | null | undefined {
+  const text = raw.trim();
+  if (text === '') return null;
+  const days = Number(text);
+  if (!Number.isInteger(days) || days < AUDIT_RETENTION_MIN_DAYS || days > AUDIT_RETENTION_MAX_DAYS) return undefined;
+  return days;
+}
+
+export function SettingsGeneralTab({ settings, envOnly, onSave, onReset: submitReset, isSaving, settingsUpdatedAt, saveFailed, onDirtyChange }: TabProps) {
+  const { t } = useTranslation('admin');
+  const { values, setters, dirty, hasDirty, discard, onReset } = useSettingsForm(settings, FIELDS, isSaving, settingsUpdatedAt, saveFailed, submitReset);
+  const retentionRaw = values.audit_retention_days as string;
+  const retentionDays = parseRetentionDays(retentionRaw);
+  const retentionInvalid = retentionDays === undefined;
+  const retentionShort = typeof retentionDays === 'number' && retentionDays < AUDIT_RETENTION_COMPLIANCE_DAYS;
+
+  const save = (changes: Record<string, unknown>) => {
+    if (typeof changes.audit_retention_days === 'string') {
+      onSave({ ...changes, audit_retention_days: parseRetentionDays(changes.audit_retention_days) });
+    } else {
+      onSave(changes);
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between max-w-md">
+        <div className="space-y-0.5">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="require-metadata-toggle">{t('settings.general.requireMetadata')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'require_metadata_for_publish')?.source ?? 'default'} settingKey="require_metadata_for_publish" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.general.requireMetadataDescription')}</p>
+        </div>
+        <Switch
+          id="require-metadata-toggle"
+          checked={values.require_metadata_for_publish as boolean}
+          onCheckedChange={setters.require_metadata_for_publish}
+          disabled={envOnly}
+        />
+      </div>
+
+      <div className="flex items-center justify-between max-w-md">
+        <div className="space-y-0.5">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="enable-dataset-editing-toggle">{t('settings.general.enableDatasetEditing')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'enable_dataset_editing')?.source ?? 'default'} settingKey="enable_dataset_editing" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.general.enableDatasetEditingDescription')}</p>
+        </div>
+        <Switch
+          id="enable-dataset-editing-toggle"
+          checked={values.enable_dataset_editing as boolean}
+          onCheckedChange={setters.enable_dataset_editing}
+          disabled={envOnly}
+        />
+      </div>
+
+      <div className="flex items-center justify-between max-w-md">
+        <div className="space-y-0.5">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="restrict-public-visibility-toggle">{t('settings.general.restrictPublicVisibility')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'restrict_public_visibility')?.source ?? 'default'} settingKey="restrict_public_visibility" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.general.restrictPublicVisibilityDescription')}</p>
+        </div>
+        <Switch
+          id="restrict-public-visibility-toggle"
+          checked={values.restrict_public_visibility as boolean}
+          onCheckedChange={setters.restrict_public_visibility}
+          disabled={envOnly}
+        />
+      </div>
+
+      <div className="flex items-center justify-between max-w-md">
+        <div className="space-y-0.5">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="banner-enabled-toggle">{t('settings.general.bannerEnabled')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'banner_enabled')?.source ?? 'default'} settingKey="banner_enabled" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.general.bannerEnabledDescription')}</p>
+        </div>
+        <Switch
+          id="banner-enabled-toggle"
+          checked={values.banner_enabled as boolean}
+          onCheckedChange={setters.banner_enabled}
+          disabled={envOnly}
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="banner-text">{t('settings.general.bannerText')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'banner_text')?.source ?? 'default'} settingKey="banner_text" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.general.bannerTextDescription')}</p>
+        <Input
+          id="banner-text"
+          type="text"
+          value={values.banner_text as string}
+          onChange={(e) => setters.banner_text(e.target.value)}
+          disabled={envOnly}
+          className="max-w-md"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="banner-color">{t('settings.general.bannerColor')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'banner_color')?.source ?? 'default'} settingKey="banner_color" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.general.bannerColorDescription')}</p>
+        <Select value={values.banner_color as string} onValueChange={setters.banner_color} disabled={envOnly}>
+          <SelectTrigger id="banner-color" className="w-48">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="warning">{t('settings.general.bannerColorWarning')}</SelectItem>
+            <SelectItem value="info">{t('settings.general.bannerColorInfo')}</SelectItem>
+            <SelectItem value="success">{t('settings.general.bannerColorSuccess')}</SelectItem>
+            <SelectItem value="destructive">{t('settings.general.bannerColorDestructive')}</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="public-app-url">{t('settings.general.publicAppUrl')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'public_app_url')?.source ?? 'default'} settingKey="public_app_url" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.general.publicAppUrlDescription')}</p>
+        <Input
+          id="public-app-url"
+          type="text"
+          value={values.public_app_url as string}
+          onChange={(e) => setters.public_app_url(e.target.value)}
+          disabled={envOnly}
+          className="max-w-md"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="public-api-url">{t('settings.general.publicApiUrl')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'public_api_url')?.source ?? 'default'} settingKey="public_api_url" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.general.publicApiUrlDescription')}</p>
+        <Input
+          id="public-api-url"
+          type="text"
+          value={values.public_api_url as string}
+          onChange={(e) => setters.public_api_url(e.target.value)}
+          disabled={envOnly}
+          className="max-w-md"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="privacy-url">{t('settings.general.privacyUrl')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'privacy_url')?.source ?? 'default'} settingKey="privacy_url" onReset={onReset} />
+        </div>
+        <p className="text-sm text-muted-foreground">{t('settings.general.privacyUrlDescription')}</p>
+        <Input
+          id="privacy-url"
+          type="text"
+          value={values.privacy_url as string}
+          onChange={(e) => setters.privacy_url(e.target.value)}
+          disabled={envOnly}
+          className="max-w-md"
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="log-level">{t('settings.general.logLevel')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'log_level')?.source ?? 'default'} settingKey="log_level" onReset={onReset} />
+        </div>
+        <Select value={values.log_level as string} onValueChange={setters.log_level} disabled={envOnly}>
+          <SelectTrigger id="log-level" className="w-48">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="DEBUG">DEBUG</SelectItem>
+            <SelectItem value="INFO">INFO</SelectItem>
+            <SelectItem value="WARNING">WARNING</SelectItem>
+            <SelectItem value="ERROR">ERROR</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      <div className="flex items-center justify-between max-w-md">
+        <div className="space-y-0.5">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="log-json-toggle">{t('settings.general.logJsonLabel')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'log_json')?.source ?? 'default'} settingKey="log_json" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.general.logJsonDescription')}</p>
+        </div>
+        <Switch
+          id="log-json-toggle"
+          checked={values.log_json as boolean}
+          onCheckedChange={setters.log_json}
+          disabled={envOnly}
+        />
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Label htmlFor="audit-retention-days">{t('settings.general.auditRetentionDays')}</Label>
+          <SettingSourceBadge source={findSetting(settings, 'audit_retention_days')?.source ?? 'default'} settingKey="audit_retention_days" onReset={onReset} />
+        </div>
+        <p id="audit-retention-help" className="text-sm text-muted-foreground">{t('settings.general.auditRetentionDaysDescription')}</p>
+        <Input
+          id="audit-retention-days"
+          type="number"
+          min={AUDIT_RETENTION_MIN_DAYS}
+          max={AUDIT_RETENTION_MAX_DAYS}
+          step={1}
+          placeholder={t('settings.general.auditRetentionKeepForever')}
+          value={retentionRaw}
+          onChange={(e) => setters.audit_retention_days(e.target.value)}
+          disabled={envOnly}
+          aria-invalid={retentionInvalid}
+          aria-describedby={`${retentionInvalid ? 'audit-retention-error ' : retentionShort ? 'audit-retention-warning ' : ''}audit-retention-help`}
+          className="w-40"
+        />
+        {retentionInvalid && (
+          <p id="audit-retention-error" className="text-sm text-destructive">{t('settings.general.auditRetentionInvalid', { min: AUDIT_RETENTION_MIN_DAYS, max: AUDIT_RETENTION_MAX_DAYS })}</p>
+        )}
+        {retentionShort && (
+          <div id="audit-retention-warning" className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/5 p-3 max-w-md">
+            <AlertTriangle className="h-4 w-4 text-warning mt-0.5 flex-shrink-0" aria-hidden="true" />
+            <p className="text-sm text-foreground">{t('settings.general.auditRetentionComplianceWarning', { days: AUDIT_RETENTION_COMPLIANCE_DAYS })}</p>
+          </div>
+        )}
+      </div>
+
+      <SettingsFormActions dirty={dirty} hasDirty={hasDirty} envOnly={envOnly || retentionInvalid} isSaving={isSaving} onSave={save} onDiscard={discard} onDirtyChange={onDirtyChange} />
+    </div>
+  );
+}

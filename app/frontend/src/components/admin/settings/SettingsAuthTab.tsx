@@ -1,0 +1,1202 @@
+import { useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useQuery, useMutation } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import { Pencil, Trash2, Plus, Copy } from 'lucide-react';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Switch } from '@/components/ui/switch';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogDescription,
+} from '@/components/ui/dialog';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { SettingSourceBadge } from './SettingSourceBadge';
+import { SettingsFormActions } from './SettingsFormActions';
+import { findSetting } from './utils';
+import { useSettingsForm, type ResetHandler } from './useSettingsForm';
+import type { SettingItem, OAuthProviderConfig, OAuthProviderCreateData, OAuthProviderUpdateData } from '@/api/settings';
+import {
+  listOAuthProviders,
+  createOAuthProvider,
+  updateOAuthProvider,
+  deleteOAuthProvider,
+} from '@/api/settings';
+import { queryKeys } from '@/lib/query-keys';
+import { useInvalidateAuthProviders } from '@/hooks/use-auth-providers';
+import { useTileConfig, useNotificationStatus } from '@/hooks/use-settings';
+import { useEdition } from '@/hooks/use-edition';
+import { formatMutationError } from '@/lib/error-map';
+import { getPublicApiBaseUrl } from '@/lib/dataset-access';
+import { Textarea } from '@/components/ui/textarea';
+import { buildOAuthEndpointFields } from './oauth-endpoint-fields';
+import { SIGN_UP_GATE_KEYS, adminSignUpReach, hasOpenSignupRisk, isValidDomainPattern, providerGrantsAdmin, readSignUpState, widensAdminSignUp } from './auth-tab-rules';
+
+interface TabProps {
+  settings: SettingItem[];
+  envOnly: boolean;
+  onSave: (changes: Record<string, unknown>) => void;
+  onReset: ResetHandler;
+  isSaving: boolean;
+  settingsUpdatedAt?: number;
+  saveFailed?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
+}
+
+// The list endpoint also returns SAML rows, which the SAML page manages.
+function useOAuthProviders() {
+  const { data = [], isLoading, isError } = useQuery({
+    queryKey: queryKeys.settingsOAuth.providers,
+    queryFn: listOAuthProviders,
+  });
+  const providers = useMemo(() => data.filter((p) => (p.provider_type as string) !== 'saml'), [data]);
+  return { providers, allProviders: data, providersKnown: !isLoading && !isError, isLoading, isError };
+}
+
+function useProviderTypeLabels(): Record<string, string> {
+  const { t } = useTranslation('admin');
+  return {
+    google: t('settings.oauth.providerTypes.google'),
+    microsoft: t('settings.oauth.providerTypes.microsoft'),
+    oidc: t('settings.oauth.providerTypes.oidc'),
+    github: t('settings.oauth.providerTypes.github'),
+  };
+}
+
+const GOOGLE_DISCOVERY_URL = 'https://accounts.google.com/.well-known/openid-configuration';
+// GitHub is plain OAuth2 (no discovery URL). The backend auto-populates the
+// authorize/token/userinfo endpoints for github providers when left blank, so
+// GitHub.com needs only client_id/secret; the URL fields are for GitHub Enterprise.
+const GITHUB_DEFAULT_SCOPE = 'read:user user:email';
+
+function getDefaultDiscoveryUrl(type: string, tenantId?: string): string | null {
+  if (type === 'google') return GOOGLE_DISCOVERY_URL;
+  if (type === 'microsoft' && tenantId) {
+    return `https://login.microsoftonline.com/${tenantId}/v2.0/.well-known/openid-configuration`;
+  }
+  return null;
+}
+
+function slugify(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+}
+
+interface ProviderFormData {
+  provider_type: 'google' | 'microsoft' | 'oidc' | 'github';
+  display_name: string;
+  slug: string;
+  client_id: string;
+  client_secret: string;
+  discovery_url: string;
+  // Explicit endpoints are editable for GitHub Enterprise and retained for
+  // imported/legacy OIDC providers that do not use discovery.
+  authorize_url: string;
+  token_url: string;
+  userinfo_url: string;
+  scopes: string;
+  default_role: string;
+  group_claim: string;
+  group_role_mapping: string; // JSON string for editing
+  enabled: boolean;
+  microsoft_tenant_id: string; // UI-only field
+}
+
+const BUILTIN_ROLES = ['viewer', 'editor', 'admin'];
+
+function roleLabel(t: (key: string) => string, role: string): string {
+  return BUILTIN_ROLES.includes(role) ? t(`settings.oauth.roles.${role}`) : role;
+}
+
+const EMPTY_FORM: ProviderFormData = {
+  provider_type: 'google',
+  display_name: 'Google',
+  slug: 'google',
+  client_id: '',
+  client_secret: '',
+  discovery_url: GOOGLE_DISCOVERY_URL,
+  authorize_url: '',
+  token_url: '',
+  userinfo_url: '',
+  scopes: 'openid profile email',
+  default_role: 'viewer',
+  group_claim: '',
+  group_role_mapping: '',
+  enabled: true,
+  microsoft_tenant_id: '',
+};
+
+// --- OAuth Provider Management Section ---
+
+function OAuthProvidersSection() {
+  const { t } = useTranslation('admin');
+  const PROVIDER_TYPE_LABELS = useProviderTypeLabels();
+  // Invalidates the login page's provider buttons alongside this
+  // table so the two cannot drift, see hooks/use-auth-providers.ts.
+  const invalidateAuthProviders = useInvalidateAuthProviders();
+
+  const { providers, isLoading, isError } = useOAuthProviders();
+  const { isEnterprise, isResolved: editionResolved } = useEdition();
+
+  const createMutation = useMutation({
+    mutationFn: (data: OAuthProviderCreateData) => createOAuthProvider(data),
+    onSuccess: () => {
+      invalidateAuthProviders();
+      toast.success(t('settings.oauth.created'));
+    },
+    onError: (err) => {
+      toast.error(formatMutationError('admin:settings.oauth.createFailed', err));
+    },
+  });
+
+  const updateMutation = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: OAuthProviderUpdateData }) =>
+      updateOAuthProvider(id, data),
+    onSuccess: () => {
+      invalidateAuthProviders();
+      toast.success(t('settings.oauth.updated'));
+    },
+    onError: (err) => {
+      toast.error(formatMutationError('admin:settings.oauth.updateFailed', err));
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => deleteOAuthProvider(id),
+    onSuccess: () => {
+      invalidateAuthProviders();
+      toast.success(t('settings.oauth.deleted'));
+    },
+    onError: (err) => {
+      toast.error(formatMutationError('admin:settings.oauth.deleteFailed', err));
+    },
+  });
+
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [editingProvider, setEditingProvider] = useState<OAuthProviderConfig | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<OAuthProviderConfig | null>(null);
+  const [adminRoleConfirmOpen, setAdminRoleConfirmOpen] = useState(false);
+  const [form, setForm] = useState<ProviderFormData>(EMPTY_FORM);
+  // Until the edition is known the fields stay visible, so a saved mapping can
+  // still be seen and cleared if the edition lookup fails.
+  const showGroupFields = (isEnterprise || !editionResolved) && form.provider_type !== 'github';
+  const { data: tileConfig, isLoading: tileConfigLoading } = useTileConfig();
+  // Derive the callback from the CONFIGURED public API URL (what the backend
+  // builds redirect_uri from, same as SAML settings), not the browser origin:
+  // split frontend/API hosts, reverse proxies or a custom API root would
+  // otherwise hand admins the wrong redirect URI.
+  const oauthCallbackUrl = `${getPublicApiBaseUrl(tileConfig) ?? `${window.location.origin}/api`}/auth/oauth/${form.slug || '<provider>'}/callback`;
+  // The OAuth login path resolves redirect_uri from an EXPLICITLY configured
+  // public URL (for_external_use) and raises if none is set, but both
+  // /settings/all and tile-config return a request-derived value, so the
+  // client cannot tell "configured" from "derived". The field is therefore
+  // informational and the hint states the requirement that the deployment's
+  // Public API URL (PUBLIC_API_URL) be configured to match.
+
+  function openAddDialog() {
+    setEditingProvider(null);
+    setForm(EMPTY_FORM);
+    setDialogOpen(true);
+  }
+
+  function openEditDialog(provider: OAuthProviderConfig) {
+    setEditingProvider(provider);
+    let tenantId = '';
+    if (provider.provider_type === 'microsoft' && provider.discovery_url) {
+      const match = provider.discovery_url.match(/microsoftonline\.com\/([^/]+)\//);
+      if (match) tenantId = match[1];
+    }
+    setForm({
+      provider_type: provider.provider_type,
+      display_name: provider.display_name,
+      slug: provider.slug,
+      client_id: provider.client_id,
+      client_secret: '', // never pre-filled
+      discovery_url: provider.discovery_url ?? '',
+      authorize_url: provider.authorize_url ?? '',
+      token_url: provider.token_url ?? '',
+      userinfo_url: provider.userinfo_url ?? '',
+      scopes: provider.scopes,
+      default_role: provider.default_role,
+      group_claim: provider.group_claim ?? '',
+      group_role_mapping: provider.group_role_mapping
+        ? JSON.stringify(provider.group_role_mapping, null, 2)
+        : '',
+      enabled: provider.enabled,
+      microsoft_tenant_id: tenantId,
+    });
+    setDialogOpen(true);
+  }
+
+  function handleProviderTypeChange(type: string) {
+    const providerType = type as ProviderFormData['provider_type'];
+    const displayName = PROVIDER_TYPE_LABELS[providerType] ?? providerType;
+    const isGithub = providerType === 'github';
+    const discoveryUrl = getDefaultDiscoveryUrl(providerType, form.microsoft_tenant_id) ?? '';
+    setForm((prev) => ({
+      ...prev,
+      provider_type: providerType,
+      ...(editingProvider ? {} : { display_name: displayName, slug: slugify(displayName) }),
+      // GitHub has no discovery URL; its endpoints are auto-filled by the
+      // backend (or supplied per-field below for GitHub Enterprise).
+      discovery_url: isGithub ? '' : discoveryUrl,
+      authorize_url: isGithub ? prev.authorize_url : '',
+      token_url: isGithub ? prev.token_url : '',
+      userinfo_url: isGithub ? prev.userinfo_url : '',
+      scopes: isGithub ? GITHUB_DEFAULT_SCOPE : prev.scopes,
+    }));
+  }
+
+  function handleTenantIdChange(tenantId: string) {
+    const discoveryUrl = tenantId
+      ? `https://login.microsoftonline.com/${tenantId}/v2.0/.well-known/openid-configuration`
+      : '';
+    setForm((prev) => ({
+      ...prev,
+      microsoft_tenant_id: tenantId,
+      discovery_url: discoveryUrl,
+    }));
+  }
+
+  function handleSubmit(adminRoleConfirmed = false) {
+    // The backend refuses group mapping outside enterprise, so a hidden field
+    // is cleared rather than resent; until the edition is known, keep it.
+    const clearGroupFields = editionResolved && !isEnterprise;
+    let groupMapping: Record<string, string> | null = null;
+    if (!clearGroupFields && form.group_role_mapping.trim()) {
+      try {
+        groupMapping = JSON.parse(form.group_role_mapping);
+      } catch {
+        toast.error(t('settings.oauth.invalidJson'));
+        return;
+      }
+    }
+
+    if (!editingProvider && !form.client_secret) {
+      toast.error(t('settings.oauth.secretRequired'));
+      return;
+    }
+
+    const grantsAdmin = form.default_role === 'admin'
+      || Object.values(groupMapping ?? {}).includes('admin');
+    if (grantsAdmin && !adminRoleConfirmed) {
+      setAdminRoleConfirmOpen(true);
+      return;
+    }
+
+    // Clear the inactive endpoint mode while preserving an existing generic
+    // OIDC provider's explicit endpoints when it has no discovery URL. Those legacy
+    // endpoint fields are not editable here, but unrelated edits must retain them.
+    const endpointFields = buildOAuthEndpointFields(form);
+
+    if (editingProvider) {
+      const data: OAuthProviderUpdateData = {
+        slug: form.slug,
+        display_name: form.display_name,
+        provider_type: form.provider_type,
+        client_id: form.client_id,
+        scopes: form.scopes,
+        default_role: form.default_role,
+        group_claim: clearGroupFields ? null : form.group_claim || null,
+        group_role_mapping: groupMapping,
+        enabled: form.enabled,
+        ...endpointFields,
+      };
+      // Only include client_secret if user entered a new one
+      if (form.client_secret) {
+        data.client_secret = form.client_secret;
+      }
+      updateMutation.mutate(
+        { id: editingProvider.id, data },
+        { onSuccess: () => setDialogOpen(false) },
+      );
+    } else {
+      const data: OAuthProviderCreateData = {
+        slug: form.slug,
+        display_name: form.display_name,
+        provider_type: form.provider_type,
+        client_id: form.client_id,
+        client_secret: form.client_secret,
+        scopes: form.scopes,
+        default_role: form.default_role,
+        group_claim: clearGroupFields ? null : form.group_claim || null,
+        group_role_mapping: groupMapping,
+        enabled: form.enabled,
+        ...endpointFields,
+      };
+      createMutation.mutate(data, { onSuccess: () => setDialogOpen(false) });
+    }
+  }
+
+  const isMutating = createMutation.isPending || updateMutation.isPending;
+
+  return (
+    <>
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-base font-medium">{t('settings.oauth.title')}</h3>
+            <p className="text-sm text-muted-foreground">
+              {t('settings.oauth.description')}
+            </p>
+          </div>
+          <Button
+            size="sm"
+            onClick={openAddDialog}
+          >
+            <Plus className="me-1 h-4 w-4" />
+            {t('settings.oauth.addProvider')}
+          </Button>
+        </div>
+
+        {isLoading ? (
+          <p className="text-sm text-muted-foreground">{t('settings.oauth.loading')}</p>
+        ) : isError ? (
+          <p className="text-sm text-destructive">{t('settings.oauth.loadFailed')}</p>
+        ) : providers.length === 0 ? (
+          <p className="text-sm text-muted-foreground italic">
+            {t('settings.oauth.emptyState')}
+          </p>
+        ) : (
+          <Table aria-label={t('settings.oauth.title')}>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{t('settings.oauth.provider')}</TableHead>
+                <TableHead>{t('settings.oauth.type')}</TableHead>
+                <TableHead>{t('settings.oauth.defaultRole')}</TableHead>
+                <TableHead>{t('settings.oauth.status')}</TableHead>
+                <TableHead className="text-end">{t('settings.oauth.actions')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {providers.map((provider) => (
+                <TableRow key={provider.id}>
+                  <TableCell className="font-medium">{provider.display_name}</TableCell>
+                  <TableCell>
+                    <Badge variant="outline">
+                      {PROVIDER_TYPE_LABELS[provider.provider_type] ?? provider.provider_type}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>{roleLabel(t, provider.default_role)}</TableCell>
+                  <TableCell>
+                    <Badge variant={provider.enabled ? 'default' : 'secondary'}>
+                      {provider.enabled ? t('settings.oauth.enabled') : t('settings.oauth.disabled')}
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-end">
+                    <div className="flex items-center justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => openEditDialog(provider)}
+                        aria-label={t('settings.oauth.editProvider', { name: provider.display_name })}
+                      >
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setDeleteTarget(provider)}
+                        aria-label={t('settings.oauth.deleteProvider', { name: provider.display_name })}
+                      >
+                        <Trash2 className="h-4 w-4 text-destructive" />
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </div>
+
+      {/* Add/Edit Dialog */}
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent className="sm:max-w-lg max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>
+              {editingProvider ? t('settings.oauth.editTitle') : t('settings.oauth.addTitle')}
+            </DialogTitle>
+            <DialogDescription>
+              {editingProvider
+                ? t('settings.oauth.editDescription')
+                : t('settings.oauth.addDescription')}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="provider-type">{t('settings.oauth.providerType')}</Label>
+              <Select
+                value={form.provider_type}
+                onValueChange={handleProviderTypeChange}
+              >
+                <SelectTrigger id="provider-type" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="google">{t('settings.oauth.providerTypes.google')}</SelectItem>
+                  <SelectItem value="microsoft">{t('settings.oauth.providerTypes.microsoft')}</SelectItem>
+                  <SelectItem value="oidc">{t('settings.oauth.providerTypes.oidc')}</SelectItem>
+                  <SelectItem value="github">{t('settings.oauth.providerTypes.github')}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            {form.provider_type === 'microsoft' && (
+              <div className="space-y-2">
+                <Label htmlFor="tenant-id">{t('settings.oauth.tenantId')}</Label>
+                <Input
+                  id="tenant-id"
+                  value={form.microsoft_tenant_id}
+                  onChange={(e) => handleTenantIdChange(e.target.value)}
+                  placeholder={t('settings.oauth.tenantIdPlaceholder')}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.oauth.tenantIdHint')}
+                </p>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="display-name">{t('settings.oauth.displayName')}</Label>
+              <Input
+                id="display-name"
+                value={form.display_name}
+                onChange={(e) => {
+                  const name = e.target.value;
+                  setForm((prev) => ({
+                    ...prev,
+                    display_name: name,
+                    ...(editingProvider ? {} : { slug: slugify(name) }),
+                  }));
+                }}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="slug">{t('settings.oauth.slug')}</Label>
+              <Input
+                id="slug"
+                value={form.slug}
+                onChange={(e) => setForm((prev) => ({ ...prev, slug: e.target.value }))}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.oauth.slugHint')}
+              </p>
+              {editingProvider && form.slug !== editingProvider.slug && (
+                <p role="alert" className="text-xs text-warning">
+                  {t('settings.auth.slugChangeWarning')}
+                </p>
+              )}
+            </div>
+
+            {/* Read-only redirect/callback URL admins must register with the provider. */}
+            <div className="space-y-2">
+              <Label htmlFor="callback-url">
+                {t('settings.oauth.callbackUrl')}
+              </Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="callback-url"
+                  value={oauthCallbackUrl}
+                  readOnly
+                  className="font-mono text-xs"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  // Until tile-config resolves, the URL may still be the origin
+                  // fallback (wrong on split-host deployments); block copying
+                  // so an admin can't register a premature value.
+                  disabled={tileConfigLoading}
+                  aria-label={t('settings.oauth.copyCallbackUrl')}
+                  onClick={async () => {
+                    // The Clipboard API is unavailable on non-secure (HTTP)
+                    // origins and can reject; await + catch so a failure
+                    // surfaces an error toast instead of a false success.
+                    try {
+                      await navigator.clipboard.writeText(oauthCallbackUrl);
+                      toast.success(t('settings.oauth.callbackUrlCopied'));
+                    } catch {
+                      toast.error(t('settings.oauth.callbackUrlCopyFailed'));
+                    }
+                  }}
+                >
+                  <Copy className="h-4 w-4" />
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t('settings.oauth.callbackUrlHint')}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="client-id">{t('settings.oauth.clientId')}</Label>
+              <Input
+                id="client-id"
+                value={form.client_id}
+                onChange={(e) => setForm((prev) => ({ ...prev, client_id: e.target.value }))}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="client-secret">
+                {t('settings.oauth.clientSecret')}
+                {editingProvider && (
+                  <span className="ms-1 text-xs text-muted-foreground font-normal">
+                    ({t('settings.oauth.clientSecretKeep')})
+                  </span>
+                )}
+              </Label>
+              <Input
+                id="client-secret"
+                type="password"
+                value={form.client_secret}
+                onChange={(e) => setForm((prev) => ({ ...prev, client_secret: e.target.value }))}
+                placeholder={editingProvider ? '********' : ''}
+                // Admin secret, not a login credential, so opt out
+                // of every password manager explicitly.
+                autoComplete="new-password"
+                data-1p-ignore
+                data-lpignore="true"
+                data-bwignore
+              />
+            </div>
+
+            {form.provider_type !== 'github' && (
+              <div className="space-y-2">
+                <Label htmlFor="discovery-url">{t('settings.oauth.discoveryUrl')}</Label>
+                <Input
+                  id="discovery-url"
+                  value={form.discovery_url}
+                  onChange={(e) => setForm((prev) => ({ ...prev, discovery_url: e.target.value }))}
+                  placeholder="https://.../.well-known/openid-configuration"
+                />
+              </div>
+            )}
+
+            {form.provider_type === 'github' && (
+              <div className="space-y-2 rounded-md border border-border/60 p-3">
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.oauth.githubEnterpriseHint')}
+                </p>
+                <div className="space-y-2">
+                  <Label htmlFor="github-authorize-url">{t('settings.oauth.authorizeUrl')}</Label>
+                  <Input
+                    id="github-authorize-url"
+                    value={form.authorize_url}
+                    onChange={(e) => setForm((prev) => ({ ...prev, authorize_url: e.target.value }))}
+                    placeholder="https://github.example.com/login/oauth/authorize"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="github-token-url">{t('settings.oauth.tokenUrl')}</Label>
+                  <Input
+                    id="github-token-url"
+                    value={form.token_url}
+                    onChange={(e) => setForm((prev) => ({ ...prev, token_url: e.target.value }))}
+                    placeholder="https://github.example.com/login/oauth/access_token"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="github-userinfo-url">{t('settings.oauth.userinfoUrl')}</Label>
+                  <Input
+                    id="github-userinfo-url"
+                    value={form.userinfo_url}
+                    onChange={(e) => setForm((prev) => ({ ...prev, userinfo_url: e.target.value }))}
+                    placeholder="https://github.example.com/api/v3/user"
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="scopes">{t('settings.oauth.scopes')}</Label>
+              <Input
+                id="scopes"
+                value={form.scopes}
+                onChange={(e) => setForm((prev) => ({ ...prev, scopes: e.target.value }))}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="provider-default-role">{t('settings.oauth.defaultRole')}</Label>
+              <Select
+                value={form.default_role}
+                onValueChange={(v) => setForm((prev) => ({ ...prev, default_role: v }))}
+              >
+                <SelectTrigger id="provider-default-role" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="viewer">{t('settings.oauth.roles.viewer')}</SelectItem>
+                  <SelectItem value="editor">{t('settings.oauth.roles.editor')}</SelectItem>
+                  <SelectItem value="admin">{t('settings.oauth.roles.admin')}</SelectItem>
+                  {!BUILTIN_ROLES.includes(form.default_role) && (
+                    <SelectItem value={form.default_role}>{form.default_role}</SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
+              {/* The role only applies to accounts this provider
+                  creates, and whether it creates any is the registration
+                  switch's call. Say so here, where the decision is made. */}
+              <p className="text-xs text-muted-foreground">
+                {t('settings.oauth.defaultRoleHint')}
+              </p>
+            </div>
+
+            {showGroupFields && (
+              <>
+              <div className="space-y-2">
+                <Label htmlFor="group-claim">{t('settings.oauth.groupClaim')}</Label>
+                <Input
+                  id="group-claim"
+                  value={form.group_claim}
+                  onChange={(e) => setForm((prev) => ({ ...prev, group_claim: e.target.value }))}
+                  placeholder='e.g. "groups"'
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.oauth.groupClaimHint')}
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="group-role-mapping">{t('settings.oauth.groupRoleMapping')}</Label>
+                <Textarea
+                  id="group-role-mapping"
+                  className="min-h-[80px]"
+                  value={form.group_role_mapping}
+                  onChange={(e) => setForm((prev) => ({ ...prev, group_role_mapping: e.target.value }))}
+                  placeholder='{"IdP Group": "viewer", "Admins": "admin"}'
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.oauth.groupRoleMappingHint')}
+                </p>
+              </div>
+              </>
+            )}
+
+            <div className="flex items-center gap-3">
+              <Switch
+                id="enabled"
+                checked={form.enabled}
+                onCheckedChange={(checked) =>
+                  setForm((prev) => ({ ...prev, enabled: checked }))
+                }
+              />
+              <Label htmlFor="enabled">{t('settings.oauth.enabledToggle')}</Label>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>
+              {t('common:cancel')}
+            </Button>
+            <Button
+              onClick={() => handleSubmit()}
+              disabled={isMutating || !form.slug || !form.client_id}
+            >
+              {editingProvider ? t('settings.oauth.saveChanges') : t('settings.oauth.createProvider')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <AlertDialog open={adminRoleConfirmOpen} onOpenChange={setAdminRoleConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('settings.auth.adminRoleConfirmTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {form.default_role === 'admin'
+                ? t('settings.auth.adminRoleConfirmDescription')
+                : t('settings.auth.adminGroupConfirmDescription')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={() => handleSubmit(true)}>
+              {t('settings.auth.adminRoleConfirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Delete Confirmation */}
+      <AlertDialog
+        open={!!deleteTarget}
+        onOpenChange={(open) => { if (!open) setDeleteTarget(null); }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('settings.oauth.deleteTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('settings.oauth.deleteDescription', { name: deleteTarget?.display_name })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                if (deleteTarget) {
+                  deleteMutation.mutate(deleteTarget.id, {
+                    onSuccess: () => setDeleteTarget(null),
+                  });
+                }
+              }}
+            >
+              {t('common:delete')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+// --- Main Auth Tab ---
+
+const AUTH_FIELDS = [
+  { key: 'registration_enabled', defaultValue: false },
+  { key: 'registration_default_role', defaultValue: 'viewer' },
+  { key: 'landing_first', defaultValue: false },
+  { key: 'password_login_enabled', defaultValue: true },
+  // compare:'json' deep-compares the array so the dirty flag clears after a save.
+  { key: 'allowed_email_domains', defaultValue: [] as string[], compare: 'json' as const },
+  { key: 'access_token_expire_minutes', defaultValue: 15 },
+  { key: 'refresh_token_expire_days', defaultValue: 7 },
+  { key: 'login_rate_limit', defaultValue: 5 },
+  { key: 'email_verification_required', defaultValue: true },
+] as const;
+
+// Resetting these loosens sign-up or sign-in at once, with no Save step.
+const CONFIRM_RESET_KEYS = new Set([
+  'registration_enabled',
+  'allowed_email_domains',
+  'email_verification_required',
+  'password_login_enabled',
+]);
+
+function NumberField({
+  id,
+  value,
+  min,
+  max,
+  disabled,
+  onValue,
+}: {
+  id: string;
+  value: number;
+  min: number;
+  max: number;
+  disabled: boolean;
+  onValue: (n: number) => void;
+}) {
+  // An emptied field keeps the last number in form state rather than sending 0.
+  const [draft, setDraft] = useState<string | null>(null);
+  return (
+    <Input
+      id={id}
+      type="number"
+      min={min}
+      max={max}
+      value={draft ?? String(value)}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setDraft(raw);
+        if (raw !== '' && Number.isFinite(Number(raw))) onValue(Number(raw));
+      }}
+      onBlur={() => setDraft(null)}
+      disabled={disabled}
+      className="w-32"
+    />
+  );
+}
+
+function SettingHeading({ id, children }: { id: string; children: string }) {
+  return <h3 id={id} className="border-b border-border pb-2 text-base font-medium">{children}</h3>;
+}
+
+export function SettingsAuthTab({ settings, envOnly, onSave, onReset: submitReset, isSaving, settingsUpdatedAt, saveFailed, onDirtyChange }: TabProps) {
+  const { t } = useTranslation('admin');
+  const { values, setters, dirty, hasDirty, discard, onReset: resetSetting } = useSettingsForm(settings, AUTH_FIELDS, isSaving, settingsUpdatedAt, saveFailed, submitReset);
+  const { providers, allProviders, providersKnown } = useOAuthProviders();
+  const { data: notifStatus } = useNotificationStatus();
+  const [pendingReset, setPendingReset] = useState<string | null>(null);
+  const [pendingAdminSave, setPendingAdminSave] = useState<Record<string, unknown> | null>(null);
+
+  function onReset(key: string) {
+    if (CONFIRM_RESET_KEYS.has(key)) setPendingReset(key);
+    else void resetSetting(key);
+  }
+
+  // Local input state for the domain allowlist add-input (not part of form state).
+  const [domainInput, setDomainInput] = useState('');
+  const [domainError, setDomainError] = useState<string | null>(null);
+
+  const domains = (values.allowed_email_domains as string[]) ?? [];
+  const registrationEnabled = values.registration_enabled as boolean;
+  const defaultRoleSetting = findSetting(settings, 'registration_default_role');
+  const defaultRole = values.registration_default_role as string;
+  const smtpMissing = notifStatus?.smtp_configured === false;
+  // SAML rows count here: they provision accounts the same way. Until the
+  // providers load, assume one may give the admin role, so the check fails closed.
+  const providerGivesAdmin = providerGrantsAdmin(allProviders);
+  const providerMayGiveAdmin = providerGivesAdmin || !providersKnown;
+  const adminRoleInEffect = defaultRole === 'admin' || providerMayGiveAdmin;
+  const signUpNow = readSignUpState((key) => findSetting(settings, key)?.value);
+  const signUpAfterSave = readSignUpState((key) => values[key as keyof typeof values]);
+  const adminReachNow = adminSignUpReach(
+    signUpNow,
+    providerGivesAdmin,
+    notifStatus?.smtp_configured === true,
+  );
+  const adminReachAfterSave = adminSignUpReach(
+    signUpAfterSave,
+    providerMayGiveAdmin,
+    !smtpMissing,
+  );
+
+  function handleAddDomain() {
+    const normalized = domainInput.trim().toLowerCase();
+    if (!normalized) {
+      setDomainInput('');
+      return;
+    }
+    if (!isValidDomainPattern(normalized)) {
+      setDomainError(normalized);
+      return;
+    }
+    setDomainError(null);
+    if (!domains.includes(normalized)) {
+      setters.allowed_email_domains([...domains, normalized]);
+    }
+    setDomainInput('');
+  }
+
+  function handleRemoveDomain(domain: string) {
+    setters.allowed_email_domains(domains.filter((d) => d !== domain));
+  }
+
+  return (
+    <div className="space-y-8">
+      {hasDirty && (
+        <p role="status" className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm">
+          {t('settings.auth.unsavedIndicator')}
+        </p>
+      )}
+
+      <section className="space-y-6" aria-labelledby="auth-section-signup">
+        <SettingHeading id="auth-section-signup">{t('settings.auth.sectionSignUp')}</SettingHeading>
+
+        <div className="flex items-center justify-between max-w-md">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="registration-toggle">{t('settings.general.registration')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'registration_enabled')?.source ?? 'default'} settingKey="registration_enabled" onReset={onReset} />
+            </div>
+            <p className="text-sm text-muted-foreground">{t('settings.general.registrationDescription')}</p>
+          </div>
+          <Switch
+            id="registration-toggle"
+            checked={registrationEnabled}
+            onCheckedChange={setters.registration_enabled}
+            disabled={envOnly}
+          />
+        </div>
+
+        {defaultRoleSetting && (
+          <div className="space-y-2 max-w-md">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="registration-default-role">{t('settings.auth.registrationDefaultRole')}</Label>
+              <SettingSourceBadge source={defaultRoleSetting.source ?? 'default'} settingKey="registration_default_role" onReset={onReset} />
+            </div>
+            <Select
+              value={defaultRole}
+              onValueChange={setters.registration_default_role}
+              disabled={envOnly}
+            >
+              <SelectTrigger id="registration-default-role" className="w-48">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="viewer">{t('settings.oauth.roles.viewer')}</SelectItem>
+                <SelectItem value="editor">{t('settings.oauth.roles.editor')}</SelectItem>
+                <SelectItem value="admin">{t('settings.oauth.roles.admin')}</SelectItem>
+                {!BUILTIN_ROLES.includes(defaultRole) && (
+                  <SelectItem value={defaultRole}>{defaultRole}</SelectItem>
+                )}
+              </SelectContent>
+            </Select>
+            <p className="text-sm text-muted-foreground">{t('settings.auth.registrationDefaultRoleHint')}</p>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between max-w-md">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="email-verification-toggle">{t('settings.security.emailVerificationRequired')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'email_verification_required')?.source ?? 'default'} settingKey="email_verification_required" onReset={onReset} />
+            </div>
+            <p className="text-sm text-muted-foreground">{t('settings.security.emailVerificationRequiredDescription')}</p>
+            {!registrationEnabled && (
+              <p className="text-sm text-muted-foreground">{t('settings.auth.verificationNeedsRegistration')}</p>
+            )}
+            {smtpMissing && (
+              <p className="text-sm text-warning">{t('settings.auth.smtpMissingNote')}</p>
+            )}
+          </div>
+          <Switch
+            id="email-verification-toggle"
+            checked={values.email_verification_required as boolean}
+            onCheckedChange={setters.email_verification_required}
+            disabled={envOnly || !registrationEnabled}
+          />
+        </div>
+
+        <div className="space-y-3 max-w-md">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="domain-input">{t('settings.security.allowedEmailDomains')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'allowed_email_domains')?.source ?? 'default'} settingKey="allowed_email_domains" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.security.allowedEmailDomainsDescription')}</p>
+
+          {domains.length === 0 ? (
+            <p className="text-sm text-muted-foreground italic">{t('settings.security.allowedEmailDomainsUnrestricted')}</p>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {domains.map((domain) => (
+                <Badge key={domain} variant="secondary" className="flex items-center gap-1 px-2 py-1">
+                  <span>{domain}</span>
+                  <button
+                    type="button"
+                    aria-label={t('settings.security.removeDomain', { domain })}
+                    onClick={() => handleRemoveDomain(domain)}
+                    disabled={envOnly}
+                    className="ml-1 rounded-full hover:bg-muted-foreground/20 disabled:pointer-events-none"
+                  >
+                    <span aria-hidden="true" className="text-xs leading-none">&times;</span>
+                  </button>
+                </Badge>
+              ))}
+            </div>
+          )}
+
+          <div className="flex items-center gap-2">
+            <Input
+              id="domain-input"
+              value={domainInput}
+              onChange={(e) => { setDomainInput(e.target.value); setDomainError(null); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddDomain(); } }}
+              placeholder={t('settings.security.addDomainPlaceholder')}
+              aria-invalid={domainError !== null}
+              disabled={envOnly}
+              className="w-48"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handleAddDomain}
+              disabled={envOnly || !domainInput.trim()}
+            >
+              {t('settings.security.addDomain')}
+            </Button>
+          </div>
+          {domainError !== null && (
+            <p role="alert" className="text-sm text-destructive">
+              {t('settings.auth.invalidDomain', { domain: domainError })}
+            </p>
+          )}
+          {hasOpenSignupRisk(registrationEnabled, domains, providers) && (
+            <p role="alert" className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm">
+              {t('settings.auth.openSignupWarning')}
+            </p>
+          )}
+        </div>
+      </section>
+
+      <section className="space-y-6" aria-labelledby="auth-section-signin">
+        <SettingHeading id="auth-section-signin">{t('settings.auth.sectionSignIn')}</SettingHeading>
+
+        <div className="flex items-center justify-between max-w-md">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="password-login-toggle">{t('settings.security.passwordLogin')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'password_login_enabled')?.source ?? 'default'} settingKey="password_login_enabled" onReset={onReset} />
+            </div>
+            <p className="text-sm text-muted-foreground">{t('settings.security.passwordLoginDescription')}</p>
+          </div>
+          <Switch
+            id="password-login-toggle"
+            checked={values.password_login_enabled as boolean}
+            onCheckedChange={setters.password_login_enabled}
+            disabled={envOnly}
+          />
+        </div>
+
+        <div className="flex items-center justify-between max-w-md">
+          <div className="space-y-0.5">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="landing-first-toggle">{t('settings.general.landingFirst')}</Label>
+              <SettingSourceBadge source={findSetting(settings, 'landing_first')?.source ?? 'default'} settingKey="landing_first" onReset={onReset} />
+            </div>
+            <p className="text-sm text-muted-foreground">{t('settings.general.landingFirstDescription')}</p>
+          </div>
+          <Switch
+            id="landing-first-toggle"
+            checked={values.landing_first as boolean}
+            onCheckedChange={setters.landing_first}
+            disabled={envOnly}
+          />
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="login-rate-limit">{t('settings.security.loginRateLimitLabel')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'login_rate_limit')?.source ?? 'default'} settingKey="login_rate_limit" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.security.loginRateLimitDescription')}</p>
+          <NumberField
+            id="login-rate-limit"
+            min={1}
+            max={1000}
+            value={values.login_rate_limit as number}
+            onValue={setters.login_rate_limit}
+            disabled={envOnly}
+          />
+        </div>
+      </section>
+
+      <section className="space-y-6" aria-labelledby="auth-section-sessions">
+        <SettingHeading id="auth-section-sessions">{t('settings.auth.sectionSessions')}</SettingHeading>
+
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="access-token-expire">{t('settings.security.accessTokenExpire')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'access_token_expire_minutes')?.source ?? 'default'} settingKey="access_token_expire_minutes" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.security.accessTokenExpireDescription')}</p>
+          <NumberField
+            id="access-token-expire"
+            min={1}
+            max={1440}
+            value={values.access_token_expire_minutes as number}
+            onValue={setters.access_token_expire_minutes}
+            disabled={envOnly}
+          />
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Label htmlFor="refresh-token-expire">{t('settings.security.refreshTokenExpire')}</Label>
+            <SettingSourceBadge source={findSetting(settings, 'refresh_token_expire_days')?.source ?? 'default'} settingKey="refresh_token_expire_days" onReset={onReset} />
+          </div>
+          <p className="text-sm text-muted-foreground">{t('settings.security.refreshTokenExpireDescription')}</p>
+          <NumberField
+            id="refresh-token-expire"
+            min={1}
+            max={365}
+            value={values.refresh_token_expire_days as number}
+            onValue={setters.refresh_token_expire_days}
+            disabled={envOnly}
+          />
+        </div>
+
+        <p className="text-sm text-muted-foreground italic">{t('settings.security.tokenLifetimeNote')}</p>
+      </section>
+
+      <div className="sticky bottom-0 z-10 -mx-1 border-t border-border bg-background px-1 pb-2">
+        <SettingsFormActions dirty={dirty} hasDirty={hasDirty} envOnly={envOnly} isSaving={isSaving} onSave={(changes) => {
+          const opensAdminSignUp = changes.registration_default_role === 'admin'
+            || (Object.keys(changes).some((key) => SIGN_UP_GATE_KEYS.has(key))
+              && widensAdminSignUp(
+                adminReachNow,
+                adminReachAfterSave,
+                signUpNow.allowed_email_domains,
+                signUpAfterSave.allowed_email_domains,
+              ));
+          if (opensAdminSignUp) setPendingAdminSave(changes);
+          else onSave(changes);
+        }} onDiscard={discard} onDirtyChange={onDirtyChange} />
+      </div>
+
+      <hr className="border-border" />
+
+      <OAuthProvidersSection />
+
+      <AlertDialog open={pendingAdminSave !== null} onOpenChange={(open) => { if (!open) setPendingAdminSave(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('settings.auth.adminRoleConfirmTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {adminReachAfterSave > 0
+                ? t('settings.auth.signupAdminActivationDescription')
+                : t('settings.auth.registrationAdminConfirmDescription')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                if (pendingAdminSave) onSave(pendingAdminSave);
+                setPendingAdminSave(null);
+              }}
+            >
+              {t('settings.auth.adminRoleConfirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={pendingReset !== null} onOpenChange={(open) => { if (!open) setPendingReset(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('settings.auth.resetConfirmTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>{t('settings.auth.resetConfirmDescription')}</AlertDialogDescription>
+            {/* The backend default is unknown here, so a reset may open admin sign-ups. */}
+            {pendingReset !== null && SIGN_UP_GATE_KEYS.has(pendingReset) && adminRoleInEffect && adminReachNow < 2 && (
+              <p className="text-sm font-medium text-destructive">{t('settings.auth.signupAdminActivationDescription')}</p>
+            )}
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (pendingReset) void resetSetting(pendingReset);
+                setPendingReset(null);
+              }}
+            >
+              {t('settings.auth.resetConfirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}

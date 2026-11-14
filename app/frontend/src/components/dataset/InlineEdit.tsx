@@ -1,0 +1,257 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
+import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
+
+interface InlineEditProps {
+  value: string;
+  onSave: (newValue: string) => void | Promise<void>;
+  as?: 'h1' | 'h2' | 'p' | 'span';
+  multiline?: boolean;
+  /** Stage multiline drafts when focus leaves the editor. */
+  saveOnBlur?: boolean;
+  className?: string;
+  placeholder?: string;
+  canEdit?: boolean;
+  onDirtyChange?: (isDirty: boolean) => void;
+  /** Start in edit mode immediately (e.g. after clicking "Add" CTA). */
+  initialEditing?: boolean;
+  /** Emit an emptied value so the consumer can stage a clear.
+   * Off by default — non-clearable fields (title) must never save empty. */
+  allowClear?: boolean;
+  /** Input type of the single-line editor; `date` yields and expects ISO `YYYY-MM-DD`. */
+  inputType?: 'text' | 'date';
+  /** Shown in view mode in place of `value`, which stays the editable raw value. */
+  displayValue?: string;
+}
+
+export function InlineEdit({
+  value,
+  onSave,
+  as: Tag = 'span',
+  multiline = false,
+  saveOnBlur = false,
+  className,
+  placeholder = '',
+  canEdit = true,
+  onDirtyChange,
+  initialEditing = false,
+  allowClear = false,
+  inputType = 'text',
+  displayValue,
+}: InlineEditProps) {
+  const { t } = useTranslation();
+  const [editing, setEditing] = useState(initialEditing);
+  const [draft, setDraft] = useState(value);
+  const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+  const multilineContainerRef = useRef<HTMLDivElement>(null);
+  const isDirtyRef = useRef(false);
+
+  const emitDirtyChange = useCallback(
+    (nextIsDirty: boolean) => {
+      if (!onDirtyChange || isDirtyRef.current === nextIsDirty) {
+        return;
+      }
+      isDirtyRef.current = nextIsDirty;
+      onDirtyChange(nextIsDirty);
+    },
+    [onDirtyChange],
+  );
+
+  const computeDirty = useCallback(
+    (nextDraft: string) => nextDraft.trim() !== value.trim(),
+    [value],
+  );
+
+  // Sync draft with external value when not editing
+  useEffect(() => {
+    if (!editing) {
+      setDraft(value);
+      emitDirtyChange(false);
+    }
+  }, [value, editing, emitDirtyChange]);
+
+  // Focus input after entering edit mode, using requestAnimationFrame
+  // to avoid the activation click triggering an immediate blur
+  useEffect(() => {
+    if (editing) {
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+        // Select all text for easy replacement
+        inputRef.current?.select();
+      });
+    }
+  }, [editing]);
+
+  const save = useCallback(async () => {
+    const trimmed = draft.trim();
+    // A half-edited date input reports an empty value; that is not a clear.
+    const incompleteInput = inputRef.current?.validity.badInput === true;
+    try {
+      if (!incompleteInput && (trimmed || allowClear) && trimmed !== value) {
+        // Wrap onSave in try/catch so a rejected mutation never
+        // strands the editor open or produces an unhandled rejection.
+        await onSave(trimmed);
+      }
+    } catch {
+      toast.error(t('dataset:inline.saveFailed'));
+    } finally {
+      emitDirtyChange(false);
+      setEditing(false);
+    }
+  }, [draft, value, allowClear, onSave, emitDirtyChange, t]);
+
+  const cancel = useCallback(() => {
+    setDraft(value);
+    emitDirtyChange(false);
+    setEditing(false);
+  }, [value, emitDirtyChange]);
+
+  const handleDraftChange = useCallback(
+    (nextDraft: string) => {
+      setDraft(nextDraft);
+      emitDirtyChange(computeDirty(nextDraft));
+    },
+    [computeDirty, emitDirtyChange],
+  );
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        cancel();
+      }
+      if (e.key === 'Enter' && !multiline) {
+        e.preventDefault();
+        save();
+      }
+      // For multiline, Enter inserts a newline; Ctrl+Enter or Meta+Enter saves
+      if (e.key === 'Enter' && multiline && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        save();
+      }
+    },
+    [cancel, save, multiline],
+  );
+
+  // Clear the dirty flag on true unmount ONLY. Depending on [emitDirtyChange]
+  // would re-run this cleanup whenever the onDirtyChange prop identity changes,
+  // which the dirty change itself triggers when the parent passes an inline
+  // arrow, instantly self-reverting the flag so the pending-edits bar never
+  // appeared for an in-progress multiline edit.
+  const emitDirtyChangeRef = useRef(emitDirtyChange);
+  useEffect(() => {
+    emitDirtyChangeRef.current = emitDirtyChange;
+  });
+  useEffect(
+    () => () => {
+      emitDirtyChangeRef.current(false);
+    },
+    [],
+  );
+
+  // The placeholder invites an edit, so a viewer who can't edit sees a neutral empty state.
+  if (!canEdit) {
+    return (
+      <Tag className={className}>
+        {displayValue || value || <span className="text-muted-foreground">{t('common:notSet')}</span>}
+      </Tag>
+    );
+  }
+
+  // Editing mode
+  if (editing) {
+    const inputClasses = cn(
+      'w-full bg-transparent border-b-2 border-primary outline-none',
+      'px-1 -mx-1',
+      className,
+    );
+
+    if (multiline) {
+      return (
+        <div
+          ref={multilineContainerRef}
+          onBlur={(e) => {
+            if (multilineContainerRef.current?.contains(e.relatedTarget as Node)) return;
+            if (saveOnBlur) void save();
+            else cancel();
+          }}
+        >
+          <textarea
+            ref={inputRef as React.RefObject<HTMLTextAreaElement>}
+            value={draft}
+            onChange={(e) => handleDraftChange(e.target.value)}
+            onKeyDown={handleKeyDown}
+            // Deliberately shares inputClasses with its sibling <input> so the
+            // inline editor looks identical in both modes; that's why it doesn't
+            // use the ui/textarea primitive.
+            className={cn(inputClasses, 'resize-none min-h-[3rem]')}
+            rows={3}
+            title={t('common:inlineEdit.hint', { defaultValue: 'Ctrl+Enter to save, Escape to cancel' })}
+          />
+          {/* Visible buttons, because click-away cancels and a hover-only
+              Ctrl+Enter hint loses edits. mousedown is prevented so the
+              textarea's blur→cancel doesn't fire before the click lands. */}
+          <div className="mt-1 flex items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => void save()}
+            >
+              {t('common:save')}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={cancel}
+            >
+              {t('common:cancel')}
+            </Button>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <input
+        ref={inputRef as React.RefObject<HTMLInputElement>}
+        type={inputType}
+        value={draft}
+        onChange={(e) => handleDraftChange(e.target.value)}
+        onBlur={save}
+        onKeyDown={handleKeyDown}
+        className={inputClasses}
+        // The single-line editor has no other accessible-name mechanism
+        // (unlike the multiline mode's `title` hint), so fall back to the
+        // caller's placeholder, the same string already shown as ghost text
+        // when the value is empty.
+        aria-label={placeholder || undefined}
+      />
+    );
+  }
+
+  // Display mode with hover indicator
+  return (
+    <Tag
+      role="button"
+      tabIndex={0}
+      onClick={() => setEditing(true)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          setEditing(true);
+        }
+      }}
+      className={cn(
+        'cursor-pointer hover:bg-accent/50 rounded-sm px-1 -mx-1 transition-colors duration-150',
+        className,
+      )}
+    >
+      {displayValue || value || <span className="text-muted-foreground italic">{placeholder}</span>}
+    </Tag>
+  );
+}

@@ -1,0 +1,632 @@
+"""OGC/STAC asset and record conversion helpers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import uuid
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
+from urllib.parse import urlencode
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.platform.storage.provider import StorageProvider
+
+import structlog
+
+from app.core.config import settings
+from app.core.geo import extent_to_bbox, shown_extent, shows_mosaic_size
+from app.core.pointcloud import POINTCLOUD_MEDIA_TYPE, pointcloud_path
+from app.core.raster_bands import band_display_name, stac_band_nodata
+from app.core.record_types import RASTER_FAMILY_RECORD_TYPES, capabilities
+from app.core.tile_scope import (
+    republished_tile_url,
+    tile_template_params,
+    tile_template_query,
+)
+from app.core.tiles3d import TILESET_MEDIA_TYPE, tileset_path
+from app.modules.catalog.datasets.domain.models import Dataset
+from app.modules.catalog.datasets.domain.source_freshness import (
+    compute_source_freshness,
+)
+from app.modules.catalog.records.localization import select_localized_record_text
+from app.modules.catalog.search.record_metadata import (
+    build_contacts,
+    build_external_ids,
+    build_themes,
+    build_time,
+)
+from app.modules.catalog.sources.provenance import derive_last_edited
+from app.platform.dataset_origin import classify_origin, project_unknown
+from app.standards.distributions import cog_download_path, is_publishable_url
+from app.standards.ogc.utils import build_url
+
+logger = structlog.stdlib.get_logger(__name__)
+
+_FORMAT_MEDIA = {
+    "gpkg": "application/geopackage+sqlite3",
+    "geojson": "application/geo+json",
+    "shp": "application/x-shapefile",
+    "csv": "text/csv",
+    "parquet": "application/vnd.apache.parquet",
+    "fgb": "application/vnd.flatgeobuf",
+    "pmtiles": "application/vnd.pmtiles",
+}
+
+_RASTER_FORMAT_MEDIA = {
+    "geotiff": "image/tiff; application=geotiff",
+    "cog": "image/tiff; application=geotiff; profile=cloud-optimized",
+}
+
+# Non-spatial table formats -- shapefile excluded (geometry-specific)
+_TABLE_FORMAT_MEDIA = {
+    "csv": "text/csv",
+    "gpkg": "application/geopackage+sqlite3",
+    "geojson": "application/geo+json",
+}
+
+
+def _quicklook_version(uri: str | None) -> str | None:
+    """A token that changes whenever the dataset's quicklook points at a new image."""
+    if uri is None:
+        return None
+    return hashlib.sha256(uri.encode()).hexdigest()[:12]
+
+
+def _record_formats(record_type: str) -> list[str]:
+    """Media types a record advertises; the vector exports need a feature table."""
+    if record_type in RASTER_FAMILY_RECORD_TYPES:
+        return list(_RASTER_FORMAT_MEDIA.values())
+    if record_type == "table":
+        return list(_TABLE_FORMAT_MEDIA.values())
+    if record_type == "tiles3d_dataset":
+        # Tile content types vary by tileset; its tileset.json is always JSON.
+        return [TILESET_MEDIA_TYPE]
+    if record_type == "pointcloud_dataset":
+        return [POINTCLOUD_MEDIA_TYPE]
+    if capabilities(record_type).feature_table:
+        return list(_FORMAT_MEDIA.values())
+    return []
+
+
+def build_assets(
+    dataset: Dataset,
+    public_api_url: str,
+    *,
+    stac_asset_rows: list[dict] | None = None,
+    record_status: str = "draft",
+    storage_backend: str = "local",
+    storage_provider: "StorageProvider | None" = None,
+    public_app_url: str | None = None,
+    cog_download: bool = False,
+) -> dict:
+    """Build a modality-aware unified assets dict for a dataset.
+
+    ``cog_download``: the caller may use the COG download route, so a
+    raster's stored data-role assets are advertised: a signed URL on S3,
+    the route on any other store.
+
+    The raster/VRT ``raster_tiles`` asset uses ``public_app_url``
+    (nginx-rewritten to the tile proxy), not ``/api``; every other
+    asset/link stays on ``public_api_url``.
+    """
+    record_type = (
+        getattr(dataset.record, "record_type", "vector_dataset") or "vector_dataset"
+    )
+
+    if record_type == "collection":
+        return {}
+
+    assets: dict = {}
+
+    if record_type == "vector_dataset":
+        for fmt, media_type in _FORMAT_MEDIA.items():
+            assets[f"download_{fmt}"] = {
+                "href": build_url(
+                    f"/datasets/{dataset.id}/export?format={fmt}",
+                    base_url=public_api_url,
+                ),
+                "type": media_type,
+                "title": f"Download as {fmt.upper()}",
+                "roles": ["data"],
+            }
+        # Vector tiles and OGC features (require table_name)
+        if dataset.table_name is not None:
+            assets["vector_tiles"] = {
+                "href": build_url(
+                    f"/tiles/data.{dataset.table_name}/{{z}}/{{x}}/{{y}}.pbf"
+                    + tile_template_query(
+                        None, getattr(dataset, "publication_version", None)
+                    ),
+                    base_url=public_api_url,
+                ),
+                "type": "application/vnd.mapbox-vector-tile",
+                "title": "Vector tiles",
+                "roles": ["visual"],
+            }
+            assets["ogc_features"] = {
+                "href": build_url(
+                    f"/collections/{dataset.id}/items",
+                    base_url=public_api_url,
+                ),
+                "type": "application/geo+json",
+                "title": "OGC Features",
+                "roles": ["data"],
+            }
+
+    elif record_type in RASTER_FAMILY_RECORD_TYPES:
+        # Public APP origin, not /api. Versioned so a
+        # refetching STAC/OGC client stops sharing the unversioned entry, and
+        # a publication transition rolls what it may share.
+        raster_tiles_path = (
+            f"/raster-tiles/{dataset.id}/tiles/{{z}}/{{x}}/{{y}}.png"
+            + (
+                tile_template_query(
+                    getattr(dataset, "tile_cache_version", None),
+                    getattr(dataset, "publication_version", None),
+                )
+            )
+        )
+        assets["raster_tiles"] = {
+            "href": build_url(
+                raster_tiles_path,
+                base_url=(public_app_url or public_api_url),
+            ),
+            "type": "image/png",
+            "title": "Raster tiles",
+            "roles": ["visual"],
+        }
+
+    elif record_type == "tiles3d_dataset":
+        assets["tileset"] = {
+            "href": build_url(tileset_path(dataset.id), base_url=public_api_url),
+            "type": TILESET_MEDIA_TYPE,
+            "title": "3D Tiles tileset",
+            "roles": ["data"],
+        }
+
+    elif record_type == "pointcloud_dataset" and dataset.pointcloud_attempt_id:
+        copc_path = pointcloud_path(dataset.id, dataset.pointcloud_attempt_id)
+        assets["pointcloud"] = {
+            "href": build_url(copc_path, base_url=public_api_url),
+            "type": POINTCLOUD_MEDIA_TYPE,
+            "title": "COPC point cloud",
+            "roles": ["data"],
+        }
+
+    # Merge DatasetAsset rows -- takes precedence on key conflict
+    stac_built = _build_stac_assets(
+        stac_asset_rows,
+        record_status=record_status,
+        storage_backend=storage_backend,
+        public_api_url=public_api_url,
+        storage_provider=storage_provider,
+        proxy_routes=_proxied_raster_asset_routes(dataset, record_type, record_status),
+        cog_download=cog_download,
+    )
+    assets.update(stac_built)
+
+    return assets
+
+
+def _proxied_raster_asset_routes(
+    dataset: Dataset,
+    record_type: str,
+    record_status: str,
+) -> dict[str, str] | None:
+    """API routes serving a published raster's stored files behind its access checks.
+
+    They stand in for an asset that has no URL of its own: any key on local
+    or Azure storage, and an S3 key where the caller passed no provider to
+    sign it. VRTs have no single COG. The quicklook URLs carry the tile
+    cache-key params: that route is cached publicly, and a replaced raster
+    must not show the old images.
+    """
+    if not (record_status == "published" and record_type == "raster_dataset"):
+        return None
+    version = tile_template_params(
+        getattr(dataset, "tile_cache_version", None),
+        getattr(dataset, "publication_version", None),
+    )
+    quicklook = f"/datasets/{dataset.id}/quicklook?"
+    return {
+        "data": cog_download_path(dataset.id),
+        "thumbnail": quicklook + urlencode({"size": 256, **version}),
+        "overview": quicklook + urlencode({"size": 512, **version}),
+    }
+
+
+def _build_stac_assets(
+    asset_rows: list[dict] | None,
+    *,
+    record_status: str = "draft",
+    storage_backend: str = "local",
+    public_api_url: str = "",
+    storage_provider: "StorageProvider | None" = None,
+    proxy_routes: dict[str, str] | None = None,
+    cog_download: bool = False,
+) -> dict:
+    if not asset_rows:
+        return {}
+
+    from app.platform.assets.urls import is_remote_href, resolve_asset_url
+
+    from app.platform.assets.keys import is_public_asset_key
+
+    result = {}
+    for row in asset_rows:
+        # Shared boundary — see app/platform/assets/keys.py for
+        # why it is an allowlist.
+        if not is_public_asset_key(row["key"]):
+            continue
+        # Stored data files go only to callers the COG download route serves,
+        # which excludes every VRT; a remote URL is public at its origin.
+        # The primary keys count too, since roles is nullable.
+        if (
+            ("data" in (row.get("roles") or ()) or row["key"] in ("data", "vrt"))
+            and not cog_download
+            and not is_remote_href(row["href"])
+        ):
+            continue
+        resolved_href = resolve_asset_url(
+            row["href"],
+            storage_backend=storage_backend,
+            record_status=record_status,
+            roles=row.get("roles"),
+            public_api_url=public_api_url,
+            storage_provider=storage_provider,
+        )
+        if resolved_href is None and proxy_routes and row["key"] in proxy_routes:
+            resolved_href = build_url(proxy_routes[row["key"]], base_url=public_api_url)
+        # No safe authorized URL (e.g. a local key with no serving route):
+        # skip the entry rather than publish a dead /assets/{key} href.
+        if resolved_href is None:
+            continue
+        entry: dict = {"href": resolved_href}
+        if row.get("media_type"):
+            entry["type"] = row["media_type"]
+        if row.get("roles"):
+            entry["roles"] = row["roles"]
+        if row.get("title"):
+            entry["title"] = row["title"]
+        if row.get("description"):
+            entry["description"] = row["description"]
+        result[row["key"]] = entry
+    return result
+
+
+def dataset_to_ogc_record(
+    dataset: Dataset,
+    public_api_url: str,
+    *,
+    stac_asset_rows: list[dict] | None = None,
+    raster_meta: dict | None = None,
+    spatial_extent_geojson: str | None = None,
+    public_app_url: str | None = None,
+    preferred_languages: Sequence[str] | None = None,
+    lineage_summary: str | None = None,
+    vrt_extents: Mapping[uuid.UUID, object | None] | None = None,
+) -> dict:
+    """Convert a Dataset ORM object to an OGC Record GeoJSON Feature dict.
+
+    ``lineage_summary`` must arrive already access-checked
+    (``visible_lineage_summary``) — this function has no requester to check
+    the derived-from titles against. Omitted when the caller doesn't supply
+    it: missing is recoverable, leaked is not. A VRT shows only what
+    ``vrt_extents`` (``visible_vrt_extents``) holds for it (``shown_extent``),
+    never its stored extent or ``spatial_extent_geojson``.
+    """
+    record = dataset.record
+    extent = shown_extent(record, dataset.id, vrt_extents)
+    if record.record_type == "vrt_dataset":
+        spatial_extent_geojson = None
+    localized = select_localized_record_text(record, preferred_languages)
+    updated_user = getattr(record, "_provenance_updated_user", None)
+    last_edited = derive_last_edited(
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        updated_by=record.updated_by,
+        updated_user=updated_user,
+    )
+
+    # A precomputed ST_AsGeoJSON string is parsed directly; otherwise fall back
+    # to Python-side WKB deserialization.
+    geometry = None
+    if spatial_extent_geojson is not None:
+        try:
+            geometry = json.loads(spatial_extent_geojson)
+        except (
+            Exception
+        ):  # broad: GeoJSON string from DB may be malformed; degrade to None geometry
+            logger.warning(
+                "ogc_geometry_geojson_parse_failed",
+                extra={"record_id": str(record.id)},
+                exc_info=True,
+            )
+            geometry = None
+    elif extent is not None:
+        try:
+            from geoalchemy2.shape import to_shape
+            from shapely.geometry import mapping
+
+            # mapping() emits valid GeoJSON for any geometry type, Point
+            # extents included.
+            geometry = mapping(to_shape(extent))
+        except Exception:  # broad: WKB deserialize — geoalchemy/shapely errors fall back to None geometry
+            logger.warning(
+                "ogc_geometry_wkb_deserialize_failed",
+                extra={"record_id": str(record.id)},
+                exc_info=True,
+            )
+            geometry = None
+
+    # STAC 1.0.0: if datetime is null, start_datetime and end_datetime must
+    # both be present. With no temporal extent, fall back to created_at so the
+    # item always validates.
+    _ts = record.temporal_start
+    _te = record.temporal_end
+    if _ts is not None and _te is None:
+        stac_datetime = f"{_ts.isoformat()}T00:00:00Z"
+        stac_start_datetime = None
+        stac_end_datetime = None
+    elif _ts is not None and _te is not None:
+        stac_datetime = None
+        stac_start_datetime = f"{_ts.isoformat()}T00:00:00Z"
+        stac_end_datetime = f"{_te.isoformat()}T00:00:00Z"
+    else:
+        stac_datetime = (
+            record.created_at.isoformat().replace("+00:00", "Z")
+            if record.created_at
+            else None
+        )
+        stac_start_datetime = None
+        stac_end_datetime = None
+
+    # OGC Records puts "time" at the record root (alongside geometry) and, for
+    # STAC consumers, in properties.
+    record_time = build_time(dataset)
+    description = (
+        localized.summary.strip()
+        if localized.summary and localized.summary.strip()
+        else localized.title.strip()
+    )
+    keywords = [keyword.keyword for keyword in record.keywords]
+    if not keywords:
+        keywords = list(record.theme_category or [])
+    license_value = record.license or "proprietary"
+
+    # Used for has_quicklook and formats below and for the STAC raster block.
+    record_type = getattr(record, "record_type", "vector_dataset") or "vector_dataset"
+
+    quicklook_uri = (
+        (raster_meta.get("quicklook_256_uri") if raster_meta is not None else None)
+        if record_type in RASTER_FAMILY_RECORD_TYPES
+        else dataset.quicklook_256_uri
+    )
+
+    ogc_record: dict = {
+        "type": "Feature",
+        "id": str(dataset.id),
+        "conformsTo": [
+            "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/record-core",
+            "http://www.opengis.net/spec/ogcapi-records-1/1.0/conf/json",
+        ],
+        "time": record_time,
+        "geometry": geometry,
+        "properties": {
+            "type": "dataset",
+            "title": localized.title,
+            "description": description,
+            "keywords": keywords,
+            "created": record.created_at.isoformat() if record.created_at else None,
+            "updated": record.updated_at.isoformat() if record.updated_at else None,
+            "updated_by_display": last_edited.display,
+            "never_edited": last_edited.never_edited,
+            "crs": f"EPSG:{dataset.srid}" if dataset.srid else None,
+            "record_type": getattr(record, "record_type", "vector_dataset"),
+            "band_count": None,
+            "geometry_type": dataset.geometry_type,
+            "feature_count": dataset.feature_count,
+            "row_count": dataset.feature_count
+            if getattr(record, "record_type", None) == "table"
+            else None,
+            "column_count": len(dataset.column_info) if dataset.column_info else None,
+            "license": license_value,
+            "source_organization": record.source_organization,
+            # Dataset origin for catalog cards: file format for uploads,
+            # service/stac identifiers for remote registrations, 'created'
+            # for empty layers, null for registered PostGIS tables and VRTs.
+            "source_format": dataset.source_format,
+            "quality_detail": dataset.quality_detail,
+            "quality_statement": dataset.quality_statement,
+            "record_status": record.record_status,
+            # vector_dataset/table reads Dataset.quicklook_256_uri; raster
+            # types read it off raster_meta (RasterAsset.quicklook_256_uri).
+            "has_quicklook": quicklook_uri is not None,
+            "quicklook_version": _quicklook_version(quicklook_uri),
+            "formats": _record_formats(record_type),
+            "language": localized.language,
+            "externalIds": build_external_ids(dataset),
+            "themes": build_themes(record.theme_category, record.keywords),
+            "rights": license_value,
+            "contacts": build_contacts(dataset),
+            "datetime": stac_datetime,
+            **(
+                {
+                    "start_datetime": stac_start_datetime,
+                    "end_datetime": stac_end_datetime,
+                }
+                if stac_start_datetime
+                else {}
+            ),
+            "time": record_time,
+            "lineage": lineage_summary,
+            "update_frequency": record.update_frequency,
+            # Same read-time computation as dataset_to_response, so
+            # a catalog card and detail page can't disagree. SEARCH_CACHE_TTL
+            # (30s) is far below the shortest declared period, so a cached
+            # value only lags a transition by that window. Named
+            # source_freshness, not freshness: the frontend's
+            # quality-freshness.ts answers a different question under that word.
+            "source_freshness": compute_source_freshness(
+                dataset.last_refreshed_at,
+                record.update_frequency,
+                datetime.now(timezone.utc),
+                origin=classify_origin(dataset.source_format, record_type),
+            ),
+            # Projected only after search_datasets applies the caller's
+            # visibility filter; keeps the unprobed-health wire spelling
+            # aligned with dataset detail responses.
+            "source_health": project_unknown(dataset.source_health),
+            # Wire values, not raw ORM datetimes: this also feeds
+            # JSONResponse-backed OGC item/STAC routes that skip Pydantic.
+            "last_checked_at": (
+                dataset.last_checked_at.isoformat() if dataset.last_checked_at else None
+            ),
+            "last_refreshed_at": (
+                dataset.last_refreshed_at.isoformat()
+                if dataset.last_refreshed_at
+                else None
+            ),
+            "constraints": (
+                {"usage": record.usage_constraints, "access": record.access_constraints}
+                if record.usage_constraints or record.access_constraints
+                else None
+            ),
+            # From record_distributions. A raster/VRT ingest tail writes a row
+            # whose url is the COG's object-storage key, which is unresolvable
+            # and layout-exposing, so is_publishable_url drops it;
+            # build_assets' raster_tiles asset covers that access surface.
+            "distributions": [
+                {
+                    "type": d.distribution_type,
+                    "format": d.format,
+                    # As in published_distributions: a stored vector-tile
+                    # template cannot hold a counter that rolls.
+                    "url": (
+                        build_url(
+                            republished_tile_url(
+                                d.url,
+                                getattr(dataset, "publication_version", None),
+                            ),
+                            base_url=public_api_url,
+                        )
+                        if d.url.startswith("/")
+                        else d.url
+                    ),
+                    "title": d.title,
+                    "media_type": d.media_type,
+                    "is_primary": d.is_primary,
+                }
+                for d in (record.distributions or ())
+                if is_publishable_url(d.url)
+            ],
+        },
+        "links": [
+            {
+                "rel": "self",
+                "href": build_url(
+                    f"/collections/datasets/items/{dataset.id}",
+                    base_url=public_api_url,
+                ),
+                "type": "application/geo+json",
+            },
+            {
+                "rel": "collection",
+                "href": build_url("/collections/datasets", base_url=public_api_url),
+                "type": "application/json",
+            },
+            {
+                "rel": "root",
+                "href": build_url("/", base_url=public_api_url),
+                "type": "application/json",
+            },
+        ],
+        # Unsigned: a signed URL outlives a revocation, and search pages are cached.
+        "assets": build_assets(
+            dataset,
+            public_api_url,
+            stac_asset_rows=stac_asset_rows,
+            record_status=record.record_status or "draft",
+            storage_backend=settings.storage_provider,
+            public_app_url=public_app_url,
+        ),
+    }
+
+    if raster_meta and record_type in RASTER_FAMILY_RECORD_TYPES:
+        if raster_meta.get("epsg") is not None:
+            ogc_record["properties"]["proj:code"] = f"EPSG:{raster_meta['epsg']}"
+        # A VRT's shape spans every member, readable or not.
+        if (
+            raster_meta.get("width")
+            and raster_meta.get("height")
+            and shows_mosaic_size(record, dataset.id, vrt_extents)
+        ):
+            ogc_record["properties"]["proj:shape"] = [
+                raster_meta["height"],
+                raster_meta["width"],
+            ]
+        if (
+            raster_meta.get("res_x") is not None
+            and raster_meta.get("res_y") is not None
+        ):
+            ogc_record["properties"]["gsd"] = min(
+                abs(raster_meta["res_x"]), abs(raster_meta["res_y"])
+            )
+            # The gsd is a lossy min(abs(res_x), abs(res_y)) that can collapse
+            # two misaligned sources to one value and pass a client gsd-only
+            # check that _check_grid_alignment (res_x and res_y independently)
+            # would reject. Expose both axes.
+            ogc_record["properties"]["res_x"] = raster_meta["res_x"]
+            ogc_record["properties"]["res_y"] = raster_meta["res_y"]
+            # The gsd is in CRS units, which are degrees for geographic CRSs;
+            # without this flag the UI would format them as meters.
+            if raster_meta.get("crs_is_geographic") is not None:
+                ogc_record["properties"]["crs_is_geographic"] = raster_meta[
+                    "crs_is_geographic"
+                ]
+        if raster_meta.get("band_count"):
+            ogc_record["properties"]["band_count"] = raster_meta["band_count"]
+
+        # The band_name/nodata values go through the same normalisers as the
+        # STAC serializer (`app.core.raster_bands`), so one dataset can't
+        # report a band one way here and another way there.
+        bands = []
+        band_info = raster_meta.get("band_info")
+        if band_info and isinstance(band_info, list):
+            for bi in band_info:
+                if not isinstance(bi, dict):
+                    continue
+                band_entry: dict = {}
+                band_name = band_display_name(bi)
+                if band_name:
+                    band_entry["name"] = band_name
+                if bi.get("dtype"):
+                    band_entry["data_type"] = bi["dtype"]
+                nodata = stac_band_nodata(bi.get("nodata"))
+                if nodata is not None:
+                    band_entry["nodata"] = nodata
+                elif raster_meta.get("nodata") is None:
+                    # The asset was probed and its authoritative
+                    # RasterAsset.nodata is None, so absence is confirmed, not
+                    # merely unrecorded. Emit the key so the client can tell
+                    # "absent" from "unavailable" (an omitted key).
+                    band_entry["nodata"] = None
+                if bi.get("description"):
+                    band_entry["description"] = bi["description"]
+                if band_entry:
+                    bands.append(band_entry)
+        if bands:
+            ogc_record["properties"]["raster:bands"] = bands
+
+        if raster_meta.get("vrt_type"):
+            ogc_record["properties"]["vrt_type"] = raster_meta["vrt_type"]
+        if raster_meta.get("source_count") is not None:
+            ogc_record["properties"]["source_count"] = raster_meta["source_count"]
+
+    bbox = extent_to_bbox(extent)
+    if bbox is not None:
+        ogc_record["bbox"] = bbox
+
+    return ogc_record

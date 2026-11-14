@@ -1,0 +1,329 @@
+"""Community-edition Anthropic AI provider default.
+
+Import ``DefaultAnthropicProvider`` via the
+``app.platform.extensions.defaults`` facade, never from this sub-module.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+from app.platform.ai_tool_payloads import tool_result_content
+
+
+async def _run_tool_use_blocks(
+    content,  # type: ignore[no-untyped-def]
+    *,
+    tool_executor,
+    action_collector,
+    collected_actions: list[dict],
+    log,
+) -> list[dict]:
+    """Execute one round's tool_use blocks and build the tool_result payload.
+
+    ``collected_actions`` is appended in place.
+    """
+    tool_results: list[dict] = []
+    for block in content:
+        if block.type != "tool_use":
+            continue
+        log.info("Tool call", tool=block.name, input=block.input)
+        result = await tool_executor(block.name, block.input)
+        if action_collector:
+            action = action_collector(block.name, block.input, result)
+            if action:
+                collected_actions.append(action)
+        tool_results.append(
+            {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                # Fenced, not bare JSON — see tool_result_content
+                # for why every result, not a subset.
+                "content": tool_result_content(result),
+            }
+        )
+    return tool_results
+
+
+# Stop reasons whose text is partial. A stop_sequence reply is finished, and
+# pause_turn comes only from server tools, which these requests never send.
+_TRUNCATED_STOP_REASONS = frozenset(
+    {"max_tokens", "refusal", "model_context_window_exceeded"}
+)
+
+
+class DefaultAnthropicProvider:
+    """Community-edition default: Anthropic native tool-calling loop.
+
+    ``stream()`` raises NotImplementedError: there is no token-by-token
+    streaming, and ``stream_generate_map`` is "semi-streaming" around
+    ``complete()``.
+
+    Class-level ``_client`` cache survives test registry resets and is
+    process-scoped in production.
+
+    All SDK and app-module imports happen INSIDE the methods, never at
+    module load.
+    """
+
+    _client = None  # class-level cache (AsyncAnthropic | None)
+
+    async def complete(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        model,
+        system_prompt,
+        user_message,
+        tools,
+        tool_executor,
+        action_collector=None,
+        history=None,
+        max_rounds=None,
+        max_tokens=4096,
+        base_url=None,
+        temperature=0.5,
+    ):
+        del temperature  # rejected by Claude 4.6+; kept in signature for callers
+        import time
+
+        import structlog
+
+        from app.processing.ai.constants import (
+            MAX_REQUEST_TOKEN_BUDGET,
+            MAX_STREAMING_WALL_CLOCK_SECONDS,
+            MAX_TOOL_ROUNDS,
+        )
+        from app.processing.ai.llm_loop import (
+            ToolLoopExhaustedError,
+            attach_token_usage,
+            ToolLoopResult,
+            add_tool_cache_control,
+            build_history_messages,
+            get_anthropic_client,
+        )
+
+        log = structlog.stdlib.get_logger(__name__)
+
+        if max_rounds is None:
+            max_rounds = MAX_TOOL_ROUNDS
+
+        client = get_anthropic_client()
+
+        messages = build_history_messages(history)
+        messages.append({"role": "user", "content": user_message})
+
+        cached_system = [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        cached_tools = add_tool_cache_control(tools)
+
+        collected_actions: list[dict] = []
+        total_input = 0
+        total_output = 0
+        # The streaming path's runaway guards: a wall-clock deadline and a
+        # cumulative token cap, so a pathological tool loop can't burn budget
+        # until max_rounds.
+        deadline = time.monotonic() + MAX_STREAMING_WALL_CLOCK_SECONDS
+
+        # EVERY exit from this loop carries the tokens already spent: after
+        # round one the provider has billed, so a later failure must still
+        # reach the daily quota.
+        try:
+            for round_num in range(max_rounds):
+                if time.monotonic() > deadline:
+                    raise ToolLoopExhaustedError(
+                        "LLM tool loop exceeded wall-clock budget",
+                        input_tokens=total_input,
+                        output_tokens=total_output,
+                    )
+                if total_input + total_output > MAX_REQUEST_TOKEN_BUDGET:
+                    raise ToolLoopExhaustedError(
+                        "LLM tool loop exceeded request token budget",
+                        input_tokens=total_input,
+                        output_tokens=total_output,
+                    )
+                # Anthropic API rejects `tools=[]` with a 400 ("tools: must
+                # have at least 1 item"); omit the kwarg entirely for
+                # no-tools paths. Claude 4.6+ also rejects a non-default
+                # `temperature` with a 400, so it's omitted here too.
+                create_kwargs: dict[str, object] = {
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "system": cached_system,
+                    "messages": messages,
+                }
+                if cached_tools:
+                    create_kwargs["tools"] = cached_tools
+                response = await client.messages.create(**create_kwargs)
+
+                if hasattr(response, "usage") and response.usage:
+                    total_input += response.usage.input_tokens
+                    total_output += response.usage.output_tokens
+
+                log.info(
+                    "LLM round",
+                    provider="anthropic",
+                    round=round_num + 1,
+                    stop_reason=response.stop_reason,
+                    input_tokens=response.usage.input_tokens if response.usage else 0,
+                    output_tokens=response.usage.output_tokens if response.usage else 0,
+                )
+
+                if response.stop_reason == "end_turn":
+                    text = "".join(
+                        block.text for block in response.content if block.type == "text"
+                    )
+                    return ToolLoopResult(
+                        text=text,
+                        actions=collected_actions,
+                        input_tokens=total_input,
+                        output_tokens=total_output,
+                    )
+
+                if response.stop_reason == "tool_use":
+                    tool_results = await _run_tool_use_blocks(
+                        response.content,
+                        tool_executor=tool_executor,
+                        action_collector=action_collector,
+                        collected_actions=collected_actions,
+                        log=log,
+                    )
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append({"role": "user", "content": tool_results})
+                    continue
+
+                # Any other stop reason: return whatever text there is.
+                text = "".join(
+                    block.text for block in response.content if block.type == "text"
+                )
+                return ToolLoopResult(
+                    text=text,
+                    actions=collected_actions,
+                    input_tokens=total_input,
+                    output_tokens=total_output,
+                    truncated=response.stop_reason in _TRUNCATED_STOP_REASONS,
+                )
+
+            raise ToolLoopExhaustedError(
+                "Max tool rounds exceeded without final response",
+                input_tokens=total_input,
+                output_tokens=total_output,
+            )
+        except BaseException as exc:
+            # BaseException, not Exception: a client disconnect and the
+            # caller's wait_for timeout both surface as asyncio.CancelledError,
+            # and wait_for re-raises TimeoutError *from* it, so the stamp
+            # survives on __cause__ for token_usage_from_error to find.
+            attach_token_usage(exc, total_input, total_output)
+            raise
+
+    # Explicit keyword-only signature matching AIProviderExtension.stream.
+    async def stream(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        model,
+        system_prompt,
+        user_message,
+        tools,
+        tool_executor,
+        action_collector=None,
+        history=None,
+        max_rounds=None,
+        max_tokens=4096,
+        base_url=None,
+        temperature=0.5,
+    ):
+        raise NotImplementedError(
+            "DefaultAnthropicProvider.stream() not implemented in community "
+            "edition; use complete(). Token-by-token streaming is not "
+            "implemented."
+        )
+
+    # `base_url` is accepted (the Protocol declares it) but unused:
+    # Anthropic's streaming client resolves its own endpoint.
+    async def stream_chat_events(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        message,
+        system_prompt,
+        session,
+        user,
+        user_roles,
+        layers,
+        model,
+        base_url=None,
+        history=None,
+        port,
+        map_id=None,
+        tools=None,
+        restrict_tables=None,
+    ):
+        del base_url
+        from app.processing.ai.llm_loop import get_anthropic_client
+        from app.processing.ai.streaming import _stream_anthropic_chat
+
+        async for event in _stream_anthropic_chat(
+            message=message,
+            system_prompt=system_prompt,
+            session=session,
+            user=user,
+            user_roles=user_roles,
+            layers=layers,
+            model=model,
+            history=history,
+            client=get_anthropic_client(),
+            port=port,
+            map_id=map_id,
+            tools=tools,
+            restrict_tables=restrict_tables,
+        ):
+            yield event
+
+    async def structured_complete(  # type: ignore[no-untyped-def]
+        self,
+        *,
+        model,
+        system_prompt,
+        user_message,
+        response_model,
+        base_url=None,
+        max_tokens=1024,
+        temperature=0.3,
+    ):
+        del base_url
+        import structlog
+
+        from app.processing.ai.claude_structured import claude_structured_reply
+        from app.processing.ai.llm_loop import get_anthropic_client
+
+        structlog.stdlib.get_logger(__name__).info(
+            "AI metadata request",
+            provider="anthropic",
+            model=model,
+            response_model=response_model.__name__,
+        )
+
+        # Claude 4.6+ models reject a non-default `temperature` with a 400;
+        # omit it on the Anthropic path (steering is prompt-based).
+        del temperature
+        return await claude_structured_reply(
+            get_anthropic_client(),
+            model=model,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            response_model=response_model,
+            max_tokens=max_tokens,
+        )
+
+    async def resolve_runtime_config(  # type: ignore[no-untyped-def]
+        self, db, settings: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
+        from app.core.persistent_config import llm_model_default
+
+        # The default without the admin override, which callers apply.
+        model = llm_model_default("anthropic")
+        return {"base_url": None, "default_model": model}

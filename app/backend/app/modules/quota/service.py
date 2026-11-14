@@ -1,0 +1,387 @@
+"""Per-user upload and storage quota enforcement service.
+
+The core check is authoritative for community and enterprise editions. The
+EntitlementPort ``enforce_limit`` calls are an additive cloud seam; in
+OSS/Enterprise the DefaultEntitlementPort is grant-all and never raises.
+
+Ownerless datasets: every seam here resolves the billed identity from
+``catalog.records.created_by``, which is nullable. A NULL ``created_by`` is
+EXEMPT from quota accounting everywhere, by policy. It is a live state:
+``created_by`` is ``ON DELETE SET NULL``, so hard-deleting a user orphans
+their datasets while the datasets keep serving.
+
+The exemption is one mechanism: ``get_user_quota_usage`` filters
+``created_by = :user_id``, which is never true for NULL, so a NULL identity
+reads zero usage and every other function inherits that through the one
+aggregate. It is not an early return: the count cap can never refuse a NULL
+owner, but the byte cap still weighs the incoming amount (net of what a
+replacement supersedes), so one oversized new file is still refused.
+
+Chosen over refusing mutation (no ownership-assignment surface exists, so a
+refusal has no remedy) or billing the admin pool (misattributes storage to
+whichever operator happens to be listed). The durable fix is ownership
+adoption (#998); ``TestOwnerlessDatasetsAreExemptAtEverySeam`` in
+``backend/tests/test_raster_replace_1221.py`` pins the current policy.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+from fastapi import HTTPException, Request, status
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.persistent_config import (
+    MAX_DATASETS_PER_USER,
+    MAX_STORAGE_BYTES_PER_USER,
+)
+from app.core.record_types import DATASET_RECORD_TYPES
+from app.core.pointcloud import POINTCLOUD_ASSET_KEY
+from app.core.tiles3d import TILESET_ASSET_KEY
+from app.modules.quota.schemas import UserQuotaUsage
+from app.platform.extensions import get_catalog_port
+from app.platform.extensions.entitlement import enforce_limit
+
+
+async def get_user_quota_usage(
+    db: AsyncSession,
+    user_id: uuid.UUID | None,
+) -> UserQuotaUsage:
+    """Return current bytes-used and dataset-count for a user in one SQL round-trip.
+
+    Joins records -> datasets -> dataset_assets (key 'data', 'tileset',
+    'pointcloud', 'vrt_overview', 'archived_original:*' or 'retained_cog:*') to sum byte
+    size; only dataset record types are counted (maps/services/collections
+    excluded).
+
+    ``bytes_used`` sums ONLY those assets, so in practice raster files,
+    unpacked tilesets and point cloud files: vector/``table`` datasets are
+    PostGIS-resident and ``vrt_dataset`` is definition-only, so they
+    contribute 0. The dataset-COUNT cap is the cross-type fence instead, and
+    ``check_upload_quota`` still gates each upload on its incoming size. A
+    true cross-type storage total is deferred to the metered/per-tenant
+    (cloud) quota work.
+
+    The ownerless-dataset exemption lives here (see the module docstring): a
+    NULL ``user_id`` reads zero.
+    """
+    sql = text(
+        """
+        SELECT
+            COALESCE(SUM(da.size_bytes), 0)::bigint AS bytes_used,
+            COUNT(DISTINCT r.id)::bigint            AS dataset_count
+        FROM   catalog.records r
+        LEFT JOIN catalog.datasets d  ON d.record_id = r.id
+        LEFT JOIN catalog.dataset_assets da
+               ON da.dataset_id = d.id
+              AND (da.key IN ('data', 'vrt_overview', :tileset_key, :pointcloud_key)
+                   OR da.key LIKE 'archived_original:%'
+                   OR da.key LIKE 'retained_cog:%')
+        WHERE  r.created_by = :user_id
+          AND  r.record_type = ANY(CAST(:record_types AS text[]))
+        """
+    )
+    result = await db.execute(
+        sql,
+        {
+            "user_id": user_id,
+            "record_types": list(DATASET_RECORD_TYPES),
+            "tileset_key": TILESET_ASSET_KEY,
+            "pointcloud_key": POINTCLOUD_ASSET_KEY,
+        },
+    )
+    row = result.one()
+
+    storage_cap = await MAX_STORAGE_BYTES_PER_USER.get(db)
+    count_cap = await MAX_DATASETS_PER_USER.get(db)
+
+    return UserQuotaUsage(
+        bytes_used=int(row.bytes_used),
+        dataset_count=int(row.dataset_count),
+        storage_cap=int(storage_cap),
+        count_cap=int(count_cap),
+    )
+
+
+async def remaining_dataset_quota(db: AsyncSession, user_id: uuid.UUID) -> int | None:
+    """Datasets the user can still create, or None when no count cap is set.
+
+    Advisory: lets a client cap a batch at what the user can actually create.
+    """
+    usage = await get_user_quota_usage(db, user_id)
+    if usage.count_cap <= 0:
+        return None
+    return max(0, usage.count_cap - usage.dataset_count)
+
+
+async def get_user_quota_usage_bulk(
+    db: AsyncSession,
+    user_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, UserQuotaUsage]:
+    """Return quota usage for many users in one aggregate plus one cap read.
+
+    Calling `get_user_quota_usage()` once per row would run a three-table
+    aggregate plus two persistent-config reads for each of the 200 rows on an
+    admin user-list page: 600 queries.
+
+    Users with no records get a zeroed usage row, so callers can index the
+    result unconditionally.
+    """
+    storage_cap = int(await MAX_STORAGE_BYTES_PER_USER.get(db))
+    count_cap = int(await MAX_DATASETS_PER_USER.get(db))
+
+    if not user_ids:
+        return {}
+
+    sql = text(
+        """
+        SELECT
+            r.created_by                            AS user_id,
+            COALESCE(SUM(da.size_bytes), 0)::bigint AS bytes_used,
+            COUNT(DISTINCT r.id)::bigint            AS dataset_count
+        FROM   catalog.records r
+        LEFT JOIN catalog.datasets d  ON d.record_id = r.id
+        LEFT JOIN catalog.dataset_assets da
+               ON da.dataset_id = d.id
+              AND (da.key IN ('data', 'vrt_overview', :tileset_key, :pointcloud_key)
+                   OR da.key LIKE 'archived_original:%'
+                   OR da.key LIKE 'retained_cog:%')
+        WHERE  r.created_by = ANY(CAST(:user_ids AS uuid[]))
+          AND  r.record_type = ANY(CAST(:record_types AS text[]))
+        GROUP BY r.created_by
+        """
+    )
+    result = await db.execute(
+        sql,
+        {
+            "user_ids": [str(uid) for uid in user_ids],
+            "record_types": list(DATASET_RECORD_TYPES),
+            "tileset_key": TILESET_ASSET_KEY,
+            "pointcloud_key": POINTCLOUD_ASSET_KEY,
+        },
+    )
+    by_user = {
+        row.user_id: UserQuotaUsage(
+            bytes_used=int(row.bytes_used),
+            dataset_count=int(row.dataset_count),
+            storage_cap=storage_cap,
+            count_cap=count_cap,
+        )
+        for row in result.all()
+    }
+
+    return {
+        user_id: by_user.get(
+            user_id,
+            UserQuotaUsage(
+                bytes_used=0,
+                dataset_count=0,
+                storage_cap=storage_cap,
+                count_cap=count_cap,
+            ),
+        )
+        for user_id in user_ids
+    }
+
+
+async def check_upload_quota(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    incoming_bytes: int,
+    request: Request | None,
+) -> None:
+    """Enforce per-user byte and dataset-count caps before accepting an upload.
+
+    Call this BEFORE creating an ingest job or staging the file.
+
+    ``request`` is optional so a worker re-check charges the same policy the
+    door applied. It reaches only ``enforce_limit``, which forwards a
+    dimension and a count.
+
+    Raises HTTPException 413 if the byte cap is exceeded, 422 if the
+    dataset-count cap is. Never raises when either cap is 0 (the default
+    unlimited config). After the core checks, calls the EntitlementPort
+    ``enforce_limit`` seam, a no-op in OSS/Enterprise.
+    """
+    usage = await get_user_quota_usage(db, user_id)
+
+    if (
+        usage.storage_cap > 0
+        and (usage.bytes_used + incoming_bytes) > usage.storage_cap
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=(
+                f"Storage quota exceeded: used {usage.bytes_used} of "
+                f"{usage.storage_cap} bytes (adding {incoming_bytes} bytes)"
+            ),
+        )
+
+    if usage.count_cap > 0 and usage.dataset_count >= usage.count_cap:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Dataset quota exceeded: {usage.dataset_count} of "
+                f"{usage.count_cap} datasets used"
+            ),
+        )
+
+    await enforce_limit(request, "storage_bytes", usage.bytes_used + incoming_bytes)
+    await enforce_limit(request, "dataset_count", usage.dataset_count + 1)
+
+
+async def check_replacement_quota(
+    db: AsyncSession,
+    owner_id: uuid.UUID | None,
+    incoming_bytes: int,
+    request: Request,
+    *,
+    dataset_id: uuid.UUID,
+) -> None:
+    """Admit a REPLACEMENT at the door, where ``check_upload_quota`` cannot.
+
+    ``check_upload_quota`` is creation-shaped: it refuses at
+    ``dataset_count >= count_cap``, which would lock out an owner at their
+    limit though replacing creates no dataset, and charges the incoming file
+    on top of existing usage. So there is no count check, and the byte check
+    credits what the replacement SUPERSEDES: the ``data`` row in
+    ``dataset_assets``, not the raster asset (a STAC-imported dataset has an
+    asset but no counted row, and crediting that would admit an overshoot).
+    Archived originals are NOT credited: a replacement doesn't supersede them.
+
+    Nor is a COG a VRT may still read: the publish keeps it, charged, so
+    crediting it here could admit a replacement the publish then refuses.
+    The reader test is the publish's own, asked through the catalog port. A
+    reader that appears after this check is seen only by the publish.
+
+    Deliberately an EARLY, approximate bound: the door sees the uploaded
+    file, not the (possibly larger) COG it converts into. The authoritative
+    check is ``reserve_storage_bytes`` at publish time, under the per-user
+    advisory lock, against the real converted size. Shared by both reupload
+    doors and every record type.
+
+    Identity is the dataset's OWNER, not the requester: an admin replacing
+    someone else's dataset is checked against the identity the worker later
+    reserves against (``dataset.record.created_by``), so the two authorities
+    agree. ``owner_id`` is None for an ownerless dataset (see the module
+    docstring's exemption policy).
+    """
+    usage = await get_user_quota_usage(db, owner_id)
+    counted = await db.scalar(
+        text(
+            "SELECT COALESCE(SUM(size_bytes), 0)::bigint "
+            "FROM catalog.dataset_assets "
+            "WHERE dataset_id = :dataset_id AND key = 'data'"
+        ),
+        {"dataset_id": dataset_id},
+    )
+    credited = int(counted or 0)
+    if credited and await get_catalog_port().cog_may_be_read(db, dataset_id):
+        credited = 0
+    projected = usage.bytes_used - credited + incoming_bytes
+
+    if usage.storage_cap > 0 and projected > usage.storage_cap:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=(
+                f"Storage quota exceeded: used {usage.bytes_used} of "
+                f"{usage.storage_cap} bytes (replacing {credited} "
+                f"bytes with {incoming_bytes} bytes)"
+            ),
+        )
+
+    # No dataset_count seam call: a replacement does not create one.
+    await enforce_limit(request, "storage_bytes", projected)
+
+
+class DatasetQuotaExceededError(Exception):
+    """Dataset-count cap exceeded at Record-creation time.
+
+    Plain exception rather than HTTPException because the authoritative
+    check runs inside the ingest worker, where there is no HTTP response
+    to shape; API-side callers get a 422 via the handler registered in
+    ``app.api.main``.
+    """
+
+
+async def reserve_dataset_slot(db: AsyncSession, user_id: uuid.UUID | None) -> None:
+    """Atomically reserve a dataset-count slot for ``user_id``.
+
+    ``check_upload_quota`` runs at upload time, but the ingest worker
+    creates the ``Record`` row it counts later, so N concurrent uploads could
+    all pass the pre-check and overshoot the cap. This is the authoritative
+    check: call inside the SAME transaction that inserts the new ``Record``
+    row. Takes a per-user transaction-scoped advisory lock and recounts, so
+    concurrent creations for one user serialize.
+
+    No-op when the cap is 0 (default unlimited).
+
+    ``user_id`` is nullable like every other seam here, though no current
+    caller passes None (a Record always has an authenticated uploader). The
+    module docstring's ownerless policy applies: a NULL identity counts as
+    zero, below every positive cap.
+    """
+    cap = await MAX_DATASETS_PER_USER.get(db)
+    if cap <= 0:
+        return
+
+    await db.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended('geolens:dataset_quota:' || :uid, 0))"
+        ),
+        {"uid": str(user_id)},
+    )
+    usage = await get_user_quota_usage(db, user_id)
+    if usage.dataset_count >= cap:
+        raise DatasetQuotaExceededError(
+            f"Dataset quota exceeded: {usage.dataset_count} of {cap} datasets used"
+        )
+
+
+class StorageQuotaExceededError(Exception):
+    """Per-user storage byte cap exceeded at asset-commit time.
+
+    Plain exception (not HTTPException) because the authoritative check runs
+    inside the ingest worker; API-side callers get a 413 via the handler
+    registered in ``app.api.main``.
+    """
+
+
+async def reserve_storage_bytes(
+    db: AsyncSession, user_id: uuid.UUID | None, incoming_bytes: int
+) -> None:
+    """Atomically reserve ``incoming_bytes`` against the per-user byte cap.
+
+    ``check_upload_quota`` checks at upload time with no serialization, so N
+    concurrent uploads can all read the same pre-upload usage, all pass,
+    and overshoot the cap. Mirrors ``reserve_dataset_slot``: call inside
+    the SAME transaction that persists the byte-bearing asset, under the
+    same per-user advisory lock, recounting so concurrent uploads serialize.
+
+    No-op when the cap is 0 (default unlimited).
+
+    ``user_id`` is None for an ownerless dataset (the replacement path passes
+    ``record.created_by`` through unchanged): the recount reads zero, so
+    ``incoming_bytes`` alone is weighed against the cap.
+    """
+    cap = await MAX_STORAGE_BYTES_PER_USER.get(db)
+    if cap <= 0:
+        return
+
+    # Same lock namespace as reserve_dataset_slot so both caps serialize together
+    # per user (a single upload takes both under one lock, no interleave).
+    await db.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended('geolens:dataset_quota:' || :uid, 0))"
+        ),
+        {"uid": str(user_id)},
+    )
+    usage = await get_user_quota_usage(db, user_id)
+    if (usage.bytes_used + incoming_bytes) > cap:
+        raise StorageQuotaExceededError(
+            f"Storage quota exceeded: used {usage.bytes_used} of {cap} bytes "
+            f"(adding {incoming_bytes} bytes)"
+        )

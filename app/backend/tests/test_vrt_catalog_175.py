@@ -1,0 +1,993 @@
+"""Tests for VRT catalog API extension.
+
+Covers:
+- TestRasterMetadataVrtFields: _build_raster_metadata returns vrt_type, source_count, resolution_strategy for VRT assets
+- TestDatasetToResponseVrt: dataset_to_response populates raster sub-object for vrt_dataset record_type
+- TestQuicklookVrt: quicklook guard accepts vrt_dataset (200), rejects vector_dataset (400)
+- TestVrtSourcesEndpoint: list_vrt_sources returns ordered source list; 404 for non-VRT/non-existent datasets
+- TestTileTokenVrt: raster_auth_check accepts vrt_dataset record_type (regression)
+- TestSearchEnrichmentVrt: search enrichment includes vrt_dataset in band_count batch fetch
+
+All tests are pure unit tests -- no DB, no real files, no network.
+"""
+
+import uuid
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_raster_asset(
+    vrt_type: str | None = None,
+    resolution_strategy: str | None = None,
+    status: str = "ready",
+    band_count: int = 3,
+    epsg: int = 4326,
+    storage_backend: str = "local",
+    asset_uri: str = "rasters/abc/cog.tif",
+    quicklook_256_uri: str = "rasters/abc/quicklook_256.png",
+) -> MagicMock:
+    asset = MagicMock()
+    asset.vrt_type = vrt_type
+    asset.resolution_strategy = resolution_strategy
+    asset.status = status
+    asset.band_count = band_count
+    asset.epsg = epsg
+    asset.res_x = 10.0
+    asset.res_y = 10.0
+    asset.nodata = None
+    asset.compression = "deflate"
+    asset.width = 512
+    asset.height = 512
+    asset.size_bytes = 1024 * 1024
+    asset.storage_backend = storage_backend
+    asset.asset_uri = asset_uri
+    asset.band_info = []
+    asset.quicklook_256_uri = quicklook_256_uri
+    asset.quicklook_512_uri = None
+    return asset
+
+
+def _make_mock_dataset(record_type: str, title: str = "Test Dataset") -> MagicMock:
+    ds = MagicMock()
+    ds.id = uuid.uuid4()
+    ds.table_name = "test_table"
+    ds.record_id = uuid.uuid4()
+    ds.srid = 4326
+    ds.geometry_type = None
+    ds.feature_count = None
+    ds.column_info = None
+    ds.quality_detail = None
+    ds.source_format = None
+    ds.source_filename = None
+    ds.original_srid = None
+    ds.current_version = 1
+    ds.source_url = None
+    ds.quality_statement = None
+    # source-origin & refresh state. A bare MagicMock returns a
+    # MagicMock for any attribute never set, which DatasetResponse rejects, so
+    # every new dataset column has to be pinned here explicitly.
+    ds.origin_uri = None
+    ds.origin_ref = None
+    ds.last_refreshed_at = None
+    ds.last_checked_at = None
+    ds.source_health = None
+    ds.source_health_detail = None
+    ds.schema_drift_status = None
+    ds.retention_column = None
+    ds.retention_days = None
+    # _build_raster_metadata reads this into the tile URL's `v=`.
+    ds.tile_cache_version = 1
+    # And this into its `pv=`.
+    ds.publication_version = 0
+
+    ds.record = MagicMock()
+    ds.record.record_type = record_type
+    ds.record.title = title
+    ds.record.summary = None
+    ds.record.visibility = "public"
+    ds.record.created_by = uuid.uuid4()
+    ds.record.updated_by = None
+    ds.record.created_at = datetime(2026, 1, 1)
+    ds.record.updated_at = datetime(2026, 1, 2)
+    ds.record.record_status = "published"
+    ds.record.license = None
+    # See the note above — an unset attribute yields a MagicMock,
+    # which DatasetResponse.attribution (str | None) rejects.
+    ds.record.attribution = None
+    ds.record.source_organization = None
+    ds.record.temporal_start = None
+    ds.record.temporal_end = None
+    ds.record.spatial_extent = None
+    ds.record.lineage_summary = None
+    ds.record.update_frequency = None
+    ds.record.usage_constraints = None
+    ds.record.access_constraints = None
+    ds.record.sensitivity_classification = None
+    ds.record.theme_category = None
+    ds.record.owner_org = None
+    ds.record.published_at = None
+    ds.record.language = None
+
+    return ds
+
+
+# ---------------------------------------------------------------------------
+# TestRasterMetadataVrtFields
+# ---------------------------------------------------------------------------
+
+
+class TestRasterMetadataVrtFields:
+    """_build_raster_metadata returns correct VRT fields for VRT assets and None for COGs."""
+
+    def test_vrt_asset_populates_vrt_fields(self):
+        """VRT asset with vrt_type, resolution_strategy, and source_count returns populated fields."""
+        from app.modules.catalog.datasets.domain.helpers import _build_raster_metadata
+
+        dataset = _make_mock_dataset("vrt_dataset", "My VRT")
+        asset = _make_mock_raster_asset(
+            vrt_type="mosaic",
+            resolution_strategy="finest",
+            status="ready",
+        )
+
+        result = _build_raster_metadata(dataset, asset, is_admin=False, source_count=3)
+
+        assert result is not None
+        assert result.vrt_type == "mosaic"
+        assert result.resolution_strategy == "finest"
+        assert result.source_count == 3
+        assert result.status == "ready"
+
+    def test_cog_asset_has_no_vrt_fields(self):
+        """Regular COG asset returns None for all VRT-specific fields."""
+        from app.modules.catalog.datasets.domain.helpers import _build_raster_metadata
+
+        dataset = _make_mock_dataset("raster_dataset", "My COG")
+        asset = _make_mock_raster_asset(
+            vrt_type=None,
+            resolution_strategy=None,
+            status="ready",
+        )
+
+        result = _build_raster_metadata(
+            dataset, asset, is_admin=False, source_count=None
+        )
+
+        assert result is not None
+        assert result.vrt_type is None
+        assert result.resolution_strategy is None
+        assert result.source_count is None
+
+    def test_none_raster_asset_returns_none(self):
+        """Passing raster_asset=None returns None (no metadata to build)."""
+        from app.modules.catalog.datasets.domain.helpers import _build_raster_metadata
+
+        dataset = _make_mock_dataset("vrt_dataset")
+        result = _build_raster_metadata(dataset, None, source_count=5)
+
+        assert result is None
+
+    def test_vrt_band_stack_type(self):
+        """band_stack vrt_type is also correctly propagated."""
+        from app.modules.catalog.datasets.domain.helpers import _build_raster_metadata
+
+        dataset = _make_mock_dataset("vrt_dataset")
+        asset = _make_mock_raster_asset(
+            vrt_type="band_stack", resolution_strategy="first"
+        )
+
+        result = _build_raster_metadata(dataset, asset, source_count=2)
+
+        assert result is not None
+        assert result.vrt_type == "band_stack"
+        assert result.resolution_strategy == "first"
+        assert result.source_count == 2
+
+    def test_source_count_zero(self):
+        """source_count=0 is valid (empty VRT, edge case)."""
+        from app.modules.catalog.datasets.domain.helpers import _build_raster_metadata
+
+        dataset = _make_mock_dataset("vrt_dataset")
+        asset = _make_mock_raster_asset(vrt_type="mosaic")
+
+        result = _build_raster_metadata(dataset, asset, source_count=0)
+
+        assert result is not None
+        assert result.source_count == 0
+
+    def test_band_info_without_index_gets_unique_positions(self):
+        """Legacy band_info rows lacking 'index' default to 1-based positions,
+        not all 0 (which made every band collide on React key 0 + show '#'=0)."""
+        from app.modules.catalog.datasets.domain.helpers import _build_raster_metadata
+
+        dataset = _make_mock_dataset("raster_dataset")
+        asset = _make_mock_raster_asset()
+        asset.band_info = [{"dtype": "uint8"}, {"dtype": "uint8"}, {"dtype": "uint8"}]
+
+        result = _build_raster_metadata(dataset, asset, source_count=None)
+
+        assert result is not None
+        assert [b.index for b in result.bands] == [1, 2, 3]
+
+    def test_band_info_preserves_explicit_index(self):
+        """An explicit 'index' is preserved (not overwritten by position)."""
+        from app.modules.catalog.datasets.domain.helpers import _build_raster_metadata
+
+        dataset = _make_mock_dataset("raster_dataset")
+        asset = _make_mock_raster_asset()
+        asset.band_info = [
+            {"index": 1, "dtype": "uint8"},
+            {"index": 2, "dtype": "uint8"},
+        ]
+
+        result = _build_raster_metadata(dataset, asset, source_count=None)
+
+        assert result is not None
+        assert [b.index for b in result.bands] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# TestDatasetToResponseVrt
+# ---------------------------------------------------------------------------
+
+
+class TestDatasetToResponseVrt:
+    """dataset_to_response populates raster sub-object for vrt_dataset; None for vector_dataset."""
+
+    def test_vrt_dataset_response_has_raster_object(self):
+        """vrt_dataset record_type produces a DatasetResponse with non-None raster field."""
+        from app.modules.catalog.datasets.domain.helpers import dataset_to_response
+
+        dataset = _make_mock_dataset("vrt_dataset", "VRT Mosaic")
+        asset = _make_mock_raster_asset(vrt_type="mosaic", resolution_strategy="finest")
+
+        response = dataset_to_response(dataset, raster_asset=asset, source_count=4)
+
+        assert response.raster is not None
+        assert response.raster.vrt_type == "mosaic"
+        assert response.raster.source_count == 4
+        assert response.raster.resolution_strategy == "finest"
+        assert response.record_type == "vrt_dataset"
+
+    def test_vector_dataset_response_has_no_raster(self):
+        """vector_dataset record_type produces a DatasetResponse with raster=None."""
+        from app.modules.catalog.datasets.domain.helpers import dataset_to_response
+
+        dataset = _make_mock_dataset("vector_dataset", "Vector Layer")
+
+        response = dataset_to_response(dataset, raster_asset=None)
+
+        assert response.raster is None
+        assert response.record_type == "vector_dataset"
+
+    def test_raster_dataset_response_has_raster_object(self):
+        """raster_dataset (COG) produces DatasetResponse with raster field (no VRT fields)."""
+        from app.modules.catalog.datasets.domain.helpers import dataset_to_response
+
+        dataset = _make_mock_dataset("raster_dataset", "COG Layer")
+        asset = _make_mock_raster_asset(vrt_type=None, resolution_strategy=None)
+
+        response = dataset_to_response(dataset, raster_asset=asset, source_count=None)
+
+        assert response.raster is not None
+        assert response.raster.vrt_type is None
+        assert response.raster.source_count is None
+        assert response.record_type == "raster_dataset"
+
+    def test_vrt_dataset_with_no_asset_returns_none_raster(self):
+        """vrt_dataset without a RasterAsset (edge case) does not crash; raster is None."""
+        from app.modules.catalog.datasets.domain.helpers import dataset_to_response
+
+        dataset = _make_mock_dataset("vrt_dataset", "VRT No Asset Yet")
+
+        response = dataset_to_response(dataset, raster_asset=None)
+
+        assert response.raster is None
+        assert response.record_type == "vrt_dataset"
+
+
+# ---------------------------------------------------------------------------
+# TestQuicklookVrt
+# ---------------------------------------------------------------------------
+
+
+def _quicklook_request():
+    from starlette.requests import Request
+
+    return Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+
+
+class TestQuicklookVrt:
+    """Quicklook guard accepts vrt_dataset (200); rejects vector_dataset (400)."""
+
+    @pytest.mark.asyncio
+    async def test_quicklook_accepts_vrt_dataset(self):
+        """get_quicklook passes the guard when record_type is vrt_dataset."""
+        from app.modules.catalog.datasets.api.router import get_quicklook
+
+        dataset_id = uuid.uuid4()
+        mock_dataset = _make_mock_dataset("vrt_dataset", "My VRT")
+        mock_dataset.record.record_status = "published"
+        mock_dataset.record.visibility = "public"
+
+        mock_asset = _make_mock_raster_asset(quicklook_256_uri="rasters/abc/q256.png")
+        mock_asset.quicklook_256_uri = "rasters/abc/q256.png"
+
+        mock_ra_result = MagicMock()
+        mock_ra_result.scalar_one_or_none = MagicMock(return_value=mock_asset)
+
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=mock_ra_result)
+
+        mock_storage = AsyncMock()
+        mock_storage.get = AsyncMock(return_value=b"\x89PNG\r\n\x1a\n")
+
+        mock_user = MagicMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router.get_dataset",
+            AsyncMock(return_value=mock_dataset),
+        ):
+            with patch(
+                "app.modules.catalog.datasets.api.router.check_dataset_access_or_anonymous",
+                AsyncMock(return_value=None),
+            ):
+                with patch(
+                    "app.modules.catalog.datasets.api.router.get_storage",
+                    return_value=mock_storage,
+                ):
+                    # Should not raise HTTPException 400 — guard passes for vrt_dataset
+                    response = await get_quicklook(
+                        dataset_id=dataset_id,
+                        request=_quicklook_request(),
+                        size=256,
+                        user=mock_user,
+                        db=mock_db,
+                    )
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_quicklook_rejects_table_dataset(self):
+        """get_quicklook raises 400 when record_type is table (non-spatial)."""
+        from fastapi import HTTPException
+        from app.modules.catalog.datasets.api.router import get_quicklook
+
+        dataset_id = uuid.uuid4()
+        mock_dataset = _make_mock_dataset("table", "My Table")
+        mock_dataset.record.record_status = "published"
+        mock_dataset.record.visibility = "public"
+
+        mock_user = MagicMock()
+        mock_db = AsyncMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router.get_dataset",
+            AsyncMock(return_value=mock_dataset),
+        ):
+            with patch(
+                "app.modules.catalog.datasets.api.router.check_dataset_access_or_anonymous",
+                AsyncMock(return_value=None),
+            ):
+                with pytest.raises(HTTPException) as exc_info:
+                    await get_quicklook(
+                        dataset_id=dataset_id,
+                        request=_quicklook_request(),
+                        size=256,
+                        user=mock_user,
+                        db=mock_db,
+                    )
+
+        assert exc_info.value.status_code == 400
+        assert "Quicklook not available for this dataset type" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_quicklook_returns_404_when_dataset_not_found(self):
+        """get_quicklook raises 404 when dataset does not exist."""
+        from fastapi import HTTPException
+        from app.modules.catalog.datasets.api.router import get_quicklook
+
+        dataset_id = uuid.uuid4()
+        mock_db = AsyncMock()
+        mock_user = MagicMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router.get_dataset",
+            AsyncMock(return_value=None),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await get_quicklook(
+                    dataset_id=dataset_id,
+                    request=_quicklook_request(),
+                    size=256,
+                    user=mock_user,
+                    db=mock_db,
+                )
+
+        assert exc_info.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# TestVrtSourcesEndpoint
+# ---------------------------------------------------------------------------
+
+
+class TestVrtSourcesEndpoint:
+    """list_vrt_sources returns ordered VrtSourceItems; 404 for non-VRT / non-existent."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_vrt_member_authz(self):
+        """list_vrt_sources now drops members the caller
+        cannot access via get_permission_extension().can_access_dataset(per
+        member). These unit tests mock the SQL rows and ``check_dataset_access``
+        (which they set to return None), then assert the FULL returned list, so
+        stub the per-member check to allow-all — otherwise can_access_dataset
+        would run for real against a None user_roles and raise. The filtering
+        behavior itself is covered by tests/test_vrt_source_authz_1172.py.
+
+        The endpoint batch-loads member datasets in one query instead
+        of calling `get_dataset()` per row, so stub `_load_source_datasets` too. These
+        tests point a blanket `db.execute` mock at the raw-SQL result, which the
+        batch loader would otherwise read as "no member datasets exist".
+        """
+        ext = MagicMock()
+        ext.can_access_dataset = AsyncMock(return_value=True)
+
+        async def _all_members_exist(_db, dataset_ids):
+            return {
+                ds_id: _make_mock_dataset("raster_dataset") for ds_id in dataset_ids
+            }
+
+        with patch(
+            "app.modules.catalog.datasets.api.router_vrt.get_permission_extension",
+            return_value=ext,
+        ):
+            with patch(
+                "app.modules.catalog.datasets.api.router_vrt._load_source_datasets",
+                _all_members_exist,
+            ):
+                yield
+
+    @pytest.mark.asyncio
+    async def test_returns_ordered_source_list_for_vrt_dataset(self):
+        """list_vrt_sources returns VrtSourceListResponse with correct fields."""
+        from app.modules.catalog.datasets.api.router_vrt import list_vrt_sources
+
+        dataset_id = uuid.uuid4()
+        source_id_1 = uuid.uuid4()
+        source_id_2 = uuid.uuid4()
+
+        mock_dataset = _make_mock_dataset("vrt_dataset", "My VRT")
+        mock_dataset.id = dataset_id
+
+        # Mock two source rows returned by raw SQL
+        row1 = MagicMock()
+        row1.dataset_id = source_id_1
+        row1.title = "Source 1"
+        row1.position = 0
+        row1.band_count = 3
+        row1.resolution_x = 10.0
+        row1.resolution_y = 10.0
+        row1.crs_epsg = 4326
+        row1.extent_wkt = "POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))"
+
+        row2 = MagicMock()
+        row2.dataset_id = source_id_2
+        row2.title = "Source 2"
+        row2.position = 1
+        row2.band_count = 3
+        row2.resolution_x = 20.0
+        row2.resolution_y = 20.0
+        row2.crs_epsg = 4326
+        row2.extent_wkt = "POLYGON((5 5, 6 5, 6 6, 5 6, 5 5))"
+
+        mock_result = MagicMock()
+        mock_result.all = MagicMock(return_value=[row1, row2])
+
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=mock_result)
+
+        mock_user = MagicMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router_vrt.get_dataset",
+            AsyncMock(return_value=mock_dataset),
+        ):
+            with patch(
+                "app.modules.catalog.datasets.api.router_vrt.check_dataset_access",
+                AsyncMock(return_value=None),
+            ):
+                response = await list_vrt_sources(
+                    dataset_id=dataset_id,
+                    user=mock_user,
+                    db=mock_db,
+                )
+
+        assert len(response.sources) == 2
+        assert response.sources[0].title == "Source 1"
+        assert response.sources[0].position == 0
+        assert response.sources[0].band_count == 3
+        assert response.sources[0].dataset_id == source_id_1
+        assert response.sources[1].title == "Source 2"
+        assert response.sources[1].position == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_404_for_non_existent_dataset(self):
+        """list_vrt_sources raises 404 when dataset is None."""
+        from fastapi import HTTPException
+        from app.modules.catalog.datasets.api.router_vrt import list_vrt_sources
+
+        dataset_id = uuid.uuid4()
+        mock_db = AsyncMock()
+        mock_user = MagicMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router_vrt.get_dataset",
+            AsyncMock(return_value=None),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await list_vrt_sources(
+                    dataset_id=dataset_id,
+                    user=mock_user,
+                    db=mock_db,
+                )
+
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_returns_404_for_non_vrt_raster_dataset(self):
+        """list_vrt_sources raises 404 when dataset is a raster_dataset (not VRT)."""
+        from fastapi import HTTPException
+        from app.modules.catalog.datasets.api.router_vrt import list_vrt_sources
+
+        dataset_id = uuid.uuid4()
+        mock_dataset = _make_mock_dataset("raster_dataset", "Plain COG")
+
+        mock_db = AsyncMock()
+        mock_user = MagicMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router_vrt.get_dataset",
+            AsyncMock(return_value=mock_dataset),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await list_vrt_sources(
+                    dataset_id=dataset_id,
+                    user=mock_user,
+                    db=mock_db,
+                )
+
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_returns_404_for_vector_dataset(self):
+        """list_vrt_sources raises 404 when dataset is a vector_dataset."""
+        from fastapi import HTTPException
+        from app.modules.catalog.datasets.api.router_vrt import list_vrt_sources
+
+        dataset_id = uuid.uuid4()
+        mock_dataset = _make_mock_dataset("vector_dataset", "Vector Layer")
+
+        mock_db = AsyncMock()
+        mock_user = MagicMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router_vrt.get_dataset",
+            AsyncMock(return_value=mock_dataset),
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await list_vrt_sources(
+                    dataset_id=dataset_id,
+                    user=mock_user,
+                    db=mock_db,
+                )
+
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_source_extent_bbox_parsed_correctly(self):
+        """Extent WKT is parsed into a 4-element bbox list."""
+        from app.modules.catalog.datasets.api.router_vrt import list_vrt_sources
+
+        dataset_id = uuid.uuid4()
+        mock_dataset = _make_mock_dataset("vrt_dataset")
+        mock_dataset.id = dataset_id
+
+        row = MagicMock()
+        row.dataset_id = uuid.uuid4()
+        row.title = "Tile"
+        row.position = 0
+        row.band_count = 1
+        row.resolution_x = 5.0
+        row.resolution_y = 5.0
+        row.crs_epsg = 32632
+        row.extent_wkt = "POLYGON((-10 -20, 10 -20, 10 20, -10 20, -10 -20))"
+
+        mock_result = MagicMock()
+        mock_result.all = MagicMock(return_value=[row])
+
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=mock_result)
+
+        mock_user = MagicMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router_vrt.get_dataset",
+            AsyncMock(return_value=mock_dataset),
+        ):
+            with patch(
+                "app.modules.catalog.datasets.api.router_vrt.check_dataset_access",
+                AsyncMock(return_value=None),
+            ):
+                response = await list_vrt_sources(
+                    dataset_id=dataset_id,
+                    user=mock_user,
+                    db=mock_db,
+                )
+
+        assert len(response.sources) == 1
+        bbox = response.sources[0].extent_bbox
+        assert bbox is not None
+        assert len(bbox) == 4
+        # POLYGON((-10 -20, 10 -20, 10 20, -10 20, -10 -20)) -> minx=-10, miny=-20, maxx=10, maxy=20
+        assert bbox[0] == pytest.approx(-10.0)
+        assert bbox[1] == pytest.approx(-20.0)
+        assert bbox[2] == pytest.approx(10.0)
+        assert bbox[3] == pytest.approx(20.0)
+
+    @pytest.mark.asyncio
+    async def test_null_extent_wkt_produces_none_bbox(self):
+        """Source with no spatial extent (extent_wkt=None) returns None for extent_bbox."""
+        from app.modules.catalog.datasets.api.router_vrt import list_vrt_sources
+
+        dataset_id = uuid.uuid4()
+        mock_dataset = _make_mock_dataset("vrt_dataset")
+        mock_dataset.id = dataset_id
+
+        row = MagicMock()
+        row.dataset_id = uuid.uuid4()
+        row.title = "No Extent"
+        row.position = 0
+        row.band_count = 1
+        row.resolution_x = 5.0
+        row.resolution_y = 5.0
+        row.crs_epsg = 4326
+        row.extent_wkt = None
+
+        mock_result = MagicMock()
+        mock_result.all = MagicMock(return_value=[row])
+
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=mock_result)
+
+        mock_user = MagicMock()
+
+        with patch(
+            "app.modules.catalog.datasets.api.router_vrt.get_dataset",
+            AsyncMock(return_value=mock_dataset),
+        ):
+            with patch(
+                "app.modules.catalog.datasets.api.router_vrt.check_dataset_access",
+                AsyncMock(return_value=None),
+            ):
+                response = await list_vrt_sources(
+                    dataset_id=dataset_id,
+                    user=mock_user,
+                    db=mock_db,
+                )
+
+        assert len(response.sources) == 1
+        assert response.sources[0].extent_bbox is None
+
+
+# ---------------------------------------------------------------------------
+# TestTileTokenVrt
+# ---------------------------------------------------------------------------
+
+
+class TestTileTokenVrt:
+    """Raster tile auth accepts the vrt_dataset record_type.
+
+    The record_type guard lives in ``_read_raster_meta``, the metadata reader
+    behind ``_resolve_raster_meta`` and so behind ``_resolve_raster_access``.
+    Tests inspect the reader's source since that is where the guard lives.
+    """
+
+    def test_resolve_raster_access_accepts_vrt_dataset_record_type(self):
+        """_read_raster_meta accepts both raster_dataset and vrt_dataset.
+
+        The guard checks membership in the canonical RASTER_FAMILY_RECORD_TYPES
+        constant rather than an inline tuple literal, so the assertion targets
+        the constant plus its contents.
+        """
+        import inspect
+
+        import app.processing.tiles.router as tiles_module
+        from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+
+        # The guard lives in the reader every metadata cache path goes through.
+        source = inspect.getsource(tiles_module._read_raster_meta)
+
+        assert "RASTER_FAMILY_RECORD_TYPES" in source, (
+            "_read_raster_meta must guard record_type via the canonical raster family"
+        )
+        assert "vrt_dataset" in RASTER_FAMILY_RECORD_TYPES
+
+    def test_resolve_raster_access_uses_tuple_guard_for_both_types(self):
+        """_read_raster_meta guards via the family covering both record types."""
+        import inspect
+
+        import app.processing.tiles.router as tiles_module
+        from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+
+        # The guard lives in the reader every metadata cache path goes through.
+        source = inspect.getsource(tiles_module._read_raster_meta)
+
+        # Must reject non-raster types; the family constant carries both.
+        assert "RASTER_FAMILY_RECORD_TYPES" in source
+        assert "raster_dataset" in RASTER_FAMILY_RECORD_TYPES
+        assert "vrt_dataset" in RASTER_FAMILY_RECORD_TYPES
+
+    def test_resolve_raster_access_not_raster_detail(self):
+        """Confirm the family guard appears in a real code line, not a comment."""
+        import inspect
+
+        import app.processing.tiles.router as tiles_module
+
+        # The guard lives in the reader every metadata cache path goes through.
+        source = inspect.getsource(tiles_module._read_raster_meta)
+
+        # Find the guard line that checks record_type
+        lines = [
+            ln.strip()
+            for ln in source.splitlines()
+            if "RASTER_FAMILY_RECORD_TYPES" in ln and not ln.strip().startswith("#")
+        ]
+        assert len(lines) >= 1, (
+            "RASTER_FAMILY_RECORD_TYPES must appear in at least one guard line"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestSearchEnrichmentVrt
+# ---------------------------------------------------------------------------
+
+
+class TestSearchEnrichmentVrt:
+    """Search enrichment includes vrt_dataset in band_count batch fetch (regression guard)."""
+
+    @pytest.mark.anyio
+    async def test_bulk_fetch_dataset_metadata_includes_raster_and_vrt_records(
+        self, monkeypatch
+    ):
+        """The search metadata helper requests raster metadata for raster and VRT rows."""
+        import app.modules.catalog.search.router as search_module
+
+        vector = _make_mock_dataset("vector_dataset", "Vector")
+        raster = _make_mock_dataset("raster_dataset", "Raster")
+        vrt = _make_mock_dataset("vrt_dataset", "VRT")
+
+        seen_ids: list[uuid.UUID] = []
+
+        async def fake_fetch_raster_meta_bulk(_db, dataset_ids):
+            seen_ids.extend(dataset_ids)
+            return {
+                str(raster.id): {"band_count": 1},
+                str(vrt.id): {"band_count": 3, "vrt_type": "mosaic"},
+            }
+
+        monkeypatch.setattr(
+            "app.processing.raster.queries.fetch_raster_meta_bulk",
+            fake_fetch_raster_meta_bulk,
+        )
+
+        class FakeScalarResult:
+            def all(self):
+                return []
+
+        class FakeExecuteResult:
+            def __init__(self, rows=None):
+                self._rows = rows or []
+
+            def scalars(self):
+                return FakeScalarResult()
+
+            def all(self):
+                return self._rows
+
+        class FakeSession:
+            async def execute(self, _stmt):
+                return FakeExecuteResult()
+
+        counted: list[uuid.UUID] = []
+
+        async def fake_visible_vrt_source_counts(_db, vrt_ids, _user, _roles):
+            counted.extend(vrt_ids)
+            return {vrt_id: 2 for vrt_id in vrt_ids}
+
+        monkeypatch.setattr(
+            search_module, "visible_vrt_source_counts", fake_visible_vrt_source_counts
+        )
+
+        _, raster_meta, _ = await search_module._bulk_fetch_dataset_metadata(
+            FakeSession(), [vector, raster, vrt], None, set()
+        )
+
+        assert set(seen_ids) == {raster.id, vrt.id}
+        assert vector.id not in seen_ids
+        assert raster_meta[str(vrt.id)]["vrt_type"] == "mosaic"
+        assert counted == [vrt.id]
+        assert raster_meta[str(vrt.id)]["source_count"] == 2
+
+    def test_dataset_to_ogc_record_exposes_vrt_raster_meta_from_facade(self):
+        """The public search facade exposes VRT raster metadata in OGC records."""
+        from app.modules.catalog.search.service import dataset_to_ogc_record
+
+        dataset = _make_mock_dataset("vrt_dataset", "VRT")
+        dataset.record.id = uuid.uuid4()
+        dataset.record.keywords = []
+        dataset.record.contacts = []
+        dataset.record.distributions = []
+        dataset.quicklook_256_uri = None
+        raster_meta = {"band_count": 3, "vrt_type": "mosaic", "source_count": 2}
+
+        result = dataset_to_ogc_record(
+            dataset,
+            "https://example.test",
+            raster_meta=raster_meta,
+        )
+
+        properties = result["properties"]
+        assert properties["record_type"] == "vrt_dataset"
+        assert properties["band_count"] == 3
+        assert properties["vrt_type"] == "mosaic"
+        assert properties["source_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# TestDatasetDetailSessionIsolation
+# ---------------------------------------------------------------------------
+
+
+class TestDatasetDetailSessionIsolation:
+    """get_dataset_detail's raster/VRT/asset fetches run on the caller's session.
+
+    The raster asset, VRT source-count, and dataset-asset fetches run
+    sequentially on the caller's own session. ``asyncio.gather`` on one
+    ``AsyncSession`` is unsafe (asyncpg's per-connection execute lock
+    serializes the calls anyway), and a short-lived ``async_session()`` per
+    branch would be a nested pool checkout while the caller's connection is
+    held for the rest of the request, which the default (non-external-pooler)
+    connection pool cannot absorb under moderate concurrency.
+    """
+
+    @pytest.mark.anyio
+    async def test_fetches_run_sequentially_on_callers_session(self, monkeypatch):
+        from app.modules.catalog.datasets.domain import service_query
+
+        # vrt_dataset is in RASTER_FAMILY_RECORD_TYPES, so this scenario
+        # exercises all three fetches: raster asset, VRT source count, and
+        # dataset assets.
+        dataset = _make_mock_dataset("vrt_dataset", "My VRT")
+        dataset.record.created_by = None
+        dataset.record.updated_by = None
+        dataset.source_format = "cog"
+
+        class CallerSession:
+            async def execute(self, *args, **kwargs):
+                result = MagicMock()
+                result.scalar.return_value = 2
+                return result
+
+        caller_db = CallerSession()
+
+        opened_sessions: list[object] = []
+
+        class FakeInnerSession:
+            def __init__(self):
+                opened_sessions.append(self)
+
+            async def execute(self, *args, **kwargs):
+                raise AssertionError(
+                    "get_dataset_detail opened a fresh session instead of "
+                    "reusing the caller's db"
+                )
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        def _fake_async_session(*args, **kwargs):
+            return FakeInnerSession()
+
+        import app.core.db as _db_module
+
+        monkeypatch.setattr(_db_module, "async_session", _fake_async_session)
+
+        raster_asset_sessions: list[object] = []
+        dataset_asset_sessions: list[object] = []
+        fake_raster_asset = MagicMock()
+
+        async def _fake_get_raster_asset(session, _dataset_id):
+            raster_asset_sessions.append(session)
+            return fake_raster_asset
+
+        async def _fake_get_dataset_assets(session, _dataset_id):
+            dataset_asset_sessions.append(session)
+            return []
+
+        port = MagicMock()
+        port.get_raster_asset = _fake_get_raster_asset
+        port.get_dataset_assets = _fake_get_dataset_assets
+        monkeypatch.setattr(service_query, "get_catalog_port", lambda: port)
+
+        # Downstream response building is irrelevant to session reuse —
+        # stub it so the test stays focused on the fetches themselves.
+        monkeypatch.setattr(
+            "app.modules.catalog.datasets.domain.helpers.dataset_to_response",
+            lambda *args, **kwargs: MagicMock(),
+        )
+        monkeypatch.setattr(
+            "app.modules.catalog.authorization.visible_derived_from",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "app.modules.catalog.authorization.visible_lineage_summary",
+            AsyncMock(return_value=None),
+        )
+
+        result = await service_query.get_dataset_detail(
+            caller_db,
+            dataset.id,
+            user=None,
+            dataset=dataset,
+            user_roles=set(),
+        )
+
+        assert result is not None
+        # No extra pool checkout: async_session() is never called.
+        assert opened_sessions == []
+        # Both port fetches ran on the caller's own session.
+        assert raster_asset_sessions == [caller_db]
+        assert dataset_asset_sessions == [caller_db]
+
+    def test_no_asyncio_gather_over_the_dataset_fetches(self):
+        """Structural pin: the false-"parallel" gather must not come back.
+
+        A per-branch ``async_session()`` re-adds a nested pool checkout under
+        the caller's own held connection (the exact codex finding this
+        revision fixed), so service_query.py must not import the ``asyncio``
+        module at all — there is nothing left in it that needs to.
+        (The prose above, explaining the history, is exempt: it names
+        "asyncio.gather" as what USED to be here.)
+        """
+        import ast
+        import inspect
+
+        from app.modules.catalog.datasets.domain import service_query
+
+        tree = ast.parse(inspect.getsource(service_query))
+        imported_names = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        assert "asyncio" not in imported_names
+
+
+def test_search_enrichment_vrt_no_longer_uses_source_introspection():
+    source = Path(__file__).read_text()
+
+    for target in ("_handle_search", "_bulk_fetch_dataset_metadata"):
+        forbidden = "inspect.getsource(search_module." + target + ")"
+        assert forbidden not in source

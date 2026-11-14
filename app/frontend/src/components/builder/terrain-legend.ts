@@ -1,0 +1,113 @@
+import type { MapTerrainConfig, StyleConfig } from '@/types/api';
+import { legendEntryName } from '@/components/map/legend-facts';
+import { isDemTerrainVisualSuppressed } from './map-sync';
+import { resolveTerrainSourceLayer } from './map-stack';
+
+/**
+ * Single source of truth for "this DEM layer is suppressed because it powers
+ * active 3D terrain." Re-exported so both legend surfaces (builder LegendPlugin
+ * and viewer LayerLegend) share one predicate.
+ */
+export { isDemTerrainVisualSuppressed };
+
+/**
+ * Synthetic "3D terrain" legend descriptor. Mirrors the shape/id of the stack's
+ * synthetic `relief:terrain` row (`map-stack.ts` makeTerrainReliefEntry) so the
+ * legend and stack agree. Surface-agnostic: carries an i18n label key, never
+ * literal text, so each surface resolves it in its own namespace (builder:
+ * `plugins.legend.terrain3d`; viewer: `viewer.legend.terrain3d`).
+ */
+interface TerrainLegendEntry {
+  /** Mirrors the stack synthetic row id for visual agreement. */
+  id: 'relief:terrain';
+  /** Mirrors the stack synthetic row role. */
+  role: 'surface-terrain';
+  /** i18n key the caller resolves in its own namespace. */
+  labelKey: string;
+  /**
+   * The bound DEM layer's legend entry name, so the legend keeps the dataset
+   * identity ("swissALTI3D relief") instead of a generic "3D terrain" row once
+   * the overlay is off. Null when the layer has no name; callers then fall back
+   * to t(labelKey).
+   */
+  sourceName: string | null;
+}
+
+interface DeriveTerrainLegendEntryOptions {
+  /** i18n key for the synthetic entry label, resolved by the calling surface. */
+  labelKey: string;
+}
+
+/** Minimal layer shape needed to decide whether a backing terrain DEM exists. */
+type TerrainBackingLayer = {
+  dataset_id?: string | null;
+  is_dem?: boolean | null;
+  dataset_record_type?: string | null;
+  display_name?: string | null;
+  dataset_name?: string | null;
+  style_config?: Pick<StyleConfig, 'legendLabel'> | null;
+  visible?: boolean | null;
+};
+
+/**
+ * Returns a single synthetic "3D terrain" legend entry descriptor when terrain
+ * is active, else null. "Active" matches map-stack's synthetic `relief:terrain`
+ * row (`sourceStatus: 'active'`): terrain_config is enabled, a source dataset is
+ * selected, and a terrain-capable DEM layer for that dataset is present.
+ * Without the backing-layer check, a dangling terrain_config (legacy maps whose
+ * source layer was deleted) would render a phantom legend entry while the stack
+ * reports it missing and no mesh paints.
+ */
+export function deriveTerrainLegendEntry(
+  terrainConfig: MapTerrainConfig | null | undefined,
+  layers: readonly TerrainBackingLayer[] | null | undefined,
+  opts: DeriveTerrainLegendEntryOptions,
+): TerrainLegendEntry | null {
+  const sourceDatasetId = terrainConfig?.enabled === true ? terrainConfig.source_dataset_id : null;
+  if (!sourceDatasetId) return null;
+
+  // Resolve the backing DEM as BuilderMap/useViewerTerrain do (prefer a visible
+  // rendering). Renderers apply no mesh when the resolved DEM is saved-hidden,
+  // so a hidden source must not list a phantom "3D terrain" entry under that
+  // hidden layer's name.
+  const backingLayer = resolveTerrainSourceLayer(layers ?? [], terrainConfig);
+  if (!backingLayer || backingLayer.visible === false) return null;
+
+  return {
+    id: 'relief:terrain',
+    role: 'surface-terrain',
+    labelKey: opts.labelKey,
+    sourceName: legendEntryName(backingLayer),
+  };
+}
+
+/**
+ * True when the terrain source dataset is already represented by one of the
+ * surface's per-layer legend entries, so the synthetic "3D terrain" entry would
+ * duplicate it. Callers pass their own shown-entry list (LegendPlugin drops
+ * hidden layers, LayerLegend keeps them as toggles). When the source DEM has no
+ * shown entry (pure terrain render_mode, or hidden), this returns false and the
+ * synthetic entry stays the only terrain indicator.
+ */
+export function terrainSourceIsShownAsLayer(
+  terrainConfig: MapTerrainConfig | null | undefined,
+  shownLayers: readonly { dataset_id?: string | null }[],
+): boolean {
+  const src = terrainConfig?.enabled === true ? terrainConfig.source_dataset_id : null;
+  return !!src && shownLayers.some((l) => l.dataset_id === src);
+}
+
+/**
+ * The synthetic terrain entry for a legend whose per-layer rows are
+ * `shownLayers`: deriveTerrainLegendEntry's entry, unless the terrain source
+ * already has a row of its own.
+ */
+export function syntheticTerrainEntry(
+  terrainConfig: MapTerrainConfig | null | undefined,
+  layers: readonly TerrainBackingLayer[] | null | undefined,
+  shownLayers: readonly { dataset_id?: string | null }[],
+  opts: DeriveTerrainLegendEntryOptions,
+): TerrainLegendEntry | null {
+  const entry = deriveTerrainLegendEntry(terrainConfig, layers, opts);
+  return entry && !terrainSourceIsShownAsLayer(terrainConfig, shownLayers) ? entry : null;
+}

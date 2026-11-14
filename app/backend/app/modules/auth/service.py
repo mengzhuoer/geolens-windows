@@ -1,0 +1,730 @@
+"""Auth service: JWT token creation, refresh tokens, and user registration."""
+
+import hashlib
+import re
+import secrets
+import uuid
+from datetime import UTC, datetime, timedelta
+
+import jwt
+from fastapi import HTTPException, status
+from sqlalchemy import delete, func, literal_column, or_, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.identity import Identity
+from app.core.tenancy import is_multi_tenant
+from app.modules.auth.dependencies import DOWNLOAD_TOKEN_VERSION_CLAIM
+from app.modules.auth.models import ApiKey, RefreshToken, Role, User, UserRole
+from app.modules.auth.providers import AuthenticatedIdentity
+from app.modules.auth.providers.local import hash_password_async
+
+# Covers the exchange queueing behind a few other tabs' cookie-lock holders,
+# each bounded to 30 seconds by its own request timeout.
+SSO_EXCHANGE_TTL_SECONDS = 120
+
+# A SHA-256 hex digest never contains ":", so no refresh token, however
+# chosen, hashes to a pending sign-in's row.
+_SSO_EXCHANGE_HASH_PREFIX = "sso-exchange:"
+# Codes, bindings and the page's sign-in nonce are all 32 random bytes in
+# unpadded base64url.
+SIGN_IN_NONCE_PATTERN = r"^[A-Za-z0-9_-]{43}$"
+_SSO_EXCHANGE_SECRET = re.compile(r"\A[A-Za-z0-9_-]{43}\Z")
+
+
+def _sso_exchange_hash(code: str, binding: str, sign_in_nonce: str) -> str:
+    digest = hashlib.sha256(f"{code}.{binding}.{sign_in_nonce}".encode()).hexdigest()
+    return _SSO_EXCHANGE_HASH_PREFIX + digest
+
+
+class AuthService:
+    """Handles JWT creation, user registration, and role queries."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def create_access_token(
+        self,
+        identity: AuthenticatedIdentity,
+        expire_minutes: int | None = None,
+        *,
+        family_id: uuid.UUID | None = None,
+    ) -> str:
+        """Create a signed JWT for the given identity.
+
+        The payload includes ``jti`` (unique per-token id) and
+        ``token_version``: a JWT whose token_version is behind the user's
+        current value is rejected by get_current_user/get_optional_user, so
+        logout and password-change revocations take effect immediately.
+        """
+        minutes = expire_minutes or settings.access_token_expire_minutes
+        now = datetime.now(UTC)
+        multi_tenant = is_multi_tenant()
+
+        if multi_tenant:
+            result = await self.db.execute(
+                select(User.token_version, User.tenant_id).where(
+                    User.id == identity.user_id
+                )
+            )
+            row = result.one_or_none()
+            _raw_version = row.token_version if row is not None else None
+            tenant_id = row.tenant_id if row is not None else None
+        else:
+            # The single-tenant query and payload carry no tenancy axis, which
+            # stays inert for Community/self-hosted installs.
+            result = await self.db.execute(
+                select(User.token_version).where(User.id == identity.user_id)
+            )
+            _raw_version = result.scalar_one_or_none()
+            tenant_id = None
+        # Explicit None check rather than `or 1`, so a stored token_version=0
+        # isn't silently coerced to 1.
+        token_version: int = _raw_version if _raw_version is not None else 1
+
+        payload = {
+            "sub": str(identity.user_id),
+            "username": identity.username,
+            "jti": uuid.uuid4().hex,
+            "token_version": token_version,
+            "exp": now + timedelta(minutes=minutes),
+            "iat": now,
+        }
+        if family_id is not None:
+            payload["sid"] = str(family_id)
+        if multi_tenant:
+            if tenant_id is None:
+                raise ValueError(
+                    "Cannot issue a multi-tenant access token without a tenant id"
+                )
+            payload["tid"] = str(tenant_id)
+        return jwt.encode(
+            payload,
+            settings.jwt_secret_key.get_secret_value(),
+            algorithm=settings.jwt_algorithm,
+        )
+
+    async def create_download_token(
+        self,
+        identity: AuthenticatedIdentity,
+        dataset_id: uuid.UUID,
+        expire_seconds: int = 120,
+        *,
+        tenant_id: uuid.UUID | None = None,
+    ) -> str:
+        """Create a download-scoped JWT for a single dataset.
+
+        A JWT in a URL query parameter is far more leak-prone than a Bearer
+        header (browser history, logs, accidental copy). ``typ='download'``, a
+        dataset-scoped ``scope``, and a <=2-minute TTL bound the damage if the
+        URL is exposed; the session JWT keeps working via the Authorization
+        header. ``expire_seconds`` is silently capped at 120, never raised. The
+        user's current ``token_version`` is stamped so a sign-out or password
+        change revokes the token too.
+        """
+        ttl = min(expire_seconds, 120)
+        now = datetime.now(UTC)
+        token_version = (
+            await self.db.execute(
+                select(User.token_version).where(User.id == identity.user_id)
+            )
+        ).scalar_one_or_none()
+        payload = {
+            "sub": str(identity.user_id),
+            "username": identity.username,
+            DOWNLOAD_TOKEN_VERSION_CLAIM: token_version,
+            "typ": "download",
+            "scope": f"dataset:{dataset_id}",
+            "exp": now + timedelta(seconds=ttl),
+            "iat": now,
+        }
+        if is_multi_tenant():
+            if tenant_id is None:
+                raise ValueError(
+                    "Cannot issue a multi-tenant download token without a tenant id"
+                )
+            payload["tid"] = str(tenant_id)
+        return jwt.encode(
+            payload,
+            settings.jwt_secret_key.get_secret_value(),
+            algorithm=settings.jwt_algorithm,
+        )
+
+    def create_refresh_token(
+        self,
+        user_id: uuid.UUID,
+        expire_days: int | None = None,
+        *,
+        family_id: uuid.UUID | None = None,
+    ) -> str:
+        """expire_days falls back to settings.refresh_token_expire_days if None."""
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        days = expire_days or settings.refresh_token_expire_days
+        expires_at = datetime.now(UTC) + timedelta(days=days)
+        refresh = RefreshToken(
+            user_id=user_id,
+            token_hash=token_hash,
+            family_id=family_id or uuid.uuid4(),
+            expires_at=expires_at,
+        )
+        self.db.add(refresh)
+        return raw_token
+
+    async def get_user_from_refresh_token(self, raw_token: str) -> "User | None":
+        """Return the User linked to *raw_token* without revoking it.
+
+        Used by the refresh handler to check the domain allowlist BEFORE the
+        old token is revoked: callers call rotate_refresh_token only after the
+        check passes, so a rejected token stays usable (no silent revocation on
+        block).
+
+        Returns None if the token is missing, expired, revoked, the linked
+        user doesn't exist, or the row predates the owner's revocation horizon.
+        """
+        stored = await self._usable_refresh_token(raw_token)
+        if stored is None:
+            return None
+        user_result = await self.db.execute(
+            select(User).where(User.id == stored.user_id)
+        )
+        return user_result.scalar_one_or_none()
+
+    async def get_refresh_session_id(self, raw_token: str) -> uuid.UUID | None:
+        """The session (token family) *raw_token* belongs to, if it is usable.
+
+        Same acceptance rules as get_user_from_refresh_token, so a guessed or
+        retired token never names a session.
+        """
+        stored = await self._usable_refresh_token(raw_token)
+        return stored.family_id if stored is not None else None
+
+    async def _usable_refresh_token(self, raw_token: str) -> RefreshToken | None:
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        result = await self.db.execute(
+            select(RefreshToken)
+            .join(User, RefreshToken.user_id == User.id)
+            .where(
+                RefreshToken.token_hash == token_hash,
+                RefreshToken.revoked == False,  # noqa: E712
+                RefreshToken.expires_at > datetime.now(UTC),
+                or_(
+                    RefreshToken.rotated_at.is_(None),
+                    RefreshToken.rotated_at
+                    > datetime.now(UTC)
+                    - timedelta(seconds=settings.refresh_rotation_grace_seconds),
+                ),
+                # Revocation horizon, checked at use time so it covers rows
+                # revoke_all_tokens couldn't see when it ran (DB clock on both
+                # sides, so skew-free).
+                or_(
+                    User.sessions_revoked_at.is_(None),
+                    RefreshToken.created_at > User.sessions_revoked_at,
+                ),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def rotate_refresh_token(
+        self,
+        raw_token: str,
+        expire_minutes: int | None = None,
+        expire_days: int | None = None,
+    ) -> tuple[str, str]:
+        """Validate refresh token, retire it, issue new access + refresh pair.
+
+        Concurrent callers inside the rotation grace window receive their own
+        valid successors in the same family. Reuse after grace revokes that
+        family, until the presented token reaches its original expiry.
+
+        Returns (new_access_token, new_refresh_token).
+        Raises ValueError on invalid/expired/revoked token or inactive user.
+        """
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        result = await self.db.execute(
+            select(RefreshToken.user_id)
+            .join(User, RefreshToken.user_id == User.id)
+            .where(
+                RefreshToken.token_hash == token_hash,
+                RefreshToken.revoked == False,  # noqa: E712
+                RefreshToken.expires_at > datetime.now(UTC),
+                or_(
+                    User.sessions_revoked_at.is_(None),
+                    RefreshToken.created_at > User.sessions_revoked_at,
+                ),
+            )
+        )
+        user_id = result.scalar_one_or_none()
+        if user_id is None:
+            raise ValueError("Invalid or expired refresh token")
+
+        # Every family mutation shares revoke-all's owner lock.
+        # Re-read rows after waiting so a queued rotation cannot revive a family.
+        user = (
+            await self.db.execute(
+                select(User)
+                .where(User.id == user_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if user is None or not user.is_active or user.status != "active":
+            raise ValueError("User account is not active")
+        stored = (
+            await self.db.execute(
+                select(RefreshToken)
+                .where(RefreshToken.token_hash == token_hash)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if (
+            stored is None
+            or stored.revoked
+            or (
+                user.sessions_revoked_at is not None
+                and stored.created_at <= user.sessions_revoked_at
+            )
+        ):
+            raise ValueError("Invalid or expired refresh token")
+
+        now = datetime.now(UTC)
+        grace = timedelta(seconds=settings.refresh_rotation_grace_seconds)
+        if stored.expires_at <= now:
+            raise ValueError("Invalid or expired refresh token")
+        if stored.rotated_at is not None and now >= stored.rotated_at + grace:
+            await self._revoke_family(user.id, stored.family_id)
+            # The router returns 401; the revocation must survive its rollback.
+            await self.db.commit()
+            raise ValueError("Invalid or expired refresh token")
+        if stored.rotated_at is None:
+            stored.rotated_at = now
+
+        identity = AuthenticatedIdentity(user_id=user.id, username=user.username)
+        new_access = await self.create_access_token(
+            identity, expire_minutes=expire_minutes, family_id=stored.family_id
+        )
+        new_refresh = self.create_refresh_token(
+            user.id, expire_days=expire_days, family_id=stored.family_id
+        )
+        await self.cleanup_refresh_tokens()
+
+        await self.db.commit()
+        return new_access, new_refresh
+
+    async def stage_sso_sign_in(
+        self, user_id: uuid.UUID, *, family_id: uuid.UUID, sign_in_nonce: str
+    ) -> tuple[str, str]:
+        """Stage a completed SSO sign-in for one exchange; returns (code, binding).
+
+        The pending row joins the new session's family, so logout-everywhere
+        and the revocation horizon reach it like any refresh token. Its hash
+        covers the code, the binding and the starting page's nonce, so
+        redeeming needs all three. Expired staged rows are swept here, since an
+        abandoned callback is never redeemed or rotated.
+        """
+        expired = (
+            select(RefreshToken.id)
+            .where(
+                RefreshToken.token_hash.startswith(_SSO_EXCHANGE_HASH_PREFIX),
+                RefreshToken.expires_at < datetime.now(UTC),
+                RefreshToken.user_id.in_(select(User.id)),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        await self.db.execute(delete(RefreshToken).where(RefreshToken.id.in_(expired)))
+        code = secrets.token_urlsafe(32)
+        binding = secrets.token_urlsafe(32)
+        self.db.add(
+            RefreshToken(
+                user_id=user_id,
+                token_hash=_sso_exchange_hash(code, binding, sign_in_nonce),
+                family_id=family_id,
+                expires_at=datetime.now(UTC)
+                + timedelta(seconds=SSO_EXCHANGE_TTL_SECONDS),
+            )
+        )
+        return code, binding
+
+    async def redeem_sso_sign_in(
+        self,
+        code: str,
+        binding: str,
+        sign_in_nonce: str,
+        *,
+        expire_minutes: int | None = None,
+        expire_days: int | None = None,
+    ) -> tuple[str, str]:
+        """Consume a staged sign-in once; returns (access_token, refresh_token).
+
+        Raises ValueError when the values name no live staged sign-in: wrong,
+        expired, already redeemed, revoked, or its user is no longer active.
+        """
+        if not all(
+            _SSO_EXCHANGE_SECRET.match(value)
+            for value in (code, binding, sign_in_nonce)
+        ):
+            raise ValueError("Invalid or expired sign-in code")
+        token_hash = _sso_exchange_hash(code, binding, sign_in_nonce)
+        user_id = (
+            await self.db.execute(
+                select(RefreshToken.user_id)
+                .join(User, RefreshToken.user_id == User.id)
+                .where(
+                    RefreshToken.token_hash == token_hash,
+                    RefreshToken.revoked == False,  # noqa: E712
+                    RefreshToken.expires_at > datetime.now(UTC),
+                )
+            )
+        ).scalar_one_or_none()
+        if user_id is None:
+            raise ValueError("Invalid or expired sign-in code")
+
+        # The owner lock every family mutation takes, as in rotate_refresh_token.
+        user = (
+            await self.db.execute(
+                select(User)
+                .where(User.id == user_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if user is None or not user.is_active or user.status != "active":
+            raise ValueError("Invalid or expired sign-in code")
+        # DELETE is the single-use gate: a concurrent redemption finds no row.
+        staged = (
+            await self.db.execute(
+                delete(RefreshToken)
+                .where(
+                    RefreshToken.token_hash == token_hash,
+                    RefreshToken.user_id == user.id,
+                    RefreshToken.revoked == False,  # noqa: E712
+                    RefreshToken.expires_at > datetime.now(UTC),
+                )
+                .returning(RefreshToken.family_id, RefreshToken.created_at)
+            )
+        ).one_or_none()
+        if staged is None or (
+            user.sessions_revoked_at is not None
+            and staged.created_at <= user.sessions_revoked_at
+        ):
+            raise ValueError("Invalid or expired sign-in code")
+
+        identity = AuthenticatedIdentity(
+            user_id=user.id, username=user.username, email=user.email
+        )
+        access_token = await self.create_access_token(
+            identity, expire_minutes=expire_minutes, family_id=staged.family_id
+        )
+        refresh_token = self.create_refresh_token(
+            user.id, expire_days=expire_days, family_id=staged.family_id
+        )
+        await self.db.commit()
+        return access_token, refresh_token
+
+    async def cleanup_refresh_tokens(self) -> None:
+        """Keep hashes through original expiry plus one day, even after rotation."""
+        await self.db.execute(
+            delete(RefreshToken).where(
+                RefreshToken.expires_at < datetime.now(UTC) - timedelta(days=1),
+                RefreshToken.user_id.in_(select(User.id)),
+            )
+        )
+
+    async def _revoke_family(self, user_id: uuid.UUID, family_id: uuid.UUID) -> None:
+        """Caller holds the owner lock; never bump the user's global version."""
+        await self.db.execute(
+            update(RefreshToken)
+            .where(
+                RefreshToken.user_id == user_id,
+                RefreshToken.family_id == family_id,
+                RefreshToken.user_id.in_(select(User.id)),
+            )
+            .values(revoked=True)
+        )
+
+    async def revoke_session(
+        self, *, access_token: str | None = None, refresh_token: str | None = None
+    ) -> None:
+        """Revoke one refresh family by possession; access JWTs retain their TTL.
+
+        Valid signed access JWTs may end only their own family. Legacy JWTs
+        without sid require a refresh credential. No credential grants broader
+        authority here, and tenant-scoped user visibility is still required.
+        """
+        if access_token is not None:
+            try:
+                payload = jwt.decode(
+                    access_token,
+                    settings.jwt_secret_key.get_secret_value(),
+                    algorithms=[settings.jwt_algorithm],
+                    options={"require": ["sub", "sid", "exp"]},
+                )
+                user_id = uuid.UUID(payload["sub"])
+                family_id = uuid.UUID(payload["sid"])
+            except (jwt.PyJWTError, ValueError, TypeError, AttributeError) as exc:
+                raise ValueError("Invalid session credential") from exc
+            predicate = (
+                RefreshToken.user_id == user_id,
+                RefreshToken.family_id == family_id,
+            )
+        elif refresh_token:
+            predicate = (
+                RefreshToken.token_hash
+                == hashlib.sha256(refresh_token.encode()).hexdigest(),
+            )
+        else:
+            raise ValueError("Invalid session credential")
+        row = (
+            await self.db.execute(
+                select(RefreshToken.user_id, RefreshToken.family_id)
+                .join(User, RefreshToken.user_id == User.id)
+                .where(*predicate)
+                .limit(1)
+            )
+        ).one_or_none()
+        if row is None:
+            raise ValueError("Invalid session credential")
+        await self.db.execute(
+            select(User.id).where(User.id == row.user_id).with_for_update()
+        )
+        await self._revoke_family(row.user_id, row.family_id)
+        await self.db.commit()
+
+    async def revoke_all_tokens(
+        self, user_id: uuid.UUID, *, commit: bool = True, bump_key_epoch: bool = False
+    ) -> int:
+        """Revoke all active refresh tokens AND bump User.token_version (logout).
+
+        Incrementing token_version invalidates every access JWT issued before
+        the bump on the next authenticated request, so logout ends them too.
+
+        commit=False lets the caller fold revocation into a larger transaction
+        (e.g. change_password, where the password hash and audit row must land
+        in the same commit).
+
+        bump_key_epoch also bumps User.key_epoch, invalidating every API key
+        minted before the bump. Default False so plain logout never kills
+        long-lived API keys; pass True only from security-event callers.
+
+        Returns the new token_version value.
+        """
+        # Take the owner-row lock BEFORE revoking, matching
+        # rotate_refresh_token: a concurrent rotation either finishes before
+        # this UPDATE's snapshot (so its replacement is caught) or blocks here
+        # and finds its own row already revoked.
+        await self.db.execute(
+            select(User.id).where(User.id == user_id).with_for_update()
+        )
+
+        # 1. Revoke all active refresh tokens for the user.
+        await self.db.execute(
+            update(RefreshToken)
+            .where(
+                RefreshToken.user_id.in_(select(User.id).where(User.id == user_id)),
+                RefreshToken.revoked == False,  # noqa: E712
+            )
+            .values(revoked=True)
+        )
+
+        # 2. Atomically increment token_version (and key_epoch, if requested)
+        #    so prior access JWTs/API keys are rejected, and stamp the
+        #    revocation horizon in the same UPDATE. Step 1 only revokes what
+        #    its own snapshot sees, so a rotation committing its replacement
+        #    just after that snapshot survives it; the horizon is a predicate
+        #    evaluated at USE time, the only shape that covers a row this
+        #    transaction can't see yet. func.now() is the transaction
+        #    timestamp, matching RefreshToken.created_at (skew-free). GREATEST
+        #    keeps the horizon monotonic if the clock steps backward; COALESCE
+        #    is needed because SQL GREATEST is not guaranteed to ignore NULLs
+        #    (Postgres does, the standard doesn't).
+        #
+        #    token_version is kept alongside the horizon: iat is API-clock and
+        #    the horizon is DB-clock, so a fast API clock could mint a
+        #    pre-logout token whose iat clears the horizon, and the bump still
+        #    kills it. Since iat is whole seconds, the same-second region is
+        #    covered by the bump ALONE (see _predates_revocation_horizon in
+        #    dependencies.py), so weakening the bump needs that rounding
+        #    tightened in the same change.
+        values: dict = {
+            "token_version": User.token_version + 1,
+            "sessions_revoked_at": func.greatest(
+                func.coalesce(
+                    User.sessions_revoked_at,
+                    literal_column("'-infinity'::timestamptz"),
+                ),
+                func.now(),
+            ),
+        }
+        if bump_key_epoch:
+            values["key_epoch"] = User.key_epoch + 1
+        version_result = await self.db.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(**values)
+            .returning(User.token_version)
+        )
+        new_version = version_result.scalar_one_or_none()
+        if new_version is None:
+            raise ValueError("User not found")
+
+        if commit:
+            await self.db.commit()
+        return new_version
+
+    async def register_user(
+        self,
+        username: str,
+        password: str,
+        email: str | None = None,
+    ) -> uuid.UUID:
+        """Create a new pending user (no role assigned). Returns the new user id.
+
+        Raises ValueError if the username or email already exists.
+
+        FLUSHES but does NOT commit: the caller controls the transaction so a
+        follow-up audit_emit lands in the same one.
+        """
+        # Hashed before the existence checks so a taken name or email costs
+        # the same bcrypt time as a new account and the timing can't tell
+        # them apart.
+        password_hash = await hash_password_async(password)
+        existing = await self.db.execute(
+            select(User).where(func.lower(User.username) == func.lower(username))
+        )
+        if existing.scalar_one_or_none() is not None:
+            raise ValueError("Username or email already taken")
+
+        if email is not None:
+            existing_email = await self.db.execute(
+                select(User).where(func.lower(User.email) == func.lower(email))
+            )
+            if existing_email.scalar_one_or_none() is not None:
+                raise ValueError("Username or email already taken")
+
+        user = User(
+            username=username,
+            password_hash=password_hash,
+            email=email,
+            status="pending",
+            is_active=False,
+        )
+        self.db.add(user)
+        # Flush so user.id is populated (server_default UUID); caller commits.
+        await self.db.flush()
+        return user.id
+
+    async def get_user_roles(self, user_id: uuid.UUID) -> set[str]:
+        result = await self.db.execute(
+            select(Role.name)
+            .join(UserRole, Role.id == UserRole.role_id)
+            .where(UserRole.user_id == user_id)
+        )
+        return {row[0] for row in result.all()}
+
+
+async def get_user_identity(db: AsyncSession, user_id: uuid.UUID) -> Identity | None:
+    """The account ``user_id`` names, or None when the caller's scope has none."""
+    return await db.get(User, user_id)
+
+
+class ApiKeyTargetUserNotFoundError(LookupError):
+    """The target user is absent from the caller's RLS-visible scope."""
+
+
+class ApiKeyTargetUserInactiveError(ValueError):
+    """The target user is not active, so an API key must not be minted.
+
+    A key minted for a pending account would be blocked by the
+    resolution-time status check while pending, then gain the approved
+    role's privileges at approval. Refusing the mint closes that door early;
+    approve_user's key_epoch bump also voids any key minted before approval.
+    """
+
+
+# Marks a GeoLens API key wherever one is pasted, so log redaction and secret
+# scanners can recognise it. Keys minted before the prefix still authenticate.
+API_KEY_PREFIX = "glk_"
+
+
+async def lock_current_session_owner(db: AsyncSession, identity: Identity) -> None:
+    """Row-lock the caller's account until the transaction ends.
+
+    Raises 401 when a built-in account's ``token_version`` moved after its
+    bearer token was checked, or its row is gone. Holding the lock through the
+    commit makes a concurrent revocation wait, so it also invalidates what this
+    transaction issues. Another identity's revocation belongs to its extension.
+    The lock leaves key-share room, so a key issued for another locked account
+    can still pass its foreign-key check instead of deadlocking.
+    """
+    admitted = identity.token_version if isinstance(identity, User) else None
+    current = (
+        await db.execute(
+            select(User.token_version)
+            .where(User.id == identity.id)
+            .with_for_update(key_share=True)
+        )
+    ).scalar_one_or_none()
+    if admitted is not None and current != admitted:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def create_api_key_for_user(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    name: str,
+    expires_at: datetime | None = None,
+    scope: str = "full",
+    dataset_id: uuid.UUID | None = None,
+) -> tuple[ApiKey, str]:
+    """Create an API key for a user. Returns (api_key, raw_key).
+
+    The raw key is only available at creation time. Flushes but does NOT
+    commit; the caller controls the transaction.
+
+    ``expires_at=None`` mints a non-expiring key. The key snapshots the
+    owner's key_epoch so a later security event (password/role change,
+    SAML-to-local conversion, NOT logout) invalidates it. Minting requires an
+    active owner.
+
+    ``scope="read_only"`` mints a key limited to reads (see
+    ``_read_only_key_may_call``), and ``scope="publish"`` one limited to reads
+    plus additive or restorable writes (see ``_publish_key_may_call``). The
+    default matches the column default.
+
+    ``scope="dataset_write"`` and ``scope="dataset_append"`` require
+    ``dataset_id`` and other scopes forbid it; the caller must already have
+    checked write access to that dataset.
+    """
+    owner = (
+        await db.execute(
+            select(User.id, User.key_epoch, User.status).where(User.id == user_id)
+        )
+    ).one_or_none()
+    if owner is None:
+        raise ApiKeyTargetUserNotFoundError("User not found")
+    if owner.status != "active":
+        raise ApiKeyTargetUserInactiveError(
+            "API keys can only be created for active users"
+        )
+
+    raw_key = API_KEY_PREFIX + secrets.token_urlsafe(32)
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    fingerprint = f"{raw_key[: len(API_KEY_PREFIX) + 8]}…{raw_key[-4:]}"
+    api_key = ApiKey(
+        user_id=owner.id,
+        key_hash=key_hash,
+        fingerprint=fingerprint,
+        name=name,
+        expires_at=expires_at,
+        key_epoch=owner.key_epoch,
+        scope=scope,
+        dataset_id=dataset_id,
+    )
+    db.add(api_key)
+    await db.flush()
+    await db.refresh(api_key)
+    return api_key, raw_key

@@ -1,0 +1,594 @@
+import { useState, useMemo } from 'react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { useTranslation } from 'react-i18next';
+import { Layers, X, ChevronDown, ChevronRight, LifeBuoy } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Label } from '@/components/ui/label';
+import { ImportMetadataForm } from './ImportMetadataForm';
+import { TilesetFacts } from './TilesetFacts';
+import { TypeTag } from './TypeTag';
+import { StatusPill } from './StatusPill';
+import { isRasterPreview, isFilePreview, isTilesetPreview, isPointCloudPreview, fileExt, kindFromEntry, isSpreadsheetExt, displayLayerName } from './utils';
+import { getBoundingVolumeLabel, getGeometryTypeLabel } from '@/i18n/labels';
+import { formatBytes, formatNumber } from '@/lib/format';
+import { useReportDialog } from '@/lib/report';
+import type { FileEntry, CommitImportRequest, FilePreviewResponse } from '@/types/api';
+
+
+/**
+ * Inline nudge on a failed staged file toward the in-app problem reporter.
+ * The import route already maps to the "Import / Ingestion" area
+ * (mapAreaFromPath in build-issue.ts), so opening the wizard from here
+ * pre-seeds it without any wizard changes.
+ */
+function ReportProblemButton() {
+  const { t } = useTranslation('import');
+  const openReport = useReportDialog((s) => s.openReport);
+
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="xs"
+      onClick={openReport}
+    >
+      <LifeBuoy className="size-3" />
+      {t('upload.reportProblem')}
+    </Button>
+  );
+}
+
+
+function DetectionPanel({ entry }: { entry: FileEntry }) {
+  const { t } = useTranslation('import');
+  const preview = entry.previewData;
+  if (!preview) return null;
+
+  if (isTilesetPreview(preview)) {
+    return (
+      <div className="col-span-full mt-3 border-t border-dashed border-border pt-4">
+        <TilesetFacts preview={preview} />
+      </div>
+    );
+  }
+
+  if (isPointCloudPreview(preview)) {
+    return (
+      <div className="col-span-full mt-3 border-t border-dashed border-border pt-4 text-xs">
+        {t('review.pointcloudSummary', {
+          points: formatNumber(preview.point_count),
+          crs: `EPSG:${preview.srid}`,
+          size: formatBytes(preview.size_bytes),
+        })}
+      </div>
+    );
+  }
+
+  const raster = isRasterPreview(preview);
+  const file = isFilePreview(preview) ? preview : null;
+
+  return (
+    <div className="col-span-full mt-3 grid gap-5 border-t border-dashed border-border pt-4 md:grid-cols-2">
+      {/* Geometry & projection */}
+      <div>
+        <h5 className="eyebrow mb-2">
+          {raster ? t('detect.rasterInfo') : t('detect.geometry')}
+        </h5>
+        <dl className="grid grid-cols-[92px_1fr] gap-x-3 gap-y-1 text-xs">
+          {raster ? (
+            <>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.bands')}</dt>
+              <dd className="font-mono text-mini">{preview.band_count}</dd>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.size')}</dt>
+              <dd className="font-mono text-mini">{preview.width} x {preview.height} px</dd>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.dataType')}</dt>
+              <dd className="font-mono text-mini">{preview.dtype}</dd>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.crs')}</dt>
+              <dd className="font-mono text-mini">{preview.crs_epsg ? `EPSG:${preview.crs_epsg}` : t('preview.unknown')}</dd>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.cog')}</dt>
+              <dd className="font-mono text-mini">
+                {preview.is_cog_compliant
+                  ? <span className="text-success">{t('detect.validCog')}</span>
+                  : <span className="text-warning">{t('detect.willConvert')}</span>}
+              </dd>
+            </>
+          ) : file ? (
+            <>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.type')}</dt>
+              <dd className="font-mono text-mini">
+                {file.geometry_type ? getGeometryTypeLabel(t, file.geometry_type) : t('detect.nonSpatial')}
+              </dd>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.features')}</dt>
+              <dd className="font-mono text-mini">
+                {file.feature_count != null ? formatNumber(file.feature_count) : '—'}
+              </dd>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.crs')}</dt>
+              <dd className="font-mono text-mini">
+                {file.crs ? `EPSG:${file.crs}` : '—'}
+                {file.crs && file.crs !== 4326 && file.crs !== 3857 && (
+                  <span className="ms-1 text-muted-foreground">→ {t('detect.willReproject')}</span>
+                )}
+              </dd>
+              <dt className="font-mono text-mini text-muted-foreground">{t('detect.labels.layer')}</dt>
+              <dd className="font-mono text-mini">{displayLayerName(file.layer_name, file.job_id, file.source_filename)}</dd>
+            </>
+          ) : null}
+        </dl>
+      </div>
+
+      {/* Schema columns */}
+      {file && file.columns.length > 0 && (
+        <div>
+          <h5 className="eyebrow mb-2">
+            {t('detect.schema')} · {t('detect.columnCount', { count: file.columns.length, value: formatNumber(file.columns.length) })}
+          </h5>
+          <div className="max-h-44 overflow-y-auto rounded-sm border border-border">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="border-b border-border bg-surface-0">
+                  <th className="px-2 py-1.5 text-start font-mono text-2xs uppercase tracking-wider text-muted-foreground">{t('detect.table.column')}</th>
+                  <th className="px-2 py-1.5 text-start font-mono text-2xs uppercase tracking-wider text-muted-foreground">{t('detect.table.type')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {file.columns.slice(0, 12).map((col) => (
+                  <tr key={col.name} className="border-b border-border last:border-0">
+                    <td className="px-2 py-1 font-mono text-mini">{col.name}</td>
+                    <td className="px-2 py-1">
+                      <span className={cn(
+                        'inline-block rounded-sm px-1.5 py-px font-mono text-2xs',
+                        col.type.toLowerCase().includes('geom')
+                          ? 'bg-type-vector-bg text-type-vector'
+                          : 'bg-surface-2 text-muted-foreground',
+                      )}>
+                        {col.type}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+                {file.columns.length > 12 && (
+                  <tr>
+                    <td colSpan={2} className="px-2 py-1 text-center text-mini text-muted-foreground">
+                      {t('preview.moreColumns', { count: file.columns.length - 12 })}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+function ReviewFormBlock({
+  entry,
+  isCommitting,
+  onCommitSingle,
+}: {
+  entry: FileEntry;
+  isCommitting: boolean;
+  onCommitSingle: (entryId: string, request: CommitImportRequest) => void;
+}) {
+  const preview = entry.previewData;
+  if (!preview) return null;
+
+  if (isTilesetPreview(preview) || isPointCloudPreview(preview)) {
+    return (
+      <div className="col-span-full border-t border-border pt-4 mt-2">
+        <ImportMetadataForm
+          defaultName={preview.source_filename ?? entry.fileName}
+          detectedCrs={null}
+          onCommit={(req) => onCommitSingle(entry.id, req)}
+          isCommitting={isCommitting}
+          initialRequest={entry.commitRequest}
+          isTileset={isTilesetPreview(preview)}
+          isPointCloud={isPointCloudPreview(preview)}
+        />
+      </div>
+    );
+  }
+
+  const raster = isRasterPreview(preview);
+  const fp = isFilePreview(preview) ? preview : null;
+
+  return (
+    <div className="col-span-full border-t border-border pt-4 mt-2">
+      <ImportMetadataForm
+        defaultName={preview.source_filename ?? entry.fileName}
+        detectedCrs={raster ? preview.crs_epsg : fp?.crs ?? null}
+        onCommit={(req) => onCommitSingle(entry.id, req)}
+        isCommitting={isCommitting}
+        initialRequest={entry.commitRequest}
+        isRaster={raster}
+        previewData={raster ? preview : undefined}
+        previewColumns={fp?.columns}
+        detectedGeometryType={fp?.geometry_type}
+        detectedGeometryColumns={fp?.detected_geometry_columns}
+      />
+    </div>
+  );
+}
+
+
+interface BulkReviewListProps {
+  entries: FileEntry[];
+  onCommitSingle: (entryId: string, request: CommitImportRequest) => void;
+  onCommitAll: () => void;
+  onCommitAllAsVrt?: () => void;
+  onRemove: (entryId: string) => void;
+  onSheetChange?: (entryId: string, layerName: string) => void;
+  // Optional fan-out prop — single-layer-only consumers can omit
+  onIngestAllLayers?: (entryId: string) => void;
+  isCommitting: boolean;
+}
+
+export function BulkReviewList({
+  entries,
+  onCommitSingle,
+  onCommitAll,
+  onCommitAllAsVrt,
+  onRemove,
+  onSheetChange,
+  onIngestAllLayers,
+  isCommitting,
+}: BulkReviewListProps) {
+  const { t } = useTranslation('import');
+  const [expandedId, setExpandedId] = useState<string | null>(entries[0]?.id ?? null);
+  const [confirmDefaults, setConfirmDefaults] = useState<'batch' | 'vrt' | null>(null);
+
+  const { readyCount, rasterReadyCount, vectorCount, rasterCount, tableCount, tilesetCount, pointcloudCount, hasMultiLayerFile } = useMemo(() => {
+    let ready = 0, rasterReady = 0, vec = 0, ras = 0, tab = 0, tiles = 0, clouds = 0, multiLayer = false;
+    for (const e of entries) {
+      if (e.status === 'preview') {
+        ready++;
+        if (e.previewData && isRasterPreview(e.previewData)) rasterReady++;
+      }
+      if (!e.previewData) continue;
+      if (isTilesetPreview(e.previewData)) { tiles++; }
+      else if (isPointCloudPreview(e.previewData)) { clouds++; }
+      else if (isRasterPreview(e.previewData)) { ras++; }
+      else if ((e.previewData as FilePreviewResponse).geometry_type) { vec++; }
+      else { tab++; }
+      if (isFilePreview(e.previewData) && (e.previewData.layers?.length ?? 0) > 1) multiLayer = true;
+    }
+    return {
+      readyCount: ready,
+      rasterReadyCount: rasterReady,
+      vectorCount: vec,
+      rasterCount: ras,
+      tableCount: tab,
+      tilesetCount: tiles,
+      pointcloudCount: clouds,
+      hasMultiLayerFile: multiLayer,
+    };
+  }, [entries]);
+
+  function formatCrs(crs: number | null | undefined, fallback: string) {
+    return crs ? `EPSG:${crs}` : fallback;
+  }
+
+  function formatPreviewSummary(preview: FileEntry['previewData']): string {
+    if (!preview) return '';
+
+    if (isTilesetPreview(preview)) {
+      return t('review.tilesetSummary', {
+        version: preview.version,
+        size: formatBytes(preview.unpacked_bytes),
+        volume: getBoundingVolumeLabel(t, preview.bounding_volume),
+      });
+    }
+
+    if (isPointCloudPreview(preview)) {
+      return t('review.pointcloudSummary', {
+        points: formatNumber(preview.point_count),
+        crs: `EPSG:${preview.srid}`,
+        size: formatBytes(preview.size_bytes),
+      });
+    }
+
+    if (isRasterPreview(preview)) {
+      const bands = t('review.bandCount', {
+        count: preview.band_count,
+        value: formatNumber(preview.band_count),
+      });
+      return t('review.rasterSummary', {
+        bands,
+        width: formatNumber(preview.width),
+        height: formatNumber(preview.height),
+        crs: formatCrs(preview.crs_epsg, t('preview.unknown')),
+      });
+    }
+
+    const geometryType = preview.geometry_type
+      ? getGeometryTypeLabel(t, preview.geometry_type)
+      : t('bulk.kindTable');
+    const features = preview.feature_count != null
+      ? t('review.featureCount', {
+          count: preview.feature_count,
+          value: formatNumber(preview.feature_count),
+        })
+      : '—';
+
+    return t('review.vectorSummary', {
+      geometryType,
+      features,
+      crs: formatCrs(preview.crs, t('review.noCrs')),
+    });
+  }
+
+  function formatLayerOption(layer: { name: string; feature_count?: number | null; field_count?: number | null }) {
+    // GDAL can't always count a layer; an unknown count reads as unavailable, not as zero.
+    const rows = t('bulk.rowCount', {
+      count: layer.feature_count ?? 0,
+      value: formatNumber(layer.feature_count),
+    });
+    const columns = t('bulk.columnCount', {
+      count: layer.field_count ?? 0,
+      value: formatNumber(layer.field_count),
+    });
+
+    return t('bulk.sheetOption', { name: layer.name, rows, columns });
+  }
+
+  function formatReviewCount(
+    key: 'fileCount' | 'vectorCount' | 'rasterCount' | 'tableCount' | 'tilesetCount' | 'pointcloudCount',
+    count: number,
+  ) {
+    return t(`review.${key}`, { count, value: formatNumber(count) });
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* File list card */}
+      <div className="overflow-hidden rounded-xl border border-border bg-card">
+        {/* Header */}
+        <div className="eyebrow flex items-center gap-3 border-b border-border bg-surface-0 px-4 py-2.5">
+          <span>
+            {t('review.headerStatus')} · <span className="text-success">{t('review.readyCount', { count: readyCount, value: formatNumber(readyCount) })}</span>
+          </span>
+          <span className="flex-1" />
+          <span>{t('review.headerHint')}</span>
+        </div>
+
+        {/* File rows */}
+        {entries.map((entry) => {
+          const ext = fileExt(entry.fileName);
+          const kind = kindFromEntry(entry);
+          const layerCount = entry.previewData && isFilePreview(entry.previewData)
+            ? entry.previewData.layers?.length ?? 0
+            : 0;
+          const isExpanded = expandedId === entry.id;
+          const canExpand = entry.status === 'preview' || entry.status === 'committing' || entry.status === 'commit-failed';
+
+          return (
+            <div
+              key={entry.id}
+              className={cn(
+                'border-b border-border last:border-0',
+                isExpanded && canExpand && 'bg-primary/[0.03]',
+              )}
+            >
+              <div className={cn(
+                'grid grid-cols-[32px_minmax(0,1fr)_auto] items-center gap-3 px-4 py-3',
+                isExpanded && canExpand && 'border-l-2 border-l-primary',
+              )}>
+                <TypeTag kind={kind} />
+                <button
+                  type="button"
+                  disabled={!canExpand}
+                  aria-expanded={canExpand ? isExpanded : undefined}
+                  aria-controls={canExpand ? `review-details-${entry.id}` : undefined}
+                  aria-label={t('bulk.toggleDetails', { name: entry.fileName })}
+                  onClick={() => setExpandedId(isExpanded ? null : entry.id)}
+                  className="min-w-0 text-start disabled:cursor-default enabled:rounded-sm enabled:focus-visible:outline-none enabled:focus-visible:ring-2 enabled:focus-visible:ring-ring"
+                >
+                  <div className="flex items-center gap-2">
+                    {canExpand && (
+                      isExpanded
+                        ? <ChevronDown className="size-3.5 text-muted-foreground shrink-0" />
+                        : <ChevronRight className="size-3.5 text-muted-foreground shrink-0 rtl-mirror" />
+                    )}
+                    <span className="truncate text-sm font-medium tracking-tight">
+                      {entry.fileName.replace(/\.[^.]+$/, '')}
+                      <span className="font-mono font-normal text-muted-foreground">{ext}</span>
+                    </span>
+                    {entry.status === 'tracking' && (
+                      <Badge variant="success" className="text-2xs">
+                        {t('bulk.committed')}
+                      </Badge>
+                    )}
+                    {/* Hint the container has more than one layer without needing to
+                        expand the row — "Import All with Defaults" only imports the
+                        currently selected layer, so this is the only signal a user
+                        gets before that silently drops the rest. */}
+                    {layerCount > 1 && (
+                      <Badge
+                        variant="outline"
+                        className="text-2xs"
+                        data-testid={`layer-count-badge-${entry.id}`}
+                      >
+                        <Layers className="size-3" />
+                        {t('bulk.layerCount', { count: layerCount, value: formatNumber(layerCount) })}
+                      </Badge>
+                    )}
+                  </div>
+                  {entry.previewData && (
+                    <p className="mt-0.5 font-mono text-mini text-muted-foreground">
+                      {formatPreviewSummary(entry.previewData)}
+                    </p>
+                  )}
+                </button>
+                <div className="flex items-center gap-2">
+                  <StatusPill status={entry.status} />
+                  <button
+                    type="button"
+                    onClick={() => onRemove(entry.id)}
+                    disabled={entry.status === 'committing' || entry.status === 'tracking'}
+                    className="rounded-sm p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-30"
+                    aria-label={t('bulk.removeNamedFile', { name: entry.fileName })}
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Expanded content */}
+              {canExpand && entry.previewData && (
+                <div id={`review-details-${entry.id}`} hidden={!isExpanded} className="px-4 pb-4">
+                  {/* Layer/sheet selector for multi-layer files. Spreadsheet
+                      workbooks (.xlsx/.xls) keep "Sheet" vocabulary; every other
+                      multi-layer container (GeoPackage, zipped FileGDB, ...) uses
+                      "Layer" — an ArcGIS user importing a .gdb doesn't expect
+                      spreadsheet terms. */}
+                  {isFilePreview(entry.previewData) &&
+                    entry.previewData.layers &&
+                    entry.previewData.layers.length > 1 && (
+                      <div className="mb-3 space-y-1">
+                        <Label htmlFor={`sheet-${entry.id}`}>
+                          {t(isSpreadsheetExt(ext) ? 'bulk.sheetLabel' : 'bulk.layerLabel')}
+                        </Label>
+                        {/* Native <select> → themed ui/select. */}
+                        {/* Mirrors UrlImportForm.tsx's handleLayerChange
+                            guard: a layer picker left live during a commit
+                            would re-enable the commit button against a
+                            request that cannot be recalled. */}
+                        <Select
+                          value={entry.previewData.layer_name}
+                          onValueChange={(v) => onSheetChange?.(entry.id, v)}
+                          disabled={entry.status === 'committing'}
+                        >
+                          <SelectTrigger id={`sheet-${entry.id}`} className="w-full max-w-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {entry.previewData.layers.map((layer) => (
+                              <SelectItem key={layer.name} value={layer.name}>
+                                {formatLayerOption(layer)}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    )}
+
+                  {/* "Ingest all layers" button for multi-layer files */}
+                  {isFilePreview(entry.previewData) &&
+                    entry.previewData.layers &&
+                    entry.previewData.layers.length > 1 &&
+                    onIngestAllLayers && (
+                      <div className="mb-3">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => onIngestAllLayers(entry.id)}
+                          disabled={isCommitting || entry.status !== 'preview'}
+                          data-testid={`ingest-all-layers-${entry.id}`}
+                        >
+                          <Layers className="me-1 size-3" />
+                          {t('bulk.ingestAllLayers', { count: entry.previewData.layers.length })}
+                        </Button>
+                      </div>
+                    )}
+
+                  <DetectionPanel entry={entry} />
+
+                  {(entry.status === 'preview' || entry.status === 'committing' || entry.status === 'commit-failed') && (
+                    <ReviewFormBlock
+                      entry={entry}
+                      isCommitting={entry.status === 'committing'}
+                      onCommitSingle={onCommitSingle}
+                    />
+                  )}
+
+                  {isExpanded && entry.status === 'commit-failed' && entry.error && (
+                    <div className="mt-2 space-y-1.5">
+                      <p role="alert" className="text-sm text-destructive">{entry.error}</p>
+                      <ReportProblemButton />
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Error for a row whose details are not showing: collapsed
+                  commit-failed rows keep theirs `hidden`, so the alert lives
+                  here to be announced. The `canExpand` guard (always false for
+                  upload-failed) matters because `expandedId` seeds from
+                  entries[0]: a sole file failing upload is "expanded" yet has
+                  no details panel, and `!isExpanded` alone hid its error. */}
+              {!(isExpanded && canExpand) &&
+                (entry.status === 'upload-failed' || entry.status === 'commit-failed') &&
+                entry.error && (
+                <div className="space-y-1.5 px-4 pb-3">
+                  <p role="alert" className="text-sm text-destructive">{entry.error}</p>
+                  <ReportProblemButton />
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Action bar */}
+      <div className="flex items-center gap-3 border-t border-dashed border-border pt-4">
+        <div className="flex-1">
+          <p className="text-xs font-semibold">
+            {(tilesetCount > 0
+              ? t('review.tilesetActionSummary', {
+                  files: formatReviewCount('fileCount', entries.length),
+                  tilesets: formatReviewCount('tilesetCount', tilesetCount),
+                })
+              : t('review.actionSummary', {
+                  files: formatReviewCount('fileCount', entries.length),
+                  vectors: formatReviewCount('vectorCount', vectorCount),
+                  rasters: formatReviewCount('rasterCount', rasterCount),
+                  tables: formatReviewCount('tableCount', tableCount),
+                })) + (pointcloudCount > 0 ? ` · ${formatReviewCount('pointcloudCount', pointcloudCount)}` : '')}
+          </p>
+          <p className="font-mono text-mini text-muted-foreground tracking-wide">
+            {entries.length === 1 ? t('review.singleActionHint') : t(hasMultiLayerFile ? 'review.actionHintMultiLayer' : 'review.actionHint')}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          {entries.length > 1 && rasterReadyCount >= 2 && onCommitAllAsVrt && (
+            <Button
+              variant="secondary"
+              onClick={() => setConfirmDefaults('vrt')}
+              disabled={readyCount === 0 || isCommitting}
+            >
+              <Layers className="me-1 size-3" />
+              {t('bulk.importAsVrt')}
+            </Button>
+          )}
+          {entries.length > 1 && (
+            <Button onClick={() => setConfirmDefaults('batch')} disabled={readyCount === 0 || isCommitting}>
+              {t('bulk.importAllDefaults')}
+            </Button>
+          )}
+        </div>
+      </div>
+      <Dialog open={confirmDefaults !== null} onOpenChange={(open) => { if (!open) setConfirmDefaults(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('bulk.defaultsConfirmTitle')}</DialogTitle>
+            <DialogDescription>{t('bulk.defaultsConfirmDescription')}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDefaults(null)}>{t('common:cancel')}</Button>
+            <Button onClick={() => {
+              if (confirmDefaults === 'vrt') onCommitAllAsVrt?.();
+              else onCommitAll();
+              setConfirmDefaults(null);
+            }}>{t('bulk.confirmDefaults')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

@@ -1,0 +1,1363 @@
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router';
+import { useTranslation } from 'react-i18next';
+import { toast } from 'sonner';
+import {
+  Satellite,
+  Check,
+  ChevronRight,
+  ArrowLeft,
+  Calendar,
+  Layers,
+  Image,
+} from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { formatBytes, formatNumber } from '@/lib/format';
+import { ApiError } from '@/api/client';
+import {
+  connectStac,
+  fetchStacAssetSizes,
+  fetchStacCollections,
+  searchStacItems,
+} from '@/api/stac';
+import {
+  startStacImport,
+  peekStacImport,
+  clearStacImport,
+  type StacImportContext,
+} from '@/api/stac-import-session';
+import type {
+  ServiceAuthRequest,
+  StacConnectResponse,
+  StacCollectionSummary,
+  StacItemSummary,
+  StacImportItem,
+  StacImportResult,
+  StacNextPage,
+  StacSearchRequest,
+} from '@/types/api';
+import { originOf } from './utils';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Checkbox } from '@/components/ui/checkbox';
+
+// The four-way choice the backend's CredentialMethod enum names. A copy rather
+// than a shared component, as ServiceCredentialBlock.
+type StacCredentialMethod = 'none' | 'bearer' | 'basic' | 'header';
+
+type SearchFilters = Pick<
+  StacSearchRequest,
+  'bbox' | 'datetime_range' | 'max_cloud_cover' | 'cloud_cover_mode'
+>;
+
+// Which STAC extension the catalog advertises for filtering on cloud cover:
+// Query is the simpler one, CQL2 JSON the fallback. None means no filter.
+function cloudCoverMode(conformsTo: string[]): 'query' | 'filter' | null {
+  if (conformsTo.some((c) => c.includes('item-search#query'))) return 'query';
+  if (
+    conformsTo.some((c) => c.includes('item-search#filter')) &&
+    conformsTo.some((c) => c.includes('cql2-json'))
+  ) {
+    return 'filter';
+  }
+  return null;
+}
+
+// StacImportRequest.items allows at most this many per call.
+const MAX_IMPORT_ITEMS = 50;
+
+type Step =
+  | 'idle'
+  | 'connecting'
+  | 'collections'
+  | 'loading-items'
+  | 'items'
+  | 'confirm' // size-estimate confirmation before committing to fetch
+  | 'importing'
+  | 'done';
+
+interface AssetAvailability {
+  importable: boolean;
+  /** Unset when importable. 'no_asset' has no href at all; the other three
+   * mirror the search endpoint's `data_asset_import_refusal`, the server's
+   * prediction of what `/import`'s `StacImportItem` validator (stac_router.py)
+   * would refuse, so the client screens out exactly what the door rejects. */
+  reason?: 'no_asset' | 'not_http' | 'credentials' | 'too_long';
+  /** The href's scheme, lowercase and without the trailing colon; display only,
+   * for the 'not_http' message. `data_asset_import_refusal` already decided. */
+  scheme?: string;
+}
+
+function assetAvailability(
+  item: Pick<StacItemSummary, 'data_asset_href' | 'data_asset_import_refusal'>,
+): AssetAvailability {
+  if (!item.data_asset_href) return { importable: false, reason: 'no_asset' };
+  // Absent (the field's type allows undefined) is treated as null, importable,
+  // not as unknown. Only a server too old to have the field omits it, and
+  // disabling every item against that server would break working imports.
+  if (!item.data_asset_import_refusal) return { importable: true };
+  const availability: AssetAvailability = {
+    importable: false,
+    reason: item.data_asset_import_refusal,
+  };
+  if (item.data_asset_import_refusal === 'not_http') {
+    try {
+      availability.scheme = new URL(item.data_asset_href).protocol.replace(/:$/, '');
+    } catch {
+      // Unparsable is display-only fallout; data_asset_import_refusal already decided.
+    }
+  }
+  return availability;
+}
+
+/** The reason text for a disabled item's row, one per `AssetAvailability.reason`. */
+function assetUnavailableReasonText(
+  t: (key: string, opts?: Record<string, unknown>) => string,
+  availability: AssetAvailability,
+): string {
+  switch (availability.reason) {
+    case 'not_http':
+      // A scheme names the address's actual problem; without one (the href
+      // didn't parse, e.g. a malformed authority) fall back to a generic reason
+      // rather than an empty "://" fragment.
+      return availability.scheme
+        ? t('stac.unsupportedAssetScheme', { scheme: availability.scheme })
+        : t('stac.assetUrlInvalid');
+    case 'credentials':
+      return t('stac.assetHasCredentials');
+    case 'too_long':
+      return t('stac.assetHrefTooLong');
+    default:
+      return t('stac.noCogAsset');
+  }
+}
+
+export function StacImportForm() {
+  const { t } = useTranslation('import');
+  // Per-item failures arrive in a 200 response, outside the client's error localization.
+  const itemErrorText = (error: string) => {
+    if (error === 'import_failed') return t('stac.itemErrorImportFailed');
+    if (error === 'too_long') return t('stac.itemErrorTooLong');
+    return error;
+  };
+  const [step, setStep] = useState<Step>('idle');
+  const [url, setUrl] = useState('');
+  const [credentialMethod, setCredentialMethod] = useState<StacCredentialMethod>('none');
+  const [token, setToken] = useState('');
+  const [basicUsername, setBasicUsername] = useState('');
+  const [basicPassword, setBasicPassword] = useState('');
+  const [headerName, setHeaderName] = useState('');
+  const [headerValue, setHeaderValue] = useState('');
+  const [catalogInfo, setCatalogInfo] = useState<StacConnectResponse | null>(null);
+  const [collections, setCollections] = useState<StacCollectionSummary[]>([]);
+  const [selectedCollection, setSelectedCollection] = useState<StacCollectionSummary | null>(null);
+  const [searchResult, setSearchResult] = useState<{ items: StacItemSummary[]; matched: number | null }>({ items: [], matched: null });
+  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [bboxText, setBboxText] = useState('');
+  const [maxCloud, setMaxCloud] = useState('');
+  // Latched once an item of this collection reports cloud cover, so a limit
+  // that empties the list does not take the control away.
+  const [cloudCoverSeen, setCloudCoverSeen] = useState(false);
+  const [filtering, setFiltering] = useState(false);
+  const [nextPage, setNextPage] = useState<StacNextPage | null>(null);
+  const [appliedFilters, setAppliedFilters] = useState<SearchFilters>({});
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Sizes looked up on the review step for assets the catalog gave none for,
+  // keyed by asset URL since item ids repeat across collections; null means
+  // the asset's server did not say.
+  const [probedSizes, setProbedSizes] = useState<Record<string, number | null>>({});
+  const [probingSizes, setProbingSizes] = useState(false);
+  // Bumped whenever the result set is replaced or abandoned, so a response
+  // for an earlier search cannot append to, or overwrite, a newer one.
+  const searchGenRef = useRef(0);
+  const [filterError, setFilterError] = useState<string | null>(null);
+  const [importResult, setImportResult] = useState<{
+    created: number;
+    skipped: number;
+    errors: number;
+    results: StacImportResult[];
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const importErrorId = useId();
+  // A mount that STARTED the import must not act on its own settlement after
+  // unmounting: `handleImport`'s body keeps running past an unmount (nothing
+  // cancels it), and would call setStep/clearStacImport for a dead tree,
+  // clearing the session before the NEXT mount can adopt it. Same pattern as
+  // UrlImportForm's mountedRef.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const cloudMode = catalogInfo ? cloudCoverMode(catalogInfo.conforms_to ?? []) : null;
+  const items = searchResult.items;
+  const matchedCount = searchResult.matched;
+  useEffect(() => {
+    if (items.some((i) => i.cloud_cover != null)) setCloudCoverSeen(true);
+  }, [items]);
+  const selectableItems = useMemo(
+    () => items.filter((i) => assetAvailability(i).importable),
+    [items],
+  );
+
+  // A failed Connect returns here with the credential intact, so editing the
+  // URL to another catalog would send the first catalog's key to the second.
+  // Same reset and reason as ServiceUrlForm's.
+  const authOrigin = originOf(url);
+  const lastAuthOriginRef = useRef(authOrigin);
+  useEffect(() => {
+    if (authOrigin === lastAuthOriginRef.current) return;
+    lastAuthOriginRef.current = authOrigin;
+    clearCredential('none');
+  }, [authOrigin]);
+
+  // Switching methods discards the other branches' fields rather than
+  // half-honouring them, mirroring the backend's own oneOf-shaped `auth`.
+  function clearCredential(next: StacCredentialMethod) {
+    setCredentialMethod(next);
+    setToken('');
+    setBasicUsername('');
+    setBasicPassword('');
+    setHeaderName('');
+    setHeaderValue('');
+  }
+
+  // The `ServiceAuthRequest` the credential block describes, or undefined for
+  // 'none' and for an incomplete method — the door refuses a half-filled one,
+  // so staying anonymous matches how an empty optional token behaved.
+  function buildStacAuth(): ServiceAuthRequest | undefined {
+    switch (credentialMethod) {
+      case 'bearer':
+        return token.trim() ? { method: 'bearer', token: token.trim() } : undefined;
+      case 'basic':
+        return basicUsername.trim() && basicPassword
+          ? { method: 'basic', username: basicUsername.trim(), password: basicPassword }
+          : undefined;
+      case 'header':
+        return headerName.trim() && headerValue
+          ? { method: 'header', header_name: headerName.trim(), header_value: headerValue }
+          : undefined;
+      default:
+        return undefined;
+    }
+  }
+
+  const reset = () => {
+    searchGenRef.current += 1;
+    setStep('idle');
+    setUrl('');
+    clearCredential('none');
+    setCatalogInfo(null);
+    setCollections([]);
+    setSelectedCollection(null);
+    setSearchResult({ items: [], matched: null });
+    setSelectedItems(new Set());
+    setStartDate('');
+    setEndDate('');
+    setBboxText('');
+    setMaxCloud('');
+    setCloudCoverSeen(false);
+    setFilterError(null);
+    setNextPage(null);
+    setAppliedFilters({});
+    setProbedSizes({});
+    setImportResult(null);
+    setError(null);
+    // Reset isn't reachable while an import is in flight (no control renders
+    // during 'importing'); clearing here keeps the invariant explicit.
+    clearStacImport();
+  };
+
+  const handleConnect = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = url.trim();
+    if (!trimmed) return;
+
+    try {
+      new URL(trimmed);
+    } catch {
+      setError(t('stac.invalidUrl'));
+      return;
+    }
+
+    setStep('connecting');
+    setError(null);
+    setProbedSizes({});
+
+    try {
+      const auth = buildStacAuth();
+      const [info, collectionsResult] = await Promise.all([
+        connectStac(trimmed, auth),
+        fetchStacCollections(trimmed, auth),
+      ]);
+      setCatalogInfo(info);
+      setCollections(collectionsResult.collections);
+      setStep('collections');
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : t('stac.connectFailed');
+      setError(msg);
+      setStep('idle');
+      toast.error(msg);
+    }
+  };
+
+  const handleCollectionSelect = async (collection: StacCollectionSummary) => {
+    const gen = ++searchGenRef.current;
+    setFiltering(false);
+    setLoadingMore(false);
+    setSelectedCollection(collection);
+    setStartDate('');
+    setEndDate('');
+    setBboxText('');
+    setMaxCloud('');
+    setCloudCoverSeen(false);
+    setFilterError(null);
+    setAppliedFilters({});
+    setStep('loading-items');
+    setError(null);
+
+    try {
+      // The same credential the connect step used, so search sees what connect
+      // saw rather than the anonymous view.
+      const auth = buildStacAuth();
+      const result = await searchStacItems({
+        url: catalogInfo!.url,
+        collections: [collection.id],
+        limit: 50,
+        ...(auth ? { auth } : {}),
+      });
+      if (gen !== searchGenRef.current) return;
+      setSearchResult({ items: result.items, matched: result.matched ?? null });
+      setNextPage(result.next_page ?? null);
+      setSelectedItems(new Set());
+      setStep('items');
+    } catch (err) {
+      if (gen !== searchGenRef.current) return;
+      const msg = err instanceof ApiError ? err.message : t('stac.searchItemsFailed');
+      setError(msg);
+      setStep('collections');
+      toast.error(msg);
+    }
+  };
+
+  // The `bbox` and `datetime_range` the filter fields describe, or an error
+  // message when a field is unusable. Blank fields mean no filter.
+  function buildSearchFilters(): { filters: SearchFilters } | { error: string } {
+    const filters: SearchFilters = {};
+    if (startDate && endDate && startDate > endDate) {
+      return { error: t('stac.filterDateOrder') };
+    }
+    if (startDate || endDate) {
+      const from = startDate ? `${startDate}T00:00:00Z` : '..';
+      const to = endDate ? `${endDate}T23:59:59.999999Z` : '..';
+      filters.datetime_range = `${from}/${to}`;
+    }
+    if (bboxText.trim()) {
+      const parts = bboxText.split(',').map((p) => p.trim());
+      const nums = parts.map(Number);
+      const [west, south, east, north] = nums;
+      const valid =
+        parts.length === 4 &&
+        parts.every((p) => p !== '') &&
+        nums.every(Number.isFinite) &&
+        [west, east].every((lon) => lon >= -180 && lon <= 180) &&
+        [south, north].every((lat) => lat >= -90 && lat <= 90) &&
+        south <= north;
+      if (!valid) return { error: t('stac.filterBboxInvalid') };
+      filters.bbox = nums;
+    }
+    if (cloudMode && maxCloud.trim()) {
+      const value = Number(maxCloud);
+      if (!Number.isFinite(value) || value < 0 || value > 100) {
+        return { error: t('stac.filterCloudInvalid') };
+      }
+      filters.max_cloud_cover = value;
+      filters.cloud_cover_mode = cloudMode;
+    }
+    return { filters };
+  }
+
+  const handleApplyFilters = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedCollection || !catalogInfo) return;
+    const built = buildSearchFilters();
+    if ('error' in built) {
+      setFilterError(built.error);
+      return;
+    }
+    const gen = ++searchGenRef.current;
+    setFilterError(null);
+    setFiltering(true);
+    setLoadingMore(false);
+    setError(null);
+    try {
+      const auth = buildStacAuth();
+      const result = await searchStacItems({
+        url: catalogInfo.url,
+        collections: [selectedCollection.id],
+        limit: 50,
+        ...built.filters,
+        ...(auth ? { auth } : {}),
+      });
+      if (!mountedRef.current || gen !== searchGenRef.current) return;
+      setSearchResult({ items: result.items, matched: result.matched ?? null });
+      setNextPage(result.next_page ?? null);
+      setAppliedFilters(built.filters);
+      setSelectedItems(new Set());
+    } catch (err) {
+      if (!mountedRef.current || gen !== searchGenRef.current) return;
+      const msg = err instanceof ApiError ? err.message : t('stac.searchItemsFailed');
+      setFilterError(msg);
+      toast.error(msg);
+    } finally {
+      if (mountedRef.current && gen === searchGenRef.current) setFiltering(false);
+    }
+  };
+
+  // Filters come from the last applied search, not the fields, which may
+  // have been edited since: the next page belongs to that search.
+  const handleLoadMore = async () => {
+    if (!selectedCollection || !catalogInfo || !nextPage || filtering) return;
+    const gen = searchGenRef.current;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const auth = buildStacAuth();
+      const result = await searchStacItems({
+        url: catalogInfo.url,
+        collections: [selectedCollection.id],
+        limit: 50,
+        ...appliedFilters,
+        next_page: nextPage,
+        ...(auth ? { auth } : {}),
+      });
+      if (!mountedRef.current || gen !== searchGenRef.current) return;
+      setSearchResult((prev) => {
+        const seen = new Set(prev.items.map((i) => i.id));
+        return {
+          items: [...prev.items, ...result.items.filter((i) => !seen.has(i.id))],
+          matched: result.matched ?? prev.matched,
+        };
+      });
+      setNextPage(result.next_page ?? null);
+    } catch (err) {
+      if (!mountedRef.current || gen !== searchGenRef.current) return;
+      const msg = err instanceof ApiError ? err.message : t('stac.searchItemsFailed');
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      if (mountedRef.current && gen === searchGenRef.current) setLoadingMore(false);
+    }
+  };
+
+  const toggleItem = (id: string) => {
+    setSelectedItems((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else if (next.size < MAX_IMPORT_ITEMS) next.add(id);
+      return next;
+    });
+  };
+
+  const atSelectionCap = selectedItems.size >= MAX_IMPORT_ITEMS;
+  const allSelectableSelected =
+    selectedItems.size > 0 &&
+    selectedItems.size >= Math.min(MAX_IMPORT_ITEMS, selectableItems.length);
+
+  const toggleAll = () => {
+    if (allSelectableSelected) {
+      setSelectedItems(new Set());
+    } else {
+      const next = new Set(selectedItems);
+      for (const item of selectableItems) {
+        if (next.size >= MAX_IMPORT_ITEMS) break;
+        next.add(item.id);
+      }
+      setSelectedItems(next);
+    }
+  };
+
+  const handleImport = async () => {
+    if (selectedItems.size === 0) return;
+
+    setStep('importing');
+    setError(null);
+
+    const importItems: StacImportItem[] = selectableItems
+      .filter((i) => selectedItems.has(i.id))
+      .map((i) => ({
+        id: i.id,
+        collection: i.collection,
+        title: i.title,
+        data_asset_href: i.data_asset_href!,
+        // Echo which asset key the href came from: the href is what an upstream
+        // publisher moves, the key still names the same asset afterwards, so a
+        // refresh follows the move instead of re-running the priority list and
+        // possibly binding another band.
+        data_asset_key: i.data_asset_key,
+        // Echo the asset's declared media type so the persisted origin asset
+        // re-advertises it on the STAC items GeoLens serves.
+        data_asset_type: i.data_asset_type,
+        // Echo the item's own href so the dataset's origin can point at the
+        // item, not only its asset; the health probe needs both to tell "the
+        // file is gone" from "the publisher withdrew it".
+        item_href: i.item_href,
+        bbox: i.bbox,
+        epsg: i.epsg,
+        datetime_start: i.datetime_start,
+        datetime_end: i.datetime_end,
+        keywords: selectedCollection?.keywords ?? [],
+      }));
+
+    // The request lives at module scope so its outcome survives this form
+    // unmounting before it settles (see api/stac-import-session.ts). Awaiting
+    // the SAME promise the session holds means this mount still learns the real
+    // outcome.
+    //
+    // The search context travels with the session, captured here because this
+    // is the last point every value is known; an adopted mount has no local
+    // state to fall back on.
+    const context: StacImportContext = {
+      catalogInfo: catalogInfo!,
+      collections,
+      selectedCollection: selectedCollection!,
+      searchResult,
+      selectedItemIds: Array.from(selectedItems),
+      credential: {
+        method: credentialMethod,
+        token,
+        basicUsername,
+        basicPassword,
+        headerName,
+        headerValue,
+      },
+      search: { startDate, endDate, bboxText, maxCloud, cloudCoverSeen, appliedFilters, nextPage },
+    };
+    // A boolean, never the credential. `/import` contacts no catalog, so this is
+    // the only way the dataset learns that browsing needed a credential and its
+    // first refresh should ask for one.
+    const session = startStacImport(
+      catalogInfo!.url,
+      importItems,
+      context,
+      undefined,
+      buildStacAuth() !== undefined,
+    );
+    try {
+      const result = await session.promise;
+      // If this mount unmounted mid-request, the session is what the NEXT mount
+      // adopts: leave it rather than clear it from under that adoption.
+      if (!mountedRef.current) return;
+      setImportResult({
+        created: result.created,
+        skipped: result.skipped,
+        errors: result.errors,
+        results: result.results,
+      });
+      setStep('done');
+      // Nothing left for this session to protect — the result is shown.
+      clearStacImport();
+      if (result.created > 0) {
+        toast.success(t('stac.importedCount', { count: result.created }));
+      } else if (result.errors > 0) {
+        // No datasets created and at least one failure — surface the first
+        // distinct error so the toast isn't a silent "{n} failed".
+        const firstError = (result.results ?? []).find((r) => r.status === 'error')?.error;
+        toast.error(
+          firstError ? itemErrorText(firstError) : t('stac.failedCount', { count: result.errors }),
+        );
+      }
+    } catch (err) {
+      if (!mountedRef.current) return;
+      const msg = err instanceof ApiError ? err.message : t('stac.importFailed');
+      setError(msg);
+      setStep('items');
+      toast.error(msg);
+      clearStacImport();
+    }
+  };
+
+  // Re-attach to an import that was running (or finished) while this form was
+  // unmounted. Otherwise a tab switch mid-import loses the created/skipped/error
+  // counts even though the datasets it created are real.
+  useEffect(() => {
+    const session = peekStacImport();
+    if (!session) return;
+    // Restore the search context the session captured when the import started,
+    // so 'items' and 'collections' can render again, notably via "Back to
+    // Results" from the done screen, whose guard needs `selectedCollection`/
+    // `catalogInfo`, and the collections breadcrumb, which needs `collections`.
+    setCatalogInfo(session.context.catalogInfo);
+    setCollections(session.context.collections);
+    setSelectedCollection(session.context.selectedCollection);
+    setSearchResult(session.context.searchResult);
+    setSelectedItems(new Set(session.context.selectedItemIds));
+    const { search, credential } = session.context;
+    setCredentialMethod(credential.method);
+    setToken(credential.token);
+    setBasicUsername(credential.basicUsername);
+    setBasicPassword(credential.basicPassword);
+    setHeaderName(credential.headerName);
+    setHeaderValue(credential.headerValue);
+    setStartDate(search.startDate);
+    setEndDate(search.endDate);
+    setBboxText(search.bboxText);
+    setMaxCloud(search.maxCloud);
+    setCloudCoverSeen(search.cloudCoverSeen);
+    setAppliedFilters(search.appliedFilters);
+    setNextPage(search.nextPage);
+    // A search started before the unmount must not land on the restored list.
+    searchGenRef.current += 1;
+    setStep('importing');
+
+    // The app renders under React.StrictMode (main.tsx), which in development
+    // sets an effect up, tears it down and sets it up again; only a CLEANUP
+    // undoes that. Without one, each setup would re-read the unchanged session
+    // and register another `session.promise.then(...)`, so on settlement every
+    // handler would run: duplicate setImportResult/setStep/clearStacImport
+    // calls and a duplicate toast. `mountedRef` doesn't catch this (both handlers belong
+    // to the same mounted component); a cancellation flag scoped to THIS effect
+    // instance and flipped in ITS OWN cleanup makes the first handler lose the
+    // race to its teardown.
+    let cancelled = false;
+    session.promise.then(
+      (result) => {
+        if (!mountedRef.current || cancelled) return;
+        setImportResult({
+          created: result.created,
+          skipped: result.skipped,
+          errors: result.errors,
+          results: result.results,
+        });
+        setStep('done');
+        clearStacImport();
+        if (result.created > 0) {
+          toast.success(t('stac.importedCount', { count: result.created }));
+        }
+      },
+      (err) => {
+        if (!mountedRef.current || cancelled) return;
+        // The restored context WOULD let this return to 'items' like the
+        // still-mounted path below, but it is deliberately left at 'idle'.
+        const msg = err instanceof ApiError ? err.message : t('stac.importFailed');
+        setError(msg);
+        setStep('idle');
+        toast.error(msg);
+        clearStacImport();
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+    // Deliberately mount-only, as url-import-session.ts's re-attach effect:
+    // re-running every render would re-enter a session already being displayed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The review step asks for the sizes the catalog left out, for the
+  // selected items only.
+  useEffect(() => {
+    if (step !== 'confirm' || !catalogInfo) return;
+    const missing = selectableItems.filter(
+      (i) =>
+        selectedItems.has(i.id) &&
+        typeof i.data_asset_size_bytes !== 'number' &&
+        !(i.data_asset_href! in probedSizes),
+    );
+    if (missing.length === 0) return;
+    let cancelled = false;
+    setProbingSizes(true);
+    const auth = buildStacAuth();
+    fetchStacAssetSizes(
+      catalogInfo.url,
+      missing.map((i) => ({ id: i.id, href: i.data_asset_href! })),
+      auth,
+    )
+      .then((res) => {
+        if (cancelled) return;
+        setProbedSizes((prev) => ({
+          ...prev,
+          ...Object.fromEntries(missing.map((i) => [i.data_asset_href!, null])),
+          ...Object.fromEntries(
+            // Entries come back in request order; ids can repeat.
+            res.sizes.flatMap((s, n) =>
+              missing[n] ? [[missing[n].data_asset_href!, s.size_bytes ?? null]] : [],
+            ),
+          ),
+        }));
+      })
+      .catch(() => {
+        // The size is a convenience; leave it unknown rather than block the import.
+        if (cancelled) return;
+        setProbedSizes((prev) => ({
+          ...prev,
+          ...Object.fromEntries(missing.map((i) => [i.data_asset_href!, null])),
+        }));
+      })
+      .finally(() => {
+        if (!cancelled) setProbingSizes(false);
+      });
+    return () => {
+      cancelled = true;
+      setProbingSizes(false);
+    };
+    // Only entering the review step should probe; the inputs it reads are
+    // settled by then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step]);
+
+  if (step === 'confirm' && selectedCollection && catalogInfo) {
+    const itemsToImport = selectableItems.filter((i) => selectedItems.has(i.id));
+    const sizeOf = (i: StacItemSummary) =>
+      typeof i.data_asset_size_bytes === 'number'
+        ? i.data_asset_size_bytes
+        : (probedSizes[i.data_asset_href!] ?? null);
+    const itemsWithSize = itemsToImport.filter((i) => sizeOf(i) !== null);
+    const totalBytes = itemsWithSize.reduce((acc, i) => acc + (sizeOf(i) ?? 0), 0);
+    const unavailableCount = itemsToImport.length - itemsWithSize.length;
+
+    return (
+      <div className="space-y-4">
+        <div className="rounded-xl border border-border bg-card p-6">
+          <h3 className="text-base font-medium mb-2">{t('stac.confirm.title')}</h3>
+          <p className="text-sm text-muted-foreground mb-4">
+            {t('stac.confirm.description', { count: itemsToImport.length })}
+          </p>
+
+          <div className="grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-border bg-border">
+            <div className="bg-surface-0 px-4 py-3">
+              <dt className="eyebrow mb-1">
+                {t('stac.confirm.itemsLabel')}
+              </dt>
+              <dd className="text-lg font-medium tracking-tight">{itemsToImport.length}</dd>
+            </div>
+            <div className="bg-surface-0 px-4 py-3">
+              <dt className="eyebrow mb-1">
+                {t('stac.confirm.totalSizeLabel')}
+              </dt>
+              <dd className="text-lg font-medium tracking-tight">
+                {probingSizes
+                  ? t('stac.confirm.sizeChecking')
+                  : itemsWithSize.length > 0
+                    ? formatBytes(totalBytes)
+                    : t('stac.confirm.sizeUnavailable')}
+              </dd>
+            </div>
+          </div>
+
+          {!probingSizes && unavailableCount > 0 && itemsWithSize.length > 0 && (
+            <p className="text-xs text-muted-foreground mt-3">
+              {t('stac.confirm.partialSizeNote', { count: unavailableCount })}
+            </p>
+          )}
+
+          <p className="text-xs text-muted-foreground mt-3">
+            {t('stac.confirm.estimateSource')}
+          </p>
+        </div>
+
+        <div className="flex items-center justify-between gap-2">
+          <Button variant="outline" onClick={() => setStep('items')}>
+            {t('stac.confirm.backToSelection')}
+          </Button>
+          <Button onClick={handleImport} disabled={probingSizes}>
+            {t('stac.confirm.confirmImport', { count: itemsToImport.length })}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 'connecting' || step === 'loading-items' || step === 'importing') {
+    const label =
+      step === 'connecting' ? t('stac.connecting', { defaultValue: 'Connecting to STAC catalog...' })
+      : step === 'loading-items' ? t('stac.searching', { defaultValue: 'Searching items...' })
+      : t('stac.importing', { count: selectedItems.size });
+    return (
+      <div className="flex items-center gap-3 rounded-xl border border-border bg-card px-5 py-8 justify-center">
+        <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+        <span className="text-sm text-muted-foreground">{label}</span>
+      </div>
+    );
+  }
+
+  if (step === 'done' && importResult) {
+    // Group failures by error message so 40 identical SSRF rejects collapse to
+    // a single row showing the message + a count, with the failing item ids.
+    const failures = (importResult.results ?? []).filter((r) => r.status === 'error');
+    const groupedFailures = Array.from(
+      failures.reduce((acc, r) => {
+        const message = r.error ? itemErrorText(r.error) : t('stac.failureUnknown');
+        const group = acc.get(message) ?? { message, itemIds: [] as string[] };
+        group.itemIds.push(r.item_id);
+        acc.set(message, group);
+        return acc;
+      }, new Map<string, { message: string; itemIds: string[] }>()).values(),
+    );
+
+    const createdDatasets = (importResult.results ?? []).filter(
+      (r) => r.status === 'created' && r.dataset_id,
+    );
+
+    return (
+      <div className="space-y-4">
+        <div className="rounded-xl border border-success/30 bg-success/5 p-5">
+          <div className="flex items-center gap-2 mb-3">
+            <Check className="size-5 text-success" />
+            <h3 className="text-sm font-medium">{t('stac.importComplete')}</h3>
+          </div>
+          <div className="flex gap-6 text-sm text-muted-foreground">
+            {importResult.created > 0 && (
+              <span className="text-success">{t('stac.createdCount', { count: importResult.created })}</span>
+            )}
+            {importResult.skipped > 0 && (
+              <span>{t('stac.skippedCount', { count: importResult.skipped })}</span>
+            )}
+            {importResult.errors > 0 && (
+              <span className="text-destructive">{t('stac.failedCount', { count: importResult.errors })}</span>
+            )}
+          </div>
+          {createdDatasets.length > 0 && (
+            <ul className="mt-3 divide-y divide-success/15 border-t border-success/20">
+              {createdDatasets.map((r) => (
+                <li key={r.dataset_id} className="flex items-center justify-between gap-3 py-2">
+                  <span className="truncate font-mono text-2xs text-muted-foreground" title={r.item_id}>
+                    {r.item_id}
+                  </span>
+                  <Link to={`/datasets/${r.dataset_id}`} className="shrink-0 text-xs font-medium underline">
+                    {t('bulk.openDataset')}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {groupedFailures.length > 0 && (
+          <details className="overflow-hidden rounded-xl border border-destructive/30 bg-destructive/5" open>
+            <summary className="cursor-pointer select-none px-5 py-3 text-xs font-medium text-destructive">
+              {t('stac.failureDetails', { count: importResult.errors })}
+            </summary>
+            <ul className="divide-y divide-destructive/15 border-t border-destructive/20">
+              {groupedFailures.map((group) => (
+                <li key={group.message} className="px-5 py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <p className="text-xs text-foreground">{group.message}</p>
+                    <span className="shrink-0 rounded-md bg-destructive/10 px-2 py-0.5 font-mono text-mini font-semibold text-destructive">
+                      {t('stac.failureGroupCount', { count: group.itemIds.length })}
+                    </span>
+                  </div>
+                  <p
+                    className="mt-1 truncate font-mono text-2xs text-muted-foreground"
+                    title={group.itemIds.join(', ')}
+                  >
+                    {group.itemIds.join(', ')}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={reset}>
+            {t('stac.importMore')}
+          </Button>
+          <Button variant="outline" onClick={() => { setStep('items'); setImportResult(null); }}>
+            {t('stac.backToResults')}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 'collections' && catalogInfo) {
+    return (
+      <div className="space-y-5">
+        {/* Connected state header */}
+        <div className="rounded-xl border border-border bg-card p-5">
+          <span className="eyebrow mb-2.5 block">
+            {t('stac.catalogConnected')}
+          </span>
+          <div className="flex items-stretch overflow-hidden rounded-lg border-[1.5px] border-success bg-surface-0">
+            <span className="flex items-center gap-1.5 border-r border-border bg-success/10 px-3.5 font-mono text-mini font-semibold uppercase tracking-wider text-success">
+              <Check className="size-3.5" />
+              STAC {catalogInfo.stac_version}
+            </span>
+            <input
+              type="text"
+              readOnly
+              value={catalogInfo.url}
+              className="flex-1 bg-transparent px-3.5 py-2.5 font-mono text-sm text-foreground outline-none"
+            />
+            <button
+              onClick={reset}
+              className="border-l border-border bg-surface-2 px-4 text-xs font-medium text-muted-foreground hover:bg-surface-3 hover:text-foreground"
+            >
+              {t('stac.clear')}
+            </button>
+          </div>
+        </div>
+
+        {/* Collection cards */}
+        <div className="overflow-hidden rounded-xl border border-border bg-card">
+          <div className="flex items-center gap-3.5 border-b border-border px-5 py-3.5">
+            <span className="rounded-md bg-type-raster-bg px-2.5 py-0.5 font-mono text-mini font-semibold uppercase tracking-wider text-type-raster">
+              STAC
+            </span>
+            <div className="flex-1">
+              <h3 className="text-sm font-medium tracking-tight">{catalogInfo.title}</h3>
+              <p className="font-mono text-mini text-muted-foreground tracking-wide">
+                {t('stac.collectionsAvailable', { count: collections.length })}
+              </p>
+            </div>
+          </div>
+
+          <div className="grid gap-2 p-2 sm:grid-cols-2">
+            {collections.length === 0 && (
+              <p className="col-span-2 px-3 py-4 text-center text-sm text-muted-foreground">
+                {t('stac.noCollections')}
+              </p>
+            )}
+            {collections.map((col) => (
+              <button
+                key={col.id}
+                onClick={() => handleCollectionSelect(col)}
+                className="flex items-start gap-2.5 rounded-lg border border-border p-3 text-start transition-colors hover:bg-surface-2"
+              >
+                <Layers className="mt-0.5 size-4 shrink-0 text-type-raster" />
+                <div className="flex-1 min-w-0">
+                  <p className="truncate text-xs font-medium tracking-tight">
+                    {col.title}
+                  </p>
+                  {col.description && (
+                    <p className="mt-0.5 line-clamp-2 text-mini text-muted-foreground">
+                      {col.description}
+                    </p>
+                  )}
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-2xs text-muted-foreground">
+                    {col.item_count != null && <span>{t('stac.itemCount', { count: col.item_count })}</span>}
+                    {col.license && <span>{col.license}</span>}
+                    {col.temporal_start && (
+                      <span className="flex items-center gap-0.5">
+                        <Calendar className="size-2.5" />
+                        {col.temporal_start.slice(0, 10)}
+                        {col.temporal_end ? ` — ${col.temporal_end.slice(0, 10)}` : '+'}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <ChevronRight className="mt-0.5 size-4 shrink-0 text-muted-foreground/40 rtl-mirror" />
+              </button>
+            ))}
+          </div>
+
+          {error && (
+            <p role="alert" className="border-t border-border px-5 py-3 text-sm text-destructive">{error}</p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 'items' && selectedCollection && catalogInfo) {
+    const allSelected = allSelectableSelected;
+
+    return (
+      <div className="space-y-4">
+        {/* Breadcrumb */}
+        <div className="flex items-center gap-2 text-sm">
+          <button
+            onClick={() => { searchGenRef.current += 1; setStep('collections'); setSelectedCollection(null); }}
+            className="flex items-center gap-1 text-muted-foreground hover:text-foreground"
+          >
+            <ArrowLeft className="size-3.5 rtl-mirror" />
+            {t('stac.collections')}
+          </button>
+          <ChevronRight className="size-3 text-muted-foreground/40 rtl-mirror" />
+          <span className="font-medium">{selectedCollection.title}</span>
+          {matchedCount != null && (
+            <span className="font-mono text-mini text-muted-foreground">
+              {t('stac.matchedTotal', { count: matchedCount })}
+            </span>
+          )}
+        </div>
+
+        <form
+          data-testid="stac-search-filters"
+          onSubmit={handleApplyFilters}
+          className="flex flex-wrap items-end gap-3 rounded-lg border border-border bg-surface-1 px-4 py-3"
+        >
+          <div className="space-y-1">
+            <Label htmlFor="stac-filter-start" className="text-xs">{t('stac.filterStart')}</Label>
+            <Input
+              id="stac-filter-start"
+              type="date"
+              value={startDate}
+              max={endDate || undefined}
+              onChange={(e) => setStartDate(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="stac-filter-end" className="text-xs">{t('stac.filterEnd')}</Label>
+            <Input
+              id="stac-filter-end"
+              type="date"
+              value={endDate}
+              min={startDate || undefined}
+              onChange={(e) => setEndDate(e.target.value)}
+            />
+          </div>
+          <div className="min-w-56 flex-1 space-y-1">
+            <Label htmlFor="stac-filter-bbox" className="text-xs">{t('stac.filterBbox')}</Label>
+            <Input
+              id="stac-filter-bbox"
+              value={bboxText}
+              placeholder={t('stac.filterBboxPlaceholder')}
+              onChange={(e) => setBboxText(e.target.value)}
+              aria-invalid={filterError ? true : undefined}
+            />
+          </div>
+          {cloudMode && cloudCoverSeen && (
+            <div className="w-32 space-y-1">
+              <Label htmlFor="stac-filter-cloud" className="text-xs">{t('stac.filterCloud')}</Label>
+              <Input
+                id="stac-filter-cloud"
+                type="number"
+                min={0}
+                max={100}
+                step="any"
+                inputMode="decimal"
+                value={maxCloud}
+                onChange={(e) => setMaxCloud(e.target.value)}
+              />
+            </div>
+          )}
+          <Button type="submit" size="sm" disabled={filtering}>
+            {t('stac.filterApply')}
+          </Button>
+          {filterError && (
+            <p role="alert" data-testid="stac-filter-error" className="basis-full text-sm text-destructive">
+              {filterError}
+            </p>
+          )}
+        </form>
+
+        {/* Action bar */}
+        <div
+          data-testid="stac-items-action-bar"
+          className="rounded-lg border border-border bg-surface-1 px-4 py-2.5"
+        >
+          <div className="flex items-center justify-between">
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Checkbox checked={allSelected} onCheckedChange={toggleAll} />
+              {selectedItems.size > 0
+                ? t('stac.selectedCount', { selected: selectedItems.size, total: selectableItems.length })
+                : t('stac.itemCount', { count: items.length })}
+            </label>
+            <Button
+              size="sm"
+              disabled={selectedItems.size === 0 || filtering}
+              onClick={() => setStep('confirm')}
+            >
+              {selectedItems.size > 0 ? t('stac.importItems', { count: selectedItems.size }) : t('stac.importLabel')}
+            </Button>
+          </div>
+          {atSelectionCap && selectableItems.length > MAX_IMPORT_ITEMS && (
+            <p data-testid="stac-selection-limit" className="mt-2 text-xs text-muted-foreground">
+              {t('stac.selectionLimit', { count: MAX_IMPORT_ITEMS })}
+            </p>
+          )}
+          {/* A refused import lands back on this step (see handleImport's catch);
+              shown here, beside the action that triggered it, rather than below
+              a list that can run to 50 rows and push it out of view. */}
+          {error && (
+            <p id={importErrorId} data-testid="stac-import-error" className="mt-2 text-sm text-destructive">
+              {error}
+            </p>
+          )}
+        </div>
+
+        {/* Item rows */}
+        <div
+          data-testid="stac-items-list"
+          className="overflow-hidden rounded-xl border border-border bg-card divide-y divide-border"
+        >
+          {items.length === 0 && (
+            <p className="px-5 py-8 text-center text-sm text-muted-foreground">
+              {t('stac.noItems')}
+            </p>
+          )}
+          {items.map((item) => {
+            const availability = assetAvailability(item);
+            const isSelected = selectedItems.has(item.id);
+            const reasonId = `stac-asset-reason-${item.id}`;
+
+            return (
+              <label
+                key={item.id}
+                className={cn(
+                  'flex items-center gap-3 px-4 py-3 transition-colors',
+                  availability.importable ? 'cursor-pointer hover:bg-surface-2' : 'opacity-50 cursor-not-allowed',
+                  isSelected && 'bg-primary/5',
+                )}
+              >
+                <Checkbox
+                  checked={isSelected}
+                  disabled={!availability.importable || (atSelectionCap && !isSelected)}
+                  aria-describedby={availability.importable ? undefined : reasonId}
+                  onCheckedChange={() => toggleItem(item.id)}
+                  className="shrink-0"
+                />
+
+                {/* Thumbnail */}
+                {item.thumbnail_href ? (
+                  <img
+                    src={item.thumbnail_href}
+                    alt=""
+                    className="size-10 shrink-0 rounded-sm border border-border object-cover"
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                  />
+                ) : (
+                  <div className="flex size-10 shrink-0 items-center justify-center rounded-sm border border-border bg-surface-2">
+                    <Image className="size-4 text-muted-foreground/40" />
+                  </div>
+                )}
+
+                {/* Info */}
+                <div className="flex-1 min-w-0">
+                  <p className="truncate text-xs font-medium">{item.title}</p>
+                  <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0 font-mono text-2xs text-muted-foreground">
+                    {item.datetime_start && (
+                      <span className="flex items-center gap-0.5">
+                        <Calendar className="size-2.5" />
+                        {item.datetime_start.slice(0, 10)}
+                      </span>
+                    )}
+                    {item.epsg && <span>EPSG:{item.epsg}</span>}
+                    {item.gsd != null && <span>{t('stac.gsd', { value: item.gsd })}</span>}
+                    {item.cloud_cover != null && (
+                      <span>{t('stac.cloudCover', { value: formatNumber(item.cloud_cover, { maximumFractionDigits: 0 }) })}</span>
+                    )}
+                    <span>{t('stac.assetCount', { count: item.asset_count })}</span>
+                  </div>
+                </div>
+
+                {!availability.importable && (
+                  <span
+                    id={reasonId}
+                    className="max-w-[10rem] shrink-0 text-right font-mono text-2xs text-muted-foreground"
+                  >
+                    {assetUnavailableReasonText(t, availability)}
+                  </span>
+                )}
+              </label>
+            );
+          })}
+        </div>
+
+        {nextPage && (
+          <div className="flex justify-center">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={loadingMore || filtering}
+              onClick={handleLoadMore}
+            >
+              {t('stac.loadMore')}
+            </Button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-border bg-card p-5">
+      <form onSubmit={handleConnect} className="space-y-5">
+        <div>
+          <label className="eyebrow mb-2.5 block">
+            {t('stac.label', { defaultValue: "STAC API URL — paste the catalog root endpoint" })}
+          </label>
+          <div className="flex items-stretch overflow-hidden rounded-lg border-[1.5px] border-border bg-surface-0 transition-colors focus-within:border-primary">
+            <span className="flex items-center gap-1.5 border-r border-border bg-surface-2 px-3.5 font-mono text-mini uppercase tracking-wider text-muted-foreground font-medium">
+              <Satellite className="size-3.5" />
+              STAC
+            </span>
+            <input
+              type="url"
+              placeholder="https://earth-search.aws.element84.com/v1"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              className="flex-1 bg-transparent px-3.5 py-2.5 font-mono text-sm text-foreground outline-none placeholder:text-muted-foreground/50"
+            />
+            <button
+              type="submit"
+              disabled={!url.trim()}
+              className="bg-primary px-4 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+            >
+              {t('stac.connect', { defaultValue: 'Connect' })}
+            </button>
+          </div>
+          <div className="mt-2.5 flex flex-wrap gap-4 text-xs text-muted-foreground">
+            <span>
+              {t('stac.catalogHelp')}{' '}
+              <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini">
+                Earth Search
+              </code>{' '}
+              <code className="rounded-sm bg-surface-2 px-1.5 py-px font-mono text-mini">
+                Planetary Computer
+              </code>
+            </span>
+          </div>
+        </div>
+
+        <div className="space-y-3" data-testid="stac-credential-block">
+          <div className="space-y-2">
+            <Label htmlFor="stac-credential-method" className="text-xs text-muted-foreground">
+              {t('stac.credentialMethodLabel')}
+            </Label>
+            <Select
+              value={credentialMethod}
+              onValueChange={(value) => clearCredential(value as StacCredentialMethod)}
+            >
+              <SelectTrigger
+                id="stac-credential-method"
+                aria-label={t('stac.credentialMethodLabel')}
+                className="w-full"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="none">{t('stac.credentialMethodNone')}</SelectItem>
+                <SelectItem value="bearer">{t('stac.credentialMethodBearer')}</SelectItem>
+                <SelectItem value="basic">{t('stac.credentialMethodBasic')}</SelectItem>
+                <SelectItem value="header">{t('stac.credentialMethodHeader')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {credentialMethod === 'bearer' && (
+            <div className="space-y-2">
+              <Label htmlFor="stac-credential-token" className="text-xs text-muted-foreground">
+                {t('stac.credentialTokenLabel')}
+              </Label>
+              <Input
+                id="stac-credential-token"
+                type="password"
+                placeholder={t('stac.credentialTokenPlaceholder')}
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+                className="font-mono text-sm"
+                // autocomplete="off" alone doesn't stop Chrome offering a saved
+                // password on a service credential, so opt every password manager out.
+                autoComplete="new-password"
+                data-1p-ignore
+                data-lpignore="true"
+                data-bwignore
+              />
+            </div>
+          )}
+
+          {credentialMethod === 'basic' && (
+            <div className="space-y-3 rounded-lg border border-border bg-surface-0 p-3.5">
+              <div className="space-y-2">
+                <Label htmlFor="stac-credential-username" className="text-xs text-muted-foreground">
+                  {t('stac.credentialUsernameLabel')}
+                </Label>
+                <Input
+                  id="stac-credential-username"
+                  type="text"
+                  autoComplete="username"
+                  placeholder={t('stac.credentialUsernamePlaceholder')}
+                  value={basicUsername}
+                  onChange={(e) => setBasicUsername(e.target.value)}
+                  className="text-sm"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="stac-credential-password" className="text-xs text-muted-foreground">
+                  {t('stac.credentialPasswordLabel')}
+                </Label>
+                <Input
+                  id="stac-credential-password"
+                  type="password"
+                  placeholder={t('stac.credentialPasswordPlaceholder')}
+                  value={basicPassword}
+                  onChange={(e) => setBasicPassword(e.target.value)}
+                  className="text-sm"
+                  autoComplete="new-password"
+                  data-1p-ignore
+                  data-lpignore="true"
+                  data-bwignore
+                />
+              </div>
+            </div>
+          )}
+
+          {credentialMethod === 'header' && (
+            <div className="space-y-3 rounded-lg border border-border bg-surface-0 p-3.5">
+              <div className="space-y-2">
+                <Label
+                  htmlFor="stac-credential-header-name"
+                  className="text-xs text-muted-foreground"
+                >
+                  {t('stac.credentialHeaderNameLabel')}
+                </Label>
+                <Input
+                  id="stac-credential-header-name"
+                  type="text"
+                  autoComplete="off"
+                  placeholder={t('stac.credentialHeaderNamePlaceholder')}
+                  value={headerName}
+                  onChange={(e) => setHeaderName(e.target.value)}
+                  className="font-mono text-sm"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label
+                  htmlFor="stac-credential-header-value"
+                  className="text-xs text-muted-foreground"
+                >
+                  {t('stac.credentialHeaderValueLabel')}
+                </Label>
+                <Input
+                  id="stac-credential-header-value"
+                  type="password"
+                  placeholder={t('stac.credentialHeaderValuePlaceholder')}
+                  value={headerValue}
+                  onChange={(e) => setHeaderValue(e.target.value)}
+                  className="font-mono text-sm"
+                  autoComplete="new-password"
+                  data-1p-ignore
+                  data-lpignore="true"
+                  data-bwignore
+                />
+              </div>
+            </div>
+          )}
+
+          {credentialMethod !== 'none' && (
+            <p className="text-xs text-muted-foreground">{t('stac.credentialHelpText')}</p>
+          )}
+        </div>
+
+        {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+      </form>
+    </div>
+  );
+}

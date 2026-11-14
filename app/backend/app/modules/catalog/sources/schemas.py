@@ -1,0 +1,393 @@
+"""Pydantic request/response models for service probing endpoints."""
+
+import uuid
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+
+from app.core.url_redaction import has_url_credentials
+from app.platform.portal_link import ITEM_ID_MAX_LENGTH, PORTAL_URL_MAX_LENGTH
+
+# ServiceAuthRequest lives in app.platform.service_auth because processing/
+# cannot import app.modules.catalog.* (test_layering) and needs it too.
+from app.platform.service_auth import (
+    DEPRECATED_TOKEN_SUFFIX,
+    SERVICE_AUTH_BASIC_POLICY,
+    SERVICE_AUTH_BEARER_POLICY,
+    SERVICE_AUTH_CONFLICT_POLICY,
+    SERVICE_AUTH_FIELD_DESCRIPTION,
+    SERVICE_AUTH_HEADER_POLICY,
+    SERVICE_AUTH_METHOD_DESCRIPTION,
+    ServiceAuthRequest,
+    _validate_safe_token,
+    reject_service_auth_conflict,
+    service_credential_from_request,
+)
+
+# Named re-exports so unused-import lint doesn't flag them; no `import *` here.
+__all__ = [
+    "DEPRECATED_TOKEN_SUFFIX",
+    "SERVICE_AUTH_BASIC_POLICY",
+    "SERVICE_AUTH_BEARER_POLICY",
+    "SERVICE_AUTH_CONFLICT_POLICY",
+    "SERVICE_AUTH_FIELD_DESCRIPTION",
+    "SERVICE_AUTH_HEADER_POLICY",
+    "SERVICE_AUTH_METHOD_DESCRIPTION",
+    "ServiceAuthRequest",
+    "reject_service_auth_conflict",
+    "service_credential_from_request",
+]
+
+CONNECTOR_RESOURCE_HANDLE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,254}$"
+CONNECTOR_RESOURCE_KIND_PATTERN = r"^[a-z][a-z0-9_-]{0,63}$"
+
+
+class ConnectorDefinitionResponse(BaseModel):
+    """Public, non-secret connector capabilities advertised by an overlay."""
+
+    name: str
+    display_name: str
+    config_schema: dict[str, Any]
+    supports_credentials: bool = False
+    supports_scheduled_sync: bool = False
+
+
+class ConnectorListResponse(BaseModel):
+    connectors: list[ConnectorDefinitionResponse]
+
+
+class ConnectorOperationRequest(BaseModel):
+    """Configuration shared by connector discovery and ingest dispatch."""
+
+    credential_id: str | None = Field(default=None, min_length=1, max_length=255)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConnectorDiscoverRequest(ConnectorOperationRequest):
+    pass
+
+
+class ConnectorResourceResponse(BaseModel):
+    id: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=CONNECTOR_RESOURCE_HANDLE_PATTERN,
+        description=(
+            "API-safe opaque resource handle. This is never a provider URL, "
+            "signed locator, or credential."
+        ),
+    )
+    name: str = Field(min_length=1, max_length=500)
+    kind: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=CONNECTOR_RESOURCE_KIND_PATTERN,
+    )
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConnectorDiscoverResponse(BaseModel):
+    resources: list[ConnectorResourceResponse]
+
+
+class ConnectorIngestRequest(ConnectorOperationRequest):
+    resource_id: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=CONNECTOR_RESOURCE_HANDLE_PATTERN,
+        description="API-safe opaque handle returned by connector discovery.",
+    )
+
+
+class ConnectorIngestResponse(BaseModel):
+    job_id: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=CONNECTOR_RESOURCE_HANDLE_PATTERN,
+        description="API-safe opaque handle for the dispatched ingest job.",
+    )
+    status: Literal["queued"] = "queued"
+
+
+def _validate_http_url(v: str) -> str:
+    """Validate URL format only; returns str. The SSRF guard runs separately."""
+    HttpUrl(v)
+    return v
+
+
+def _validate_service_url(v: str) -> str:
+    _validate_http_url(v)
+    if has_url_credentials(v):
+        raise ValueError(
+            "url must not include credential query parameters; use the token field instead"
+        )
+    return v
+
+
+class ProbeRequest(BaseModel):
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="Service URL to probe. May be a WFS GetCapabilities URL or an ArcGIS service endpoint.",
+    )
+    _validate_url = field_validator("url")(_validate_service_url)
+    token: str | None = Field(
+        default=None,
+        max_length=1000,
+        description=(
+            "Optional auth token for protected services (passed as query "
+            "parameter or bearer token depending on service type)."
+            + DEPRECATED_TOKEN_SUFFIX
+        ),
+    )
+    _validate_token = field_validator("token")(_validate_safe_token)
+    auth: ServiceAuthRequest | None = Field(
+        default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
+    )
+    _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
+
+
+class LayerRelationship(BaseModel):
+    """An ArcGIS relationship class as one of its two layers declares it."""
+
+    id: int | None = Field(default=None, description="Relationship ID on the layer.")
+    name: str | None = Field(default=None, description="Relationship class name.")
+    related_layer_id: int | str = Field(
+        description="ArcGIS ID of the layer or table at the other end."
+    )
+    cardinality: str | None = Field(
+        default=None,
+        description="'OneToOne', 'OneToMany' or 'ManyToMany', when the service says.",
+    )
+    role: str | None = Field(
+        default=None,
+        description="'Origin' or 'Destination': this layer's end of the relationship.",
+    )
+
+
+class LayerInfo(BaseModel):
+    name: str = Field(
+        description="Internal layer identifier used by the source service."
+    )
+    title: str | None = Field(
+        default=None,
+        description="Human-readable layer title from the service capabilities.",
+    )
+    geometry_type: str | None = Field(
+        default=None, description="Detected geometry type for the layer."
+    )
+    feature_count: int | None = Field(
+        default=None, description="Total feature count if reported by the service."
+    )
+    layer_type: str = Field(
+        default="layer",
+        description="Layer kind: 'layer' (spatial) or 'table' (non-spatial attribute table).",
+    )
+    source_layer_type: str | None = Field(
+        default=None,
+        description=(
+            "ArcGIS sub-layer type as the service reports it, for example "
+            "'Feature Layer', 'Table', 'Group Layer', 'Raster Layer' or "
+            "'Annotation Layer'. Null for other service types."
+        ),
+    )
+    parent_layer_id: int | None = Field(
+        default=None,
+        description="ArcGIS ID of the group layer that contains this layer, if any.",
+    )
+    importable: bool = Field(
+        default=True,
+        description=(
+            "False when the layer holds no features (ArcGIS composite, raster and "
+            "annotation layers) and a preview of it is refused with "
+            "'unsupported_layer_type'."
+        ),
+    )
+    has_attachments: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the ArcGIS layer reports file attachments. Null when the "
+            "service does not say, and for other service types."
+        ),
+    )
+    relationships: list[LayerRelationship] = Field(
+        default_factory=list,
+        description=(
+            "Relationship classes the ArcGIS layer takes part in. Empty when the "
+            "service declares none or does not say, and for other service types."
+        ),
+    )
+    layer_id: int | str | None = Field(
+        default=None, description="Numeric or string layer ID used by ArcGIS services."
+    )
+    object_id_field: str | None = Field(
+        default=None,
+        description="ArcGIS object ID field name, used for stable pagination.",
+    )
+    kind: Literal["vector", "raster"] = Field(
+        default="vector",
+        description=(
+            "Backend-classified layer kind. 'vector' = point/line/polygon feature data. "
+            "'raster' = imagery/coverage. Classified as 'raster' when geometry_type "
+            "contains 'raster', the adapter is STAC, the layer declares "
+            "coverage_format or bands, or one of its links has a media type of "
+            "image/*. Everything else, including a layer with no geometry_type at "
+            "all, defaults to 'vector'."
+        ),
+    )
+
+
+class ProbeResponse(BaseModel):
+    service_type: str = Field(
+        description="Detected service type, e.g. 'WFS 2.0' or 'ArcGIS FeatureServer'."
+    )
+    url: str = Field(description="Normalized service URL after probing.")
+    layers: list[LayerInfo] = Field(description="Layers exposed by the probed service.")
+    selected_layer_id: int | str | None = Field(
+        default=None,
+        description="Auto-selected layer ID when the input URL contained a specific layer number.",
+    )
+
+
+class ServicePreviewRequest(BaseModel):
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="Normalized service URL from a previous probe response.",
+    )
+    _validate_url = field_validator("url")(_validate_service_url)
+    service_type: str = Field(
+        min_length=1,
+        max_length=100,
+        description="Service type from the probe response, e.g. 'WFS 2.0.0' or 'ArcGIS FeatureServer'.",
+    )
+    layer_name: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Name of the specific layer to preview, from the probe layers list.",
+    )
+    layer_title: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Human-readable layer title from the probe LayerInfo.",
+    )
+    layer_id: int | str | None = Field(
+        default=None, description="ArcGIS layer ID, when applicable."
+    )
+    token: str | None = Field(
+        default=None,
+        max_length=1000,
+        description=(
+            "Optional auth token for protected services." + DEPRECATED_TOKEN_SUFFIX
+        ),
+    )
+    _validate_token = field_validator("token")(_validate_safe_token)
+    object_id_field: str | None = Field(
+        default=None,
+        max_length=200,
+        description="ArcGIS OID field name used for orderByFields during preview pagination.",
+    )
+    # The generated SDK positions fields by declaration order: `auth` keeps
+    # its slot, so a field added later goes after it and none before it.
+    # Pinned by test_service_auth_contract_1746.
+    auth: ServiceAuthRequest | None = Field(
+        default=None, description=SERVICE_AUTH_FIELD_DESCRIPTION
+    )
+    _reject_auth_conflict = model_validator(mode="after")(reject_service_auth_conflict)
+    item_id: str | None = Field(
+        default=None,
+        max_length=ITEM_ID_MAX_LENGTH,
+        description=(
+            "ArcGIS portal item ID the layer was published from, at most 64 "
+            "characters (longer is refused with 422). Stored as provenance "
+            "when it is 32 hex characters, otherwise dropped and reported in "
+            "origin_link_loss. Dropped for a non-ArcGIS service type."
+        ),
+    )
+    portal_url: str | None = Field(
+        default=None,
+        max_length=PORTAL_URL_MAX_LENGTH,
+        description=(
+            "ArcGIS portal address for the item link, at most 2048 characters "
+            "(longer is refused with 422). Stored only when it is https and "
+            "shares a registrable domain with the service URL, otherwise "
+            "dropped and reported in origin_link_loss."
+        ),
+    )
+
+
+class ServicePreviewResponse(BaseModel):
+    job_id: uuid.UUID = Field(
+        description="IngestJob ID for the preview. Use this to commit the import."
+    )
+    source_filename: str | None = Field(
+        description="Layer name acting as a source filename for downstream ingestion logic."
+    )
+    columns: list[dict[str, str]] = Field(
+        description="Detected attribute columns: [{'name': str, 'type': str}, ...]."
+    )
+    crs: int | None = Field(description="Detected EPSG code for the layer's CRS.")
+    geometry_type: str | None = Field(description="Detected geometry type.")
+    feature_count: int | None = Field(
+        description="Total feature count if reported by the source service."
+    )
+    sample_rows: list[dict] = Field(
+        description="Up to 5 sample rows for preview display."
+    )
+    layer_name: str = Field(
+        description="Layer name as it appears in the remote service."
+    )
+    origin_link_loss: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Reasons the item link was dropped: 'item_id_invalid', "
+            "'portal_url_invalid', 'portal_url_domain_mismatch' or 'origin_link_unsupported'. Empty when "
+            "nothing was dropped."
+        ),
+    )
+
+
+class ArcGISSignInRequest(BaseModel):
+    """Portal address plus the credentials one generateToken call needs.
+
+    No character policy on the two credential fields, deliberately. They are
+    form-encoded into the outbound body, which percent-escapes every value,
+    so neither a control character nor a separator can smuggle a second field
+    into the request the way one can into a header line. The length bounds
+    are here to keep an absurd body from reaching the portal at all.
+    """
+
+    portal_url: str = Field(
+        min_length=1,
+        max_length=2048,
+        description=(
+            "ArcGIS portal URL, for example https://your-org.maps.arcgis.com. "
+            "The /sharing/rest base is accepted too."
+        ),
+    )
+    _validate_portal_url = field_validator("portal_url")(_validate_service_url)
+    username: str = Field(
+        min_length=1,
+        max_length=256,
+        description="ArcGIS account name to sign in with.",
+    )
+    password: str = Field(
+        min_length=1,
+        max_length=1024,
+        description="Password for that ArcGIS account.",
+    )
+
+
+class ArcGISSignInResponse(BaseModel):
+    """The minted portal token and nothing else about the account."""
+
+    token: str = Field(
+        description=(
+            "Short-lived ArcGIS portal token. Use it as the `token` field on "
+            "probe, preview, commit and refresh."
+        )
+    )
+    expires_at: datetime = Field(
+        description="UTC instant at which the portal stops accepting the token."
+    )

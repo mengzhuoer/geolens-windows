@@ -1,0 +1,145 @@
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    SmallInteger,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.db import Base
+
+
+class Collection(Base):
+    __tablename__ = "collections"
+    __table_args__ = (
+        Index(
+            "uq_collections_name_global",
+            "name",
+            unique=True,
+            postgresql_where=text("tenant_id IS NULL"),
+        ),
+        Index(
+            "uq_collections_name_tenant",
+            "tenant_id",
+            "name",
+            unique=True,
+            postgresql_where=text("tenant_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_collections_created_by",
+            "created_by",
+            postgresql_where=text("created_by IS NOT NULL"),
+        ),
+        {"schema": "catalog"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Dormant tenant_id: nullable, no FK enforcement.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class CollectionDataset(Base):
+    __tablename__ = "collection_datasets"
+    __table_args__ = (
+        # Trailing composite-PK FK; covering index added in migration 0001_baseline.
+        Index("ix_collection_datasets_dataset_id", "dataset_id"),
+        Index(
+            "ix_collection_datasets_added_by",
+            "added_by",
+            postgresql_where=text("added_by IS NOT NULL"),
+        ),
+        {"schema": "catalog"},
+    )
+
+    collection_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.collections.id", ondelete="CASCADE"), primary_key=True
+    )
+    dataset_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.datasets.id", ondelete="CASCADE"), primary_key=True
+    )
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    added_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
+class DatasetVersion(Base):
+    __tablename__ = "dataset_versions"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "version_number", name="uq_dataset_version"),
+        # Covering index added in migration 0001_baseline.
+        Index("ix_dataset_versions_dataset_id", "dataset_id"),
+        Index(
+            "ix_dataset_versions_uploaded_by",
+            "uploaded_by",
+            postgresql_where=text("uploaded_by IS NOT NULL"),
+        ),
+        {"schema": "catalog"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, server_default=func.gen_random_uuid()
+    )
+    dataset_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.datasets.id", ondelete="CASCADE"), nullable=False
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_filename: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_format: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feature_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    srid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    geometry_type: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    column_info: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # What a restore of this version puts back on the dataset.
+    original_srid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_3d: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    n_dims: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # The version whose data a restore published as this one.
+    restored_from_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True
+    )
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # The table, in the dataset's data schema, that keeps this version's data
+    # after a replacement or restore replaced it. NULL: it is not kept.
+    kept_table: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kept_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    kept_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # The kept data's own last_refreshed_at, which a restore reinstates.
+    kept_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

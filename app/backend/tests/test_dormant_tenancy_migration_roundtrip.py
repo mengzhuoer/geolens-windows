@@ -1,0 +1,341 @@
+"""Programmatic migration round-trip + OSS drift-gate regression.
+
+Verifies the 0005_dormant_tenancy migration is reversible while its substrate is
+empty, refuses to discard tenant-scoped data, and leaves the schema in the exact
+state the ORM expects (no alembic check drift after upgrade).
+
+Tests
+-----
+A: upgrade head → downgrade -1 → upgrade head all exit 0 (reversibility)
+B: after downgrade, the four partial unique indexes and tenant_id columns are absent
+C: after re-upgrade, the four partial indexes and tenant_id on the six shared tables
+   are all present
+D: alembic check reports no drift after upgrade (OSS drift gate)
+E: tenant-scoped users and tenancy rows block downgrade atomically with an
+   actionable error instead of failing at a later unique constraint or losing data
+
+Notes
+-----
+- These tests shell out to ``alembic`` via subprocess so they exercise the real
+  alembic.ini / env.py stack (the same path CI uses) rather than calling the
+  Python API directly.
+- The tests run against the live test database (POSTGRES_* from .env.test).
+  Run with: cd backend && set -a && source ../.env.test && set +a && uv run pytest
+  tests/test_dormant_tenancy_migration_roundtrip.py -x -q
+- Uses the same ``test_db_session`` async fixture as the other dormant-tenancy
+  schema tests (anyio_mode = "auto" in pyproject.toml).
+- DB-mutating alembic calls are run sequentially (not in parallel) per the
+  project memory note on concurrent DB probes.
+"""
+
+import pytest
+import sqlalchemy as sa
+from tests.alembic_helpers import (
+    enterprise_migrations_present,
+    fresh_query as _fresh_query,
+    run_alembic as _run_alembic,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_FOUR_PARTIAL_INDEXES = {
+    "uq_users_username_global",
+    "uq_users_username_tenant",
+    "uq_users_email_global",
+    "uq_users_email_tenant",
+}
+
+_SIX_SHARED_TABLES = [
+    "users",
+    "records",
+    "datasets",
+    "maps",
+    "collections",
+    "embed_tokens",
+]
+
+
+_SKIP_UNDER_OVERLAY = pytest.mark.skipif(
+    enterprise_migrations_present(),
+    reason="OSS migration drift gate; multi-head under enterprise overlay — "
+    "runs in the no-overlay Pytest Parallel Isolation job instead.",
+)
+
+
+# ---------------------------------------------------------------------------
+# Test A: alembic round-trip exits 0
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestMigrationRoundTripExitCodes:
+    """0005_dormant_tenancy round-trips reversibly with no subprocess errors."""
+
+    def test_upgrade_head_exits_zero(self):
+        """alembic upgrade head exits 0 (idempotent — may already be at head)."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, (
+            f"alembic upgrade head failed (rc={r.returncode}):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        # Must reference 0005 or report already-at-head (no-op).
+        assert (
+            "0005_dormant_tenancy" in r.stderr
+            or "No upgrade operations" in r.stderr
+            or r.returncode == 0
+        )
+
+    def test_downgrade_minus_one_exits_zero(self):
+        """alembic downgrade -1 exits 0 (one step back from current head).
+
+        When head is 0006_tenant_rls this downgrades to 0005_dormant_tenancy.
+        When head is 0005_dormant_tenancy this downgrades to 0004_add_maps_legend_title.
+        We only assert exit 0 here — the direction check lives in the per-migration
+        round-trip test (test_tenant_rls_migration.py).
+        """
+        r = _run_alembic("downgrade", "-1")
+        assert r.returncode == 0, (
+            f"alembic downgrade -1 failed (rc={r.returncode}):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+
+    def test_reupgrade_head_exits_zero(self):
+        """alembic upgrade head (re-apply current head) exits 0 after downgrade."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, (
+            f"alembic upgrade head (re-apply) failed (rc={r.returncode}):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests B + C: DB state after downgrade and re-upgrade
+# ---------------------------------------------------------------------------
+
+
+async def _fresh_execute(query: str, params: dict | None = None) -> None:
+    """Run committed DML on a fresh autocommit connection."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.config import settings
+
+    engine = create_async_engine(
+        settings.test_database_url,
+        isolation_level="AUTOCOMMIT",
+    )
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(sa.text(query), params or {})
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Test E: production-shaped tenant data blocks the destructive downgrade
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestTenantDataDowngradeContract:
+    """0005 fails before DDL when reverting would discard tenant ownership."""
+
+    async def test_cross_tenant_collision_and_tenancy_rows_block_atomically(self):
+        """Valid cross-tenant duplicates remain intact after a blocked downgrade."""
+        import uuid
+
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, f"upgrade head failed: {r.stderr}"
+        r = _run_alembic("downgrade", "0005_dormant_tenancy")
+        assert r.returncode == 0, f"setup downgrade to 0005 failed: {r.stderr}"
+
+        suffix = uuid.uuid4().hex
+        username = f"rollback-shared-{suffix}"
+        organization_id = uuid.uuid4()
+        user_ids = (uuid.uuid4(), uuid.uuid4())
+        tenant_ids = (uuid.uuid4(), uuid.uuid4())
+
+        try:
+            await _fresh_execute(
+                """
+                INSERT INTO catalog.organizations (id, name)
+                VALUES (:organization_id, :name)
+                """,
+                {
+                    "organization_id": organization_id,
+                    "name": f"Rollback organization {suffix}",
+                },
+            )
+            await _fresh_execute(
+                """
+                INSERT INTO catalog.users (id, username, email, tenant_id)
+                VALUES
+                    (:user_a, :username, :email_a, :tenant_a),
+                    (:user_b, :username, :email_b, :tenant_b)
+                """,
+                {
+                    "user_a": user_ids[0],
+                    "user_b": user_ids[1],
+                    "username": username,
+                    "email_a": f"rollback-a-{suffix}@example.test",
+                    "email_b": f"rollback-b-{suffix}@example.test",
+                    "tenant_a": tenant_ids[0],
+                    "tenant_b": tenant_ids[1],
+                },
+            )
+
+            versions_before = await _fresh_query(
+                "SELECT version_num FROM catalog.alembic_version ORDER BY version_num"
+            )
+            assert versions_before == [("0005_dormant_tenancy",)]
+            result = _run_alembic("downgrade", "0004_add_maps_legend_title")
+            combined = result.stdout + result.stderr
+            assert result.returncode != 0, (
+                "tenant data downgrade unexpectedly succeeded"
+            )
+            assert "Cannot downgrade 0005_dormant_tenancy" in combined
+            assert "catalog.organizations" in combined
+            assert "catalog.users.tenant_id" in combined
+
+            versions_after = await _fresh_query(
+                "SELECT version_num FROM catalog.alembic_version ORDER BY version_num"
+            )
+            assert versions_after == versions_before
+
+            users = await _fresh_query(
+                """
+                SELECT tenant_id
+                FROM catalog.users
+                WHERE username = :username
+                ORDER BY tenant_id
+                """,
+                {"username": username},
+            )
+            assert {row[0] for row in users} == set(tenant_ids)
+            organizations = await _fresh_query(
+                "SELECT id FROM catalog.organizations WHERE id = :organization_id",
+                {"organization_id": organization_id},
+            )
+            assert {row[0] for row in organizations} == {organization_id}
+        finally:
+            restored = _run_alembic("upgrade", "head")
+            assert restored.returncode == 0, (
+                f"restore upgrade failed: {restored.stderr}"
+            )
+            await _fresh_execute(
+                "DELETE FROM catalog.users WHERE username = :username",
+                {"username": username},
+            )
+            await _fresh_execute(
+                "DELETE FROM catalog.organizations WHERE id = :organization_id",
+                {"organization_id": organization_id},
+            )
+
+
+@_SKIP_UNDER_OVERLAY
+class TestMigrationRoundTripSchemaState:
+    """Schema state reflects the migration correctly after downgrade and re-upgrade.
+
+    These tests downgrade to an absolute revision (0004_add_maps_legend_title)
+    rather than using ``-1`` so they remain correct regardless of how many
+    migrations have been added on top of 0005.
+    """
+
+    async def test_post_downgrade_indexes_absent(self):
+        """After downgrade to 0004, the four partial indexes are gone."""
+        r = _run_alembic("downgrade", "0004_add_maps_legend_title")
+        assert r.returncode == 0, f"downgrade failed: {r.stderr}"
+
+        rows = await _fresh_query(
+            """
+            SELECT indexname FROM pg_indexes
+            WHERE schemaname = 'catalog'
+              AND tablename = 'users'
+              AND indexname = ANY(:names)
+            """,
+            {"names": sorted(_FOUR_PARTIAL_INDEXES)},
+        )
+        found = {row[0] for row in rows}
+        assert not found, f"Partial indexes still present after downgrade: {found}"
+
+        # Restore head for subsequent tests.
+        r2 = _run_alembic("upgrade", "head")
+        assert r2.returncode == 0, f"re-upgrade failed: {r2.stderr}"
+
+    async def test_post_downgrade_tenant_id_absent_on_users(self):
+        """After downgrade to 0004, tenant_id is gone from catalog.users."""
+        r = _run_alembic("downgrade", "0004_add_maps_legend_title")
+        assert r.returncode == 0, f"downgrade failed: {r.stderr}"
+
+        rows = await _fresh_query(
+            """
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'catalog'
+              AND table_name = 'users'
+              AND column_name = 'tenant_id'
+            """
+        )
+        assert not rows, "tenant_id still present on catalog.users after downgrade"
+
+        r2 = _run_alembic("upgrade", "head")
+        assert r2.returncode == 0, f"re-upgrade failed: {r2.stderr}"
+
+    async def test_post_upgrade_partial_indexes_present(self):
+        """After re-upgrade, all four partial unique indexes exist on catalog.users."""
+        rows = await _fresh_query(
+            """
+            SELECT indexname FROM pg_indexes
+            WHERE schemaname = 'catalog'
+              AND tablename = 'users'
+              AND indexname = ANY(:names)
+            ORDER BY indexname
+            """,
+            {"names": sorted(_FOUR_PARTIAL_INDEXES)},
+        )
+        found = {row[0] for row in rows}
+        missing = _FOUR_PARTIAL_INDEXES - found
+        assert not missing, f"Partial indexes missing after re-upgrade: {missing}"
+
+    async def test_post_upgrade_tenant_id_on_all_shared_tables(self):
+        """After re-upgrade, tenant_id (nullable) exists on all six shared tables."""
+        rows = await _fresh_query(
+            """
+            SELECT table_name, is_nullable FROM information_schema.columns
+            WHERE table_schema = 'catalog'
+              AND column_name = 'tenant_id'
+              AND table_name = ANY(:tables)
+            ORDER BY table_name
+            """,
+            {"tables": _SIX_SHARED_TABLES},
+        )
+        result_map = {r[0]: r[1] for r in rows}
+
+        missing = [t for t in _SIX_SHARED_TABLES if t not in result_map]
+        assert not missing, f"tenant_id missing from tables after re-upgrade: {missing}"
+
+        not_nullable = [t for t, nullable in result_map.items() if nullable != "YES"]
+        assert not not_nullable, f"tenant_id is not nullable on: {not_nullable}"
+
+
+# ---------------------------------------------------------------------------
+# Test D: alembic check — OSS drift gate
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestAlembicCheckNoDrift:
+    """alembic check (OSS drift gate) reports no new upgrade operations after 0005."""
+
+    def test_alembic_check_no_drift(self):
+        """alembic check exits 0 and prints 'No new upgrade operations detected.'"""
+        r = _run_alembic("check")
+        assert r.returncode == 0, (
+            f"alembic check exited {r.returncode} (drift detected):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        combined = r.stdout + r.stderr
+        assert "No new upgrade operations detected." in combined, (
+            f"Expected 'No new upgrade operations detected.' in check output.\n"
+            f"Got:\nstdout: {r.stdout}\nstderr: {r.stderr}"
+        )

@@ -1,0 +1,626 @@
+import { act, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { useParams } from 'react-router';
+import { render, screen } from '@/test/test-utils';
+import { useDataset, useUpdateDataset } from '@/components/dataset/hooks/use-dataset';
+import { useAuthStore } from '@/stores/auth-store';
+import { DatasetPage } from '@/pages/DatasetPage';
+import type { DatasetResponse, UserResponse } from '@/types/api';
+
+const drawingStoreState = vi.hoisted(() => ({
+  isDrawing: false,
+  isEditDirty: false,
+  hasUnsavedMapWork: false,
+  setDrawing: vi.fn(),
+  clearDrawing: vi.fn(),
+}));
+
+// A plain object mock can't vary the blocker's `state` per test,
+// and the "Leave" wiring is only exercised while it is 'blocked'.
+const mockUseUnsavedGuard = vi.hoisted(() => vi.fn());
+
+vi.mock('react-router', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('react-router')>();
+  return {
+    ...actual,
+    useParams: vi.fn(),
+  };
+});
+
+vi.mock('@/hooks/use-unsaved-guard', () => ({
+  useUnsavedGuard: mockUseUnsavedGuard,
+}));
+
+vi.mock('@/components/dataset/hooks/use-dataset', () => ({
+  useDataset: vi.fn(),
+  useUpdateDataset: vi.fn(),
+  useSetTargetStatus: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useValidation: () => ({ data: { errors: [], warnings: [] } }),
+  useDatasetVersions: () => ({ data: { versions: [], total: 0 }, isLoading: false }),
+  useDatasetRefreshRuns: () => ({
+    data: { runs: [], total: 0 },
+    isLoading: false,
+    isError: false,
+    isFetching: false,
+  }),
+  useCancelRefreshJob: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useAttributes: () => ({ data: [] }),
+  useUpdateAttribute: () => ({ mutateAsync: vi.fn() }),
+  useDatasetHistory: () => ({ data: { history: [], total: 0 }, isLoading: false }),
+  useDatasetRows: () => ({ data: { rows: [], total: 0 }, isLoading: false }),
+  // Mounted at the page level now.
+  useDatasetRefreshWatch: () => ({ latestRun: undefined, isBusy: false, trackDispatchedRun: vi.fn() }),
+}));
+
+vi.mock('@/hooks/use-settings', () => ({
+  useAllSettings: () => ({ data: { tabs: { general: [] } } }),
+  useFeatureFlags: () => ({ data: { enable_dataset_editing: false, require_metadata_for_publish: false } }),
+  useTileConfig: () => ({ data: null }),
+}));
+
+vi.mock('@/hooks/use-mobile', () => ({
+  useIsMobile: () => false,
+}));
+
+vi.mock('@/stores/drawing-store', () => ({
+  useDrawingStore: (selector: (state: {
+    isDrawing: boolean;
+    isEditDirty: boolean;
+    hasUnsavedMapWork: boolean;
+    setDrawing: () => void;
+    clearDrawing: () => void;
+  }) => unknown) => selector(drawingStoreState),
+}));
+
+vi.mock('@/components/dataset/DatasetMap', () => ({
+  DatasetMap: () => <div data-testid="dataset-map" />,
+}));
+
+vi.mock('@/components/import/hooks/use-vrt', () => ({
+  useVrtGenerations: () => ({ data: { generations: [] } }),
+  useVrtStatus: () => ({ data: null }),
+}));
+
+vi.mock('@/components/dataset/DatasetChatPanel', () => ({
+  DatasetChatPanel: ({ abovePendingBar }: { abovePendingBar?: boolean }) => (
+    <div data-testid="dataset-chat-panel" data-above-pending-bar={String(Boolean(abovePendingBar))} />
+  ),
+}));
+
+vi.mock('@/components/dataset/DatasetDeleteDialog', () => ({
+  DatasetDeleteDialog: () => null,
+}));
+
+vi.mock('@/components/dataset/ReuploadDialog', () => ({
+  ReuploadDialog: () => null,
+}));
+
+vi.mock('@/components/dataset/DatasetDetailSkeleton', () => ({
+  DatasetDetailSkeleton: () => <div data-testid="dataset-detail-skeleton" />,
+}));
+
+vi.mock('@/components/dataset/tabs/StructureTab', () => ({
+  StructureTab: () => <div data-testid="structure-tab-stub" />,
+}));
+
+
+vi.mock('@/components/dataset/tabs/MetadataTab', () => ({
+  MetadataTab: () => <div data-testid="metadata-tab-stub" />,
+}));
+
+vi.mock('@/components/dataset/ValidationStatus', () => ({
+  ValidationStatus: () => <span data-testid="validation-status-compact">validation</span>,
+}));
+
+vi.mock('@/components/search/RecordTypeBadge', () => ({
+  RecordTypeBadge: () => <span data-testid="record-type-badge" />,
+}));
+
+vi.mock('@/hooks/use-admin', () => ({
+  useAIStatus: () => ({ data: { enabled: false, configured: false } }),
+}));
+
+vi.mock('@/hooks/use-ai-metadata', () => ({
+  useSummaryDraft: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useKeywordSuggestions: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useLineageDraft: () => ({ mutateAsync: vi.fn(), isPending: false }),
+}));
+
+vi.mock('@/components/dataset/hooks/use-records', () => ({
+  useCreateKeyword: () => ({ mutateAsync: vi.fn() }),
+  useKeywords: () => ({ data: { keywords: [] } }),
+  useDistributions: () => ({ data: { distributions: [], total: 0 }, isLoading: false }),
+}));
+
+vi.mock('@/components/collections/DatasetCollectionBadges', () => ({
+  DatasetCollectionBadges: () => null,
+}));
+
+vi.mock('@/components/dataset/ContactsEditor', () => ({
+  ContactsEditor: () => <div data-testid="contacts-editor-stub" />,
+}));
+
+vi.mock('@/components/dataset/KeywordsEditor', () => ({
+  KeywordsEditor: () => <div data-testid="keywords-editor-stub" />,
+}));
+
+vi.mock('@/components/dataset/AiAssistButton', () => ({
+  AiAssistButton: () => null,
+  AiDraftPreview: () => null,
+  AiKeywordSuggestions: () => null,
+}));
+
+vi.mock('@/components/dataset/VersionHistory', () => ({
+  VersionHistory: () => <div data-testid="version-history-stub" />,
+}));
+
+vi.mock('@/components/dataset/ChangeHistory', () => ({
+  ChangeHistory: () => <div data-testid="change-history-stub" />,
+}));
+
+vi.mock('@/components/dataset/QualityScoreCard', () => ({
+  QualityScoreCard: () => <div data-testid="quality-score-card-stub" />,
+}));
+
+vi.mock('@/components/dataset/RelatedDatasets', () => ({
+  RelatedDatasets: () => null,
+}));
+
+vi.mock('@/components/dataset/UsedInMaps', () => ({
+  UsedInMaps: () => null,
+}));
+
+const mockUseParams = vi.mocked(useParams);
+const mockUseDataset = vi.mocked(useDataset);
+const mockUseUpdateDataset = vi.mocked(useUpdateDataset);
+
+const EDITOR_USER: UserResponse = {
+  id: 'user-editor',
+  username: 'editor-user',
+  email: 'editor@example.com',
+  is_active: true,
+  status: 'active',
+  last_login_at: null,
+  can_reset_password: true,
+  created_at: '2026-03-01T00:00:00Z',
+  roles: ['editor'],
+};
+
+const VIEWER_USER: UserResponse = {
+  ...EDITOR_USER,
+  id: 'user-viewer',
+  username: 'viewer-user',
+  email: 'viewer@example.com',
+  roles: ['viewer'],
+};
+
+function makeDataset(): DatasetResponse {
+  return {
+    id: 'dataset-1',
+    record_id: 'record-1',
+    table_name: 'world_countries',
+    source_health: 'unknown',
+    schema_drift_status: 'unknown',
+    source_freshness: 'unknown',
+    has_generic_geometry: false,
+    title: 'World Countries',
+    summary: 'Original summary',
+    srid: 4326,
+    geometry_type: 'Polygon',
+    feature_count: 195,
+    extent_bbox: [-180, -90, 180, 90],
+    column_info: [{ name: 'name', type: 'text' }],
+    license: null,
+    attribution: null,
+    source_organization: 'Natural Earth',
+    data_vintage_start: null,
+    data_vintage_end: null,
+    source_format: 'GeoJSON',
+    source_filename: 'countries.geojson',
+    original_srid: 4326,
+    visibility: 'public',
+    created_by: 'user-editor',
+    created_by_display: 'editor-user',
+    created_at: '2026-03-01T00:00:00Z',
+    updated_at: '2026-03-02T00:00:00Z',
+    last_edited_by_display: 'editor-user',
+    last_edited_at: '2026-03-02T00:00:00Z',
+    record_status: 'published',
+    lineage_summary: 'Compiled from official country boundaries.',
+    update_frequency: 'annually',
+    usage_constraints: 'Public domain.',
+    access_constraints: 'None.',
+    sensitivity_classification: 'unclassified',
+    theme_category: ['boundaries'],
+    owner_org: 'Natural Earth',
+    published_at: '2026-03-02T00:00:00Z',
+    updated_by: 'user-editor',
+    current_version: 1,
+    source_url: 'https://example.test/world-countries',
+    quality_statement: 'Validated against source metadata.',
+    collections: [],
+    tile_columns: null,
+    quality_detail: {
+      overall: 96,
+      metadata_completeness: 95,
+      geometry_validity: 99,
+      attribute_completeness: 93,
+      crs_defined: 100,
+      computed_at: '2026-03-02T00:00:00Z',
+    },
+    record_type: 'vector_dataset',
+    raster: null,
+  };
+}
+
+function setUser(user: UserResponse | null) {
+  const state = useAuthStore.getState();
+  act(() => {
+    useAuthStore.setState({
+      ...state,
+      user,
+      token: user ? 'token' : null,
+      refreshToken: user ? 'refresh-token' : null,
+      expiresAt: user ? Date.now() + 60_000 : null,
+    });
+  });
+}
+
+describe('DatasetPage editable affordance integration', () => {
+  const mutateAsync = vi.fn();
+
+  beforeEach(() => {
+    mutateAsync.mockReset();
+    mutateAsync.mockResolvedValue({});
+    drawingStoreState.isDrawing = false;
+    drawingStoreState.isEditDirty = false;
+    drawingStoreState.hasUnsavedMapWork = false;
+    drawingStoreState.setDrawing.mockReset();
+    drawingStoreState.clearDrawing.mockReset();
+    mockUseUnsavedGuard.mockReset();
+    mockUseUnsavedGuard.mockReturnValue({ state: 'unblocked', reset: vi.fn(), proceed: vi.fn() });
+
+    mockUseParams.mockReturnValue({ id: 'dataset-1' });
+    mockUseDataset.mockReturnValue({
+      data: makeDataset(),
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useDataset>);
+    mockUseUpdateDataset.mockReturnValue({
+      mutateAsync,
+    } as unknown as ReturnType<typeof useUpdateDataset>);
+  });
+
+  afterEach(() => {
+    window.history.replaceState({}, '', '/');
+    setUser(null);
+  });
+
+  // This test walks two full edit→stage→resolve cycles with
+  // per-keystroke userEvent typing through a heavy DatasetPage render; on
+  // loaded CI runners (coverage-instrumented, 2 cores) it can exceed the 5s
+  // default timeout while every step is properly awaited — slowness, not a
+  // race. Give it explicit headroom.
+  it('shows sticky pending controls for staged drafts and clears after save/cancel', { timeout: 15_000 }, async () => {
+    setUser(EDITOR_USER);
+    const user = userEvent.setup();
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+
+    // DetailPanel is React.lazy — wait for the chunk
+    // to resolve before querying its child fields synchronously. Under
+    // coverage load the chunk can take longer than findBy's 1s default.
+    await user.click(await screen.findByText('Original summary', undefined, { timeout: 10_000 }));
+
+    const summaryInput = screen.getByDisplayValue('Original summary');
+    await user.clear(summaryInput);
+    await user.type(summaryInput, 'Updated summary pending save');
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(await screen.findByTestId('pending-edits-bar')).toBeInTheDocument();
+    expect(screen.getByTestId('pending-edits-count')).toHaveTextContent('1 unsaved change');
+
+    await user.click(screen.getByTestId('pending-edits-save'));
+
+    expect(mutateAsync).toHaveBeenCalledWith({
+      datasetId: 'dataset-1',
+      data: {
+        summary: 'Updated summary pending save',
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+    });
+
+    await user.click(await screen.findByText('Original summary'));
+
+    const secondEditInput = screen.getByDisplayValue('Original summary');
+    await user.clear(secondEditInput);
+    await user.type(secondEditInput, 'Summary that will be canceled');
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(await screen.findByTestId('pending-edits-bar')).toBeInTheDocument();
+
+    await user.click(screen.getByTestId('pending-edits-cancel'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+    });
+
+    expect(await screen.findByText('Original summary')).toBeInTheDocument();
+  });
+
+  it('lifts the Ask AI dock above the pending-edits bar only while edits are pending', { timeout: 15_000 }, async () => {
+    setUser(EDITOR_USER);
+    const user = userEvent.setup();
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(await screen.findByTestId('dataset-chat-panel')).toHaveAttribute('data-above-pending-bar', 'false');
+
+    await user.click(await screen.findByText('Original summary'));
+    const summaryInput = screen.getByDisplayValue('Original summary');
+    await user.clear(summaryInput);
+    await user.type(summaryInput, 'Updated summary pending save');
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(await screen.findByTestId('pending-edits-bar')).toBeInTheDocument();
+    expect(screen.getByTestId('dataset-chat-panel')).toHaveAttribute('data-above-pending-bar', 'true');
+
+    await user.click(screen.getByTestId('pending-edits-cancel'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId('dataset-chat-panel')).toHaveAttribute('data-above-pending-bar', 'false');
+  });
+
+  // "Leave" on the unsaved-changes dialog must discard the staged draft, not
+  // just let navigation proceed: otherwise it reappears (and could be saved)
+  // against whatever dataset mounts next.
+  it('discards the staged draft when the user chooses Leave on the unsaved-changes dialog', async () => {
+    setUser(EDITOR_USER);
+    const user = userEvent.setup();
+    const mockProceed = vi.fn();
+
+    const { rerender } = render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    await user.click(await screen.findByText('Original summary'));
+    const summaryInput = screen.getByDisplayValue('Original summary');
+    await user.clear(summaryInput);
+    await user.type(summaryInput, 'Updated summary pending save');
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(await screen.findByTestId('pending-edits-bar')).toBeInTheDocument();
+
+    // Simulate the blocker intercepting a route change with unsaved changes
+    // present — the same shape react-router's real useBlocker returns.
+    mockUseUnsavedGuard.mockReturnValue({ state: 'blocked', reset: vi.fn(), proceed: mockProceed });
+    rerender(<DatasetPage />);
+
+    await user.click(await screen.findByRole('button', { name: 'Leave' }));
+
+    expect(mockProceed).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+    });
+  });
+
+  // Resetting useDraftEditing's own state (the test
+  // above) is not enough — InlineEdit keeps its OWN local editing/draft
+  // state, and it deliberately ignores prop-value changes while `editing` is
+  // true (see InlineEdit.tsx's sync effect). Typed-but-uncommitted text in an
+  // open editor survived a dataset-to-dataset navigation and could be PATCHed
+  // onto the wrong dataset on the next Save. Covers "route change to a
+  // cached dataset" directly, since DetailPanel's key={dataset.id} (the fix)
+  // is what has to remount it — going through the Leave button first would
+  // also work, but risks the dialog's own focus trap blurring the textarea
+  // and masking the bug via InlineEdit's separate blur-cancels-uncommitted-
+  // edits behavior.
+  it('discards uncommitted InlineEdit text on navigation to a different (cached) dataset', async () => {
+    setUser(EDITOR_USER);
+    const user = userEvent.setup();
+
+    const datasetB: DatasetResponse = { ...makeDataset(), id: 'dataset-2', summary: 'Second dataset summary' };
+    mockUseDataset.mockImplementation(((datasetId: string) => ({
+      data: datasetId === 'dataset-2' ? datasetB : makeDataset(),
+      isLoading: false,
+      error: null,
+    })) as unknown as typeof useDataset);
+
+    const { rerender } = render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    await user.click(await screen.findByText('Original summary'));
+    const summaryInput = screen.getByDisplayValue('Original summary');
+    await user.clear(summaryInput);
+    await user.type(summaryInput, 'Uncommitted dataset A text');
+    // Deliberately no Ctrl+Enter and no blur — this text was never staged or
+    // saved, only typed.
+
+    expect(await screen.findByTestId('pending-edits-bar')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('Uncommitted dataset A text')).toBeInTheDocument();
+
+    // Navigate to a different, already-cached dataset.
+    mockUseParams.mockReturnValue({ id: 'dataset-2' });
+    rerender(<DatasetPage />);
+
+    expect(await screen.findByText('Second dataset summary')).toBeInTheDocument();
+    expect(screen.queryByDisplayValue('Uncommitted dataset A text')).not.toBeInTheDocument();
+    expect(mutateAsync).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+    });
+  });
+
+  it('keeps viewer fields read-only and reveals denial hint only after attempted edit', async () => {
+    setUser(VIEWER_USER);
+    const user = userEvent.setup();
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    // DetailPanel is React.lazy — wait for the chunk
+    // to resolve before querying its child fields synchronously.
+    const summaryShell = await screen.findByTestId('editable-field-shell-summary');
+    expect(summaryShell).toHaveAttribute('data-editable', 'false');
+    const hintCountBeforeAttempt = screen.getAllByTestId('role-capability-hint').length;
+
+    await user.click(summaryShell);
+
+    expect(screen.getAllByTestId('role-capability-hint')).toHaveLength(hintCountBeforeAttempt + 1);
+    expect(screen.getByText('You can view this field. Editors can make changes.')).toBeInTheDocument();
+    expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+  });
+
+  it('normalizes legacy tab hashes to the new metadata route', async () => {
+    setUser(EDITOR_USER);
+    window.history.replaceState({}, '', '/datasets/dataset-1#source-coverage');
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#metadata');
+    });
+
+    // DetailPanel is React.lazy — wait for the chunk
+    // to resolve before querying tab roles synchronously.
+    expect(await screen.findByRole('tab', { name: 'Metadata' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('selects Sources for a refresh-run permalink on a fresh page', async () => {
+    setUser(EDITOR_USER);
+    const user = userEvent.setup();
+    window.history.replaceState({}, '', '/datasets/dataset-1#refresh-run-run-old-target');
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    const sourceTab = await screen.findByRole('tab', { name: 'Source' });
+    expect(sourceTab).toHaveAttribute('aria-selected', 'true');
+
+    await user.click(screen.getByRole('tab', { name: 'Overview' }));
+    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+
+    act(() => {
+      window.history.replaceState({}, '', '/datasets/dataset-1#refresh-run-run-old-target');
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+    expect(sourceTab).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('guards navigation for unsaved map work beyond a dirty selection', () => {
+    setUser(EDITOR_USER);
+    drawingStoreState.hasUnsavedMapWork = true;
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(mockUseUnsavedGuard).toHaveBeenLastCalledWith(true);
+  });
+
+  it('does not guard navigation with no unsaved work', () => {
+    setUser(EDITOR_USER);
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(mockUseUnsavedGuard).toHaveBeenLastCalledWith(false);
+  });
+
+  it('does not show metadata pending controls when only geometry edits are dirty', () => {
+    setUser(EDITOR_USER);
+    drawingStoreState.isEditDirty = true;
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    expect(screen.queryByTestId('pending-edits-bar')).not.toBeInTheDocument();
+  });
+
+  // #1289: raster reupload (upload -> commit, skipping the schema-preview
+  // step) is now reachable from the app — raster offers both Create VRT and
+  // Re-Upload.
+  it('offers both reupload and create-vrt for raster datasets', async () => {
+    setUser(EDITOR_USER);
+    mockUseDataset.mockReturnValue({
+      data: {
+        ...makeDataset(),
+        record_type: 'raster_dataset',
+        raster: {
+          tile_url: '/raster-tiles/test/{z}/{x}/{y}.png',
+        } as DatasetResponse['raster'],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useDataset>);
+    const user = userEvent.setup();
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
+
+    expect(
+      await screen.findByRole('menuitem', { name: 'Create VRT' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('menuitem', { name: 'Re-upload' }),
+    ).toBeInTheDocument();
+  });
+
+  // jsdom has no layout, so assert the class that lets the row wrap instead of
+  // widening the page past a phone viewport.
+  it('lets a raster owner\'s header actions wrap within the viewport', () => {
+    setUser(EDITOR_USER);
+    mockUseDataset.mockReturnValue({
+      data: {
+        ...makeDataset(),
+        record_type: 'raster_dataset',
+        raster: {
+          tile_url: '/raster-tiles/test/{z}/{x}/{y}.png',
+          connect: {
+            download_url: 'https://example.test/cog.tif',
+            tile_url: '/raster-tiles/test/{z}/{x}/{y}.png',
+          },
+        } as DatasetResponse['raster'],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useDataset>);
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+
+    const downloadCog = screen.getByRole('button', { name: 'Download COG' });
+    expect(downloadCog.parentElement).toHaveClass('flex-wrap');
+    expect(screen.getByRole('button', { name: 'Connect' }).parentElement).toBe(
+      downloadCog.parentElement,
+    );
+  });
+
+  // VRT stays on the regenerate flow — it never gets a reupload action,
+  // and Create VRT is raster-only so it's absent here too.
+  it('does not offer reupload or create-vrt for VRT datasets', async () => {
+    setUser(EDITOR_USER);
+    mockUseDataset.mockReturnValue({
+      data: {
+        ...makeDataset(),
+        record_type: 'vrt_dataset',
+        raster: {
+          tile_url: '/raster-tiles/test/{z}/{x}/{y}.png',
+        } as DatasetResponse['raster'],
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useDataset>);
+    const user = userEvent.setup();
+
+    render(<DatasetPage />, { route: '/datasets/dataset-1' });
+    await user.click(screen.getByRole('button', { name: 'More actions' }));
+
+    expect(
+      await screen.findByRole('menuitem', { name: 'Delete' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('menuitem', { name: 'Create VRT' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('menuitem', { name: 'Re-upload' }),
+    ).not.toBeInTheDocument();
+  });
+});

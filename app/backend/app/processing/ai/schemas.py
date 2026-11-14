@@ -1,0 +1,613 @@
+"""Schemas for AI map generation."""
+
+import json
+import re
+from typing import Literal
+
+import structlog
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+logger = structlog.stdlib.get_logger(__name__)
+
+_VALID_PAINT_PROPS: dict[str, set[str]] = {
+    "fill": {
+        "fill-color",
+        "fill-opacity",
+        "fill-outline-color",
+        "_outline-color",
+        "_outline-width",
+        "_fill-disabled",
+        "_stroke-disabled",
+        "_outline-width-saved",
+        "_fill-opacity-saved",
+        "fill-antialias",
+        "fill-translate",
+        "fill-translate-anchor",
+        "fill-pattern",
+    },
+    "line": {
+        "line-color",
+        "line-opacity",
+        "line-width",
+        "line-gap-width",
+        "line-blur",
+        "line-dasharray",
+        "line-translate",
+        "line-translate-anchor",
+        "line-offset",
+        "line-gradient",
+        "line-pattern",
+    },
+    "circle": {
+        "circle-color",
+        "circle-opacity",
+        "circle-radius",
+        "circle-blur",
+        "circle-stroke-color",
+        "circle-stroke-opacity",
+        "circle-stroke-width",
+        "circle-translate",
+        "circle-translate-anchor",
+        "circle-pitch-scale",
+        "circle-pitch-alignment",
+    },
+    "heatmap": {
+        "heatmap-radius",
+        "heatmap-weight",
+        "heatmap-intensity",
+        "heatmap-color",
+        "heatmap-opacity",
+    },
+}
+
+_COLOR_PROPS = {
+    "fill-color",
+    "fill-outline-color",
+    "_outline-color",
+    "line-color",
+    "circle-color",
+    "circle-stroke-color",
+    "heatmap-color",
+}
+
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$")
+_RGBA_RE = re.compile(r"^rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(,\s*[\d.]+\s*)?\)$")
+
+
+def _is_valid_color(value: object) -> bool:
+    """Check if a value is a valid MapLibre color (hex or rgba)."""
+    if isinstance(value, list):
+        return True  # expression — validated separately
+    if not isinstance(value, str):
+        return False
+    return bool(_HEX_COLOR_RE.match(value) or _RGBA_RE.match(value))
+
+
+_PAINT_BOUNDS: dict[str, tuple[float, float]] = {
+    "fill-opacity": (0.0, 1.0),
+    "line-opacity": (0.0, 1.0),
+    "line-width": (0.0, 50.0),
+    "line-gap-width": (0.0, 50.0),
+    "line-blur": (0.0, 50.0),
+    "line-offset": (-50.0, 50.0),
+    "circle-opacity": (0.0, 1.0),
+    "circle-radius": (0.0, 200.0),
+    "circle-blur": (0.0, 50.0),
+    "circle-stroke-opacity": (0.0, 1.0),
+    "circle-stroke-width": (0.0, 20.0),
+    "heatmap-radius": (1.0, 200.0),
+    "heatmap-weight": (0.0, 10.0),
+    "heatmap-intensity": (0.0, 10.0),
+    "heatmap-opacity": (0.0, 1.0),
+}
+
+
+def _validate_expression(expr: list) -> bool:
+    """Lightweight MapLibre expression syntax check."""
+    if not isinstance(expr, list) or len(expr) < 2:
+        return False
+    op = expr[0]
+    if op == "get" and len(expr) == 2 and isinstance(expr[1], str):
+        return True
+    if op == "match" and len(expr) >= 4:
+        return True  # ["match", getter, val1, out1, ..., fallback]
+    # Stop values occupy every other slot starting at index 3.
+    if op == "step" and len(expr) >= 4:
+        return all(isinstance(expr[i], (int, float)) for i in range(3, len(expr), 2))
+    if op == "interpolate" and len(expr) >= 5:
+        return all(isinstance(expr[i], (int, float)) for i in range(3, len(expr), 2))
+    if op == "case" and len(expr) >= 3:
+        return True
+    if op in ("literal", "to-string", "to-number", "to-boolean"):
+        return True
+    if op in (
+        "all",
+        "any",
+        "!",
+        "==",
+        "!=",
+        ">",
+        "<",
+        ">=",
+        "<=",
+        "in",
+        "!in",
+        "has",
+        "!has",
+    ):
+        return True
+    return op in ("concat", "downcase", "upcase", "coalesce")
+
+
+def _paint_layer_type_for_geometry(geometry_type: str | None) -> str | None:
+    if not geometry_type:
+        return None
+    gt = geometry_type.lower()
+    if "polygon" in gt:
+        return "fill"
+    if "line" in gt:
+        return "line"
+    if "heatmap" in gt:
+        return "heatmap"
+    return "circle"
+
+
+def _valid_paint_props_for_geometry(
+    geometry_type: str | None,
+    render_mode: str | None = None,
+) -> tuple[str | None, set[str]]:
+    # Mirrors frontend validateChatPaint: a heatmap-rendered layer's geometry
+    # type is virtually always Point, so without this branch the geometry-type
+    # filter would strip every heatmap property.
+    if render_mode == "heatmap":
+        return "heatmap", _VALID_PAINT_PROPS["heatmap"]
+    if render_mode == "symbol":
+        # Symbol layers draw icons; paint only holds the circle paint for a return to points.
+        return "symbol", set()
+    layer_type = _paint_layer_type_for_geometry(geometry_type)
+    if not layer_type:
+        return None, set()
+    return layer_type, _VALID_PAINT_PROPS.get(layer_type, _VALID_PAINT_PROPS["circle"])
+
+
+def validate_paint_for_geometry(
+    paint: dict | None, geometry_type: str | None
+) -> dict | None:
+    """Validate and sanitize paint properties for the given geometry type.
+
+    Removes properties that don't match the geometry type (e.g. fill-color on a
+    point layer) and logs a warning. Returns the cleaned paint dict.
+    """
+    cleaned, warnings = validate_paint_with_feedback(paint, geometry_type)
+    for msg in warnings:
+        logger.warning("paint_validation", message=msg, geometry_type=geometry_type)
+    return cleaned
+
+
+def _removed_property_warning(key: str, layer_type: str) -> str:
+    message = f"Removed '{key}': not valid for {layer_type} layers"
+    if key.startswith("fill-extrusion-"):
+        # The 3D companion takes its colour from fill-color; height and opacity
+        # live in the builder config, which paint edits cannot reach.
+        message += (
+            ". A 3D polygon layer is coloured with fill-color; change its opacity"
+            " with set_opacity"
+        )
+    return message
+
+
+def validate_paint_with_feedback(
+    paint: dict | None,
+    geometry_type: str | None,
+    render_mode: str | None = None,
+) -> tuple[dict | None, list[str]]:
+    """Like validate_paint_for_geometry but also returns a list of warning strings.
+
+    Used by the chat service to feed validation feedback back to the LLM.
+
+    render_mode: when 'heatmap', geometry-type filtering is skipped so
+    heatmap-* properties are kept, as in the frontend's validateChatPaint.
+    """
+    if not paint or (not geometry_type and render_mode != "heatmap"):
+        return paint, []
+
+    layer_type, valid_props = _valid_paint_props_for_geometry(
+        geometry_type, render_mode
+    )
+    if not layer_type:
+        return paint, []
+    cleaned = {}
+    warnings: list[str] = []
+    for key, value in paint.items():
+        if key not in valid_props:
+            warnings.append(_removed_property_warning(key, layer_type))
+            continue
+        if key in _COLOR_PROPS and not _is_valid_color(value):
+            warnings.append(f"Removed '{key}': invalid color value")
+            continue
+        if key in _PAINT_BOUNDS and isinstance(value, (int, float)):
+            lo, hi = _PAINT_BOUNDS[key]
+            value = max(lo, min(hi, float(value)))
+        if key in _COLOR_PROPS and isinstance(value, list):
+            if not _validate_expression(value):
+                warnings.append(f"Removed '{key}': invalid MapLibre expression")
+                continue
+        cleaned[key] = value
+    return cleaned or None, warnings
+
+
+def validate_paint_property_names_with_feedback(
+    properties: list | None,
+    geometry_type: str | None,
+    render_mode: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Validate paint property names for explicit style-clear actions.
+
+    render_mode: see validate_paint_with_feedback.
+    """
+    if not properties or (not geometry_type and render_mode != "heatmap"):
+        return [], []
+
+    layer_type, valid_props = _valid_paint_props_for_geometry(
+        geometry_type, render_mode
+    )
+    if not layer_type:
+        return [], []
+
+    cleaned: list[str] = []
+    warnings: list[str] = []
+    for prop in properties:
+        if not isinstance(prop, str):
+            warnings.append("Removed non-string paint clear entry")
+            continue
+        if prop not in valid_props:
+            warnings.append(_removed_property_warning(prop, layer_type))
+            continue
+        if prop not in cleaned:
+            cleaned.append(prop)
+    return cleaned, warnings
+
+
+class MapGenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=3, max_length=1000)
+    language: str | None = None  # e.g. "en", "es", "fr", "de"
+
+
+class MapGenerateResponse(BaseModel):
+    map_id: str
+    map_name: str
+    explanation: str
+    datasets_used: list[str]
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(max(value, low), high)
+
+
+# Internal — structured output the LLM produces. Values are clamped to the
+# ranges the map save API enforces, so a generated map can be re-saved from
+# the editor.
+class LLMLayerSpec(BaseModel):
+    dataset_id: str
+    sort_order: int = 0
+    visible: bool = True
+    opacity: float = 1.0
+    paint: dict | None = None
+    layout: dict | None = None
+
+    @field_validator("sort_order")
+    @classmethod
+    def _bound_sort_order(cls, v: int) -> int:
+        return int(_clamp(v, 0, 32767))
+
+    @field_validator("opacity")
+    @classmethod
+    def _bound_opacity(cls, v: float) -> float:
+        return _clamp(v, 0.0, 1.0)
+
+
+class LLMMapSpec(BaseModel):
+    name: str
+    description: str | None = None
+    center_lng: float = 0.0
+    center_lat: float = 0.0
+    zoom: float = 2.0
+    basemap_style: str = "openfreemap-positron"
+    layers: list[LLMLayerSpec]
+    explanation: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _bound_name(cls, v: str) -> str:
+        v = v.strip()[:255].strip()
+        if not v:
+            raise ValueError("name must not be empty")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _bound_description(cls, v: str | None) -> str | None:
+        return v[:2000] if v is not None else None
+
+    @field_validator("center_lat")
+    @classmethod
+    def _bound_center_lat(cls, v: float) -> float:
+        return _clamp(v, -90.0, 90.0)
+
+    @field_validator("zoom")
+    @classmethod
+    def _bound_zoom(cls, v: float) -> float:
+        return _clamp(v, 0.0, 24.0)
+
+    @field_validator("layers")
+    @classmethod
+    def _bound_layers(cls, v: list[LLMLayerSpec]) -> list[LLMLayerSpec]:
+        return v[:200]
+
+
+# Bounds on client-supplied chat context. Without them the only limit is
+# DEFAULT_BODY_LIMIT_BYTES (10 MB, ~2.5M tokens), billed to the provider and
+# re-sent on each of up to 8 tool rounds. enforce_ai_token_budget checks usage
+# already recorded before the handler runs, and MAX_REQUEST_TOKEN_BUDGET is
+# checked at the top of the loop where the running total is still zero, so
+# neither bounds the first request.
+#
+# The per-message cap is generous against the loop's own max_tokens=4096
+# (~16k chars), so a long assistant turn replayed as history is never rejected.
+# The aggregate sits above what the other three caps can produce together, so
+# a long conversation never 422s on its own; it bounds the free-form layer
+# context, which has no shape of its own to cap.
+_MAX_HISTORY_CONTENT_CHARS = 20_000
+_MAX_CHAT_LAYERS = 50
+_MAX_CHAT_PAYLOAD_CHARS = 500_000
+
+
+def _chat_payload_chars(message: str, history: list["ChatHistoryMessage"]) -> int:
+    return len(message) + sum(len(h.content) for h in history)
+
+
+class ChatHistoryMessage(BaseModel):
+    """A single message in the conversation history."""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(..., max_length=_MAX_HISTORY_CONTENT_CHARS)
+
+
+def history_to_dicts(
+    history: list[ChatHistoryMessage] | None,
+) -> list[dict] | None:
+    """Convert ChatHistoryMessage list to plain dicts for the LLM loop."""
+    if not history:
+        return None
+    return [{"role": h.role, "content": h.content} for h in history]
+
+
+class ChatMapLayer(BaseModel):
+    """Layer state sent from frontend for chat context."""
+
+    id: str
+    name: str
+    dataset_id: str
+    dataset_table_name: str
+    geometry_type: str | None = None
+    layer_type: str | None = None  # 'raster_geolens' or 'vector_geolens'
+    column_info: list[dict] | None = None
+    dataset_title: str | None = None
+    feature_count: int | None = None
+    sample_values: dict | None = None
+    visible: bool = True
+    filter: list | dict | None = None
+    label_config: dict | None = None
+    style_config: dict | None = None
+    paint: dict | None = None
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    map_id: str
+    layers: list[ChatMapLayer] = Field(..., max_length=_MAX_CHAT_LAYERS)
+    language: str | None = None  # e.g. "en", "es", "fr", "de"
+    history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def _bound_total_payload(self) -> "ChatRequest":
+        # Layer context is free-form (column_info, sample_values), so the
+        # per-field caps above don't bound it; size the whole payload once.
+        total = _chat_payload_chars(self.message, self.history) + len(
+            json.dumps([layer.model_dump() for layer in self.layers], default=str)
+        )
+        if total > _MAX_CHAT_PAYLOAD_CHARS:
+            raise ValueError(
+                "This chat request is too large. Start a new conversation or "
+                "reduce the number of layers."
+            )
+        return self
+
+
+class DatasetChatRequest(BaseModel):
+    """Dataset-scoped chat: no map, no client-supplied layer state.
+
+    The server resolves ALL dataset context (table name, columns, samples)
+    authoritatively from the DB — the client only names the dataset.
+    """
+
+    message: str = Field(..., min_length=1, max_length=2000)
+    dataset_id: str
+    language: str | None = None  # e.g. "en", "es", "fr", "de"
+    history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def _bound_total_payload(self) -> "DatasetChatRequest":
+        # Same bound as ChatRequest; this route carries no layers.
+        if _chat_payload_chars(self.message, self.history) > _MAX_CHAT_PAYLOAD_CHARS:
+            raise ValueError(
+                "This chat request is too large. Start a new conversation."
+            )
+        return self
+
+
+class GeoJSONFeature(BaseModel):
+    """A GeoJSON Feature."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = "Feature"
+    geometry: dict | None = None
+    properties: dict | None = None
+
+
+class GeoJSONFeatureCollection(BaseModel):
+    """A GeoJSON FeatureCollection."""
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = "FeatureCollection"
+    features: list[GeoJSONFeature] = []
+
+
+class ChatAction(BaseModel):
+    type: Literal[
+        "set_filter",
+        "set_style",
+        "set_data_driven_style",
+        "set_label",
+        "toggle_visibility",
+        "add_layer",
+        "remove_layer",
+        "show_query_result",
+        "set_opacity",
+        "set_render_as",
+    ]
+    layer_id: str | None = None
+    expression: list | None = None  # for set_filter
+    paint: dict | None = None  # for set_style / set_data_driven_style
+    clear_paint: list[str] | None = None  # for set_style explicit property clears
+    replace_paint: bool | None = None  # for set_style full replacement
+    style_config: dict | None = None  # for set_data_driven_style
+    label_config: dict | None = None  # for set_label
+    dataset_id: str | None = None  # for add_layer
+    dataset_name: str | None = None  # for add_layer (staging-chip display label)
+    visible: bool | None = None  # for toggle_visibility
+    opacity: float | None = Field(None, ge=0.0, le=1.0)  # for set_opacity
+    render_as: str | None = None  # for set_render_as
+    height_column: str | None = None  # for set_render_as extrusion-3d
+    geojson: GeoJSONFeatureCollection | None = None  # for show_query_result
+    bbox: list[float] | None = None  # for show_query_result
+    rows: list[list] | None = (
+        None  # for show_query_result (row arrays, paired with columns)
+    )
+    columns: list[str] | None = None  # for show_query_result (inline data table)
+    row_count: int | None = None  # for show_query_result (total matched rows)
+    truncated: bool | None = None  # for show_query_result (rows capped for payload)
+    # ``run_analysis`` handoff: lets the builder prefill the Analysis panel
+    # ("Save as dataset") from a chat preview. layer_id above is reused.
+    operation: str | None = None  # for show_query_result (analysis operation)
+    distance_meters: float | None = None  # for show_query_result (buffer distance)
+
+
+class SSETokenEvent(BaseModel):
+    """Token payload carried by a ``token`` server-sent event."""
+
+    type: Literal["token"]
+    text: str
+
+
+class SSEToolStartEvent(BaseModel):
+    """Progress payload emitted when an AI tool starts."""
+
+    type: Literal["tool_start"]
+    tool: str
+    label: str
+
+
+class SSEToolResultEvent(BaseModel):
+    """Progress payload emitted when an AI tool finishes."""
+
+    type: Literal["tool_result"]
+    tool: str
+    success: bool
+
+
+class SSEActionsEvent(BaseModel):
+    """Validated map-edit actions produced by streaming chat."""
+
+    type: Literal["actions"]
+    actions: list[ChatAction]
+
+
+class SSEChatDoneEvent(BaseModel):
+    """Terminal payload for a successful streaming chat request."""
+
+    type: Literal["done"]
+    explanation: str
+
+
+class SSEMapDoneEvent(BaseModel):
+    """Terminal payload for a successful streaming map-generation request."""
+
+    type: Literal["done"]
+    map_id: str
+    map_name: str
+    explanation: str
+    datasets_used: list[str]
+
+
+class SSEErrorEvent(BaseModel):
+    """Error payload carried inside an already-open SSE response."""
+
+    type: Literal["error"]
+    message: str | dict | list
+    status: int | None = Field(
+        default=None,
+        description=(
+            "HTTP-equivalent status for router-level failures; provider and "
+            "model errors raised inside the stream may omit it."
+        ),
+    )
+    code: Literal["model_requires_responses_api"] | None = Field(
+        default=None,
+        description=(
+            "Stable identifier for a failure the client can explain in its own "
+            "language. model_requires_responses_api: the configured model "
+            "calls tools only through the OpenAI Responses API."
+        ),
+    )
+
+
+class ChatResponse(BaseModel):
+    explanation: str
+    actions: list[ChatAction]
+
+
+# Live provider probe
+
+
+class AIProbeCheck(BaseModel):
+    """Result of one live provider check (chat or embeddings)."""
+
+    configured: bool = Field(
+        description="Whether this purpose has a provider key configured. "
+        "False means no probe call was made."
+    )
+    ok: bool | None = Field(
+        default=None,
+        description="Whether the live provider call succeeded. "
+        "None when not configured (no call was made).",
+    )
+    status: int | None = Field(
+        default=None,
+        description="HTTP status returned by the provider on failure, when available.",
+    )
+    error: str | None = Field(
+        default=None,
+        description="Short sanitized failure reason. Never contains the key "
+        "or raw provider error bodies.",
+    )
+
+
+class AIProbeReport(BaseModel):
+    """Per-purpose live provider probe results (admin ai-status ?probe=true)."""
+
+    chat: AIProbeCheck
+    embeddings: AIProbeCheck

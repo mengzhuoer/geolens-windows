@@ -1,0 +1,251 @@
+import { useTranslation } from 'react-i18next';
+import { Link } from 'react-router';
+import { AlertTriangle, Loader2, Save, Share2, MoreHorizontal, Info, Copy, Download, Pencil, ChevronRight, Eye } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
+// Shared platform detection + Save chord.
+import { SAVE_SHORTCUT } from '@/lib/platform';
+
+export interface OverflowActions {
+  onExportPNG: () => void;
+  onShowInfo: () => void;
+  onFork: () => void;
+  isForkPending: boolean;
+  /**
+   * Opens the read-only viewer UI of this map (`?preview=viewer`, handled by
+   * MapViewerGate) in a new tab, so an editor can check the viewer layout
+   * without losing their in-progress builder session. NOT an anonymous-data
+   * preview: requests still carry the editor's session, so private layers they
+   * can access still render. Undefined (e.g. an unsaved new map with no id yet)
+   * hides the menu item, like the `onShare` optional prop above.
+   */
+  onViewAsViewer?: () => void;
+}
+
+interface MapTitleBarProps {
+  name: string;
+  onNameChange: (value: string) => void;
+  description?: string;
+  onDescriptionChange?: (value: string) => void;
+  onMarkDirty: () => void;
+  hasUnsavedChanges: boolean;
+  isSaving: boolean;
+  saveStatus?: 'saved' | 'unsaved' | 'saving' | 'failed';
+  isSaveRetryable?: boolean;
+  onSave: () => void;
+  onShare?: () => void;
+  overflow: OverflowActions;
+}
+
+export function MapTitleBar({
+  name,
+  onNameChange,
+  description,
+  onDescriptionChange,
+  onMarkDirty,
+  hasUnsavedChanges,
+  isSaving,
+  saveStatus = isSaving ? 'saving' : hasUnsavedChanges ? 'unsaved' : 'saved',
+  isSaveRetryable = false,
+  onSave,
+  onShare,
+  overflow,
+}: MapTitleBarProps) {
+  const { t } = useTranslation('builder');
+  const saveStatusLabel = saveStatus === 'saving'
+    ? t('titleBar.saveStatus.saving', { defaultValue: 'Saving...' })
+    : saveStatus === 'failed'
+      ? t('titleBar.saveStatus.failed', { defaultValue: 'Save failed' })
+      : saveStatus === 'unsaved'
+        ? t('titleBar.saveStatus.unsaved', { defaultValue: 'Unsaved changes' })
+        : t('titleBar.saveStatus.saved', { defaultValue: 'Saved' });
+  const saveButtonLabel = saveStatus === 'failed'
+    ? t('titleBar.retrySave', { defaultValue: 'Retry save' })
+    : saveStatus === 'unsaved'
+      ? t('actions.save', { defaultValue: 'Save' })
+      : saveStatus === 'saving'
+        ? t('titleBar.saveStatus.saving', { defaultValue: 'Saving...' })
+        : t('titleBar.saved', { defaultValue: 'Saved' });
+  const saveTooltip = saveStatus === 'failed'
+    ? t('tooltips.retrySave', { defaultValue: 'Save failed. Retry saving changes.' })
+    : saveStatus === 'unsaved'
+      ? t('tooltips.save', { shortcut: SAVE_SHORTCUT, defaultValue: `Save (${SAVE_SHORTCUT})` })
+      : saveStatus === 'saving'
+        ? t('titleBar.saveStatus.saving', { defaultValue: 'Saving...' })
+        : t('tooltips.allSaved', { defaultValue: 'All changes saved' });
+  // aria-label OVERRIDES element contents in the accessible-name
+  // computation, so an sr-only status span inside the button was never
+  // conveyed. Fold the status into the label itself; the role="status" region
+  // below announces status CHANGES without the button needing focus.
+  const saveButtonAriaLabel = t('titleBar.saveButtonAriaLabel', {
+    action: saveStatus === 'failed'
+      ? t('titleBar.retrySave', { defaultValue: 'Retry save' })
+      : t('tooltips.save', { shortcut: SAVE_SHORTCUT, defaultValue: `Save (${SAVE_SHORTCUT})` }),
+    status: saveStatusLabel,
+    defaultValue: '{{action}}, {{status}}',
+  });
+
+  return (
+    <div className="h-10 border-b bg-background flex items-center gap-3 px-3 shrink-0">
+      {/* Breadcrumb: Maps > editable name */}
+      <nav aria-label={t('common:breadcrumb.label')} className="flex items-center gap-1.5 min-w-0 flex-1">
+        <Link
+          to="/maps"
+          className="text-sm text-muted-foreground hover:text-foreground transition-colors shrink-0"
+        >
+          {t('common:nav.maps', { defaultValue: 'Maps' })}
+        </Link>
+        <ChevronRight className="h-3.5 w-3.5 text-muted-foreground/60 shrink-0 rtl-mirror" />
+
+        {/* Editable map name */}
+        <div className="group relative min-w-0 shrink -ms-1.5">
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => { onNameChange(e.target.value); onMarkDirty(); }}
+            onBlur={() => { if (!name.trim()) onNameChange(t('titleBar.untitled', { defaultValue: 'Untitled Map' })); }}
+            maxLength={255}
+            aria-label={t('mapNameLabel', { defaultValue: 'Map name' })}
+            className="text-sm font-medium truncate bg-transparent border-none outline-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm px-1.5 py-0.5 w-auto max-w-full field-sizing-content hover:bg-accent/40 transition-colors pe-5"
+            title={name}
+          />
+          <Pencil className="absolute end-1 top-1/2 -translate-y-1/2 h-3 w-3 text-muted-foreground/40 opacity-0 group-hover:opacity-100 group-focus-within:opacity-0 transition-opacity pointer-events-none" />
+        </div>
+
+        {/* Inline description */}
+        {onDescriptionChange && (
+          <input
+            type="text"
+            value={description ?? ''}
+            onChange={(e) => { onDescriptionChange(e.target.value); onMarkDirty(); }}
+            maxLength={500}
+            placeholder={t('descriptionPlaceholder', { defaultValue: 'Add a description\u2026' })}
+            aria-label={t('titleBar.description', { defaultValue: 'Description' })}
+            className="grow shrink-0 basis-0 min-w-32 text-xs text-muted-foreground bg-transparent border-none outline-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-sm px-1.5 py-0.5 truncate placeholder:text-muted-foreground/40 hover:bg-accent/40 transition-colors"
+          />
+        )}
+
+      </nav>
+
+      {/* Action buttons */}
+      <TooltipProvider delayDuration={300}>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {onShare && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs gap-1"
+                  onClick={onShare}
+                  aria-label={t('share.title', { defaultValue: 'Share' })}
+                >
+                  <Share2 className="h-3 w-3" />
+                  <span className="hidden sm:inline">{t('share.title', { defaultValue: 'Share' })}</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">{t('tooltips.share', { defaultValue: 'Share' })}</TooltipContent>
+            </Tooltip>
+          )}
+
+          {/* A single Save button carries all states (Save / Saving... / Saved
+              / Save failed); its label, dot indicator and tooltip convey state. */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                data-testid="builder-save-status"
+                data-save-status={saveStatus}
+                variant={saveStatus === 'failed' ? 'destructive' : hasUnsavedChanges ? 'default' : 'outline'}
+                size="sm"
+                className="h-7 text-xs gap-1 relative"
+                onClick={onSave}
+                disabled={isSaving}
+                aria-label={saveButtonAriaLabel}
+              >
+                {isSaving ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : saveStatus === 'failed' ? (
+                  <AlertTriangle className="h-3 w-3" />
+                ) : hasUnsavedChanges ? (
+                  <span className="relative inline-flex">
+                    <Save className="h-3 w-3" />
+                    <span
+                      className="absolute -top-1 -end-1 h-1.5 w-1.5 rounded-full bg-warning ring-1 ring-background"
+                      aria-label={t('titleBar.unsavedDot', { defaultValue: 'Unsaved changes' })}
+                    />
+                  </span>
+                ) : (
+                  <span className="h-1.5 w-1.5 rounded-full bg-success" />
+                )}
+                <span className="hidden sm:inline">
+                  {isSaveRetryable ? t('titleBar.retry', { defaultValue: 'Retry' }) : saveButtonLabel}
+                </span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {saveTooltip}
+            </TooltipContent>
+          </Tooltip>
+          {/* Persistent live region: mounts with the title bar (initial "Saved"
+              is deliberately not announced) and announces each status change
+              (Saving… / Saved / Save failed) without focus. A sr-only span
+              inside the button would be dead: the button's aria-label overrides
+              it. */}
+          <span role="status" className="sr-only">{saveStatusLabel}</span>
+
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="outline"
+                size="icon-xs"
+                className="h-7 w-7"
+                aria-label={t('tooltips.moreActions', { defaultValue: 'More actions' })}
+              >
+                <MoreHorizontal className="h-3 w-3" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={overflow.onExportPNG}>
+                <Download className="h-3.5 w-3.5 me-2" />
+                {t('tooltips.downloadPng', { defaultValue: 'Download PNG' })}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={overflow.onShowInfo}>
+                <Info className="h-3.5 w-3.5 me-2" />
+                {t('tooltips.mapInfo', { defaultValue: 'Map info' })}
+              </DropdownMenuItem>
+              {/* In-flight feedback: spinner + "Duplicating…" while the fork
+                  mutation is pending. */}
+              <DropdownMenuItem onClick={overflow.onFork} disabled={overflow.isForkPending}>
+                {overflow.isForkPending ? (
+                  <Loader2 className="h-3.5 w-3.5 me-2 animate-spin" />
+                ) : (
+                  <Copy className="h-3.5 w-3.5 me-2" />
+                )}
+                {overflow.isForkPending
+                  ? t('tooltips.duplicatingMap', { defaultValue: 'Duplicating…' })
+                  : t('tooltips.duplicateMap', { defaultValue: 'Duplicate map' })}
+              </DropdownMenuItem>
+              {overflow.onViewAsViewer && (
+                <DropdownMenuItem onClick={overflow.onViewAsViewer}>
+                  <Eye className="h-3.5 w-3.5 me-2" />
+                  {t('tooltips.viewAsViewer', { defaultValue: 'View as viewer' })}
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      </TooltipProvider>
+    </div>
+  );
+}

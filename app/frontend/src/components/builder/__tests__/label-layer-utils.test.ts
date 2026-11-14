@@ -1,0 +1,291 @@
+import { describe, it, expect, vi } from 'vitest';
+import { buildLabelLayerSpec, buildLabelStyle, syncLabelLayer } from '../label-layer-utils';
+import { circleAdapter } from '../layer-adapters/circle-adapter';
+import type { AdapterLayerInput } from '../layer-adapters/types';
+import { RecordingMap } from '@/test/recording-map';
+import type { LabelConfig } from '@/types/api';
+
+// The helper returns a MapLibre `AddLayerObject`, which is a discriminated
+// union. The tests only care about the symbol-layer shape produced by
+// `buildLabelLayerSpec`, so normalize to a widened record for indexing.
+type SpecRecord = Record<string, unknown>;
+
+const baseLc: LabelConfig = {
+  column: 'name',
+  fontSize: 14,
+  textColor: '#111',
+  haloColor: '#fff',
+  haloWidth: 2,
+  minZoom: 3,
+  maxZoom: 18,
+};
+
+describe('buildLabelLayerSpec', () => {
+  it('builds a symbol layer spec with point placement defaults', () => {
+    const spec = buildLabelLayerSpec({
+      labelId: 'label-1',
+      sourceId: 'source-1',
+      sourceLayer: 'data.my_table',
+      lc: baseLc,
+      geomType: 'fill',
+    }) as unknown as SpecRecord;
+
+    expect(spec.id).toBe('label-1');
+    expect(spec.type).toBe('symbol');
+    expect(spec.source).toBe('source-1');
+    expect(spec['source-layer']).toBe('data.my_table');
+    expect(spec.minzoom).toBe(3);
+    expect(spec.maxzoom).toBe(18);
+
+    const layout = spec.layout as Record<string, unknown>;
+    expect(layout['text-field']).toEqual(['get', 'name']);
+    expect(layout['text-size']).toBe(14);
+    expect(layout['symbol-placement']).toBe('point');
+    expect(layout['text-allow-overlap']).toBe(false);
+    expect(layout['text-anchor']).toBe('center');
+    expect(layout['text-offset']).toEqual([0, 0]);
+
+    const paint = spec.paint as Record<string, unknown>;
+    expect(paint['text-color']).toBe('#111');
+    expect(paint['text-halo-color']).toBe('#fff');
+    expect(paint['text-halo-width']).toBe(2);
+    expect(paint['text-opacity']).toBe(1);
+  });
+
+  it('passes through font size and text opacity expressions on add', () => {
+    const fontSizeExpression = ['interpolate', ['linear'], ['zoom'], 4, 10, 12, 18];
+    const opacityExpression = ['step', ['zoom'], 0.2, 10, 0.9];
+    const spec = buildLabelLayerSpec({
+      labelId: 'label-expr',
+      sourceId: 'source-expr',
+      sourceLayer: 'data.labels',
+      lc: {
+        column: 'name',
+        fontSize: fontSizeExpression as LabelConfig['fontSize'],
+        textOpacity: opacityExpression as LabelConfig['textOpacity'],
+      },
+      geomType: 'circle',
+    }) as unknown as SpecRecord;
+
+    const layout = spec.layout as Record<string, unknown>;
+    const paint = spec.paint as Record<string, unknown>;
+    expect(layout['text-size']).toEqual(fontSizeExpression);
+    expect(paint['text-opacity']).toEqual(opacityExpression);
+  });
+
+  it('uses line placement for line geometry', () => {
+    const spec = buildLabelLayerSpec({
+      labelId: 'label-2',
+      sourceId: 'source-2',
+      sourceLayer: 'data.lines',
+      lc: { column: 'road_name' },
+      geomType: 'line',
+    }) as unknown as SpecRecord;
+
+    const layout = spec.layout as Record<string, unknown>;
+    expect(layout['symbol-placement']).toBe('line');
+    // Text-anchor/text-offset are now always present (pinned to the
+    // neutral center/[0,0] for non-point placement) so the add path and the
+    // update path derive from one canonical object. center/[0,0] equal
+    // MapLibre's defaults, so line labels render identically.
+    expect(layout['text-anchor']).toBe('center');
+    expect(layout['text-offset']).toEqual([0, 0]);
+  });
+
+  it('respects explicit placement override', () => {
+    const spec = buildLabelLayerSpec({
+      labelId: 'label-3',
+      sourceId: 'source-3',
+      sourceLayer: 'data.pts',
+      lc: { column: 'label', placement: 'line-center' },
+      geomType: 'circle',
+    }) as unknown as SpecRecord;
+
+    const layout = spec.layout as Record<string, unknown>;
+    expect(layout['symbol-placement']).toBe('line-center');
+    // Non-point placement pins text-anchor to the neutral default.
+    expect(layout['text-anchor']).toBe('center');
+  });
+
+  it('uses circle offset default for point placement on circle geometry', () => {
+    const spec = buildLabelLayerSpec({
+      labelId: 'label-4',
+      sourceId: 'source-4',
+      sourceLayer: 'data.pts',
+      lc: { column: 'name' },
+      geomType: 'circle',
+    }) as unknown as SpecRecord;
+
+    const layout = spec.layout as Record<string, unknown>;
+    expect(layout['text-offset']).toEqual([0, -1.5]);
+  });
+
+  it('includes visibility when provided', () => {
+    const spec = buildLabelLayerSpec({
+      labelId: 'label-5',
+      sourceId: 'source-5',
+      sourceLayer: 'data.t',
+      lc: { column: 'x' },
+      geomType: 'fill',
+      visibility: 'none',
+    }) as unknown as SpecRecord;
+
+    const layout = spec.layout as Record<string, unknown>;
+    expect(layout['visibility']).toBe('none');
+  });
+
+  it('omits visibility when not provided', () => {
+    const spec = buildLabelLayerSpec({
+      labelId: 'label-6',
+      sourceId: 'source-6',
+      sourceLayer: 'data.t',
+      lc: { column: 'x' },
+      geomType: 'fill',
+    }) as unknown as SpecRecord;
+
+    const layout = spec.layout as Record<string, unknown>;
+    expect(layout).not.toHaveProperty('visibility');
+  });
+
+  it('passes through textAnchor, textOffset, and allowOverlap', () => {
+    const spec = buildLabelLayerSpec({
+      labelId: 'label-7',
+      sourceId: 'source-7',
+      sourceLayer: 'data.t',
+      lc: { column: 'x', placement: 'point', textAnchor: 'top', textOffset: [1, -2], allowOverlap: true },
+      geomType: 'fill',
+    }) as unknown as SpecRecord;
+
+    const layout = spec.layout as Record<string, unknown>;
+    expect(layout['text-anchor']).toBe('top');
+    expect(layout['text-offset']).toEqual([1, -2]);
+    expect(layout['text-allow-overlap']).toBe(true);
+  });
+});
+
+describe('syncLabelLayer', () => {
+  function createMockMap() {
+    return {
+      setLayoutProperty: vi.fn(),
+      setPaintProperty: vi.fn(),
+      setLayerZoomRange: vi.fn(),
+    };
+  }
+
+  it('sets all layout and paint properties for point placement', () => {
+    const map = createMockMap();
+    syncLabelLayer(map, 'label-1', baseLc, 'fill');
+
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-1', 'text-field', ['get', 'name']);
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-1', 'text-size', 14);
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-1', 'symbol-placement', 'point');
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-1', 'text-allow-overlap', false);
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-1', 'text-anchor', 'center');
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-1', 'text-offset', [0, 0]);
+
+    expect(map.setPaintProperty).toHaveBeenCalledWith('label-1', 'text-color', '#111');
+    expect(map.setPaintProperty).toHaveBeenCalledWith('label-1', 'text-halo-color', '#fff');
+    expect(map.setPaintProperty).toHaveBeenCalledWith('label-1', 'text-halo-width', 2);
+    expect(map.setPaintProperty).toHaveBeenCalledWith('label-1', 'text-opacity', 1);
+
+    expect(map.setLayerZoomRange).toHaveBeenCalledWith('label-1', 3, 18);
+  });
+
+  it('passes through font size and text opacity expressions on sync', () => {
+    const map = createMockMap();
+    const fontSizeExpression = ['interpolate', ['linear'], ['zoom'], 4, 10, 12, 18];
+    const opacityExpression = ['step', ['zoom'], 0.2, 10, 0.9];
+
+    syncLabelLayer(map, 'label-expr', {
+      column: 'name',
+      fontSize: fontSizeExpression as LabelConfig['fontSize'],
+      textOpacity: opacityExpression as LabelConfig['textOpacity'],
+    }, 'circle');
+
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-expr', 'text-size', fontSizeExpression);
+    expect(map.setPaintProperty).toHaveBeenCalledWith('label-expr', 'text-opacity', opacityExpression);
+  });
+
+  it('clears text-anchor and text-offset for line placement', () => {
+    const map = createMockMap();
+    syncLabelLayer(map, 'label-2', { column: 'road', placement: 'line' }, 'line');
+
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-2', 'symbol-placement', 'line');
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-2', 'text-anchor', 'center');
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-2', 'text-offset', [0, 0]);
+  });
+
+  it('defaults to line placement for line geometry when placement not specified', () => {
+    const map = createMockMap();
+    syncLabelLayer(map, 'label-3', { column: 'name' }, 'line');
+
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-3', 'symbol-placement', 'line');
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-3', 'text-anchor', 'center');
+  });
+
+  it('uses default zoom range when not specified', () => {
+    const map = createMockMap();
+    syncLabelLayer(map, 'label-4', { column: 'x' }, 'fill');
+
+    expect(map.setLayerZoomRange).toHaveBeenCalledWith('label-4', 0, 22);
+  });
+
+  // The add path and update path consume ONE canonical {layout, paint}
+  // object, so symbol-avoid-edges (fill-only) is applied on BOTH paths — the
+  // drift where build set it and sync did not.
+  it('applies symbol-avoid-edges for fill geometry on the update path too', () => {
+    const map = createMockMap();
+    syncLabelLayer(map, 'label-fill', { column: 'x' }, 'fill');
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('label-fill', 'symbol-avoid-edges', true);
+  });
+
+  it('builds the same canonical layout/paint that buildLabelLayerSpec spreads', () => {
+    const { layout, paint } = buildLabelStyle(baseLc, 'fill');
+    const spec = buildLabelLayerSpec({
+      labelId: 'l', sourceId: 's', sourceLayer: 'data.t', lc: baseLc, geomType: 'fill',
+    }) as unknown as SpecRecord;
+    expect(spec.layout).toEqual(layout);
+    expect(spec.paint).toEqual(paint);
+  });
+});
+
+describe('withLabelCompanion — visibility is not an owned layout property (#2154)', () => {
+  function makeInput(overrides: Partial<AdapterLayerInput> = {}): AdapterLayerInput {
+    return {
+      id: 'layer-1',
+      dataset_table_name: 'trees',
+      dataset_geometry_type: 'POINT',
+      opacity: 1,
+      visible: true,
+      paint: { 'circle-color': '#ff0000' },
+      layout: {},
+      filter: null,
+      label_config: { column: 'name' },
+      style_config: null,
+      sourceId: 'source-1',
+      layerId: 'layer-1',
+      sourceLayer: 'data.trees',
+      sourceType: 'vector',
+      tileUrl: '/tiles/{z}/{x}/{y}',
+      ...overrides,
+    };
+  }
+
+  it('a stale visible=true on syncPaint does not re-show a label syncVisibility hid', () => {
+    const map = new RecordingMap();
+    map.addSource('source-1', { type: 'vector', tiles: ['http://localhost/tiles/{z}/{x}/{y}.pbf'] });
+    const input = makeInput();
+
+    circleAdapter.addLayers(map.map, input);
+    expect(map.layer('layer-1-label')?.layout.visibility).toBe('visible');
+
+    circleAdapter.syncVisibility(map.map, { ...input, visible: false });
+    expect(map.layer('layer-1-label')?.layout.visibility).toBe('none');
+
+    // The queued paint write is stale: it still carries visible: true, as it
+    // would if it were built before the visibility toggle and applied after.
+    circleAdapter.syncPaint(map.map, { ...input, visible: true, paint: { 'circle-color': '#0000ff' } });
+
+    expect(map.layer('layer-1-label')?.layout.visibility).toBe('none');
+  });
+});

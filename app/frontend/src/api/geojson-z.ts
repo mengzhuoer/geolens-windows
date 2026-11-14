@@ -1,0 +1,80 @@
+import { apiFetch } from './client';
+import { signalWithTimeout } from '@/lib/abort';
+import { API_BASE } from '@/lib/constants';
+import { translateApiErrorDetail } from '@/lib/error-map';
+
+export interface BoundedGeoJsonResponse {
+  type: 'FeatureCollection';
+  features: GeoJSON.Feature[];
+  truncated: boolean;
+  total_count: number;
+}
+
+const GEOJSON_TIMEOUT_MS = 30_000;
+
+interface GeoJsonFetchOptions {
+  embedToken?: string;
+  signal?: AbortSignal;
+}
+
+function boundedGeoJsonPath(datasetId: string) {
+  return `/datasets/${encodeURIComponent(datasetId)}/features.geojson`;
+}
+
+function directFetchPath(datasetId: string) {
+  return `${API_BASE}${boundedGeoJsonPath(datasetId)}`;
+}
+
+async function throwLocalizedResponseError(response: Response): Promise<never> {
+  let detail: unknown;
+  try {
+    const body = await response.json();
+    detail = body.detail;
+  } catch { /* not JSON */ }
+  throw new Error(translateApiErrorDetail(detail, response.status));
+}
+
+export function asFeatureCollection(response: BoundedGeoJsonResponse): GeoJSON.FeatureCollection {
+  return {
+    type: 'FeatureCollection',
+    features: response.features.flatMap(flattenMultiPoint),
+  };
+}
+
+/**
+ * Explode MultiPoint features into one Point feature per coordinate.
+ *
+ * The backend serves point datasets as MultiPoint (GDAL PROMOTE_TO_MULTI), but
+ * MapLibre's `cluster: true` sources use Supercluster, which only indexes
+ * `Point` and silently drops MultiPoint, leaving clustered layers blank.
+ * A no-op for Point geometry.
+ */
+function flattenMultiPoint(feature: GeoJSON.Feature): GeoJSON.Feature[] {
+  if (feature.geometry?.type !== 'MultiPoint') return [feature];
+  return feature.geometry.coordinates.map((coordinates) => ({
+    ...feature,
+    geometry: { type: 'Point', coordinates },
+  }));
+}
+
+/**
+ * Fetch bounded GeoJSON for map renderers that need a client-side GeoJSON source.
+ * Handles JWT auth (via apiFetch) and embed token paths.
+ */
+export async function fetchBoundedGeoJson(
+  datasetId: string,
+  options?: GeoJsonFetchOptions,
+): Promise<BoundedGeoJsonResponse> {
+  const signal = signalWithTimeout(options?.signal, GEOJSON_TIMEOUT_MS);
+
+  if (options?.embedToken) {
+    const res = await fetch(directFetchPath(datasetId), {
+      headers: { 'X-Embed-Token': options.embedToken },
+      signal,
+    });
+    if (!res.ok) await throwLocalizedResponseError(res);
+    return res.json() as Promise<BoundedGeoJsonResponse>;
+  }
+
+  return apiFetch<BoundedGeoJsonResponse>(boundedGeoJsonPath(datasetId), { signal });
+}

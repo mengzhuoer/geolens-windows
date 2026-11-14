@@ -1,0 +1,146 @@
+"""Cache and conditional-response helpers shared by tile route families."""
+
+from __future__ import annotations
+
+import hashlib
+
+from fastapi import HTTPException, Request, Response, status
+
+from app.platform.cache.scope import bound_shared_cache_lifetime
+from app.processing.tiles.cache_key import read_tile_cache_entry
+
+# Sent on a tile the feature cap sampled, so a client can say so.
+TILE_SAMPLED_HEADER = "X-GeoLens-Tile-Sampled"
+
+
+def tile_busy_error(detail: str = "Tile service busy, please retry") -> HTTPException:
+    """Return a non-cacheable rejection whose cooldown is visible cross-origin."""
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=detail,
+        headers={
+            "Retry-After": "2",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "Retry-After",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+def tile_unavailable_error() -> HTTPException:
+    """A non-cacheable 503 with no cooldown, for a failure a retry would repeat."""
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Tile service unavailable",
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"},
+    )
+
+
+def _tile_headers(cache_scope: str, cache_ttl: int) -> dict[str, str]:
+    return {
+        "Content-Encoding": "gzip",
+        "Cache-Control": f"{cache_scope}, max-age={cache_ttl}",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+
+def _empty_tile_headers(cache_scope: str, cache_ttl: int) -> dict[str, str]:
+    """Return cache and CORS headers for an empty (204) MVT tile."""
+    return {
+        "Cache-Control": f"{cache_scope}, max-age={cache_ttl}",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+
+def _serving_tile_headers(
+    cache_scope: str,
+    cache_ttl: int,
+    cache_control_override: str | None,
+    *,
+    empty: bool = False,
+) -> dict[str, str]:
+    """Apply hosted cache policy only to responses already safe for sharing.
+
+    Signed, embed-token, caller-authorized and unpublished preview tiles
+    resolve to ``private``. A serving extension must never turn those into
+    publicly cacheable CDN responses. Public tiles may use the provider's
+    CDN-specific TTL, within the shared-cache lifetime cap. A ``no-store``
+    scope is sent as a bare ``no-store`` and takes no TTL.
+    """
+    headers = (
+        _empty_tile_headers(cache_scope, cache_ttl)
+        if empty
+        else _tile_headers(cache_scope, cache_ttl)
+    )
+    if cache_scope == "no-store":
+        headers["Cache-Control"] = "no-store"
+    elif cache_scope == "public":
+        headers["Cache-Control"] = bound_shared_cache_lifetime(
+            cache_control_override or headers["Cache-Control"]
+        )
+    if cache_scope != "public":
+        # A client cache must not replay one credential's tile to another
+        # credential, or to none, on the same URL.
+        headers["Vary"] = "Authorization, X-Api-Key, X-Embed-Token"
+    return headers
+
+
+def _tile_etag(content: bytes) -> str:
+    """Return a strong, content-addressed ETag for served tile bytes."""
+    return '"' + hashlib.sha256(content).hexdigest()[:32] + '"'
+
+
+def _if_none_match_satisfied(if_none_match: str | None, etag: str) -> bool:
+    if not if_none_match:
+        return False
+    value = if_none_match.strip()
+    if value == "*":
+        return True
+    candidates = {
+        candidate.strip().removeprefix("W/") for candidate in value.split(",")
+    }
+    return etag.removeprefix("W/") in candidates
+
+
+def _tile_response(
+    request: Request,
+    content: bytes,
+    base_headers: dict[str, str],
+    *,
+    sampled: bool = False,
+) -> Response:
+    """Build an MVT response with ETag-based conditional-request support.
+
+    A ``sampled`` tile carries ``TILE_SAMPLED_HEADER``, on a 304 too.
+    """
+    if sampled:
+        base_headers = {
+            **base_headers,
+            TILE_SAMPLED_HEADER: "true",
+            "Access-Control-Expose-Headers": TILE_SAMPLED_HEADER,
+        }
+    etag = _tile_etag(content)
+    if _if_none_match_satisfied(request.headers.get("if-none-match"), etag):
+        conditional_headers = {
+            key: value
+            for key, value in base_headers.items()
+            if key.lower() != "content-encoding"
+        }
+        conditional_headers["ETag"] = etag
+        return Response(
+            status_code=status.HTTP_304_NOT_MODIFIED,
+            headers=conditional_headers,
+        )
+    return Response(
+        content=content,
+        media_type="application/vnd.mapbox-vector-tile",
+        headers={**base_headers, "ETag": etag},
+    )
+
+
+def _cached_tile_response(
+    request: Request, entry: bytes, base_headers: dict[str, str]
+) -> Response:
+    """Serve a tile cache entry with the sampled mark it was cached with."""
+    content, sampled = read_tile_cache_entry(entry)
+    return _tile_response(request, content, base_headers, sampled=sampled)

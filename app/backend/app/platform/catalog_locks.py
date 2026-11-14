@@ -1,0 +1,486 @@
+"""The one lock order for the (datasets, records) row pair, and the
+per-dataset admission lock VRT regeneration serialises on.
+
+Lives in ``platform/`` because ``processing/`` may not import
+``app.modules.catalog``: worker callers pass the mapped classes the port hands
+them, and both the catalog and the ingest router reach the VRT admission here.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from typing import Any
+
+from sqlalchemy import event, func, select, text, update
+from sqlalchemy.exc import DBAPIError, InvalidRequestError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
+
+from app.core.db.sqlstate import is_lock_conflict, sqlstate
+
+# The budget a REQUEST spends waiting for the pair. A worker passes its own
+# (``WORKER_LOCK_TIMEOUT``, or None): ``SET LOCAL`` lasts the whole transaction,
+# and this budget would fail an ingest on contention it must wait out.
+REQUEST_LOCK_TIMEOUT = "2s"
+
+# Long enough to wait out contention, bounded so a stuck holder fails the job.
+WORKER_LOCK_TIMEOUT = "60s"
+
+# Resolved at call time, not bound as a default, so the constant above stays
+# the single source of truth.
+_USE_REQUEST_DEFAULT: Any = object()
+
+
+# The machine-readable code for a contended row, wherever it is reported: the
+# 409 body, and a bulk-delete item that carries its conflict instead of raising.
+CATALOG_LOCK_CONFLICT_CODE = "catalog_lock_conflict"
+
+
+# An expired budget and a lost deadlock end an acquisition
+# alike, and the two send an operator looking for different things.
+_CONFLICT_REPORTS = {
+    "55P03": (
+        "lock_timeout",
+        "The wait expired. Find the holder of this dataset's catalog rows in "
+        "pg_stat_activity.",
+    ),
+    "40P01": (
+        "deadlock",
+        "PostgreSQL chose this transaction as the deadlock victim. Look for "
+        "the other side of the cycle: a holder of this dataset's catalog rows "
+        "that is itself waiting on something this transaction holds.",
+    ),
+}
+_CONFLICT_REPORT_UNKNOWN = (
+    "lock_failed",
+    "The wait failed and reported no SQLSTATE.",
+)
+
+
+def lock_conflict_report(
+    conflict: BaseException, *, event_prefix: str
+) -> tuple[str, str, str | None]:
+    """The log event, operator hint and SQLSTATE for a failed acquisition.
+
+    The event is ``<event_prefix>_lock_timeout``, ``<event_prefix>_deadlock``
+    or ``<event_prefix>_lock_failed``.
+    """
+    cause = conflict.__cause__
+    code = sqlstate(cause) if isinstance(cause, DBAPIError) else None
+    suffix, hint = _CONFLICT_REPORTS.get(code, _CONFLICT_REPORT_UNKNOWN)
+    return f"{event_prefix}_{suffix}", hint, code
+
+
+# True from the SET LOCAL until the transaction that ran it
+# commits, so the boundary handler answers 409 only for a wait inside it.
+catalog_timeout_installed: ContextVar[bool] = ContextVar(
+    "catalog_timeout_installed", default=False
+)
+
+_MARKER_LISTENER_KEY = "catalog_timeout_marker_listener"
+
+
+class CatalogLockConflict(Exception):
+    """Another transaction holds the catalog rows this one needs.
+
+    One handler (``app/api/main.py``) answers 409 for it, wherever the
+    acquisition was reached from. A worker lets it propagate and fails its job
+    with ``error_code``.
+    """
+
+    error_code = CATALOG_LOCK_CONFLICT_CODE
+
+
+async def lock_catalog_rows(
+    session: AsyncSession,
+    *,
+    dataset_cls: Any,
+    record_cls: Any,
+    dataset_id: Any,
+    record_id: Any,
+    lock_timeout: str | None = _USE_REQUEST_DEFAULT,
+    raster_asset_cls: Any = None,
+) -> None:
+    """Lock the catalog rows for a write, in order: ``raster_assets`` (when
+    given), then ``datasets``, then ``records``.
+
+    Call before the transaction's first write to either row, after any
+    network I/O or data-table work. Even a "single-row" writer often needs
+    it: stamping ``record.updated_by`` while rolling ``tile_cache_version``
+    touches both, and the ORM flushes ``records`` before ``datasets`` on its
+    own.
+
+    ``raster_asset_cls`` puts the raster child first, for callers that also
+    reach ``raster_assets``. Raises ``CatalogLockConflict`` on 55P03 or
+    40P01, having rolled back.
+    """
+    await _install_lock_timeout(session, lock_timeout)
+
+    # `no_autoflush` so the order below is what reaches PostgreSQL: an
+    # autoflush here emits the ORM's own order, which is the inversion.
+    try:
+        with session.no_autoflush:
+            if raster_asset_cls is not None:
+                await session.execute(
+                    select(raster_asset_cls.dataset_id)
+                    .where(raster_asset_cls.dataset_id == dataset_id)
+                    .with_for_update()
+                )
+            # One column on each table alone; a joined relationship would not
+            # lock the joined row and would touch records first.
+            await session.execute(
+                select(dataset_cls.id)
+                .where(dataset_cls.id == dataset_id)
+                .with_for_update()
+            )
+            if record_id is not None:
+                await session.execute(
+                    select(record_cls.id)
+                    .where(record_cls.id == record_id)
+                    .with_for_update()
+                )
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await _raise_rolled_back_conflict(session, exc)
+
+
+async def lock_request_key(
+    session: AsyncSession,
+    *,
+    scope: str,
+    lock_timeout: str | None = _USE_REQUEST_DEFAULT,
+) -> None:
+    """Serialise transactions on one named key until this one ends.
+
+    A transaction-scoped advisory lock on the hash of ``scope``. Take it before
+    any data-table or catalog lock, so waiting here holds neither and cannot be
+    one side of a cycle. Same timeout and exception contract as
+    :func:`lock_catalog_rows`; two scopes that hash alike only wait on each
+    other needlessly.
+    """
+    await _install_lock_timeout(session, lock_timeout)
+    try:
+        with session.no_autoflush:
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:scope, 0))"),
+                {"scope": scope},
+            )
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await _raise_rolled_back_conflict(session, exc)
+
+
+async def lock_ingest_jobs(
+    session: AsyncSession,
+    *,
+    job_cls: Any,
+    dataset_id: Any,
+    lock_timeout: str | None = _USE_REQUEST_DEFAULT,
+) -> None:
+    """Take a dataset's ingest-job rows, ahead of :func:`lock_catalog_rows`.
+
+    For a delete cascading into ``ingest_jobs``: hold the job row before any
+    data-table or catalog lock. Same timeout and exception contract.
+    """
+    await _install_lock_timeout(session, lock_timeout)
+    try:
+        with session.no_autoflush:
+            await session.execute(
+                select(job_cls.id)
+                .where(job_cls.dataset_id == dataset_id)
+                .with_for_update()
+            )
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await _raise_rolled_back_conflict(session, exc)
+
+
+@asynccontextmanager
+async def worker_lock_budget(session: AsyncSession) -> AsyncIterator[None]:
+    """Wait at most ``WORKER_LOCK_TIMEOUT`` for each row lock taken in the block.
+
+    The transaction's previous budget is restored when the block ends, so a
+    later wait keeps it. A wait in the block that fails rolls back and raises
+    ``CatalogLockConflict``.
+    """
+    # A flush here would run a pending write ahead of the budget and of the
+    # caller's lock order.
+    with session.no_autoflush:
+        previous = await session.scalar(text("SELECT current_setting('lock_timeout')"))
+        await _set_lock_timeout(session, WORKER_LOCK_TIMEOUT)
+    try:
+        yield
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await _raise_rolled_back_conflict(session, exc)
+    with session.no_autoflush:
+        await _set_lock_timeout(session, previous)
+
+
+async def _set_lock_timeout(session: AsyncSession, value: str) -> None:
+    # `set_config(..., true)` is `SET LOCAL` taking a bind parameter.
+    await session.execute(
+        text("SELECT set_config('lock_timeout', :value, true)"), {"value": value}
+    )
+
+
+async def _install_lock_timeout(
+    session: AsyncSession, lock_timeout: str | None
+) -> None:
+    if lock_timeout is _USE_REQUEST_DEFAULT:
+        lock_timeout = REQUEST_LOCK_TIMEOUT
+    if lock_timeout is not None:
+        # `SET LOCAL` takes a literal; this value is a constant, never
+        # request-supplied.
+        await session.execute(text(f"SET LOCAL lock_timeout = '{lock_timeout}'"))
+        _clear_marker_on_commit(session)
+        # Each request runs in its own task, so this cannot leak across them.
+        catalog_timeout_installed.set(True)
+
+
+def _clear_marker_on_commit(session: AsyncSession) -> None:
+    """Register, once per session, the listener that ends the marker at the
+    outermost commit; a savepoint release is not a commit."""
+    if session.info.get(_MARKER_LISTENER_KEY):
+        return
+    session.info[_MARKER_LISTENER_KEY] = True
+    event.listen(session.sync_session, "after_commit", _forget_lock_timeout)
+
+
+def _forget_lock_timeout(session: Any) -> None:
+    if session.in_nested_transaction():
+        return
+    catalog_timeout_installed.set(False)
+
+
+async def _raise_rolled_back_conflict(session: AsyncSession, exc: DBAPIError) -> None:
+    # Roll back so the caller's retry is clean. Nothing is read off an ORM
+    # instance after this: rollback expires them, and a lazy load from the
+    # exception handler would raise MissingGreenlet instead of the 409.
+    await session.rollback()
+    raise CatalogLockConflict(
+        "Another operation is updating this dataset's catalog entry."
+    ) from exc
+
+
+async def bump_tile_cache_version_atomic(
+    session: AsyncSession, *, dataset_cls: Any, dataset_id: Any
+) -> int | None:
+    """Roll ``tile_cache_version`` in the database and return the new value.
+
+    ``coalesce(tile_cache_version, 1) + 1``, evaluated against the row at
+    write time, so a counter read before a lock wait is never written back
+    over a peer's commit. Call it in the same transaction as the tile-content
+    change it describes. None when the row no longer exists.
+    """
+    return await session.scalar(
+        update(dataset_cls)
+        .where(dataset_cls.id == dataset_id)
+        .values(tile_cache_version=func.coalesce(dataset_cls.tile_cache_version, 1) + 1)
+        .returning(dataset_cls.tile_cache_version)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def bump_publication_version_atomic(
+    session: AsyncSession, *, dataset_cls: Any, dataset_id: Any
+) -> int | None:
+    """Roll ``publication_version`` in the database and return the new value.
+
+    The counter a signed tile scope binds. Same write-time evaluation
+    as :func:`bump_tile_cache_version_atomic`, and a separate counter on
+    purpose: this one rolls only when a publication-status or visibility
+    transition changes who may read the dataset, so an ordinary edit does not
+    retire a live tile template. None when the row no longer exists.
+    """
+    return await session.scalar(
+        update(dataset_cls)
+        .where(dataset_cls.id == dataset_id)
+        .values(
+            publication_version=func.coalesce(dataset_cls.publication_version, 0) + 1
+        )
+        .returning(dataset_cls.publication_version)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def bump_publication_version_on(
+    session: AsyncSession, dataset: Any
+) -> int | None:
+    """:func:`bump_publication_version_atomic` for a loaded ``Dataset``.
+
+    Sets the instance attribute to the returned value without marking it
+    dirty, mirroring :func:`bump_tile_cache_version_on`. The one spelling for
+    a request handler, whose instance was loaded before it waited for the row.
+
+    Also rolls every VRT that links the dataset: a VRT serves its members'
+    pixels, so its signed templates and shared-cache keys must not outlive a
+    change to who may read one of them.
+    """
+    version = await bump_publication_version_atomic(
+        session, dataset_cls=type(dataset), dataset_id=dataset.id
+    )
+    await session.execute(
+        text(
+            "UPDATE catalog.datasets "
+            "SET publication_version = coalesce(publication_version, 0) + 1 "
+            "WHERE id IN (SELECT vrt_dataset_id FROM catalog.vrt_source_links "
+            "WHERE source_dataset_id = :dataset_id)"
+        ),
+        {"dataset_id": dataset.id},
+    )
+    if version is not None:
+        set_committed_value(dataset, "publication_version", version)
+    return version
+
+
+async def bump_publication_versions_for_owner(
+    session: AsyncSession, owner_id: uuid.UUID
+) -> None:
+    """Roll ``publication_version`` on every dataset ``owner_id`` owns and on
+    every VRT linking one, before the owner is deleted.
+
+    Deleting the owner clears ``created_by`` through the foreign key, which
+    moves who may read those datasets without passing
+    :func:`bump_publication_version_on`.
+    """
+    await session.execute(
+        text(
+            "UPDATE catalog.datasets d "
+            "SET publication_version = coalesce(d.publication_version, 0) + 1 "
+            "WHERE d.id IN ("
+            "SELECT owned.id FROM catalog.datasets owned "
+            "JOIN catalog.records r ON r.id = owned.record_id "
+            "WHERE r.created_by = :owner_id "
+            "UNION SELECT vsl.vrt_dataset_id FROM catalog.vrt_source_links vsl "
+            "JOIN catalog.datasets s ON s.id = vsl.source_dataset_id "
+            "JOIN catalog.records sr ON sr.id = s.record_id "
+            "WHERE sr.created_by = :owner_id)"
+        ),
+        {"owner_id": owner_id},
+    )
+
+
+async def bump_publication_versions(
+    session: AsyncSession, dataset_ids: Sequence[uuid.UUID]
+) -> None:
+    """Roll ``publication_version`` on ``dataset_ids`` and on every VRT linking
+    one, for a change that moves who may read them without writing their rows.
+    """
+    await session.execute(
+        text(
+            "UPDATE catalog.datasets "
+            "SET publication_version = coalesce(publication_version, 0) + 1 "
+            "WHERE id IN (SELECT unnest(CAST(:ids AS uuid[])) "
+            "UNION SELECT vrt_dataset_id FROM catalog.vrt_source_links "
+            "WHERE source_dataset_id = ANY(CAST(:ids AS uuid[])))"
+        ),
+        {"ids": list(dataset_ids)},
+    )
+
+
+async def bump_publication_versions_for_member(
+    session: AsyncSession, user_id: uuid.UUID
+) -> None:
+    """:func:`bump_publication_versions` on every dataset granted to a group
+    ``user_id`` is in, before the account is deleted or deactivated, so tile
+    URLs it signed stop validating."""
+    granted = await session.scalars(
+        text(
+            "SELECT DISTINCT grant_row.dataset_id "
+            "FROM catalog.dataset_group_grants grant_row "
+            "JOIN catalog.group_members member "
+            "ON member.group_id = grant_row.group_id "
+            "WHERE member.user_id = :user_id"
+        ),
+        {"user_id": user_id},
+    )
+    dataset_ids = list(granted)
+    if dataset_ids:
+        await bump_publication_versions(session, dataset_ids)
+
+
+async def bump_tile_cache_version_on(session: AsyncSession, dataset: Any) -> int | None:
+    """:func:`bump_tile_cache_version_atomic` for a loaded ``Dataset`` instance.
+
+    The instance's ``tile_cache_version`` is set to the returned value without
+    marking it dirty, so a later reader sees what was published and the flush
+    does not write it back. The one spelling for a request handler, whose
+    instance was loaded before it waited for the row.
+    """
+    version = await bump_tile_cache_version_atomic(
+        session, dataset_cls=type(dataset), dataset_id=dataset.id
+    )
+    if version is not None:
+        set_committed_value(dataset, "tile_cache_version", version)
+    return version
+
+
+async def record_live_data_write(session: AsyncSession, dataset: Any) -> int | None:
+    """Roll ``data_revision`` and ``tile_cache_version`` for a live-table write.
+
+    For a write to the rows or columns of a loaded ``Dataset``'s live table, in
+    the write's transaction. One UPDATE, evaluated at write time like
+    :func:`bump_tile_cache_version_atomic`. Returns the new tile cache version,
+    set on the instance without marking it dirty; None when the row is gone.
+    """
+    cls = type(dataset)
+    row = (
+        await session.execute(
+            update(cls)
+            .where(cls.id == dataset.id)
+            .values(
+                tile_cache_version=func.coalesce(cls.tile_cache_version, 1) + 1,
+                data_revision=cls.data_revision + 1,
+            )
+            .returning(cls.tile_cache_version, cls.data_revision)
+            .execution_options(synchronize_session=False)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    set_committed_value(dataset, "tile_cache_version", row.tile_cache_version)
+    set_committed_value(dataset, "data_revision", row.data_revision)
+    return row.tile_cache_version
+
+
+def vrt_admission_lock_key(dataset_id: uuid.UUID) -> int:
+    """The advisory-lock key a dataset's VRT mutations serialise on."""
+    return dataset_id.int % (2**63)
+
+
+async def admit_vrt_mutation(
+    session: AsyncSession, dataset_id: uuid.UUID, vrt_asset: Any
+) -> bool:
+    """Admit one VRT-mutating dispatch per dataset, or refuse this one.
+
+    The partial unique index from ADR-002 Decision 5b does not reach VRT
+    regeneration, and the three doors that dispatch one read the asset status,
+    check it and flip it as three statements. The lock comes FIRST and the
+    status is re-read under it: read before the lock, the loser's snapshot
+    still says the VRT is idle and both attempts dispatch.
+
+    The lock is released at the caller's commit, by which point the winner has
+    left ``regenerating`` on the asset, which is what refuses the next caller.
+    """
+    acquired = await session.scalar(
+        text("SELECT pg_try_advisory_xact_lock(:key)"),
+        {"key": vrt_admission_lock_key(dataset_id)},
+    )
+    if not acquired:
+        return False
+    try:
+        await session.refresh(vrt_asset)
+    except InvalidRequestError:
+        # Deleted between the caller's load and this re-read. `refresh` reports
+        # that as InvalidRequestError, not the ObjectDeletedError its subclass
+        # name suggests; refusing beats a 500 on a row that is gone.
+        return False
+    return vrt_asset.status != "regenerating"

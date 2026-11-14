@@ -1,0 +1,215 @@
+import { useState } from 'react';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { cn } from '@/lib/utils';
+
+/**
+ * RasterStretchControls: the shared COLORMAP / STRETCH section for raster
+ * layers, consumed by `RasterLayerControls` (the editor LayerEditorPanel mounts
+ * for raster/vrt layers).
+ *
+ * Gates:
+ *  - STRETCH: any numeric band_count >= 1 (single and multi-band)
+ *  - COLORMAP: single-band only (band_count === 1)
+ *  - HINT: single-band only, when stretch != minmax AND colormap != gray
+ *
+ * `_colormap` / `_stretch` / `_pmin` / `_pmax` / `_sigma` are builder-private
+ * paint keys. They mutate the tile URL via buildColormapTileUrl
+ * (layer-description.ts) and never reach MapLibre setPaintProperty (absent from
+ * RASTER_OWNED_PAINT_PROPERTIES on purpose).
+ *
+ * Not shown for DEM layers: stretch corrupts terrainrgb encoding and the backend
+ * short-circuits stretch for is_dem rasters.
+ */
+interface RasterStretchControlsProps {
+  /** Numeric band count from the resolved layer; section hides when absent/<1. */
+  bandCount: number | null | undefined;
+  /** Merged builder paint dict (reads the builder-private `_*` keys). */
+  paint: Record<string, unknown>;
+  /** Patch a single builder-private paint key. */
+  onPaintProp: (key: string, value: unknown) => void;
+  /** DEM layers never show stretch/colormap (terrainrgb). */
+  isDem?: boolean | null;
+  t: (key: string, opts?: Record<string, unknown>) => string;
+}
+
+export function RasterStretchControls({
+  bandCount,
+  paint,
+  onPaintProp,
+  isDem = false,
+  t,
+}: RasterStretchControlsProps) {
+  // The user types freely into a draft and the value is clamped once, on blur;
+  // rejecting keystrokes that cross the sibling bound mid-typing (clearing pmin
+  // to type a new value, typing a high pmax digit by digit) would freeze the
+  // field. Hooks must run before the early returns below.
+  const [pminDraft, setPminDraft] = useState<string | null>(null);
+  const [pmaxDraft, setPmaxDraft] = useState<string | null>(null);
+
+  if (isDem) return null;
+  if (typeof bandCount !== 'number' || bandCount < 1) return null;
+
+  const isSingleBand = bandCount === 1;
+  const currentStretch = String(paint['_stretch'] ?? 'minmax');
+  const currentColormap = String(paint['_colormap'] ?? 'gray');
+  const pmin = typeof paint['_pmin'] === 'number' ? (paint['_pmin'] as number) : 2;
+  const pmax = typeof paint['_pmax'] === 'number' ? (paint['_pmax'] as number) : 98;
+  const sigma = typeof paint['_sigma'] === 'number' ? (paint['_sigma'] as number) : 2;
+
+  const commitPmin = () => {
+    if (pminDraft === null) return;
+    const candidate = Number(pminDraft);
+    if (pminDraft !== '' && Number.isFinite(candidate)) {
+      // Keep at least 1 below pmax, within [0, 99].
+      const clamped = Math.min(Math.max(candidate, 0), Math.min(pmax - 1, 99));
+      onPaintProp('_pmin', clamped);
+    }
+    setPminDraft(null);
+  };
+
+  const commitPmax = () => {
+    if (pmaxDraft === null) return;
+    const candidate = Number(pmaxDraft);
+    if (pmaxDraft !== '' && Number.isFinite(candidate)) {
+      const clamped = Math.max(Math.min(candidate, 100), Math.max(pmin + 1, 1));
+      onPaintProp('_pmax', clamped);
+    }
+    setPmaxDraft(null);
+  };
+
+  return (
+    <section className="border-b">
+      <div className="px-4 py-2">
+        <p className="text-2xs font-semibold uppercase tracking-[0.08em] text-muted-foreground mb-2">
+          {isSingleBand
+            ? t('style.raster.sectionColormap', { defaultValue: 'COLORMAP' })
+            : t('style.raster.stretchLabel', { defaultValue: 'STRETCH' })}
+        </p>
+        <div className="space-y-3">
+          {/* Colormap select row — single-band only */}
+          {isSingleBand && (
+            <div className="flex items-center gap-2">
+              <span className="w-28 shrink-0 text-xs text-muted-foreground">
+                {t('style.raster.colormapLabel', { defaultValue: 'Colormap' })}
+              </span>
+              {/* These 8 colormap values are hand-mirrored against the backend
+                  validator _ALLOWED_COLORMAPS (backend/app/processing/tiles/router.py),
+                  which 422s anything outside that frozenset. No codegen guard
+                  exists, so a colormap change on either side must be mirrored. */}
+              <Select value={currentColormap} onValueChange={(v) => onPaintProp('_colormap', v)}>
+                <SelectTrigger className="h-8 text-xs flex-1" aria-label={t('style.raster.colormapLabel', { defaultValue: 'Colormap' })}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="gray">{t('style.raster.colormapGray', { defaultValue: 'Grayscale' })}</SelectItem>
+                  <SelectItem value="viridis">{t('style.raster.colormapViridis', { defaultValue: 'Viridis' })}</SelectItem>
+                  <SelectItem value="inferno">{t('style.raster.colormapInferno', { defaultValue: 'Inferno' })}</SelectItem>
+                  <SelectItem value="plasma">{t('style.raster.colormapPlasma', { defaultValue: 'Plasma' })}</SelectItem>
+                  <SelectItem value="magma">{t('style.raster.colormapMagma', { defaultValue: 'Magma' })}</SelectItem>
+                  <SelectItem value="ylorrd">{t('style.raster.colormapYlorrd', { defaultValue: 'Yellow-Red' })}</SelectItem>
+                  <SelectItem value="bugn">{t('style.raster.colormapBugn', { defaultValue: 'Blue-Green' })}</SelectItem>
+                  <SelectItem value="terrain">{t('style.raster.colormapTerrain', { defaultValue: 'Terrain' })}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          {/* Stretch select row: minmax / percentile (p2–p98) / stddev (mean±2σ).
+              percentile and stddev compute a stats-based rescale via the
+              raster-proxy → Titiler /cog/statistics. Visible for band_count >= 1. */}
+          <div className="flex items-center gap-2">
+            <span className="w-28 shrink-0 text-xs text-muted-foreground">
+              {t('style.raster.stretchLabel', { defaultValue: 'Stretch' })}
+            </span>
+            <Select value={currentStretch} onValueChange={(v) => onPaintProp('_stretch', v)}>
+              <SelectTrigger className="h-8 text-xs flex-1" aria-label={t('style.raster.stretchLabel', { defaultValue: 'Stretch' })}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="minmax">{t('style.raster.stretchMinmax', { defaultValue: 'Min/Max' })}</SelectItem>
+                <SelectItem value="percentile">{t('style.raster.stretchPercentile', { defaultValue: 'Percentile' })}</SelectItem>
+                <SelectItem value="stddev">{t('style.raster.stretchStddev', { defaultValue: 'Std Deviation' })}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Percentile bounds — pmin/pmax inputs */}
+          {currentStretch === 'percentile' && (
+            <div className="flex gap-2">
+              <div className="flex-1 flex flex-col gap-1">
+                <Label htmlFor="raster-stretch-pmin" className="text-xs text-muted-foreground">{t('style.raster.pminLabel', { defaultValue: 'Low %' })}</Label>
+                <input
+                  id="raster-stretch-pmin"
+                  type="number"
+                  className="h-8 text-xs w-full rounded-md border border-input bg-background px-2"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={pminDraft ?? pmin}
+                  onChange={(e) => setPminDraft(e.target.value)}
+                  onBlur={commitPmin}
+                />
+              </div>
+              <div className="flex-1 flex flex-col gap-1">
+                <Label htmlFor="raster-stretch-pmax" className="text-xs text-muted-foreground">{t('style.raster.pmaxLabel', { defaultValue: 'High %' })}</Label>
+                <input
+                  id="raster-stretch-pmax"
+                  type="number"
+                  className="h-8 text-xs w-full rounded-md border border-input bg-background px-2"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={pmaxDraft ?? pmax}
+                  onChange={(e) => setPmaxDraft(e.target.value)}
+                  onBlur={commitPmax}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Sigma segmented control — 1/2/3 */}
+          {currentStretch === 'stddev' && (
+            <div className="flex items-center gap-2">
+              <Label className="w-28 shrink-0 text-xs text-muted-foreground">
+                {t('style.raster.sigmaLabel', { defaultValue: 'Sigma (σ)' })}
+              </Label>
+              <div className="flex gap-1">
+                {([1, 2, 3] as const).map((v) => (
+                  <button
+                    key={v}
+                    type="button"
+                    aria-pressed={sigma === v}
+                    className={cn(
+                      'h-8 w-8 text-xs rounded-md border',
+                      sigma === v
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'bg-background text-foreground border-input hover:bg-muted',
+                    )}
+                    onClick={() => onPaintProp('_sigma', v)}
+                  >
+                    {v}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Stretch↔colormap hint: single-band only, shown when stretch is not
+              minmax and colormap is not gray */}
+          {isSingleBand && currentStretch !== 'minmax' && currentColormap !== 'gray' && (
+            <p role="note" className="text-mini leading-snug text-muted-foreground">
+              {t('style.raster.stretchColormapHint', { defaultValue: 'Stretch sets the input range for the colormap.' })}
+            </p>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}

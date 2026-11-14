@@ -1,0 +1,407 @@
+"""Collection service layer: CRUD, dataset membership, visibility-aware
+reads, and per-collection stats.
+
+Write functions flush but never commit; callers own the commit boundary
+so multiple calls can batch into one transaction.
+"""
+
+import uuid
+from typing import Any
+
+from fastapi import HTTPException, status
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+from app.core.db.sqlstate import is_lock_conflict
+from app.core.geo import rollup_bbox, rollup_bbox_columns
+from app.core.identity import Identity
+from app.modules.catalog.authorization import (
+    apply_visibility_filter,
+    get_user_roles,
+    visible_extent_column,
+)
+from app.modules.catalog.collections.models import Collection, CollectionDataset
+from app.modules.catalog.datasets.domain.models import Dataset, DatasetGrant, Record
+from app.modules.catalog.write_recheck import admit_writer, recheck_admitted_writer
+
+
+async def create_collection(
+    session: AsyncSession,
+    name: str,
+    description: str | None,
+    created_by: uuid.UUID,
+) -> Collection:
+    """Create a collection. Does NOT commit."""
+    collection = Collection(
+        name=name,
+        description=description,
+        created_by=created_by,
+    )
+    session.add(collection)
+    await session.flush()
+    return collection
+
+
+async def update_collection(
+    session: AsyncSession,
+    collection_id: uuid.UUID,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+) -> Collection:
+    """Update non-None fields. Raise ValueError if not found. Does NOT commit.
+
+    Caller owns the commit boundary so the update batches with the audit-log
+    write in the same transaction.
+    """
+    result = await session.execute(
+        select(Collection).where(Collection.id == collection_id)
+    )
+    collection = result.scalar_one_or_none()
+    if collection is None:
+        raise ValueError(f"Collection {collection_id} not found")
+
+    if name is not None:
+        collection.name = name
+    if description is not None:
+        collection.description = description
+
+    await session.flush()
+    return collection
+
+
+async def delete_collection(
+    session: AsyncSession,
+    collection_id: uuid.UUID,
+) -> str:
+    """Delete collection by ID. CASCADE handles collection_datasets.
+
+    Raise ValueError if not found. Return collection name for audit.
+    Does NOT commit.
+    """
+    result = await session.execute(
+        select(Collection).where(Collection.id == collection_id)
+    )
+    collection = result.scalar_one_or_none()
+    if collection is None:
+        raise ValueError(f"Collection {collection_id} not found")
+
+    name = collection.name
+    await session.delete(collection)
+    return name
+
+
+async def get_collection(
+    session: AsyncSession,
+    collection_id: uuid.UUID,
+) -> Collection | None:
+    """Fetch single collection by ID."""
+    result = await session.execute(
+        select(Collection).where(Collection.id == collection_id)
+    )
+    return result.scalar_one_or_none()
+
+
+COLLECTION_WRITE_DENIED = (
+    "Only the collection owner or an admin may modify this collection."
+)
+
+
+async def check_collection_ownership(
+    session: AsyncSession,
+    collection: Collection,
+    user: Identity,
+) -> None:
+    """Verify the user owns the collection or is admin. Raises 403 otherwise.
+
+    Only mutation (rename/delete/membership) is gated; reads stay open.
+    Collections with no recorded owner (``created_by`` is NULL) are admin-only.
+    ``lock_collection_for_write`` checks the caller again.
+    """
+    owner = collection.created_by is not None and collection.created_by == user.id
+    if not owner and "admin" not in await get_user_roles(session, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=COLLECTION_WRITE_DENIED
+        )
+    admit_writer(session, ("collection", collection.id), user)
+
+
+_COLLECTION_LOCK_TIMEOUT = "2s"
+
+
+async def lock_collection_for_write(
+    session: AsyncSession, collection_id: uuid.UUID
+) -> None:
+    """Take the collection row before its membership rows, held through the
+    caller's commit, and re-check the writer ``check_collection_ownership``
+    admitted.
+
+    Only the wait is bounded; one that outlasts the bound answers 409. The
+    lock leaves the row's key shareable, so membership inserts still pass
+    their foreign-key check.
+    """
+    await session.execute(
+        text("SELECT set_config('lock_timeout', :timeout, true)"),
+        {"timeout": _COLLECTION_LOCK_TIMEOUT},
+    )
+    try:
+        await session.execute(
+            select(Collection.id)
+            .where(Collection.id == collection_id)
+            .with_for_update(key_share=True)
+        )
+    except DBAPIError as exc:
+        if not is_lock_conflict(exc):
+            raise
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Another change to this collection is in progress. Retry shortly.",
+        ) from exc
+    await session.execute(text("RESET lock_timeout"))
+
+    async def enforce(user: Identity, row: Any) -> None:
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Collection not found"
+            )
+        owner = row.created_by is not None and row.created_by == user.id
+        if not row.active or (not owner and "admin" not in row.roles):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=COLLECTION_WRITE_DENIED
+            )
+
+    await recheck_admitted_writer(
+        session,
+        ("collection", collection_id),
+        (Collection.created_by,),
+        Collection.id == collection_id,
+        enforce,
+    )
+
+
+async def list_collections(
+    session: AsyncSession,
+    skip: int = 0,
+    limit: int = 50,
+) -> tuple[list[Collection], int]:
+    """Paginated list of all collections ordered by created_at desc.
+
+    Returns (collections, total_count).
+    """
+    count_stmt = select(func.count()).select_from(Collection)
+    total_result = await session.execute(count_stmt)
+    total_count = total_result.scalar_one()
+
+    stmt = (
+        select(Collection)
+        .order_by(Collection.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    collections = list(result.scalars().all())
+
+    return collections, total_count
+
+
+async def add_datasets_to_collection(
+    session: AsyncSession,
+    collection_id: uuid.UUID,
+    dataset_ids: list[uuid.UUID],
+    added_by: uuid.UUID,
+) -> int:
+    """Insert CollectionDataset rows. Skip duplicates. Return count of newly added.
+
+    Raise ValueError if collection not found. Does NOT commit.
+    """
+    collection = await get_collection(session, collection_id)
+    if collection is None:
+        raise ValueError(f"Collection {collection_id} not found")
+
+    existing_result = await session.execute(
+        select(CollectionDataset.dataset_id).where(
+            CollectionDataset.collection_id == collection_id,
+            CollectionDataset.dataset_id.in_(dataset_ids),
+        )
+    )
+    existing_ids = {row[0] for row in existing_result.all()}
+
+    # Dedupe request ids or a repeated pair violates the composite PK -> 500.
+    new_ids = [did for did in dict.fromkeys(dataset_ids) if did not in existing_ids]
+    for dataset_id in new_ids:
+        session.add(
+            CollectionDataset(
+                collection_id=collection_id,
+                dataset_id=dataset_id,
+                added_by=added_by,
+            )
+        )
+    added_count = len(new_ids)
+
+    if added_count > 0:
+        await session.flush()
+
+    return added_count
+
+
+async def remove_dataset_from_collection(
+    session: AsyncSession,
+    collection_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+) -> bool:
+    """Delete the CollectionDataset row. Return True if deleted, False if not found.
+
+    Does NOT commit.
+    """
+    result = await session.execute(
+        delete(CollectionDataset).where(
+            CollectionDataset.collection_id == collection_id,
+            CollectionDataset.dataset_id == dataset_id,
+        )
+    )
+    return result.rowcount > 0
+
+
+async def get_collection_datasets(
+    session: AsyncSession,
+    collection_id: uuid.UUID,
+    user: Identity | None,
+    user_roles: set[str],
+    skip: int = 0,
+    limit: int = 50,
+) -> tuple[list[Dataset], int]:
+    """Fetch datasets in a collection with RBAC visibility filtering.
+
+    Returns (datasets, total). Ordered by sort_order then added_at.
+    """
+    base_stmt = (
+        select(Dataset)
+        .join(CollectionDataset, CollectionDataset.dataset_id == Dataset.id)
+        .join(Record, Dataset.record_id == Record.id)
+        .where(CollectionDataset.collection_id == collection_id)
+    )
+    filtered_stmt = apply_visibility_filter(
+        base_stmt, user, user_roles, Record, DatasetGrant
+    )
+
+    count_stmt = select(func.count()).select_from(filtered_stmt.subquery())
+    total_result = await session.execute(count_stmt)
+    total = total_result.scalar_one()
+
+    # sort_order and added_at both default/tie within a batch
+    # INSERT, so OFFSET/LIMIT paging needs a third column; dataset_id is
+    # unique per collection's rows.
+    paginated_stmt = (
+        filtered_stmt.options(joinedload(Dataset.record))
+        .order_by(
+            CollectionDataset.sort_order,
+            CollectionDataset.added_at,
+            CollectionDataset.dataset_id,
+        )
+        .offset(skip)
+        .limit(limit)
+    )
+    result = await session.execute(paginated_stmt)
+    datasets = list(result.scalars().all())
+
+    return datasets, total
+
+
+async def get_dataset_collections(
+    session: AsyncSession,
+    dataset_id: uuid.UUID,
+) -> list[Collection]:
+    """Reverse lookup -- which collections contain this dataset?
+
+    No RBAC needed on collections themselves (organizational, not access-controlled).
+    """
+    stmt = (
+        select(Collection)
+        .join(CollectionDataset, CollectionDataset.collection_id == Collection.id)
+        .where(CollectionDataset.dataset_id == dataset_id)
+        .limit(50)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def batch_collection_extents(
+    session: AsyncSession,
+    collection_ids: list[uuid.UUID],
+    user: Identity | None,
+    user_roles: set[str],
+) -> dict[uuid.UUID, dict]:
+    """Compute aggregated spatial and temporal extents for multiple collections in one query.
+
+    Returns {collection_id: {"extent_bbox": [...] | None, "temporal_start": ..., "temporal_end": ...}}.
+    Collections with zero visible datasets will not appear in the result dict.
+    """
+    if not collection_ids:
+        return {}
+
+    # Bbox aggregated in two longitude domains so a collection
+    # spanning the antimeridian keeps the narrower range instead of folding
+    # to a global bbox.
+    stmt = (
+        select(
+            CollectionDataset.collection_id,
+            *rollup_bbox_columns(visible_extent_column(user, user_roles)),
+            func.min(Record.temporal_start).label("temporal_start"),
+            func.max(Record.temporal_end).label("temporal_end"),
+        )
+        .select_from(Dataset)
+        .join(CollectionDataset, CollectionDataset.dataset_id == Dataset.id)
+        .join(Record, Dataset.record_id == Record.id)
+        .where(CollectionDataset.collection_id.in_(collection_ids))
+        .group_by(CollectionDataset.collection_id)
+    )
+    stmt = apply_visibility_filter(stmt, user, user_roles, Record, DatasetGrant)
+
+    result = await session.execute(stmt)
+    rows = result.all()
+
+    extents: dict[uuid.UUID, dict] = {}
+    for row in rows:
+        extents[row.collection_id] = {
+            # RFC 7946 §5.2 form (west > east on a crossing),
+            # matching the sibling per-dataset extent_bbox so BBoxPreview's
+            # crossing guard sees one contract from both fields.
+            "extent_bbox": rollup_bbox(row[1:7]),
+            "temporal_start": row.temporal_start,
+            "temporal_end": row.temporal_end,
+        }
+    return extents
+
+
+async def batch_collection_dataset_counts(
+    session: AsyncSession,
+    collection_ids: list[uuid.UUID],
+    user: Identity | None,
+    user_roles: set[str],
+) -> dict[uuid.UUID, int]:
+    """Count visible datasets for multiple collections in one query.
+
+    Returns {collection_id: count}. Collections with zero visible datasets
+    will not appear in the result dict.
+    """
+    if not collection_ids:
+        return {}
+
+    stmt = (
+        select(
+            CollectionDataset.collection_id,
+            func.count().label("dataset_count"),
+        )
+        .select_from(Dataset)
+        .join(CollectionDataset, CollectionDataset.dataset_id == Dataset.id)
+        .join(Record, Dataset.record_id == Record.id)
+        .where(CollectionDataset.collection_id.in_(collection_ids))
+        .group_by(CollectionDataset.collection_id)
+    )
+    stmt = apply_visibility_filter(stmt, user, user_roles, Record, DatasetGrant)
+
+    result = await session.execute(stmt)
+    return {row.collection_id: row.dataset_count for row in result.all()}

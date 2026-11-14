@@ -1,0 +1,77 @@
+/**
+ * Single source of truth for per-render-mode default paint and the
+ * arrow/extrusion constants the layer adapters and renderAs both need. All
+ * colors come from the MAP_COLORS design tokens (map-colors.ts), never bare
+ * hex, so a palette change updates one place.
+ */
+import { MAP_COLORS } from '@/lib/map-colors';
+
+/**
+ * The one default heatmap paint: the adapter's authored values (radius 30,
+ * weight 1), which are what a freshly created heatmap renders with at add-time.
+ *
+ * `heatmap-color` is intentionally NOT included: it is built from a named ramp
+ * by buildHeatmapColorExpression() in heatmap-adapter.ts, and importing that
+ * here would create a circular import. Consumers that need the color spread
+ * this object and add `heatmap-color` themselves.
+ */
+export const DEFAULT_HEATMAP_PAINT = {
+  'heatmap-radius': 30,
+  'heatmap-weight': 1,
+  'heatmap-intensity': 1,
+  'heatmap-opacity': 0.8,
+} as const;
+
+/**
+ * Single hillshade default. Shadow/highlight/accent are map roles rather than
+ * CSS theme colors, so they live in MAP_COLORS with the other MapLibre-safe
+ * literals.
+ */
+export const DEFAULT_HILLSHADE_PAINT = {
+  'hillshade-illumination-direction': 335,
+  'hillshade-illumination-anchor': 'viewport',
+  'hillshade-exaggeration': 0.5,
+  'hillshade-shadow-color': MAP_COLORS.hillshade.shadow,
+  'hillshade-highlight-color': MAP_COLORS.hillshade.highlight,
+  'hillshade-accent-color': MAP_COLORS.hillshade.accent,
+} as const;
+
+/**
+ * Canonical default circle paint, matching the add-time fallback used by both
+ * circle-adapter and cluster-adapter. Circles created via the render-as switch
+ * start with the same token stroke (MAP_COLORS.default.stroke = #0058ac).
+ */
+export const DEFAULT_CIRCLE_PAINT = {
+  'circle-radius': 5,
+  'circle-color': MAP_COLORS.default.fill,
+  'circle-stroke-color': MAP_COLORS.default.stroke,
+  'circle-stroke-width': 1,
+} as const;
+
+/**
+ * Canonical default fill paint. fill-opacity is MAP_COLORS.default.fillOpacity
+ * (0.30), matching map-colors.ts and shared.ts OPACITY_DEFAULTS.fill.
+ */
+export const DEFAULT_FILL_PAINT = {
+  'fill-color': MAP_COLORS.default.fill,
+  'fill-opacity': MAP_COLORS.default.fillOpacity,
+  'fill-outline-color': MAP_COLORS.default.stroke,
+} as const;
+
+/** Line paint a line layer, or a mixed layer's line family, adds when no line keys are stored. */
+export const DEFAULT_LINE_PAINT = {
+  'line-color': MAP_COLORS.default.fill,
+  'line-width': 2,
+} as const;
+
+/** Arrow render-mode defaults (size 14, spacing 80 px). */
+export const DEFAULT_ARROW_SIZE = 14;
+export const DEFAULT_ARROW_SPACING = 80;
+
+/** The builder's zoom bounds, which stand in for an end of the range the layout does not save. */
+export const FULL_ZOOM_RANGE = { minzoom: 0, maxzoom: 22 } as const;
+
+/** 3D fill-extrusion defaults. Below the min zoom the
+ *  extrusion is not shown; the opacity cap bounds a freshly-converted extrusion. */
+export const DEFAULT_EXTRUSION_MIN_ZOOM = 14;
+export const DEFAULT_EXTRUSION_OPACITY_CAP = 0.85;

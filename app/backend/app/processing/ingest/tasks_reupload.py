@@ -1,0 +1,1871 @@
+"""Procrastinate task definitions for file and service re-upload workflows."""
+
+import asyncio
+import uuid
+from datetime import datetime, timezone
+from functools import partial, wraps
+
+import structlog
+from sqlalchemy import exists, select, text, update
+
+from app.core.db.tenant_session import tenant_task
+from app.core.failure_reason import FixedReason
+from app.core.upload_errors import geometry_loss_refusal
+from app.core.url_redaction import scrub_secret_from_exception
+from app.platform.catalog_locks import (
+    CATALOG_LOCK_CONFLICT_CODE,
+    CatalogLockConflict,
+)
+from app.platform.dataset_origin import (
+    BoundPointer,
+    bound_pointer,
+    classify_origin,
+    clear_source_probe_state,
+    service_layer_identity,
+    still_bound,
+)
+from app.processing.raster.cog import sha256_file
+
+from app.platform.jobs.models import owned_presigned_staging_key
+from app.processing.ingest.uploaded_source import UploadedSource
+from app.platform.refresh import verification as refresh_policy
+from app.platform.refresh.credentials import resolve_worker_credential
+from app.platform.refresh.service import (
+    drift_status_from_diff,
+    record_refresh_blocked,
+    record_refresh_failure,
+)
+from app.processing.ingest import catalog_projection
+from app.processing.ingest.arcgis_column_types import apply_arcgis_column_casts
+from app.processing.ingest.publication import (
+    PUBLISH,
+    Failure,
+    PublicationCommit,
+    Published,
+    Verdict,
+    settle_replacement,
+    settle_timed_out_execution,
+)
+from app.processing.ingest.publish_followups import run_publish_followups
+from app.processing.ingest.source_format import derive_source_format
+from app.processing.ingest.tasks_common import (
+    SourceURLRefused,
+    _append_job_warning,
+    cleanup_step,
+    _append_mercator_clip_warning,
+    _bind_task_log_context,
+    _current_tenant_schema,
+    _install_reupload_table,
+    _run_service_import_with_wfs_fallback,
+    _write_reupload_catalog,
+    apply_manifest_publication,
+    apply_manifest_record_metadata,
+    purge_token_on_failure,
+    resolve_service_type,
+    task_app,
+)
+from app.processing.ingest.tasks_staging import (
+    StagingResult,
+    original_archive_key,
+    _run_staging_pipeline,
+    layer_to_load,
+    source_columns_for,
+    _validate_upload_file_safety,
+)
+
+
+# A keyed admitted occurrence has its own wall-clock budget. The queue claim
+# deadline ends at the pending -> running CAS and must not terminate a fetch
+# that started before it.
+_KEYED_REFRESH_EXECUTION_TIMEOUT_SECONDS = 1_800.0
+
+
+def require_scheduled_execution_claim(fn):
+    """Fence direct/late scheduled invocations before they contact a source."""
+
+    @wraps(fn)
+    async def _wrapped(*args, **kwargs):
+        scheduled_execution_key = kwargs.get("scheduled_execution_key")
+        if scheduled_execution_key is not None:
+            try:
+                execution_key = uuid.UUID(str(scheduled_execution_key))
+                job_id = uuid.UUID(str(kwargs["job_id"]))
+                attempt_id = uuid.UUID(str(kwargs["attempt_id"]))
+            except (KeyError, TypeError, ValueError):
+                structlog.get_logger().warning(
+                    "scheduled_refresh_execution_claim_invalid"
+                )
+                return None
+
+            from app.core.db import async_session
+            from app.platform.refresh.models import DatasetRefreshRun
+
+            async with async_session() as session:
+                matching_run = await session.scalar(
+                    select(DatasetRefreshRun).where(
+                        DatasetRefreshRun.ingest_job_id == job_id,
+                        DatasetRefreshRun.status == "running",
+                        DatasetRefreshRun.execution_key == execution_key,
+                    )
+                )
+            if matching_run is None:
+                structlog.get_logger().warning(
+                    "scheduled_refresh_execution_not_claimed", job_id=str(job_id)
+                )
+                return None
+            try:
+                async with asyncio.timeout(_KEYED_REFRESH_EXECUTION_TIMEOUT_SECONDS):
+                    return await fn(*args, **kwargs)
+            except TimeoutError:
+                # ``asyncio.timeout`` injects cancellation, so the service
+                # task's ordinary Exception handler does not get a chance to
+                # settle the admitted run. Terminalize it here before the
+                # queue sees the timeout; a late worker cannot publish after
+                # this transition.
+                await settle_timed_out_execution(
+                    job_id, attempt_id, matching_run.dataset_id, task=fn.__name__
+                )
+                raise
+        return await fn(*args, **kwargs)
+
+    return _wrapped
+
+
+def _quicklook_table(dataset, measurement) -> str | None:
+    """The installed table, when it has geometry for a quicklook to draw."""
+    return None if measurement.geometry_type is None else dataset.table_name
+
+
+def _assert_geometry_survives(
+    *, record_type: str | None, geometry_type: str | None, has_geometry: bool
+) -> None:
+    """Raise the preview door's refusal when a replacement would strip geometry.
+
+    Both worker paths reach the same ``record_type`` re-derivation: the file
+    path knows from ogrinfo, the service path from the staging table.
+    """
+    geometry_loss = geometry_loss_refusal(
+        record_type=record_type,
+        dataset_geometry_type=geometry_type,
+        source_has_geometry=has_geometry,
+    )
+    if geometry_loss:
+        from app.processing.ingest.ogr import IngestionError
+
+        raise IngestionError(geometry_loss)
+
+
+async def _detect_reupload_crs(
+    file_path: str,
+    layer_name: str | None,
+    user_metadata: dict,
+    *,
+    original_filename: str | None = None,
+    record_type: str | None,
+    dataset_geometry_type: str | None,
+) -> tuple[dict, int]:
+    """Detect CRS/geometry for a reupload file and resolve the effective SRID.
+
+    ``layer_name`` targets the user-chosen layer in a multi-layer GPKG rather
+    than ``layers[0]``.
+
+    Applies the missing-CRS gate ``ingest_file`` does, raising
+    ``MissingCrsError`` rather than falling through to the 4326 default, and
+    the preview door's geometry-loss refusal, for a client that skipped the
+    preview. ``record_type`` is the dataset's current one.
+
+    Returns (ogrinfo result dict, effective_srid).
+    """
+    from app.processing.ingest.ogr import MissingCrsError, run_ogrinfo
+    from app.processing.ingest.tasks_common import check_missing_crs
+
+    info = await run_ogrinfo(
+        file_path, layer_name=layer_name, original_filename=original_filename
+    )
+    srid = info.get("srid")
+    geometry_type = info.get("geometry_type")
+    srid_override = user_metadata.get("srid_override")
+
+    missing_crs = check_missing_crs(
+        file_path=file_path,
+        has_geometry=geometry_type is not None,
+        detected_srid=srid,
+        srid_override=srid_override,
+    )
+    if missing_crs:
+        raise MissingCrsError(missing_crs)
+
+    _assert_geometry_survives(
+        record_type=record_type,
+        geometry_type=dataset_geometry_type,
+        has_geometry=geometry_type is not None,
+    )
+
+    effective_srid = (
+        srid_override
+        if srid_override is not None
+        else (srid if srid is not None else 4326)
+    )
+    return info, effective_srid
+
+
+async def _hold_live_table(session, dataset, *, schema: str) -> None:
+    """Hold the live table still and re-read the dataset row that describes it.
+
+    Column edits and feature writes take the table before the dataset row, so
+    this waits for those in flight and keeps new ones out until the swap. It is
+    the swap's own lock, taken once: a feature write that already holds the
+    table can't then wait on an upgrade.
+    """
+    from app.platform.catalog_locks import worker_lock_budget
+    from app.processing.ingest.metadata import _qtable
+
+    live = _qtable(dataset.table_name, schema=schema)
+    # Bound as `schema`, so the tenant binder reads it under the tenant's role.
+    if await session.scalar(
+        text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = :schema AND table_name = :table)"
+        ),
+        {"schema": schema, "table": dataset.table_name},
+    ):
+        async with worker_lock_budget(session):
+            await session.execute(
+                # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
+                text(f"LOCK TABLE {live} IN ACCESS EXCLUSIVE MODE")
+            )
+    await session.refresh(
+        dataset,
+        attribute_names=[
+            "column_info",
+            "feature_count",
+            "srid",
+            "is_3d",
+            "n_dims",
+            "current_version",
+            "data_revision",
+        ],
+    )
+
+
+async def _data_revision_baseline(
+    session, *, job_id: uuid.UUID, dataset_id, accepted_run_id
+) -> int | None:
+    """The live data revision this attempt's replacement is compared with.
+
+    Its own run's. An acceptance keeps the one the accepted run compared
+    with, so the writes that run was held over are the ones it covers. An
+    accepted run that compared none has no known start, so its acceptance
+    counts every write as later and is held again with the revision found.
+    """
+    from app.platform.refresh.models import DatasetRefreshRun
+
+    if accepted_run_id is not None:
+        verification = await session.scalar(
+            select(DatasetRefreshRun.verification).where(
+                DatasetRefreshRun.id == uuid.UUID(str(accepted_run_id)),
+                DatasetRefreshRun.dataset_id == dataset_id,
+            )
+        )
+        baseline = (
+            verification.get("data_revision_baseline")
+            if isinstance(verification, dict)
+            else None
+        )
+        return (
+            baseline if type(baseline) is int else refresh_policy.UNKNOWN_DATA_REVISION
+        )
+    return await session.scalar(
+        select(DatasetRefreshRun.data_revision_baseline).where(
+            DatasetRefreshRun.ingest_job_id == job_id
+        )
+    )
+
+
+async def _live_table_witness(session, dataset_id, table_name: str, *, schema: str):
+    """The live table's oid and its dataset's tile cache version.
+
+    A feature write rolls the version in the transaction that writes the row,
+    and a swap or restore replaces the table, so while both are unchanged no
+    GeoLens write has reached the rows.
+    """
+    from app.platform.extensions import get_processing_port
+
+    Dataset = get_processing_port().get_dataset_orm_class()
+    oid = text(
+        "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = :schema AND c.relname = :table"
+    ).bindparams(schema=schema, table=table_name)
+    version = select(Dataset.tile_cache_version).where(Dataset.id == dataset_id)
+    return await session.scalar(oid), await session.scalar(version)
+
+
+async def _live_geometry_types(table_name: str, *, schema: str, dataset_id=None):
+    """The live table's witness and geometry types, read on a connection of its own.
+
+    The witness is read first, so a write the scan missed changes it. Without
+    ``dataset_id`` there is none. The read's lock ends with it, so publication
+    takes the live table only once, outright, before it compares.
+    """
+    from app.core.db import async_session
+    from app.processing.ingest.metadata import get_geometry_types
+
+    async with async_session() as session:
+        witness = None
+        if dataset_id is not None:
+            witness = await _live_table_witness(
+                session, dataset_id, table_name, schema=schema
+            )
+        return witness, await get_geometry_types(session, table_name, schema=schema)
+
+
+async def _held_live_geometry_types(
+    session, dataset, scan, *, schema: str
+) -> list[str] | None:
+    """The live geometry types as they are under the swap's lock.
+
+    A column declared as the one type the earlier scan found can since have
+    only lost it, which compares no less strictly. Any other scan stands while
+    its witness is unchanged, so readers wait on a scan only when something
+    wrote the table since.
+    """
+    from app.processing.ingest.metadata import get_geometry_types
+
+    witness, scanned = scan
+    table_name = dataset.table_name
+    declared = await catalog_projection._declared_geometry_type(
+        session, schema=schema, table=table_name
+    )
+    if scanned is not None and scanned == [declared]:
+        return scanned
+    if witness is not None and witness == await _live_table_witness(
+        session, dataset.id, table_name, schema=schema
+    ):
+        return scanned
+    return await get_geometry_types(session, table_name, schema=schema)
+
+
+async def _live_content_digest(
+    table_name: str, *, schema: str, dataset_id, has_geometry: bool
+):
+    """The live table's witness and content digest, read on a connection of its own.
+
+    The witness is read first, so a write the digest missed changes it. None
+    when the digest can't be read.
+    """
+    from app.core.db import async_session
+    from app.processing.ingest.metadata import compute_table_content_digest
+
+    try:
+        async with async_session() as session:
+            witness = await _live_table_witness(
+                session, dataset_id, table_name, schema=schema
+            )
+            digest = await compute_table_content_digest(
+                session,
+                table_name,
+                schema=schema,
+                has_geometry=has_geometry,
+                lock=False,
+            )
+    except Exception:  # broad: without the digest the replacement publishes as before
+        structlog.get_logger().warning(
+            "reupload_live_digest_failed", dataset_id=str(dataset_id), exc_info=True
+        )
+        return None
+    return witness, digest
+
+
+async def _table_row_count(table_name: str, *, schema: str) -> int | None:
+    """The table's row count, read on a connection of its own; None when unreadable."""
+    from app.core.db import async_session
+    from app.processing.ingest.metadata import _qtable
+
+    try:
+        async with async_session() as session:
+            return await session.scalar(
+                # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
+                text(f"SELECT count(*) FROM {_qtable(table_name, schema=schema)}")
+            )
+    except Exception:  # broad: an unread count only means the replacement publishes
+        structlog.get_logger().warning(
+            "reupload_row_count_failed", table=table_name, exc_info=True
+        )
+        return None
+
+
+class _LiveComparison:
+    """The live-table comparison a service refresh and a file re-upload share.
+
+    A run that staged exactly the live data publishes nothing: no version, no
+    swap. ``live_content`` is the live table's witness and digest, read
+    before the hold by ``_live_content_digest``, and ``content_digest`` the
+    staged table's.
+    """
+
+    live_content: tuple | None = None
+    content_digest: str | None = None
+
+    @property
+    def unchanged(self) -> bool:
+        return bool(self.verification and self.verification.get("data_unchanged"))
+
+    async def _digest_staged(self, session, *, has_geometry: bool) -> None:
+        """Digest the staged table in a savepoint; on an error nothing is compared."""
+        from app.processing.ingest.metadata import compute_table_content_digest
+
+        # A flush error belongs to the publication, not to the comparison.
+        await session.flush()
+        try:
+            async with session.begin_nested():
+                self.content_digest = await compute_table_content_digest(
+                    session,
+                    self.staging_table,
+                    schema=_current_tenant_schema(),
+                    has_geometry=has_geometry,
+                )
+        except Exception:  # broad: an unread digest only means the run publishes
+            structlog.get_logger().warning(
+                "reupload_staged_digest_failed", table=self.staging_table, exc_info=True
+            )
+
+    async def _compare_live(self, session, dataset) -> None:
+        """Record whether the staged table holds the live table's columns and rows.
+
+        Call holding the live table. The digested live rows stand while its
+        witness is unchanged. A read error counts as a difference.
+        """
+        self.verification["data_unchanged"] = False
+        if self.live_content is None or self.live_content[1] != self.content_digest:
+            return
+        witness = self.live_content[0]
+        schema = _current_tenant_schema()
+        await session.flush()
+        try:
+            async with session.begin_nested():
+                self.verification["data_unchanged"] = witness == (
+                    await _live_table_witness(
+                        session, dataset.id, dataset.table_name, schema=schema
+                    )
+                ) and await _same_columns(
+                    session, self.staging_table, dataset.table_name, schema=schema
+                )
+        except Exception:  # broad: an unread comparison only means the run publishes
+            structlog.get_logger().warning(
+                "reupload_live_comparison_failed",
+                dataset_id=str(dataset.id),
+                exc_info=True,
+            )
+
+    async def _publish_unchanged(
+        self, session, dataset, *, field_labels, **published
+    ) -> Published:
+        """Date a run that found the live data current.
+
+        The catalog projection still runs, since a source's labels can change
+        without its data. As a publish does, the record names who confirmed the
+        data last and the stored source health, now stale, is cleared.
+        """
+        schema_diff = await catalog_projection.project(
+            session, dataset, self.measurement, field_labels=field_labels
+        )
+        dataset.record.updated_by = uuid.UUID(self.user_id)
+        clear_source_probe_state(dataset)
+        dataset.last_refreshed_at = datetime.now(timezone.utc)
+        return Published(
+            dataset_version_id=None,
+            schema_diff=schema_diff,
+            verification=self.verification,
+            tiles_changed=False,
+            **published,
+        )
+
+
+async def _same_columns(session, table_a: str, table_b: str, *, schema: str) -> bool:
+    """Whether both tables have the same column names and declared types, in order."""
+    rows = await session.execute(
+        text(
+            "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = :schema AND c.relname IN (:a, :b) "
+            "AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum"
+        ),
+        {"schema": schema, "a": table_a, "b": table_b},
+    )
+    columns: dict[str, list[tuple]] = {table_a: [], table_b: []}
+    for relname, name, column_type in rows:
+        columns[relname].append((name, column_type))
+    return columns[table_a] == columns[table_b]
+
+
+async def _staged_input_needed_elsewhere(job_id: str, file_path: str) -> bool:
+    """Whether another job still needs this staged upload, such as a blocked run's.
+
+    True when that can't be read: an accepting attempt can fail before it has
+    read its own job, and its upload must outlive it for the next acceptance.
+    """
+    from app.core.db import async_session
+    from app.platform.jobs.models import IngestJob, needs_staged_input
+
+    try:
+        async with async_session() as session:
+            return bool(
+                await session.scalar(
+                    select(
+                        exists().where(
+                            IngestJob.file_path == file_path,
+                            IngestJob.id != uuid.UUID(job_id),
+                            needs_staged_input(),
+                        )
+                    )
+                )
+            )
+    except Exception:  # broad: an unreadable answer keeps the upload
+        structlog.get_logger().warning(
+            "reupload_staged_input_check_failed", job_id=job_id
+        )
+        return True
+
+
+class _FileReupload(_LiveComparison):
+    """A browser upload's bytes, loaded by ogr2ogr into this attempt's table."""
+
+    task = "reupload_file"
+    staging = True
+    raster_row = False
+    catalog_event = "reupload_swap_catalog"
+
+    def __init__(self, *, job_id: str, file_path: str, user_id: str):
+        self.job_id = job_id
+        self.file_path = file_path
+        self.original_file_path = file_path
+        self.user_id = user_id
+        # Set when the upload fails the safety checks: recorded, not raised.
+        self.refused = False
+        self.owned_staging_key: str | None = None
+        self.verification: dict | None = None
+        # Kept while a person can still accept this upload's blocked run.
+        self.held = False
+
+    def prepare(self, job, dataset, staging_table: str) -> None:
+        # Read off the row, not the local `file_path` a download rebinds.
+        self.owned_staging_key = owned_presigned_staging_key(
+            job.id, job.user_metadata, job.file_path
+        )
+        self.staging_table = staging_table
+        self.live_table = dataset.table_name
+        # Other tools may write a registered table without rolling its version.
+        registered = (
+            classify_origin(dataset.source_format, dataset.record.record_type)
+            == "postgis"
+        )
+        self.witness_for = None if registered else dataset.id
+        # A file replacing another origin's data rebinds the dataset to the
+        # upload, so only an upload-origin dataset can skip the publish.
+        self.compares_live = (
+            not registered
+            and classify_origin(dataset.source_format, dataset.record.record_type)
+            == "upload"
+        )
+        self.live_feature_count = dataset.feature_count
+        self.live_has_geometry = dataset.geometry_type is not None
+        self.attempt_id = job.attempt_id
+        self.source_filename = job.source_filename
+        self.user_metadata = job.user_metadata or {}
+        self.reviewed_fingerprint = self.user_metadata.get("review_fingerprint")
+        self.accepted_fingerprint = self.user_metadata.get(
+            "accepted_refresh_fingerprint"
+        )
+        self.accepted_run_id = self.user_metadata.get("accepted_refresh_run_id")
+        self.accepted_version = self.user_metadata.get("accepted_dataset_version")
+        self.prior_record_type = dataset.record.record_type
+        self.prior_geometry_type = dataset.geometry_type
+        # The user-chosen layer of a multi-layer file.
+        self.layer_name = job.source_layer
+
+    async def fetch(self) -> None:
+        from app.core.db import async_session
+        from app.processing.ingest.ogr import build_pg_conn_str, run_ogr2ogr
+        from app.processing.ingest.service import resolve_file_path
+
+        self.file_path = await resolve_file_path(self.file_path, self.job_id)
+        async with async_session() as session:
+            try:
+                await _validate_upload_file_safety(
+                    session,
+                    file_path=self.file_path,
+                    source_filename=self.source_filename,
+                )
+            except ValueError:
+                self.refused = True
+                raise
+
+        # Effective SRID: override > detected > 4326.
+        self.info, self.effective_srid = await _detect_reupload_crs(
+            self.file_path,
+            self.layer_name,
+            self.user_metadata,
+            original_filename=self.source_filename,
+            record_type=self.prior_record_type,
+            dataset_geometry_type=self.prior_geometry_type,
+        )
+        self.layer_name = layer_to_load(self.info, self.layer_name)
+        self.srid = self.info.get("srid")
+        await run_ogr2ogr(
+            self.file_path,
+            self.staging_table,
+            build_pg_conn_str(),
+            source_srid=self.srid,
+            geometry_type=self.info.get("geometry_type"),
+            layer_name=self.layer_name,
+            schema=_current_tenant_schema(),
+            effective_srid=self.effective_srid,
+            original_filename=self.source_filename,
+        )
+        self.file_hash = await asyncio.to_thread(sha256_file, self.file_path)
+        self.source_format = await asyncio.to_thread(
+            derive_source_format, self.file_path, self.layer_name
+        )
+        # Read while no publication session holds a pooled connection.
+        self.live_scan = await _live_geometry_types(
+            self.live_table,
+            schema=_current_tenant_schema(),
+            dataset_id=self.witness_for,
+        )
+        if (
+            self.compares_live
+            and self.live_feature_count is not None
+            and await _table_row_count(
+                self.staging_table, schema=_current_tenant_schema()
+            )
+            == self.live_feature_count
+        ):
+            self.live_content = await _live_content_digest(
+                self.live_table,
+                schema=_current_tenant_schema(),
+                dataset_id=self.witness_for,
+                has_geometry=self.live_has_geometry,
+            )
+
+    async def stage(self, session, job, dataset) -> Verdict:
+        # Before the post-process steps, so no source column clashes with a
+        # GeoLens-internal name.
+        from app.processing.ingest.metadata import (
+            get_geometry_types,
+            rename_reserved_columns,
+        )
+
+        reserved_renames = await rename_reserved_columns(
+            session, self.staging_table, schema=_current_tenant_schema()
+        )
+        if reserved_renames:
+            from app.processing.ingest.warnings import make_reserved_rename_warning
+
+            _append_job_warning(job, make_reserved_rename_warning(reserved_renames))
+
+        # Shapefile-only. Keyed on the derived format, not the .zip suffix: a
+        # File Geodatabase arrives in a .zip too and has no DBF to truncate.
+        if self.source_format == "shapefile":
+            from app.processing.ingest.metadata import (
+                detect_dbf_truncation_collisions,
+            )
+            from app.processing.ingest.ogr import run_ogrinfo_preview
+            from app.processing.ingest.warnings import make_dbf_truncation_warning
+
+            preview_cols = self.info.get("columns") or []
+            if not preview_cols:
+                preview_info = await run_ogrinfo_preview(
+                    self.file_path, sample_limit=0, layer_name=self.layer_name
+                )
+                preview_cols = preview_info.get("columns") or []
+            dbf_collisions = detect_dbf_truncation_collisions(preview_cols)
+            if dbf_collisions:
+                _append_job_warning(job, make_dbf_truncation_warning(dbf_collisions))
+                structlog.get_logger().warning(
+                    "Shapefile DBF 10-char truncation collision detected",
+                    table=self.staging_table,
+                    collisions=dbf_collisions,
+                )
+
+        staging_result = await _run_staging_pipeline(
+            session,
+            table_name=self.staging_table,
+            has_geometry=self.info.get("geometry_type") is not None,
+            effective_srid=self.effective_srid,
+            source_columns=source_columns_for(self.info, self.layer_name),
+        )
+        # The staging table, measured in the swap's transaction and never
+        # carried forward from the preview, which can be minutes old.
+        self.measurement = await catalog_projection.measure(
+            session,
+            dataset,
+            table=self.staging_table,
+            schema=_current_tenant_schema(),
+            staged=staging_result,
+        )
+        _append_mercator_clip_warning(job, staging_result.mercator_clip)
+        # Read before the live table is locked: it scans only the staged rows.
+        self.staged_geometry_types = await get_geometry_types(
+            session, self.staging_table, schema=_current_tenant_schema()
+        )
+        if self.live_content is not None:
+            await self._digest_staged(session, has_geometry=staging_result.has_geometry)
+        return Verdict(verify=self._verify)
+
+    async def _verify(self, session, dataset) -> Verdict:
+        schema = _current_tenant_schema()
+        await _hold_live_table(session, dataset, schema=schema)
+        self.live_geometry_types = await _held_live_geometry_types(
+            session, dataset, self.live_scan, schema=schema
+        )
+        if (
+            self.accepted_run_id is not None
+            and dataset.current_version != self.accepted_version
+        ):
+            raise RefreshPublicationFenceError(
+                "review_superseded", refresh_policy.REVIEW_SUPERSEDED
+            )
+        # The function and transaction `project()` diffs with after the swap.
+        self.schema_diff = catalog_projection.schema_diff(dataset, self.measurement)
+        self.verification = refresh_policy.verify_reviewed_replacement(
+            schema_diff=self.schema_diff,
+            fetched_feature_count=self.measurement.metadata.get("feature_count"),
+            live=refresh_policy.geometry_contract(
+                geometry_types=self.live_geometry_types,
+                srid=dataset.srid,
+                is_3d=dataset.is_3d,
+                n_dims=dataset.n_dims,
+            ),
+            staged=refresh_policy.geometry_contract(
+                geometry_types=self.staged_geometry_types,
+                srid=self.measurement.metadata.get("srid"),
+                is_3d=self.measurement.three_d.get("is_3d"),
+                n_dims=self.measurement.three_d.get("n_dims"),
+            ),
+            source_binding={
+                "kind": "upload",
+                "filename": self.source_filename,
+                "file_hash": self.file_hash,
+            },
+            reviewed_fingerprint=self.reviewed_fingerprint,
+            accepted_fingerprint=self.accepted_fingerprint,
+            accepted_run_id=self.accepted_run_id,
+            data_revision_baseline=await _data_revision_baseline(
+                session,
+                job_id=uuid.UUID(self.job_id),
+                dataset_id=dataset.id,
+                accepted_run_id=self.accepted_run_id,
+            ),
+            data_revision=dataset.data_revision,
+        )
+        # What an acceptance of this run must still find live.
+        self.verification["live_version"] = dataset.current_version
+        if self.verification["decision"] == "allowed":
+            if self.compares_live:
+                await self._compare_live(session, dataset)
+            return PUBLISH
+        self.held = True
+        return Verdict(
+            publish=False,
+            reason=FixedReason(
+                "Review the detected changes before publication.",
+                code="review_required",
+            ),
+            settle=self._hold_back,
+            notify=False,
+        )
+
+    async def _hold_back(self, session) -> None:
+        # A file contacts no origin, so nothing about one is stamped.
+        await record_refresh_blocked(
+            session,
+            ingest_job_id=uuid.UUID(self.job_id),
+            feature_count_after=self.measurement.metadata.get("feature_count"),
+            schema_diff=self.schema_diff,
+            verification=self.verification,
+        )
+
+    async def install(self, session, dataset) -> None:
+        if self.unchanged:
+            return
+        await _install_reupload_table(
+            session,
+            dataset=dataset,
+            staging_table=self.staging_table,
+            measurement=self.measurement,
+        )
+
+    async def write(self, session, dataset) -> Published:
+        if self.unchanged:
+            # Nothing was installed, so there is no original to archive.
+            published = await self._publish_unchanged(
+                session,
+                dataset,
+                field_labels={},
+                feature_count=self.measurement.metadata.get("feature_count"),
+                contacted_origin=False,
+                reaps_staged_upload=True,
+            )
+            await self._apply_manifest(session, dataset)
+            return published
+        version, schema_diff = await _write_reupload_catalog(
+            session,
+            dataset=dataset,
+            measurement=self.measurement,
+            user_id=self.user_id,
+            source_filename=self.source_filename,
+            source_format=self.source_format,
+            original_srid=self.srid,
+            file_hash=self.file_hash,
+            # The new bytes came from a file, so the binding says upload, even
+            # when the dataset was a registered table or service.
+            origin_ref={"filename": self.source_filename, "file_hash": self.file_hash},
+            field_labels={},
+        )
+        await self._apply_manifest(session, dataset)
+        # The bytes came from the browser, so nothing remote was contacted.
+        return Published(
+            dataset_version_id=version.id,
+            feature_count=self.measurement.metadata.get("feature_count"),
+            schema_diff=schema_diff,
+            contacted_origin=False,
+            verification=self.verification,
+            live_table=dataset.table_name,
+            quicklook_table=_quicklook_table(dataset, self.measurement),
+            reaps_staged_upload=True,
+            upload_archive_key=original_archive_key(
+                dataset.id, self.file_path, self._archive_name()
+            ),
+        )
+
+    async def _apply_manifest(self, session, dataset) -> None:
+        # A manifest re-apply lands here carrying the manifest's current
+        # attribution, which replaces the old credit.
+        await apply_manifest_record_metadata(
+            session, dataset.record, self.user_metadata
+        )
+        await apply_manifest_publication(
+            session, dataset, self.user_metadata, actor_id=uuid.UUID(self.user_id)
+        )
+
+    def classify(self, exc: BaseException) -> Failure:
+        from app.processing.ingest.ogr import MissingCrsError
+
+        if self.refused:
+            return Failure("validation_failed", refused=True)
+        if isinstance(exc, MissingCrsError):
+            # Its own code: check_missing_crs's text ends with the SRID override
+            # remedy, which the vector gate's missing_crs sentence lacks.
+            return Failure(
+                "missing_crs_reupload",
+                reason=FixedReason(str(exc), code="missing_crs_reupload"),
+            )
+        return Failure(_file_refresh_error_code(exc))
+
+    async def release(
+        self, *, publication: PublicationCommit | None, failed: bool
+    ) -> None:
+        # The follow-ups archive from this task's copy of the upload, so they
+        # run before the cleanup deletes it; a cancelled run still cleans up.
+        try:
+            if publication is not None and publication.confirmed:
+                async with cleanup_step("reupload_file follow-ups", job_id=self.job_id):
+                    await run_publish_followups(
+                        uuid.UUID(self.job_id),
+                        attempt_id=self.attempt_id,
+                        local_copy=self.file_path,
+                    )
+        finally:
+            await UploadedSource(
+                job_id=self.job_id,
+                original_path=self.original_file_path,
+                local_path=self.file_path,
+                owned_presigned_key=self.owned_staging_key,
+            ).release_file_replacement(
+                publication=publication,
+                failed=failed,
+                refused=self.refused,
+                held=self.held
+                or (
+                    failed
+                    and await _staged_input_needed_elsewhere(
+                        self.job_id, self.original_file_path
+                    )
+                ),
+            )
+
+    def _archive_name(self) -> str:
+        # The job id makes the key this upload's alone, so an object already
+        # there is its archive and never another version's.
+        from app.platform.upload_filenames import safe_upload_basename
+
+        return f"{self.job_id}_{safe_upload_basename(self.source_filename)}"
+
+
+@task_app.task(queue="ingest", retry=0, aliases=["app.ingest.tasks.reupload_file"])
+@tenant_task
+async def reupload_file(
+    job_id: str,
+    dataset_id: str,
+    file_path: str,
+    user_id: str,
+    attempt_id: str | None = None,
+    **kwargs,
+) -> None:
+    """Background task: replace dataset data via staging table swap."""
+    _bind_task_log_context(
+        task_name="reupload_file", job_id=job_id, dataset_id=dataset_id
+    )
+    await settle_replacement(
+        _FileReupload(job_id=job_id, file_path=file_path, user_id=user_id),
+        job_id=job_id,
+        dataset_id=dataset_id,
+        attempt_id=attempt_id,
+    )
+
+
+# Every file replacement is queued under a name introduced with its review
+# verification, so a pre-change worker, which would publish without it, cannot
+# run one. Jobs queued under the old name run the same verified function.
+reupload_verified_file = task_app.task(
+    reupload_file.func,
+    queue="ingest",
+    retry=0,
+    name="app.ingest.tasks.reupload_verified_file",
+)
+
+
+def _file_refresh_error_code(exc: BaseException) -> str:
+    """Map a file-reupload failure onto its run ``error_code``.
+
+    A contended catalog row reports as contention: nothing was written, and
+    the reader's next step is to find the holder, not to inspect the file.
+    """
+    if isinstance(exc, CatalogLockConflict):
+        return CATALOG_LOCK_CONFLICT_CODE
+    if isinstance(exc, RefreshPublicationFenceError):
+        return exc.code
+    return "file_refresh_failed"
+
+
+async def _resolve_service_token(
+    token: str | None, credential_ref: str | None
+) -> str | None:
+    """The credential this attempt will fetch with, redeeming a ref if given.
+
+    Delegates to ``platform.refresh.credentials.resolve_worker_credential``,
+    which ``ingest_service`` also uses.
+    """
+    return await resolve_worker_credential(token, credential_ref)
+
+
+async def _fetch_service_layer_with_paging_guard(
+    *,
+    service_type_raw: str,
+    service_type: str,
+    source_url: str,
+    layer_name: str,
+    layer_id,
+    token: str | None,
+    staging_table: str,
+    db_conn_str: str,
+    schema: str,
+    fallback_order_field: str | None,
+    on_spawn,
+    reviews_unknown_count: bool,
+    verification_policy: str | None = None,
+    return_z: bool = False,
+) -> tuple[int | None, object | None, str | None]:
+    """Fetch a service layer into staging, paging large ArcGIS layers.
+
+    Returns the source's feature count, the ArcGIS ID plan and the order
+    field the ArcGIS fetch used, each ``None`` where it doesn't apply.
+
+    A refresh of a large ArcGIS layer must not do one unpaged fetch and trust
+    GDAL driver paging, which the import path's guarded loop exists to
+    distrust; it uses the same criteria and shared loop. The page-info fetch
+    resolves through tasks_vector's module attribute so test monkeypatches
+    cover both doors.
+    """
+    from app.platform.extensions import get_processing_port
+    from app.platform.security import make_safe_client
+    from app.processing.ingest import tasks_vector as _tv
+    from app.processing.ingest.ogr import run_ogr2ogr_service
+    from app.processing.ingest.tasks_common import run_paged_arcgis_service_fetch
+
+    port = get_processing_port()
+    page_size = _tv._ARCGIS_SERVICE_IMPORT_CHUNK_SIZE
+    feature_count = max_record_count = None
+    supports_pagination = False
+    pagination_order_field = None
+    id_plan = None
+    if service_type == "arcgis_featureserver":
+        # The page-info probe is a refresh's first outbound contact and can
+        # fail before any subprocess fires on_spawn, so the contact stamp is
+        # armed here too (it is monotonic).
+        if on_spawn is not None:
+            on_spawn()
+        (
+            feature_count,
+            max_record_count,
+            supports_pagination,
+            pagination_order_field,
+        ) = await _tv._fetch_arcgis_import_page_info(
+            source_url, layer_id, token, fallback_order_field=fallback_order_field
+        )
+        if max_record_count is not None:
+            page_size = max(1, min(page_size, max_record_count))
+        if verification_policy == "arcgis_id_set_v1":
+            try:
+                async with make_safe_client(timeout=30.0) as client:
+                    id_plan = await port.fetch_arcgis_id_plan(
+                        source_url,
+                        layer_id,
+                        client,
+                        token=token,
+                        expected_oid_field=pagination_order_field,
+                    )
+            except ValueError as exc:
+                from app.processing.ingest.ogr import IngestionError
+
+                raise IngestionError(f"ArcGIS ID plan unavailable: {exc}") from exc
+            if id_plan.count:
+                await run_paged_arcgis_service_fetch(
+                    service_type_raw=service_type_raw,
+                    service_type=service_type,
+                    source_url=source_url,
+                    layer_name=layer_name,
+                    layer_id=layer_id,
+                    token=token,
+                    staging_table=staging_table,
+                    db_conn_str=db_conn_str,
+                    schema=schema,
+                    feature_count=id_plan.count,
+                    page_size=page_size,
+                    order_field=id_plan.oid_field,
+                    on_spawn=on_spawn,
+                    planned_ids=id_plan.ids,
+                    return_z=return_z,
+                )
+                return feature_count, id_plan, id_plan.oid_field
+    if (
+        service_type == "arcgis_featureserver"
+        and supports_pagination
+        and pagination_order_field is not None
+        and feature_count is not None
+        and feature_count > page_size
+    ):
+        await run_paged_arcgis_service_fetch(
+            service_type_raw=service_type_raw,
+            service_type=service_type,
+            source_url=source_url,
+            layer_name=layer_name,
+            layer_id=layer_id,
+            token=token,
+            staging_table=staging_table,
+            db_conn_str=db_conn_str,
+            schema=schema,
+            feature_count=feature_count,
+            page_size=page_size,
+            order_field=pagination_order_field,
+            on_spawn=on_spawn,
+            return_z=return_z,
+        )
+        return feature_count, id_plan, pagination_order_field
+
+    if service_type == "arcgis_featureserver":
+        _tv._refuse_truncated_arcgis_fetch(
+            feature_count,
+            max_record_count,
+            supports_pagination,
+            reviews_unknown_count=reviews_unknown_count,
+        )
+    gdal_source, layer_arg = port.build_gdal_source(
+        service_type_raw,
+        source_url,
+        layer_name,
+        layer_id,
+        token=token,
+        order_field=pagination_order_field,
+        return_z=return_z,
+    )
+    await run_ogr2ogr_service(
+        gdal_source,
+        layer_arg,
+        staging_table,
+        db_conn_str,
+        service_type,
+        token=token,
+        schema=schema,
+        on_spawn=on_spawn,
+        keep_z=return_z,
+    )
+    return feature_count, id_plan, pagination_order_field
+
+
+async def _arcgis_id_coverage_evidence(
+    session,
+    *,
+    initial_id_plan,
+    schema: str,
+    table_name: str,
+    source_url: str,
+    layer_id,
+    token: str | None,
+) -> dict | None:
+    """Return compact pre/post ArcGIS membership evidence for a staged fetch."""
+    if initial_id_plan is None:
+        return None
+
+    from app.platform.extensions import get_processing_port
+    from app.platform.security import make_safe_client
+    from app.processing.ingest.tasks_common import verify_arcgis_staged_oid_coverage
+
+    coverage = await verify_arcgis_staged_oid_coverage(
+        session,
+        schema=schema,
+        table_name=table_name,
+        oid_field=initial_id_plan.oid_field,
+        planned_ids=initial_id_plan.ids,
+    )
+    try:
+        async with make_safe_client(timeout=30.0) as client:
+            final_id_plan = await get_processing_port().fetch_arcgis_id_plan(
+                source_url,
+                layer_id,
+                client,
+                token=token,
+                expected_oid_field=initial_id_plan.oid_field,
+            )
+    except ValueError:
+        coverage["source_membership_status"] = "unavailable"
+    else:
+        coverage["source_membership_status"] = (
+            "matched" if final_id_plan.digest == initial_id_plan.digest else "changed"
+        )
+        coverage["source_marker_before"] = initial_id_plan.source_marker
+        coverage["source_marker_after"] = final_id_plan.source_marker
+    return coverage
+
+
+async def _staged_geometry_contract(
+    session, *, schema: str, table: str
+) -> tuple[str | None, int | None, int | None]:
+    row = (
+        await session.execute(
+            text(
+                "SELECT type, srid, coord_dimension FROM geometry_columns "
+                "WHERE f_table_schema = :schema AND f_table_name = :table "
+                "AND f_geometry_column = 'geom'"
+            ),
+            {"schema": schema, "table": table},
+        )
+    ).one_or_none()
+    if row is None:
+        return None, None, None
+    return row.type, int(row.srid), int(row.coord_dimension)
+
+
+def _matches_service_origin(
+    bound: BoundPointer,
+    *,
+    source_format: str,
+    source_url: str,
+    layer_id,
+    layer_name: str,
+) -> bool:
+    """Return whether a fetch still describes the dataset's stored source."""
+    if classify_origin(bound.source_format) != "service":
+        return False
+    attempted = {
+        "service_type": source_format,
+        "url": source_url,
+        "layer_id": service_layer_identity(
+            source_format, layer_id=layer_id, layer_name=layer_name
+        ),
+    }
+    fingerprint = refresh_policy.canonical_service_source_binding_fingerprint
+    try:
+        return fingerprint(bound.origin_ref or {}) == fingerprint(attempted)
+    except ValueError:
+        return False
+
+
+def _require_service_source_url(value: str | None) -> str:
+    """Return a usable service URL or fail the re-upload job."""
+    if not value:
+        from app.processing.ingest.ogr import IngestionError
+
+        raise IngestionError("Missing service source URL for re-upload commit job.")
+    return value
+
+
+class RefreshPublicationFenceError(RuntimeError):
+    """A durable source or local-edit publication fence refused the swap."""
+
+    def __init__(self, code: str, message: str):
+        self.code = code
+        super().__init__(message)
+
+
+def _service_refresh_error_code(exc: BaseException) -> str:
+    """Map a service re-upload failure onto the refresh-run vocabulary."""
+    from app.platform.refresh.credentials import (
+        CredentialExpiredError,
+        CredentialStoreUnavailable,
+    )
+
+    if isinstance(exc, CatalogLockConflict):
+        return CATALOG_LOCK_CONFLICT_CODE
+    if isinstance(exc, CredentialExpiredError):
+        return "credential_expired"
+    if isinstance(exc, CredentialStoreUnavailable):
+        return "credential_store_unavailable"
+    if isinstance(exc, RefreshPublicationFenceError):
+        return exc.code
+    if getattr(exc, "code", None) in (498, 499):
+        return "credential_expired"
+    return "service_refresh_failed"
+
+
+async def _enforce_refresh_publication_fence(
+    session,
+    *,
+    job_id: uuid.UUID,
+    dataset,
+    verification: dict | None,
+) -> None:
+    """Refuse a late swap after a scheduled source rebind or local edit."""
+    if verification is None:
+        return
+
+    from app.platform.extensions import get_processing_port
+    from app.platform.refresh.models import DatasetRefreshRun
+
+    run = await session.scalar(
+        select(DatasetRefreshRun).where(DatasetRefreshRun.ingest_job_id == job_id)
+    )
+    if run is None or run.source_binding_fingerprint is None:
+        return
+
+    record_cls = get_processing_port().get_record_orm_class()
+    current_origin, current_record_modified_at = (
+        await session.execute(
+            select(dataset.__class__.origin_ref, record_cls.updated_at)
+            .join(record_cls, record_cls.id == dataset.record_id)
+            .where(dataset.__class__.id == dataset.id)
+        )
+    ).one()
+    if not isinstance(current_origin, dict):
+        raise RefreshPublicationFenceError(
+            "source_changed", "Refresh source changed before publication."
+        )
+    try:
+        current_fingerprint = (
+            refresh_policy.canonical_service_source_binding_fingerprint(current_origin)
+        )
+    except ValueError as exc:
+        raise RefreshPublicationFenceError(
+            "source_changed", "Refresh source changed before publication."
+        ) from exc
+    if current_fingerprint != run.source_binding_fingerprint:
+        raise RefreshPublicationFenceError(
+            "source_changed", "Refresh source changed before publication."
+        )
+    if (
+        run.local_edit_baseline is not None
+        and current_record_modified_at is not None
+        and current_record_modified_at > run.local_edit_baseline
+    ):
+        raise RefreshPublicationFenceError(
+            "local_edits_changed", "Dataset changed locally before refresh publication."
+        )
+
+
+async def _refuse_over_live_writes(session, *, dataset, baseline: int | None) -> None:
+    """Refuse a service re-upload when the live table was written since ``baseline``.
+
+    Called after ``install``, whose rename holds the live table, so no write
+    can land after this read.
+    """
+    current = await session.scalar(
+        select(dataset.__class__.data_revision).where(
+            dataset.__class__.id == dataset.id
+        )
+    )
+    if refresh_policy.live_data_revision(baseline, current) is not None:
+        raise RefreshPublicationFenceError(
+            "live_data_changed",
+            "Features were edited while this re-upload ran, so nothing was "
+            "replaced. Re-upload again to replace them.",
+        )
+
+
+async def _stage_service_table(
+    session,
+    job,
+    dataset,
+    *,
+    table: str,
+    schema: str,
+    column_casts: dict[str, str] | None = None,
+) -> StagingResult:
+    """Bring a fetched service layer's staging table to the shape first ingest builds."""
+    from app.processing.ingest.metadata import rename_reserved_columns
+
+    # Before staging, so no source column clashes with a GeoLens-internal name.
+    reserved_renames = await rename_reserved_columns(session, table, schema=schema)
+    if reserved_renames:
+        from app.processing.ingest.warnings import make_reserved_rename_warning
+
+        _append_job_warning(job, make_reserved_rename_warning(reserved_renames))
+
+    await apply_arcgis_column_casts(session, table, column_casts, schema=schema)
+
+    # A service layer is fetched into 4326, and whether it has geometry is
+    # learned from the staged table.
+    staged = await _run_staging_pipeline(
+        session, table_name=table, has_geometry=None, effective_srid=4326
+    )
+    # The file door's geometry-loss refusal, before the swap DDL.
+    _assert_geometry_survives(
+        record_type=dataset.record.record_type,
+        geometry_type=dataset.geometry_type,
+        has_geometry=staged.has_geometry,
+    )
+    _append_mercator_clip_warning(job, staged.mercator_clip)
+    return staged
+
+
+class _ServiceReupload(_LiveComparison):
+    """A remote service layer, fetched by ogr2ogr into this attempt's table.
+
+    A refresh is verified against its source binding, and a re-upload against
+    the changes its preview showed, before either publishes.
+    """
+
+    task = "reupload_service"
+    staging = True
+    raster_row = False
+    catalog_event = "reupload_swap_catalog"
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        source_url: str,
+        source_layer: str,
+        user_id: str,
+        token: str | None,
+        credential_ref: str | None,
+        options: dict,
+    ):
+        self.job_uuid = uuid.UUID(job_id)
+        self.source_url = source_url
+        self.source_layer = source_layer
+        self.user_id = user_id
+        self.token = token
+        self.credential_ref = credential_ref
+        self.options = options
+        # Whether the outbound fetch was reached, so a failure can date the
+        # contact.
+        self.contacted = False
+        self.field_labels: dict | None = None
+        self.column_casts: dict[str, str] | None = None
+        self.measured_feature_count: int | None = None
+        self.measured_schema_diff: dict | None = None
+        self.verification: dict | None = None
+
+    def prepare(self, job, dataset, staging_table: str) -> None:
+        self.staging_table = staging_table
+        self.live_table = dataset.table_name
+        self.dataset_id = dataset.id
+        self.live_feature_count = dataset.feature_count
+        self.live_has_geometry = dataset.geometry_type is not None
+        self.live_is_3d = bool(dataset.is_3d)
+        # A failure's contact stamp lands only while the dataset keeps the
+        # origin this attempt fetched from.
+        self.bound = bound_pointer(dataset)
+        um = job.user_metadata or {}
+        self.service_type_raw = um.get("service_type", "")
+        self.layer_id = um.get("layer_id")
+        self.job_source_url = job.source_url
+        self.source_layer_value = job.source_layer or self.source_layer
+        self.source_filename = job.source_filename
+        self.oid_field = um.get("object_id_field") or None
+        # router_refresh writes "refresh" into user_metadata. A refresh is
+        # judged on the data it fetched, a re-upload on what its preview showed.
+        self.is_refresh = bool(um.get("refresh"))
+        self.reviewed_fingerprint = um.get("review_fingerprint")
+        self.accepted_fingerprint = um.get("accepted_refresh_fingerprint")
+        self.accepted_run_id = um.get("accepted_refresh_run_id")
+        self.verification_policy = self.options.get(
+            "verification_policy", um.get("verification_policy")
+        )
+
+    async def fetch(self) -> None:
+        from app.platform.security import SSRFError, validate_url_for_ssrf
+        from app.processing.ingest import tasks_vector as _tv
+        from app.processing.ingest.ogr import IngestionError, build_pg_conn_str
+
+        self.source_url_value = _require_service_source_url(
+            self.job_source_url or self.source_url
+        )
+        self.service_type, self.source_format = resolve_service_type(
+            self.service_type_raw
+        )
+        # Checked again on the URL this fetch uses: the route-level check
+        # covers the preview-to-commit TOCTOU, but manifest reuploads skip
+        # that route.
+        try:
+            await validate_url_for_ssrf(self.source_url_value)
+        except SSRFError as exc:
+            raise SourceURLRefused(
+                f"source_url failed safety check at worker fetch time: {exc}"
+            ) from exc
+        self.token = await _resolve_service_token(self.token, self.credential_ref)
+
+        # The stamp may only describe the stored origin, so it arms only
+        # when the whole attempted binding equals the stored one.
+        matches_binding = _matches_service_origin(
+            self.bound,
+            source_format=self.source_format,
+            source_url=self.source_url_value,
+            layer_id=self.layer_id,
+            layer_name=self.source_layer_value,
+        )
+
+        def _arm_contact() -> None:
+            # Fired when the subprocess exists, the first moment an outbound
+            # attempt began. Monotonic, so a retry that dies locally cannot
+            # erase its first attempt's contact.
+            self.contacted = self.contacted or matches_binding
+
+        db_conn_str = build_pg_conn_str()
+        self.expected_feature_count: int | None = None
+        self.initial_id_plan = None
+        self.order_field: str | None = None
+
+        async def _run_service_import(layer_name: str) -> None:
+            (
+                self.expected_feature_count,
+                self.initial_id_plan,
+                self.order_field,
+            ) = await _fetch_service_layer_with_paging_guard(
+                service_type_raw=self.service_type_raw,
+                service_type=self.service_type,
+                source_url=self.source_url_value,
+                layer_name=layer_name,
+                layer_id=self.layer_id,
+                token=self.token,
+                staging_table=self.staging_table,
+                db_conn_str=db_conn_str,
+                schema=_current_tenant_schema(),
+                fallback_order_field=self.oid_field,
+                on_spawn=_arm_contact,
+                reviews_unknown_count=self.is_refresh,
+                verification_policy=self.verification_policy,
+                return_z=return_z,
+            )
+
+        return_z = False
+        if self.service_type == "arcgis_featureserver":
+            # The layer JSON read is the first request to the origin, so a
+            # token rejection from it still counts as contact.
+            _arm_contact()
+            layer_meta = await _tv._fetch_arcgis_layer_meta_or_none(
+                self.source_url_value, self.layer_id, self.token
+            )
+            self.column_casts, return_z = _tv.arcgis_meta_import_facts(layer_meta)
+            # Staging a 3D dataset flat would be judged a lost Z.
+            return_z = return_z or (layer_meta is None and self.live_is_3d)
+        try:
+            await _run_service_import_with_wfs_fallback(
+                _run_service_import,
+                self.source_layer_value,
+                token=self.token,
+                # Serves only the refresh endpoint and the re-upload commit, and
+                # says "credential"/`auth` because a bearer token can't
+                # authenticate a basic or named-key origin.
+                auth_error_message=(
+                    "Remote service authentication failed. Retry the refresh "
+                    "with the credential in the request body's `auth` object; "
+                    "credentials are request-only and are not stored between "
+                    "runs."
+                    if self.is_refresh
+                    else "Remote service authentication failed. Retry the "
+                    "re-upload with the credential in the commit request's "
+                    "`auth` object; credentials are request-only and are not "
+                    "stored between runs."
+                ),
+            )
+        except ValueError as exc:
+            raise IngestionError(str(exc)) from exc
+        self.field_labels = (
+            await _tv._fetch_arcgis_field_labels(
+                self.source_url_value, self.layer_id, self.token
+            )
+            if self.service_type == "arcgis_featureserver"
+            else {}
+        )
+        # Read while no publication session holds a pooled connection.
+        self.live_scan = await _live_geometry_types(
+            self.live_table, schema=_current_tenant_schema(), dataset_id=self.dataset_id
+        )
+        if (
+            self.is_refresh
+            and self.expected_feature_count is not None
+            and self.expected_feature_count == self.live_feature_count
+        ):
+            self.live_content = await _live_content_digest(
+                self.live_table,
+                schema=_current_tenant_schema(),
+                dataset_id=self.dataset_id,
+                has_geometry=self.live_has_geometry,
+            )
+
+    async def stage(self, session, job, dataset) -> Verdict:
+        from app.processing.ingest.metadata import (
+            compute_table_content_digest,
+            get_geometry_types,
+        )
+        from app.processing.ingest import tasks_vector as _tv
+
+        if self.service_type == "arcgis_featureserver":
+            _tv._record_arcgis_order_field(job, self.order_field)
+        schema = _current_tenant_schema()
+        staged = await _stage_service_table(
+            session,
+            job,
+            dataset,
+            table=self.staging_table,
+            schema=schema,
+            column_casts=self.column_casts,
+        )
+        self.metadata = staged.metadata
+        self.measurement = await catalog_projection.measure(
+            session,
+            dataset,
+            table=self.staging_table,
+            schema=schema,
+            staged=staged,
+        )
+        # Verification compares this fetch, not the preview's: a live
+        # service can have changed since the preview was taken.
+        self.measured_schema_diff = catalog_projection.schema_diff(
+            dataset, self.measurement
+        )
+        self.measured_feature_count = staged.metadata.get("feature_count")
+        self.staged_contract = refresh_policy.geometry_contract(
+            geometry_types=await get_geometry_types(
+                session, self.staging_table, schema=schema
+            ),
+            srid=self.measurement.metadata.get("srid"),
+            is_3d=self.measurement.three_d.get("is_3d"),
+            n_dims=self.measurement.three_d.get("n_dims"),
+        )
+        self.source_binding = {
+            "service_type": self.source_format,
+            "url": self.source_url_value,
+            "layer_id": service_layer_identity(
+                self.source_format,
+                layer_id=self.layer_id,
+                layer_name=self.source_layer_value,
+            ),
+        }
+        if not self.is_refresh:
+            return Verdict(verify=self._verify)
+
+        self.staged_geometry = await _staged_geometry_contract(
+            session, schema=schema, table=self.staging_table
+        )
+        credential_version = self.options.get("credential_version")
+        self.source_binding |= {
+            "verification_policy": self.verification_policy,
+            "credential_version": (
+                credential_version if isinstance(credential_version, str) else None
+            ),
+            "arcgis_id_coverage": await _arcgis_id_coverage_evidence(
+                session,
+                initial_id_plan=self.initial_id_plan,
+                schema=schema,
+                table_name=self.staging_table,
+                source_url=self.source_url_value,
+                layer_id=self.layer_id,
+                token=self.token,
+            ),
+        }
+        self.content_digest = await compute_table_content_digest(
+            session, self.staging_table, schema=schema, has_geometry=staged.has_geometry
+        )
+        return Verdict(verify=self._verify)
+
+    async def _verify(self, session, dataset) -> Verdict:
+        schema = _current_tenant_schema()
+        await _hold_live_table(session, dataset, schema=schema)
+        self.live_geometry_types = await _held_live_geometry_types(
+            session, dataset, self.live_scan, schema=schema
+        )
+        self.measured_schema_diff = catalog_projection.schema_diff(
+            dataset, self.measurement
+        )
+        live = refresh_policy.geometry_contract(
+            geometry_types=self.live_geometry_types,
+            srid=dataset.srid,
+            is_3d=dataset.is_3d,
+            n_dims=dataset.n_dims,
+        )
+        if self.is_refresh:
+            self.verification = await self._verify_refresh(session, dataset, live)
+            if self.verification["decision"] == "allowed":
+                await self._compare_live(session, dataset)
+        else:
+            self.verification = refresh_policy.verify_reviewed_replacement(
+                schema_diff=self.measured_schema_diff,
+                fetched_feature_count=self.measured_feature_count,
+                live=live,
+                staged=self.staged_contract,
+                source_binding=self.source_binding,
+                reviewed_fingerprint=self.reviewed_fingerprint,
+                accepted_fingerprint=self.accepted_fingerprint,
+                accepted_run_id=self.accepted_run_id,
+            )
+            # Live edits are refused at write rather than reviewed. An
+            # acceptance keeps the held run's baseline, so edits since the
+            # hold count.
+            self.verification["data_revision_baseline"] = await _data_revision_baseline(
+                session,
+                job_id=self.job_uuid,
+                dataset_id=dataset.id,
+                accepted_run_id=self.accepted_run_id,
+            )
+        if self.verification["decision"] == "allowed":
+            return PUBLISH
+        rejected = self.verification["decision"] == "rejected"
+        if rejected:
+            error_code, message = refresh_policy.refresh_rejection_diagnostic(
+                self.verification
+            )
+        else:
+            error_code = "review_required"
+            message = "Review the detected changes before publication."
+        return Verdict(
+            publish=False,
+            # Coded as a held file replacement is, so it is listed as awaiting review.
+            reason=message
+            if self.is_refresh
+            else FixedReason(message, code=error_code),
+            settle=partial(
+                self._hold_back,
+                dataset=dataset,
+                rejected=rejected,
+                error_code=error_code,
+                message=message,
+            ),
+            # A blocked refresh waits for review; a rejected one has failed.
+            notify=rejected,
+        )
+
+    async def _verify_refresh(self, session, dataset, live) -> dict:
+        geometry_type, srid, coordinate_dimension = self.staged_geometry
+        return refresh_policy.verify_service_refresh(
+            source_binding=self.source_binding,
+            schema_diff=self.measured_schema_diff,
+            expected_feature_count=self.expected_feature_count,
+            fetched_feature_count=self.measured_feature_count,
+            content_digest=self.content_digest,
+            staged_geometry_type=geometry_type,
+            staged_srid=srid,
+            staged_coordinate_dimension=coordinate_dimension,
+            live=live,
+            staged=self.staged_contract,
+            accepted_fingerprint=self.accepted_fingerprint,
+            accepted_run_id=self.accepted_run_id,
+            data_revision_baseline=await _data_revision_baseline(
+                session,
+                job_id=self.job_uuid,
+                dataset_id=dataset.id,
+                accepted_run_id=self.accepted_run_id,
+            ),
+            data_revision=dataset.data_revision,
+        )
+
+    async def _hold_back(
+        self, session, *, dataset, rejected: bool, error_code: str, message: str
+    ) -> None:
+        # Both describe the origin this attempt fetched, so they land only while
+        # the dataset is still bound to it; a re-upload may fetch another source.
+        if self.is_refresh and self.contacted:
+            await session.execute(
+                update(type(dataset))
+                .where(still_bound(type(dataset), dataset.id, self.bound))
+                .values(
+                    last_checked_at=datetime.now(timezone.utc),
+                    schema_drift_status=drift_status_from_diff(
+                        self.measured_schema_diff
+                    ),
+                )
+            )
+        if rejected:
+            await record_refresh_failure(
+                session,
+                ingest_job_id=self.job_uuid,
+                error_code=error_code,
+                error_message=message,
+                feature_count_after=self.measured_feature_count,
+                schema_diff=self.measured_schema_diff,
+                verification=self.verification,
+            )
+        else:
+            await record_refresh_blocked(
+                session,
+                ingest_job_id=self.job_uuid,
+                feature_count_after=self.measured_feature_count,
+                schema_diff=self.measured_schema_diff,
+                verification=self.verification,
+            )
+
+    async def install(self, session, dataset) -> None:
+        if self.unchanged:
+            return
+        await _install_reupload_table(
+            session,
+            dataset=dataset,
+            staging_table=self.staging_table,
+            measurement=self.measurement,
+        )
+
+    async def write(self, session, dataset) -> Published:
+        # Runs under the catalog rows, so a rebind or local edit that lands
+        # first rolls back the rename before it is published.
+        await _enforce_refresh_publication_fence(
+            session,
+            job_id=self.job_uuid,
+            dataset=dataset,
+            verification=self.verification,
+        )
+        if not self.is_refresh:
+            await _refuse_over_live_writes(
+                session,
+                dataset=dataset,
+                baseline=self.verification["data_revision_baseline"],
+            )
+        if self.unchanged:
+            return await self._publish_unchanged(
+                session,
+                dataset,
+                field_labels=self.field_labels,
+                feature_count=self.measured_feature_count,
+                contacted_origin=True,
+                reembed=False,
+            )
+        version, schema_diff = await _write_reupload_catalog(
+            session,
+            dataset=dataset,
+            measurement=self.measurement,
+            user_id=self.user_id,
+            source_filename=self.source_filename or self.source_layer_value,
+            source_format=self.source_format,
+            original_srid=self.metadata.get("srid"),
+            source_url=(
+                f"{self.source_url_value}/{self.layer_id}"
+                if self.layer_id is not None
+                else self.source_url_value
+            ),
+            origin_ref={
+                "service_type": self.source_format,
+                "url": self.source_url_value,
+                "layer_id": self.source_binding["layer_id"],
+                "auth_required": True if self.token else None,
+            },
+            field_labels=self.field_labels,
+            job_id=self.job_uuid,
+        )
+        return Published(
+            dataset_version_id=version.id,
+            feature_count=self.measured_feature_count,
+            schema_diff=schema_diff,
+            contacted_origin=True,
+            verification=self.verification,
+            live_table=dataset.table_name,
+            quicklook_table=_quicklook_table(dataset, self.measurement),
+        )
+
+    def classify(self, exc: BaseException) -> Failure:
+        # Exact-value scrub first, in place, before anything reads `exc`: only
+        # this task knows the credential's literal value.
+        scrub_secret_from_exception(exc, self.token)
+        return Failure(
+            _service_refresh_error_code(exc),
+            feature_count_after=self.measured_feature_count,
+            schema_diff=self.measured_schema_diff,
+            verification=self.verification,
+            contacted=self.bound if self.contacted else None,
+        )
+
+    async def release(
+        self, *, publication: PublicationCommit | None, failed: bool
+    ) -> None:
+        return None
+
+
+@task_app.task(
+    queue="ingest",
+    retry=0,
+    # The context gives the task its own queue-row id, so a terminal failure
+    # can strip the raw token out of its own kwargs.
+    pass_context=True,
+    aliases=["app.ingest.tasks.reupload_service"],
+)
+@tenant_task
+@purge_token_on_failure
+@require_scheduled_execution_claim
+async def reupload_service(
+    job_id: str,
+    dataset_id: str,
+    source_url: str,
+    source_layer: str,
+    user_id: str,
+    attempt_id: str | None = None,
+    token: str | None = None,
+    credential_ref: str | None = None,
+    **kwargs,
+) -> None:
+    """Background task: replace dataset data from a remote service source.
+
+    ``credential_ref`` is a single-use reference redeemed once here for a
+    secret that never touched a committed row. ``token`` is accepted only
+    for a job an earlier release queued with the token as an argument; no
+    current door sends one. The reference wins if both are set. Neither is
+    required: a public service needs no credential.
+    """
+    _bind_task_log_context(
+        task_name="reupload_service", job_id=job_id, dataset_id=dataset_id
+    )
+    await settle_replacement(
+        _ServiceReupload(
+            job_id=job_id,
+            source_url=source_url,
+            source_layer=source_layer,
+            user_id=user_id,
+            token=token,
+            credential_ref=credential_ref,
+            options=kwargs,
+        ),
+        job_id=job_id,
+        dataset_id=dataset_id,
+        attempt_id=attempt_id,
+    )
+
+
+# Verified refreshes use a task name introduced with the publication
+# protocol, so workers older than it cannot run them through the ordinary
+# reupload door.
+reupload_verified_refresh = task_app.task(
+    reupload_service.func,
+    queue="ingest",
+    retry=0,
+    name="app.ingest.tasks.reupload_verified_refresh",
+    pass_context=True,
+)

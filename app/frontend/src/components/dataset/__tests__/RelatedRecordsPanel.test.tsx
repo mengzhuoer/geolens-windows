@@ -1,0 +1,100 @@
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { render, screen, waitFor } from '@/test/test-utils';
+import { queryKeys } from '@/lib/query-keys';
+import { RelatedRecordsPanel } from '../RelatedRecordsPanel';
+import userEvent from '@testing-library/user-event';
+import { listRelationships, getRelatedRecords } from '@/api/datasets';
+import type { DatasetRelationship } from '@/types/api';
+
+vi.mock('@/api/datasets', () => ({
+  listRelationships: vi.fn(),
+  getRelatedRecords: vi.fn(),
+}));
+
+const mockRelationship: DatasetRelationship = {
+  id: 'rel-1',
+  source_dataset_id: 'ds-1',
+  source_column: 'county_id',
+  target_dataset_id: 'ds-2',
+  target_column: 'id',
+  target_dataset_title: 'Counties',
+  label: 'County Records',
+  relationship_type: 'one-to-many',
+  broken: false,
+};
+
+describe('RelatedRecordsPanel', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows loading skeletons while fetching', () => {
+    vi.mocked(listRelationships).mockImplementation(
+      () => new Promise(() => {}), // never resolves
+    );
+    const { container } = render(
+      <RelatedRecordsPanel datasetId="ds-1" featureGid={1} />,
+    );
+    // Skeleton elements render with data-slot="skeleton"
+    const skeletons = container.querySelectorAll('[data-slot="skeleton"]');
+    expect(skeletons.length).toBeGreaterThan(0);
+  });
+
+  it('returns null when no relationships exist', async () => {
+    vi.mocked(listRelationships).mockResolvedValue([]);
+    render(
+      <div data-testid="container">
+        <RelatedRecordsPanel datasetId="ds-1" featureGid={1} />
+      </div>,
+    );
+    await waitFor(() => {
+      const wrapper = screen.getByTestId('container');
+      expect(wrapper.children).toHaveLength(0);
+    });
+  });
+
+  it('shows error state when fetch fails', async () => {
+    vi.mocked(listRelationships).mockRejectedValue(new Error('Network error'));
+    render(<RelatedRecordsPanel datasetId="ds-1" featureGid={1} />);
+    await waitFor(() => {
+      expect(screen.getByText('Failed to load relationships')).toBeInTheDocument();
+    });
+  });
+
+  it('shows relationship label and column mapping when populated', async () => {
+    vi.mocked(listRelationships).mockResolvedValue([mockRelationship]);
+    render(<RelatedRecordsPanel datasetId="ds-1" featureGid={1} />);
+    await waitFor(() => {
+      expect(screen.getByText('County Records')).toBeInTheDocument();
+    });
+    expect(screen.getByText(/county_id/)).toBeInTheDocument();
+  });
+
+  it('marks a broken relationship and does not fetch its records', async () => {
+    vi.mocked(listRelationships).mockResolvedValue([{ ...mockRelationship, broken: true }]);
+    render(<RelatedRecordsPanel datasetId="ds-1" featureGid={1} />);
+    expect(await screen.findByText('Broken')).toBeInTheDocument();
+    await userEvent.click(screen.getByText('County Records'));
+    expect(screen.getByText(/join column no longer exists/)).toBeInTheDocument();
+    expect(getRelatedRecords).not.toHaveBeenCalled();
+  });
+
+  it('does not render cached rows beside the broken warning', async () => {
+    vi.mocked(listRelationships).mockResolvedValue([{ ...mockRelationship, broken: true }]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.relationships.records('ds-1', 1, 'rel-1'), {
+      rows: [{ gid: 1, name: 'Stale Row' }],
+      columns: [{ name: 'name', type: 'text' }],
+      approximate_total: 1,
+      next_cursor: null,
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RelatedRecordsPanel datasetId="ds-1" featureGid={1} />
+      </QueryClientProvider>,
+    );
+    await userEvent.click(await screen.findByText('County Records'));
+    expect(screen.getByText(/join column no longer exists/)).toBeInTheDocument();
+    expect(screen.queryByText('Stale Row')).not.toBeInTheDocument();
+  });
+});

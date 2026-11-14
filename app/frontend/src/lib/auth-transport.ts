@@ -1,0 +1,119 @@
+import { API_BASE } from '@/lib/constants';
+import { readStorage, writeStorage } from '@/lib/storage';
+
+/**
+ * How this browser talks to /auth/login and /auth/refresh/.
+ *
+ * The refresh token moves into an httpOnly cookie, which the browser will only
+ * replay to the origin that set it. Both shipped deployments put the API on the
+ * app's own origin — the dev Vite proxy (`/api` -> API, `rewrite` strips the
+ * prefix) and the production nginx `location /api/` block — and `API_BASE`
+ * defaults to the relative `/api`, so cookie mode is the normal path.
+ *
+ * A deployment that repoints `API_BASE_URL` at a different origin cannot use
+ * the cookie (its refresh POST is cross-site, and `SameSite=Lax` withholds it),
+ * so those installs stay on the earlier body-token flow rather than being
+ * handed a credential the browser would never send back.
+ */
+export const AUTH_MODE_HEADER = 'X-GeoLens-Auth-Mode';
+const CSRF_HEADER = 'X-CSRF-Token';
+const CSRF_COOKIE_NAME = 'geolens_csrf';
+
+/**
+ * Mount point the refresh cookie is scoped under. The backend derives its
+ * `Path` from the ASGI `root_path`, which `api/main.py` fixes at `/api`.
+ */
+const COOKIE_SCOPED_API_PATH = '/api';
+
+export function cookieAuthAvailable(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    // Resolve every base against the page URL: a protocol-relative base like
+    // `//api.example.com` has no scheme yet is cross-origin, and misreading it
+    // would opt into cookie mode while `credentials: 'same-origin'` withheld
+    // the cookie, so sessions would stop refreshing once the access token
+    // expired.
+    const base = new URL(API_BASE, window.location.href);
+    if (base.origin !== window.location.origin) return false;
+    // The PATH must also fall inside the cookie's scope. A deployment can
+    // mount the API at, say, `/geolens-api` behind a rewriting proxy; the
+    // cookie is still scoped to `/api/auth`, so the browser would never send
+    // it and the session would silently stop refreshing. Such deployments stay
+    // on the body-token flow, which works at any mount point.
+    return base.pathname.replace(/\/+$/, '') === COOKIE_SCOPED_API_PATH;
+  } catch {
+    return false;
+  }
+}
+
+export function readCsrfCookie(): string | null {
+  if (typeof document === 'undefined') return null;
+  for (const entry of document.cookie.split(';')) {
+    const [name, ...rest] = entry.trim().split('=');
+    if (name === CSRF_COOKIE_NAME) return decodeURIComponent(rest.join('='));
+  }
+  return null;
+}
+
+/**
+ * Headers that opt this request into the cookie flow. Empty when cookie mode is
+ * unavailable, which leaves the request byte-identical to the legacy call.
+ */
+export function cookieAuthHeaders(): Record<string, string> {
+  if (!cookieAuthAvailable()) return {};
+  const headers: Record<string, string> = { [AUTH_MODE_HEADER]: 'cookie' };
+  const csrf = readCsrfCookie();
+  // Absent on the very first login and on the one migrating refresh, where the
+  // backend has no cookie to compare against and so does not require it.
+  if (csrf) headers[CSRF_HEADER] = csrf;
+  return headers;
+}
+
+const COOKIE_WRITE_LOCK = 'geolens-auth-cookie';
+
+/**
+ * Run a request that sets the refresh cookie while no other tab runs one.
+ * Without it, a refresh one tab already sent can land its rotated cookie after
+ * a sign-in in another tab, over the new session's. Where Web Locks are
+ * unavailable the request runs unguarded.
+ */
+export function withCookieWrite<T>(request: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks;
+  if (!locks) return request();
+  return locks.request(COOKIE_WRITE_LOCK, signal ? { signal } : {}, request);
+}
+
+const SIGN_IN_ORDER_KEY = 'geolens-auth-order';
+let latestSignInOrder = 0;
+
+function storedSignInOrder(): number {
+  const stored = Number(readStorage(SIGN_IN_ORDER_KEY));
+  return Number.isFinite(stored) ? stored : 0;
+}
+
+/**
+ * Number a write that installs a new session in the refresh cookie, above
+ * every earlier one. Call it while holding the cookie lock. Storage keeps the
+ * numbers strictly increasing across tabs, and the clock keeps them in order
+ * where storage is unavailable.
+ */
+export function takeSignInOrder(): number {
+  latestSignInOrder = Math.max(storedSignInOrder() + 1, latestSignInOrder + 1, Date.now());
+  writeStorage(SIGN_IN_ORDER_KEY, String(latestSignInOrder));
+  return latestSignInOrder;
+}
+
+/**
+ * Place another tab's sign-in numbered `order` against the latest one this
+ * tab knows of, recording it when it is newer. Notices arrive after the
+ * cookie lock is released, so an earlier sign-in's can follow a later one's.
+ * A tie is possible only on the clock fallback. A notice without a number,
+ * from an older build, counts as newer.
+ */
+export function compareSignInOrder(order: unknown): 'newer' | 'tie' | 'older' {
+  if (typeof order !== 'number') return 'newer';
+  if (order < storedSignInOrder() || order < latestSignInOrder) return 'older';
+  if (order === latestSignInOrder) return 'tie';
+  latestSignInOrder = order;
+  return 'newer';
+}

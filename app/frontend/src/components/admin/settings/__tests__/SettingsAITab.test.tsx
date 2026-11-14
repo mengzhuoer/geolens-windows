@@ -1,0 +1,407 @@
+import { render, screen, waitFor } from '@/test/test-utils';
+import userEvent from '@testing-library/user-event';
+import { SettingsAITab } from '../SettingsAITab';
+import type { SettingItem } from '@/api/settings';
+import type { EmbeddingStatsResponse } from '@/types/api';
+import { probeAIStatus } from '@/api/admin';
+
+// #347 regression: the Embedding Coverage box has two buttons ("Generate
+// Missing" + "Regenerate All") backed by one backfill mutation. Each spinner
+// must key off backfill.variables.force (false = missing, true = regenerate) so only
+// the clicked button spins — previously both keyed off backfill.isPending and
+// both spun at once.
+
+const hoisted = vi.hoisted(() => ({
+  backfill: { mutate: vi.fn(), isPending: false, variables: undefined as unknown },
+  canManageUsers: true,
+  canManageTenants: false,
+  isMultiTenant: false,
+  useEmbeddingStats: vi.fn((_options?: { enabled?: boolean }) => ({
+    data: {
+      total_records: 100,
+      embedded_records: 50,
+      missing_records: 50,
+      stale_records: 0,
+      coverage_percent: 50,
+      current_run: null,
+      recent_runs: [],
+      estimate: null,
+    } as EmbeddingStatsResponse,
+  })),
+}));
+
+vi.mock('@/hooks/use-permissions', () => ({
+  usePermissions: () => ({
+    can: (capability: string) =>
+      (capability === 'manage_users' && hoisted.canManageUsers) ||
+      (capability === 'manage_tenants' && hoisted.canManageTenants),
+  }),
+}));
+
+vi.mock('@/hooks/use-edition', () => ({
+  useEdition: () => ({
+    edition: 'community',
+    features: [],
+    isEnterprise: false,
+    isMultiTenant: hoisted.isMultiTenant,
+    isLoading: false,
+  }),
+}));
+
+vi.mock('@/hooks/use-admin', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/use-admin')>();
+  return {
+    ...actual,
+    useEmbeddingStats: (options?: { enabled?: boolean }) => hoisted.useEmbeddingStats(options),
+    useBackfillEmbeddings: () => hoisted.backfill,
+  };
+});
+
+vi.mock('@/hooks/use-settings', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/use-settings')>();
+  return {
+    ...actual,
+    useApiKeyStatus: () => ({ data: { configured: true } }),
+  };
+});
+
+vi.mock('@/api/admin', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/admin')>();
+  return { ...actual, probeAIStatus: vi.fn() };
+});
+
+function renderTab(settings: SettingItem[] = []) {
+  return render(
+    <SettingsAITab
+      settings={settings}
+      envOnly={false}
+      onSave={vi.fn()}
+      onReset={vi.fn()}
+      isSaving={false}
+    />,
+  );
+}
+
+describe('SettingsAITab — embedding coverage single spinner (#347 (ADM-05))', () => {
+  beforeEach(() => {
+    hoisted.canManageUsers = true;
+    hoisted.useEmbeddingStats.mockClear();
+  });
+
+  it('shows exactly one spinner — only Regenerate All — while regenerating', () => {
+    hoisted.backfill = { mutate: vi.fn(), isPending: true, variables: { force: true } };
+    const { container } = renderTab();
+    expect(container.querySelectorAll('.animate-spin')).toHaveLength(1);
+  });
+
+  it('shows exactly one spinner — only Generate Missing — while generating missing', () => {
+    hoisted.backfill = { mutate: vi.fn(), isPending: true, variables: { force: false } };
+    const { container } = renderTab();
+    expect(container.querySelectorAll('.animate-spin')).toHaveLength(1);
+  });
+
+  it('shows no spinner when idle', () => {
+    hoisted.backfill = { mutate: vi.fn(), isPending: false, variables: undefined };
+    const { container } = renderTab();
+    expect(container.querySelectorAll('.animate-spin')).toHaveLength(0);
+  });
+
+  // Tracking only the run this page queued would leave both buttons live for
+  // a run another operator started, and the click would buy a 409.
+  it('disables both buttons while a run somebody else started is in flight', () => {
+    hoisted.useEmbeddingStats.mockReturnValue({
+      data: {
+        total_records: 100,
+        embedded_records: 50,
+        missing_records: 50,
+        stale_records: 0,
+        coverage_percent: 50,
+        current_run: {
+          job_id: 'live',
+          status: 'running',
+          records_processed: 10,
+          records_total: 50,
+          started_at: '2026-09-09T10:00:00Z',
+          heartbeat_at: null,
+        },
+        recent_runs: [],
+        estimate: null,
+      },
+    });
+    renderTab();
+
+    expect(screen.getByRole('button', { name: /Generate Missing/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Regenerate All' })).toBeDisabled();
+    hoisted.useEmbeddingStats.mockReset();
+  });
+
+  it('uses settings for the semantic toggle and suppresses user-management probes', () => {
+    hoisted.canManageUsers = false;
+    renderTab([
+      {
+        key: 'semantic_search_enabled',
+        value: true,
+        source: 'overridden',
+        label: 'Semantic search',
+      },
+    ]);
+
+    expect(hoisted.useEmbeddingStats).toHaveBeenCalledWith({ enabled: false });
+    expect(screen.getByRole('switch', { name: 'Semantic Search' })).toBeChecked();
+    expect(screen.queryByText('Embedding Coverage')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Generate Missing/ })).not.toBeInTheDocument();
+  });
+});
+
+// After an embedding-model swap every stored vector belongs to the
+// previous model, so coverage reads 0 while the rows are still there. The panel
+// has to name that state and keep Regenerate All — the control that clears
+// those rows — reachable.
+// The non-force backfill selects on "no vector under the ACTIVE
+// model", so Generate Missing covers stale records too. The button is gated on
+// `missing_records > 0`; gating on `missing_records - stale_records > 0` would
+// hide the cheap remedy on the exact state it fixes.
+describe('SettingsAITab — stale embeddings after a model swap (#1503)', () => {
+  beforeEach(() => {
+    hoisted.canManageUsers = true;
+    hoisted.backfill = { mutate: vi.fn(), isPending: false, variables: undefined };
+    hoisted.useEmbeddingStats.mockReturnValue({
+      data: {
+        total_records: 100,
+        embedded_records: 0,
+        missing_records: 100,
+        stale_records: 100,
+        coverage_percent: 0,
+        current_run: null,
+        recent_runs: [],
+        estimate: null,
+      },
+    });
+  });
+
+  afterEach(() => {
+    hoisted.useEmbeddingStats.mockReset();
+    hoisted.useEmbeddingStats.mockReturnValue({
+      data: {
+        total_records: 100,
+        embedded_records: 50,
+        missing_records: 50,
+        stale_records: 0,
+        coverage_percent: 50,
+        current_run: null,
+        recent_runs: [],
+        estimate: null,
+      },
+    });
+  });
+
+  it('keeps Regenerate All available when every embedding is stale', () => {
+    renderTab();
+    expect(screen.getByRole('button', { name: 'Regenerate All' })).toBeInTheDocument();
+  });
+
+  // The counterfactual for the gate. Under
+  // `missing_records - stale_records > 0` this state (100 missing, all of them
+  // stale) would evaluate to 0 and the button would be absent.
+  it('offers Generate Missing when every missing record is stale', () => {
+    renderTab();
+    expect(screen.getByRole('button', { name: /Generate Missing/ })).toBeInTheDocument();
+  });
+
+  it('still hides Generate Missing when the active model covers everything', () => {
+    hoisted.useEmbeddingStats.mockReturnValue({
+      data: {
+        total_records: 100,
+        embedded_records: 100,
+        missing_records: 0,
+        stale_records: 0,
+        coverage_percent: 100,
+        current_run: null,
+        recent_runs: [],
+        estimate: null,
+      },
+    });
+    renderTab();
+    expect(
+      screen.queryByRole('button', { name: /Generate Missing/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('warns that stale vectors are unusable by semantic search', () => {
+    renderTab();
+    expect(screen.getByText(/cannot be used by semantic search/)).toBeInTheDocument();
+  });
+
+  // Regenerate All re-embeds the whole catalog, so the warning has to name
+  // the incremental remedy first.
+  it('names Generate Missing as the remedy before Regenerate All', () => {
+    renderTab();
+    expect(
+      screen.getByText(/Generate missing embeddings to re-embed just those records/),
+    ).toBeInTheDocument();
+  });
+});
+
+// Test Connection button drives the live ?probe=true endpoint.
+describe('SettingsAITab — Test Connection probe (#635)', () => {
+  const mockProbe = vi.mocked(probeAIStatus);
+
+  beforeEach(() => {
+    hoisted.canManageUsers = true;
+    hoisted.canManageTenants = false;
+    hoisted.isMultiTenant = false;
+    hoisted.backfill = { mutate: vi.fn(), isPending: false, variables: undefined };
+    mockProbe.mockReset();
+  });
+
+  it('renders per-purpose results after a probe: chat ok, embeddings failed', async () => {
+    const user = userEvent.setup();
+    mockProbe.mockResolvedValue({
+      provider: 'anthropic',
+      model: 'claude',
+      enabled: true,
+      configured: true,
+      semantic_search_enabled: false,
+      has_embeddings: false,
+      probe: {
+        chat: { configured: true, ok: true },
+        embeddings: { configured: true, ok: false, status: 401, error: 'authentication failed' },
+      },
+    });
+    renderTab();
+
+    await user.click(screen.getByRole('button', { name: /Test Connection/ }));
+
+    await waitFor(() => expect(screen.getByText('OK')).toBeInTheDocument());
+    expect(screen.getByText('authentication failed')).toBeInTheDocument();
+    expect(mockProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows "not set" for an unconfigured purpose (no live call was made)', async () => {
+    const user = userEvent.setup();
+    mockProbe.mockResolvedValue({
+      provider: 'anthropic',
+      model: 'claude',
+      enabled: true,
+      configured: true,
+      semantic_search_enabled: false,
+      has_embeddings: false,
+      probe: {
+        chat: { configured: true, ok: true },
+        embeddings: { configured: false, ok: null },
+      },
+    });
+    renderTab();
+
+    await user.click(screen.getByRole('button', { name: /Test Connection/ }));
+
+    await waitFor(() => expect(screen.getByText('not set')).toBeInTheDocument());
+  });
+
+  it('hides the button for a settings-only operator (probe needs manage_users)', () => {
+    hoisted.canManageUsers = false;
+    renderTab();
+    expect(screen.queryByRole('button', { name: /Test Connection/ })).not.toBeInTheDocument();
+  });
+
+  // require_ai_status_reader switches to manage_tenants in
+  // multi-tenant mode — the button gate must switch with it.
+  // The gate now flows through the shared useAIStatusReader hook;
+  // these tests exercise the real hook via the mocked permission/edition hooks.
+  it('multi-tenant: manage_users alone does NOT show the button', () => {
+    hoisted.isMultiTenant = true;
+    hoisted.canManageUsers = true;
+    hoisted.canManageTenants = false;
+    renderTab();
+    expect(screen.queryByRole('button', { name: /Test Connection/ })).not.toBeInTheDocument();
+  });
+
+  it('multi-tenant: manage_tenants without manage_users DOES show the button', () => {
+    hoisted.isMultiTenant = true;
+    hoisted.canManageUsers = false;
+    hoisted.canManageTenants = true;
+    renderTab();
+    expect(screen.getByRole('button', { name: /Test Connection/ })).toBeInTheDocument();
+  });
+
+  // /admin/embedding-stats + /admin/backfill-embeddings require
+  // manage_users in BOTH tenancy modes — unlike the ai-status reader gate,
+  // the coverage block must NOT unlock for a manage_tenants-only operator.
+  it('multi-tenant: manage_tenants alone keeps embedding coverage disabled', () => {
+    hoisted.isMultiTenant = true;
+    hoisted.canManageUsers = false;
+    hoisted.canManageTenants = true;
+    renderTab();
+    expect(hoisted.useEmbeddingStats).toHaveBeenCalledWith({ enabled: false });
+    expect(screen.queryByText('Embedding Coverage')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Generate Missing/ })).not.toBeInTheDocument();
+  });
+
+  // The probe tests PERSISTED settings — a dirty form must not
+  // let green results vouch for unsaved edits.
+  it('disables the button and explains while the form has unsaved changes', async () => {
+    const user = userEvent.setup();
+    // dirty-tracking only covers fields present in the server settings list
+    renderTab([{ key: 'llm_model', value: 'claude-3', source: 'default', label: 'Model' }]);
+
+    await user.type(screen.getByRole('textbox', { name: 'Model' }), 'claude-x');
+
+    expect(screen.getByRole('button', { name: /Test Connection/ })).toBeDisabled();
+    expect(
+      screen.getByText('Save your changes first — the test runs against the saved configuration.'),
+    ).toBeInTheDocument();
+    expect(mockProbe).not.toHaveBeenCalled();
+  });
+
+  // Prior results describe the persisted config — they must not
+  // stay visible next to unsaved edits they never probed.
+  it('hides prior results while the form is dirty', async () => {
+    const user = userEvent.setup();
+    mockProbe.mockResolvedValueOnce({
+      provider: 'anthropic',
+      model: 'claude',
+      enabled: true,
+      configured: true,
+      semantic_search_enabled: false,
+      has_embeddings: false,
+      probe: {
+        chat: { configured: true, ok: true },
+        embeddings: { configured: true, ok: true },
+      },
+    });
+    renderTab([{ key: 'llm_model', value: 'claude-3', source: 'default', label: 'Model' }]);
+
+    await user.click(screen.getByRole('button', { name: /Test Connection/ }));
+    await waitFor(() => expect(screen.getAllByText('OK')).toHaveLength(2));
+
+    await user.type(screen.getByRole('textbox', { name: 'Model' }), '-edited');
+
+    expect(screen.queryByText('OK')).not.toBeInTheDocument();
+  });
+
+  // A failed retry must not keep showing the previous green rows.
+  it('clears prior results when a retry fails before returning a probe body', async () => {
+    const user = userEvent.setup();
+    mockProbe.mockResolvedValueOnce({
+      provider: 'anthropic',
+      model: 'claude',
+      enabled: true,
+      configured: true,
+      semantic_search_enabled: false,
+      has_embeddings: false,
+      probe: {
+        chat: { configured: true, ok: true },
+        embeddings: { configured: true, ok: true },
+      },
+    });
+    renderTab();
+
+    await user.click(screen.getByRole('button', { name: /Test Connection/ }));
+    await waitFor(() => expect(screen.getAllByText('OK')).toHaveLength(2));
+
+    mockProbe.mockRejectedValueOnce(new Error('429'));
+    await user.click(screen.getByRole('button', { name: /Test Connection/ }));
+
+    await waitFor(() => expect(screen.queryByText('OK')).not.toBeInTheDocument());
+  });
+});

@@ -1,0 +1,384 @@
+"""Tenant-context middleware.
+
+Resolves a tenant signal (subdomain or JWT claim) into
+``request.state.tenant_id``. Single-tenant (default): strict no-op, one
+boolean check and no database lookup.
+
+Multi-tenant: reads the first ``Host`` subdomain label or a ``tid``
+claim from a verified GeoLens Bearer JWT, resolves it to the tenant
+**UUID** (slug looked up against ``catalog.tenants``; UUID claim passes
+through), and rejects unresolved explicit tenant hosts and host/token
+mismatches before the request reaches application code. A non-GeoLens
+bearer token may proceed only after the Host resolves a tenant; requests
+with neither signal stay unscoped so RLS fails closed.
+
+Slug→UUID resolution happens here because the RLS GUC casts to ``::uuid``,
+so ``current_tenant_var`` must carry a UUID,
+never a slug.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+import uuid
+from collections import OrderedDict
+from typing import NamedTuple
+from urllib.parse import urlsplit
+
+import jwt
+import structlog
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from app.core.config import settings
+from app.core.db.tenant_session import current_tenant_var
+from app.api.middleware.liveness import is_liveness_request
+from app.core.tenancy import is_multi_tenant
+
+logger = structlog.stdlib.get_logger(__name__)
+
+# Regex for a safe subdomain label (alphanumeric + hyphens, 1-63 chars, no
+# leading/trailing hyphens). This is the attacker-controlled input from the
+# Host header, so validate it strictly.
+_SUBDOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$")
+
+# Reserved labels below the configured base domain are service endpoints, not
+# tenant slugs.
+_BASE_DOMAIN_LABELS = frozenset({"www", "api", "app", "localhost"})
+
+
+class _TenantHost(NamedTuple):
+    trusted: bool
+    signal: str | None
+
+
+def _normalize_request_host(host: str) -> str | None:
+    """Return a canonical hostname from one RFC Host value, or ``None``."""
+    if not host or any(char in host for char in ("/", "\\", "@", ",", "\x00")):
+        return None
+    try:
+        parsed = urlsplit(f"//{host}", allow_fragments=False)
+        # Accessing .port also validates a malformed/non-numeric port.
+        _ = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or parsed.hostname is None
+    ):
+        return None
+    hostname = parsed.hostname.lower().rstrip(".")
+    return hostname or None
+
+
+def _validated_tenant_origin(request: Request, host: str) -> str | None:
+    """Build an origin only from the Host value this middleware classified.
+
+    The ASGI scheme is supplied by the trusted server/proxy configuration;
+    forwarded host headers are deliberately not consulted here. The caller
+    invokes this only after the host slug resolves to the request tenant.
+    """
+    try:
+        parsed = urlsplit(f"//{host}", allow_fragments=False)
+        port = parsed.port
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    scheme = str(request.scope.get("scheme", "")).lower()
+    if not hostname or scheme not in {"http", "https"}:
+        return None
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    return f"{scheme}://{netloc}"
+
+
+def _classify_tenant_host(host: str) -> _TenantHost:
+    """Classify a Host against explicit service hosts and tenant base suffix.
+
+    A foreign or malformed host is *untrusted*, not an unscoped host. This
+    distinction prevents a forged Host from falling through to JWT-only tenant
+    resolution or from scoping anonymous/API-key/refresh requests.
+    """
+    hostname = _normalize_request_host(host)
+    if hostname is None:
+        return _TenantHost(False, None)
+
+    if hostname in settings.tenant_trusted_hosts_list:
+        return _TenantHost(True, None)
+
+    base_domain = settings.tenant_base_domain
+    if base_domain is None:
+        return _TenantHost(False, None)
+    if hostname == base_domain:
+        return _TenantHost(True, None)
+
+    suffix = f".{base_domain}"
+    if not hostname.endswith(suffix):
+        return _TenantHost(False, None)
+
+    label = hostname[: -len(suffix)]
+    if (
+        "." in label
+        or label in _BASE_DOMAIN_LABELS
+        or _SUBDOMAIN_RE.fullmatch(label) is None
+    ):
+        # Reserved service labels are trusted non-tenant endpoints. Any other
+        # malformed/multi-level prefix is rejected rather than silently ignored.
+        if label in _BASE_DOMAIN_LABELS:
+            return _TenantHost(True, None)
+        return _TenantHost(False, None)
+    return _TenantHost(True, label)
+
+
+def _extract_jwt_tenant_claim(authorization: str) -> str | None:
+    """Return the tenant UUID from a verified GeoLens access token.
+
+    The value feeds the RLS tenant GUC, so decoding without verification is
+    never safe here. Signature, expiry, and required access-token claims are
+    validated before ``tid`` is accepted. User activity and token-version
+    checks remain in the normal authentication dependency after RLS has been
+    scoped; a token that fails this cryptographic pre-auth step leaves the
+    request unscoped and therefore fails closed under tenant RLS.
+    """
+    if not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization[7:].strip()
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret_key.get_secret_value(),
+            algorithms=[settings.jwt_algorithm],
+            options={"require": ["sub", "exp", "iat", "jti", "token_version"]},
+        )
+        tenant_id = uuid.UUID(str(payload["tid"]))
+        uuid.UUID(str(payload["sub"]))
+        token_version = payload["token_version"]
+        if not isinstance(token_version, int) or isinstance(token_version, bool):
+            return None
+        return str(tenant_id)
+    except (jwt.PyJWTError, KeyError, ValueError, AttributeError, TypeError):
+        return None
+
+
+# Only hits are cached, so a new tenant resolves at once. A hit can outlive a
+# deleted tenant by the TTL but still names only that tenant: ids are never
+# reused, and no code path changes a live tenant's slug.
+_TENANT_HOST_CACHE_TTL_SECONDS = 30.0
+_TENANT_HOST_CACHE_MAX_ENTRIES = 1024
+_tenant_host_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
+
+
+def _tenant_host_cache_get(tenant_signal: str) -> str | None:
+    entry = _tenant_host_cache.get(tenant_signal)
+    if entry is None:
+        return None
+    resolved_at, tenant_id = entry
+    if time.monotonic() - resolved_at >= _TENANT_HOST_CACHE_TTL_SECONDS:
+        del _tenant_host_cache[tenant_signal]
+        return None
+    _tenant_host_cache.move_to_end(tenant_signal)
+    return tenant_id
+
+
+def _tenant_host_cache_put(tenant_signal: str, tenant_id: str) -> None:
+    _tenant_host_cache[tenant_signal] = (time.monotonic(), tenant_id)
+    _tenant_host_cache.move_to_end(tenant_signal)
+    while len(_tenant_host_cache) > _TENANT_HOST_CACHE_MAX_ENTRIES:
+        _tenant_host_cache.popitem(last=False)
+
+
+def _tenant_host_cache_clear() -> None:
+    """Clear the host-resolution cache (test-helper)."""
+    _tenant_host_cache.clear()
+
+
+async def _resolve_tenant_uuid(tenant_signal: str | None) -> str | None:
+    """Resolve an untrusted Host signal against the tenant registry.
+
+    The RLS GUC casts to ``::uuid``, so ``current_tenant_var`` must hold a
+    UUID string, never a slug.
+
+    UUID-shaped host labels are not trusted tenant identities. Both UUIDs
+    and slugs are resolved against ``catalog.tenants`` (no RLS, needs no
+    tenant context). Only the verified JWT ``tid`` path may skip this
+    lookup.
+
+    Resilient by design: any DB error resolves to ``None`` (logged) rather
+    than 500-ing the request — enforcement is RLS, not this middleware.
+    """
+    if tenant_signal is None:
+        return None
+    cached = _tenant_host_cache_get(tenant_signal)
+    if cached is not None:
+        return cached
+
+    tenant_uuid: uuid.UUID | None = None
+    try:
+        tenant_uuid = uuid.UUID(tenant_signal)
+    except (ValueError, AttributeError, TypeError):
+        pass
+
+    try:
+        from sqlalchemy import text
+
+        from app.core.db import async_session
+
+        async with async_session() as session:
+            # Use bound params; catalog.tenants has no RLS because it is the registry.
+            if tenant_uuid is not None:
+                resolved = await session.scalar(
+                    text("SELECT id FROM catalog.tenants WHERE id = :tenant_id"),
+                    {"tenant_id": tenant_uuid},
+                )
+            else:
+                resolved = await session.scalar(
+                    text("SELECT id FROM catalog.tenants WHERE slug = :slug"),
+                    {"slug": tenant_signal},
+                )
+    except Exception:  # broad: a resolution failure must not 500 the request
+        logger.warning(
+            "tenant Host resolution failed; running request unscoped",
+            tenant_signal=tenant_signal,
+            exc_info=True,
+        )
+        return None
+    if resolved is None:
+        return None
+    _tenant_host_cache_put(tenant_signal, str(resolved))
+    return str(resolved)
+
+
+class TenantContextMiddleware:
+    """Resolve a tenant signal into ``request.state.tenant_id``.
+
+    In single_tenant mode (default): strict no-op — returns immediately
+    after a single ``is_multi_tenant()`` check.
+
+    In multi_tenant mode: resolves a public subdomain or a verified JWT tenant
+    claim. Sets ``request.state.tenant_id`` to the resolved value or ``None``,
+    and ``current_tenant_var`` until the response body has been sent.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Single-tenant mode is the common fast path and the vast
+        # majority of deployments. One boolean check, zero state mutation.
+        #
+        # Liveness bypasses tenant lookup so a database outage cannot trigger
+        # restarts. It also bypasses Host validation because kubelet probes
+        # may use a pod IP.
+        if (
+            scope["type"] != "http"
+            or not is_multi_tenant()
+            or is_liveness_request(scope)
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        rejection = await _resolve_request_tenant(request)
+        if rejection is not None:
+            await rejection(scope, receive, send)
+            return
+
+        # Bridge request.state.tenant_id → current_tenant_var
+        # so the after_begin hook on the engine can read the tenant id when the
+        # request handler opens a DB session (get_db or raw async_session).
+        # Use a token for reset so the var never bleeds across requests.
+        token = current_tenant_var.set(request.state.tenant_id)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            current_tenant_var.reset(token)
+
+
+async def _resolve_request_tenant(request: Request) -> JSONResponse | None:
+    """Set ``request.state.tenant_id`` and its public origin, or refuse.
+
+    Returns the refusal to send, or ``None`` once the request is scoped.
+    """
+    # Resolve host and verified bearer signals independently. A host may
+    # scope anonymous/API-key/refresh requests, while an access token is
+    # accepted only when its signed tenant binding agrees with that host.
+    raw_host_values = [
+        value.decode("latin-1")
+        for name, value in request.scope.get("headers", [])
+        if name.lower() == b"host"
+    ]
+    if len(raw_host_values) != 1:
+        return JSONResponse(
+            {"detail": "Exactly one trusted Host header is required"},
+            status_code=400,
+        )
+    classified_host = _classify_tenant_host(raw_host_values[0])
+    if not classified_host.trusted:
+        logger.warning("Rejected untrusted tenant Host")
+        return JSONResponse(
+            {"detail": "Host is not trusted for tenant routing"},
+            status_code=400,
+        )
+    host_signal = classified_host.signal
+
+    auth_header = request.headers.get("authorization", "")
+    bearer_present = auth_header.lower().startswith("bearer ")
+    jwt_signal = _extract_jwt_tenant_claim(auth_header) if bearer_present else None
+
+    host_tenant_id = (
+        await _resolve_tenant_uuid(host_signal) if host_signal is not None else None
+    )
+    if host_signal is not None and host_tenant_id is None:
+        return JSONResponse(
+            {"detail": "Tenant host could not be resolved"},
+            status_code=403,
+        )
+    # Alternate identity backends validate their opaque/externally signed
+    # bearer tokens in the normal auth dependency, after the Host-derived
+    # tenant context has scoped the DB session. Without a resolved tenant
+    # Host, only a locally verified JWT may establish the tenant boundary.
+    if bearer_present and jwt_signal is None and host_tenant_id is None:
+        return JSONResponse(
+            {"detail": "Bearer token is invalid or not tenant-bound"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # ``jwt_signal`` came from a signature-, expiry-, and claim-verified
+    # access token above. It is the only caller-controlled tenant signal
+    # allowed to bypass the public Host registry lookup.
+    jwt_tenant_id = jwt_signal
+    if (
+        host_tenant_id is not None
+        and jwt_tenant_id is not None
+        and host_tenant_id != jwt_tenant_id
+    ):
+        logger.warning(
+            "Tenant host and bearer token disagree",
+            host_tenant_id=host_tenant_id,
+            token_tenant_id=jwt_tenant_id,
+        )
+        return JSONResponse(
+            {"detail": "Tenant host does not match bearer token"},
+            status_code=403,
+        )
+
+    tenant_id = host_tenant_id or jwt_tenant_id
+
+    request.state.tenant_id = tenant_id
+    request.state.tenant_public_origin = (
+        _validated_tenant_origin(request, raw_host_values[0])
+        if host_tenant_id is not None
+        else None
+    )
+    if host_tenant_id is not None and request.state.tenant_public_origin is None:
+        return JSONResponse(
+            {"detail": "Tenant host could not form a trusted public origin"},
+            status_code=400,
+        )
+
+    if tenant_id is not None:
+        logger.debug("Tenant context resolved", tenant_id=tenant_id)
+    return None

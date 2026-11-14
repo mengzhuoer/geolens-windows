@@ -1,0 +1,207 @@
+import { useEffect, useRef, useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router';
+import { useTranslation } from 'react-i18next';
+import { Loader2, Mail } from 'lucide-react';
+import { toast } from 'sonner';
+import { verifyEmail, resendVerification } from '@/api/auth';
+import { useDocumentTitle } from '@/hooks/use-document-title';
+import { GeoLensLogo } from '@/components/GeoLensLogo';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+
+type PageState = 'loading' | 'success' | 'awaitingApproval' | 'error';
+
+export function VerifyEmailPage() {
+  const { t } = useTranslation('auth');
+  // Landed on directly from an email link, so it needs a real tab title.
+  useDocumentTitle(t('common:pageTitle.verifyEmail'));
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const token = searchParams.get('token');
+
+  const [pageState, setPageState] = useState<PageState>('loading');
+  const [email, setEmail] = useState('');
+  const [resendSent, setResendSent] = useState(false);
+  const [resendFailed, setResendFailed] = useState(false);
+  const [resending, setResending] = useState(false);
+
+  // Use a ref to guard against StrictMode double-invocations.
+  const attempted = useRef(false);
+
+  useEffect(() => {
+    if (attempted.current) return;
+    attempted.current = true;
+
+    if (!token) {
+      setPageState('error');
+      return;
+    }
+
+    verifyEmail(token)
+      .then((response) => {
+        // The address is confirmed but an administrator still has to approve
+        // the account, so signing in would only be refused.
+        if (response.next_step === 'await_approval') {
+          setPageState('awaitingApproval');
+          return;
+        }
+        setPageState('success');
+        toast.success(t('verifyEmail.success'));
+      })
+      .catch(() => {
+        setPageState('error');
+      });
+  }, [token, t]);
+
+  // Brief pause so the toast is visible before the redirect. Cleared on
+  // unmount, so a user who already followed a link keeps their destination.
+  useEffect(() => {
+    if (pageState !== 'success') return;
+    const timer = setTimeout(() => {
+      navigate('/login', { replace: true });
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [pageState, navigate]);
+
+  async function handleResend(e: React.FormEvent) {
+    e.preventDefault();
+    if (!email.trim()) return;
+    setResending(true);
+    setResendFailed(false);
+    try {
+      // The backend answers every accepted request with the same 200, whether
+      // or not the email is registered, so only that 200 earns the generic
+      // confirmation. A failure (rate limit, outage, network) says nothing
+      // about the account and leaves the form up for another try.
+      await resendVerification(email.trim());
+      setResendSent(true);
+    } catch {
+      setResendFailed(true);
+    } finally {
+      setResending(false);
+    }
+  }
+
+  return (
+    <main className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background px-4">
+      <div className="text-center">
+        {/* sr-only <h1>: the cards below use CardTitle (a plain <div>), so the
+            page would have no level-one heading. */}
+        <h1 className="sr-only">{t('verifyEmail.title')}</h1>
+        <GeoLensLogo size="lg" className="justify-center" />
+        <p className="text-muted-foreground mt-1 text-sm">
+          {t('geospatialDataCatalog')}
+        </p>
+      </div>
+
+      {pageState === 'loading' && (
+        <Card className="w-full max-w-sm">
+          <CardHeader className="items-center text-center">
+            <Loader2 className="text-muted-foreground mx-auto mb-2 h-10 w-10 animate-spin" />
+            <CardTitle level={2} className="text-xl">{t('verifyEmail.title')}</CardTitle>
+            <CardDescription>{t('verifyEmail.verifying')}</CardDescription>
+          </CardHeader>
+        </Card>
+      )}
+
+      {pageState === 'success' && (
+        <Card className="w-full max-w-sm">
+          <CardHeader className="items-center text-center">
+            <Mail className="text-primary mx-auto mb-2 h-10 w-10" />
+            <CardTitle level={2} className="text-xl">{t('verifyEmail.title')}</CardTitle>
+            <CardDescription>{t('verifyEmail.success')}</CardDescription>
+          </CardHeader>
+          <CardContent className="flex justify-center">
+            <Link
+              to="/login"
+              className="text-primary text-sm underline hover:text-primary/80"
+            >
+              {t('backToSignIn')}
+            </Link>
+          </CardContent>
+        </Card>
+      )}
+
+      {pageState === 'awaitingApproval' && (
+        <Card className="w-full max-w-sm">
+          <CardHeader className="items-center text-center">
+            <Mail className="text-primary mx-auto mb-2 h-10 w-10" />
+            <CardTitle level={2} className="text-xl">{t('pendingApproval')}</CardTitle>
+            <CardDescription>{t('verifyEmail.awaitingApproval')}</CardDescription>
+          </CardHeader>
+          <CardContent className="flex justify-center">
+            <Link
+              to="/login"
+              className="text-primary text-sm underline hover:text-primary/80"
+            >
+              {t('backToSignIn')}
+            </Link>
+          </CardContent>
+        </Card>
+      )}
+
+      {pageState === 'error' && (
+        <Card className="w-full max-w-sm">
+          <CardHeader className="items-center text-center">
+            <CardTitle level={2} className="text-destructive text-xl">
+              {t('verifyEmail.invalid')}
+            </CardTitle>
+            <CardDescription>{t('verifyEmail.invalidDescription')}</CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-4">
+            {resendSent ? (
+              <p className="text-muted-foreground text-center text-sm">
+                {t('verifyEmail.resendSent')}
+              </p>
+            ) : (
+              <form onSubmit={handleResend} className="flex flex-col gap-3">
+                {resendFailed && (
+                  <p role="alert" className="text-destructive text-sm">
+                    {t('verifyEmail.resendFailed')}
+                  </p>
+                )}
+                <div className="flex flex-col gap-1.5">
+                  <Label htmlFor="resend-email">{t('verifyEmail.emailLabel')}</Label>
+                  <Input
+                    id="resend-email"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder={t('enterEmail')}
+                    required
+                  />
+                </div>
+                <Button type="submit" disabled={resending}>
+                  {resending ? (
+                    <>
+                      <Loader2 className="me-2 h-4 w-4 animate-spin" />
+                      {t('verifyEmail.resending')}
+                    </>
+                  ) : (
+                    t('verifyEmail.resend')
+                  )}
+                </Button>
+              </form>
+            )}
+            <div className="flex justify-center">
+              <Link
+                to="/login"
+                className="text-primary text-sm underline hover:text-primary/80"
+              >
+                {t('backToSignIn')}
+              </Link>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </main>
+  );
+}

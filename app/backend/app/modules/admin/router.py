@@ -1,0 +1,1456 @@
+"""Admin API endpoints: user management and catalog stats (admin-only)."""
+
+import asyncio
+import csv
+import io
+import uuid
+from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
+from typing import Any, Literal, NoReturn
+
+import anyio
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import StreamingResponse
+
+from app.modules.admin.job_review import REVIEW_REQUIRED, review_states
+from app.modules.admin.schemas import (
+    AdminJobListResponse,
+    AdminJobResponse,
+    AdminPasswordReset,
+    AdminUserCreate,
+    AIStatusResponse,
+    AIStatusUpdate,
+    ApproveRequest,
+    BackfillResponse,
+    BackfillTenantRun,
+    CatalogStatsResponse,
+    EmbeddingStatsResponse,
+    JobSortField,
+    SamlToLocalConversion,
+    SortDirection,
+    UserListResponse,
+    UserNameItem,
+    UserSortField,
+    UserUpdate,
+)
+from app.modules.admin.service import (
+    AdminNotFoundError,
+    AdminService,
+    PendingUserMutationError,
+    PendingUserTransitionConflict,
+)
+from app.modules.quota.service import get_user_quota_usage_bulk
+from app.modules.audit.service import AuditEvent, audit_emit, audit_emit_durable
+from app.modules.auth.dependencies import (
+    get_current_active_user,
+    require_mode_permission,
+    require_permission,
+)
+from app.platform.ratelimit import limiter
+from app.modules.auth.models import User
+from app.modules.auth.schemas import RoleName, UserResponse
+from app.processing.export.service import safe_content_disposition
+from app.core.ai_credentials import anthropic_configured
+from app.core.config import settings as app_settings
+from app.core.permissions import MANAGE_TENANTS
+from app.core.db.tenant_session import (
+    current_tenant_var,
+    defer_async_with_tenant,
+    tenant_job_context,
+)
+from app.core.csv_safety import escape_csv_formula
+from app.core.dependencies import get_client_ip, get_db
+from app.core.url_redaction import redact_url_credentials
+from app.modules.admin.router_groups import router as groups_router
+from app.modules.admin.router_operations import router as operations_router
+from app.platform.binary_response import binary_response
+from app.platform.extensions import get_catalog_port
+from app.platform.jobs.defer_guard import (
+    DeferFailed,
+    defer_with_orphan_guard,
+    make_ingest_job_failed_rollback,
+)
+from app.platform.jobs.models import (
+    IngestJob,
+    ACTIVE_BACKFILL_INDEX_NAME,
+    EMBEDDING_BACKFILL_METADATA_KEY,
+    FAN_OUT_INTERRUPTED_METADATA_KEY,
+    URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY,
+    URL_IMPORT_METADATA_KEY,
+    public_job_metadata,
+)
+from app.platform.jobs.router import (
+    _can_access_another_users_job,
+    get_retry_capability,
+)
+from app.standards.ogc.errors import (
+    CONFLICT_RESPONSE,
+    ERROR_RESPONSES_AUTH,
+    NOT_FOUND_RESPONSE,
+    QUEUE_UNAVAILABLE_RESPONSE,
+)
+
+logger = structlog.stdlib.get_logger(__name__)
+
+router = APIRouter(prefix="/admin", tags=["Admin"], responses=ERROR_RESPONSES_AUTH)
+router.include_router(operations_router)
+router.include_router(groups_router)
+
+require_ai_status_reader = require_mode_permission(
+    single_tenant="manage_users", multi_tenant="manage_tenants"
+)
+require_ai_status_writer = require_mode_permission(
+    single_tenant="manage_settings", multi_tenant="manage_tenants"
+)
+_EXPORT_OUTCOME_TIMEOUT_SECONDS = 5
+
+
+def _user_response(user: User) -> UserResponse:
+    return UserResponse(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        is_active=user.is_active,
+        status=user.status,
+        last_login_at=user.last_login_at,
+        created_at=user.created_at,
+        roles=sorted(r.name for r in user.roles),
+        can_reset_password=user.auth_provider == "local",
+    )
+
+
+def _refuse_backfill_in_flight(
+    *,
+    active_job_id: str | None,
+    user_id: str | None,
+    force: bool,
+    detected_by: str,
+) -> NoReturn:
+    """Refuse a backfill because one is already in flight.
+
+    Shared by both guard paths (pre-flight query and partial unique index) so
+    they report the same conflict consistently. ``active_job_id`` is None only
+    when the index path's winning run finished before the re-read.
+    """
+    logger.info(
+        "embedding_backfill_refused_run_in_flight",
+        user_id=user_id,
+        force=force,
+        active_job_id=active_job_id,
+        detected_by=detected_by,
+    )
+    if active_job_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An embedding backfill is already running. Retry shortly.",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            f"An embedding backfill is already running (job {active_job_id}). "
+            f"Wait for it to finish, or poll /jobs/{active_job_id} for its status."
+        ),
+    )
+
+
+def _raise_on_error(exc: ValueError, default_status: int) -> NoReturn:
+    """Map a service-layer ValueError to an HTTPException.
+
+    AdminNotFoundError maps to 404; everything else uses default_status.
+    """
+    if isinstance(exc, AdminNotFoundError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    raise HTTPException(status_code=default_status, detail=str(exc))
+
+
+# Trailing slash is canonical (in OpenAPI); the no-slash form is a hidden alias
+# because api/main.py sets redirect_slashes=False.
+@router.post(
+    "/users",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    include_in_schema=False,
+)
+@router.post(
+    "/users/",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses={409: CONFLICT_RESPONSE},
+)
+@limiter.limit("30/minute")
+async def create_user(
+    body: AdminUserCreate,
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Create a new user with the specified role (admin only)."""
+    # Enforce allowed_email_domains on admin-create. Break-glass: the
+    # requesting admin is exempt when they hold manage_settings (see the shared
+    # gate).
+    from app.modules.auth.domain_policy import (
+        enforce_email_domain_gate,
+    )
+
+    await enforce_email_domain_gate(db, body.email, break_glass_user=current_user)
+
+    service = AdminService(db)
+    try:
+        user = await service.create_user(
+            username=body.username,
+            password=body.password,
+            email=body.email,
+            role_name=body.role,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+    ip = get_client_ip(request)
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=current_user.id,
+            action="user.create",
+            resource_type="user",
+            resource_id=user.id,
+            details={"username": body.username, "role": body.role},
+            ip_address=ip,
+        ),
+    )
+    await db.commit()
+    return _user_response(user)
+
+
+@router.get(
+    "/users",
+    response_model=UserListResponse,
+    dependencies=[Depends(require_permission("manage_users"))],
+    include_in_schema=False,
+)
+@router.get(
+    "/users/",
+    response_model=UserListResponse,
+    dependencies=[Depends(require_permission("manage_users"))],
+)
+async def list_users(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    status_filter: str | None = Query(None, alias="status", max_length=50),
+    role: RoleName | None = Query(
+        None, description="Assigned role membership to match."
+    ),
+    search: str | None = Query(None, max_length=200),
+    sort: UserSortField = Query(
+        "created_at",
+        description=(
+            "Column to order by. Roles and storage are not sortable: roles is a "
+            "many-to-many and storage is aggregated per page after the query."
+        ),
+    ),
+    order: SortDirection = Query("asc", description="Sort direction."),
+    db: AsyncSession = Depends(get_db),
+) -> UserListResponse:
+    """List users with optional status, role, search, and sort filters (admin only).
+
+    `sort` and `order` are closed enums, so an unrecognised value is refused
+    with a 422 and never reaches the query.
+    """
+    service = AdminService(db)
+    users, total = await service.list_users(
+        skip=skip,
+        limit=limit,
+        status=status_filter,
+        role=role,
+        search=search,
+        sort=sort,
+        order=order,
+    )
+    # Quota usage for the page, fetched in one batch rather than one
+    # three-table aggregate per user.
+    usage_by_user = await get_user_quota_usage_bulk(db, [u.id for u in users])
+    user_responses = [
+        UserResponse(
+            id=u.id,
+            username=u.username,
+            email=u.email,
+            is_active=u.is_active,
+            status=u.status,
+            last_login_at=u.last_login_at,
+            created_at=u.created_at,
+            roles=sorted(r.name for r in u.roles),
+            can_reset_password=u.auth_provider == "local",
+            quota_usage=usage_by_user[u.id],
+        )
+        for u in users
+    ]
+    return UserListResponse(users=user_responses, total=total)
+
+
+@router.get(
+    "/users/export.csv",
+    response_class=StreamingResponse,
+    responses={200: binary_response("The CSV file", "text/csv")},
+    summary="Export registered users as CSV",
+    tags=["Admin"],
+)
+async def export_users_csv(
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """Export all registered users as a hardened CSV file (admin only).
+
+    Columns: email, display_name, auth_provider, status, created_at.
+    Rows are ordered by created_at ASC and streamed without full materialisation.
+    Cells starting with =, +, -, or @ are tab-prefixed (CSV injection hardening).
+    """
+
+    operation_id = uuid.uuid4()
+    actor_id = current_user.id
+    ip_address = get_client_ip(request)
+    tenant_id = getattr(getattr(request, "state", None), "tenant_id", None)
+    audit_context = {
+        "operation_id": str(operation_id),
+        "format": "csv",
+        "mode": "stream",
+        "filters": {},
+    }
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=actor_id,
+            action="user.export",
+            resource_type="user",
+            resource_id=operation_id,
+            details={**audit_context, "outcome": "requested"},
+            ip_address=ip_address,
+        ),
+    )
+    # The response body executes after this handler returns. Persist the request
+    # before releasing the stream, then use fresh sessions for stream outcome
+    # bookkeeping so the request-scoped session is never reused concurrently.
+    await db.commit()
+
+    async def record_outcome(outcome: str, selected_rows: int) -> None:
+        details: dict[str, object] = {
+            **audit_context,
+            "outcome": outcome,
+            "selected_rows": selected_rows,
+        }
+        if outcome == "failed":
+            details["error_code"] = "stream_failed"
+        # AnyIO cancellation is level-triggered: an unshielded await after a
+        # client disconnect is cancelled immediately, so bound the shield —
+        # otherwise disconnect cleanup could hold a response task indefinitely.
+        with tenant_job_context(tenant_id):
+            with anyio.move_on_after(_EXPORT_OUTCOME_TIMEOUT_SECONDS, shield=True):
+                try:
+                    await audit_emit_durable(
+                        AuditEvent(
+                            user_id=actor_id,
+                            action="user.export",
+                            resource_type="user",
+                            resource_id=operation_id,
+                            details=details,
+                            ip_address=ip_address,
+                        )
+                    )
+                except Exception:  # broad: response bytes may already have been sent
+                    logger.exception(
+                        "Failed to persist user export stream outcome",
+                        operation_id=str(operation_id),
+                        outcome=outcome,
+                    )
+
+    async def csv_generator() -> AsyncGenerator[str, None]:
+        row_count = 0
+        try:
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(
+                ["email", "display_name", "auth_provider", "status", "created_at"]
+            )
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+            from app.core.db import async_session
+
+            with tenant_job_context(tenant_id):
+                async with async_session() as stream_db:
+                    stmt = select(User).order_by(User.created_at.asc())
+                    result = await stream_db.stream(
+                        stmt.execution_options(yield_per=100)
+                    )
+                    async for (user,) in result:
+                        writer.writerow(
+                            [
+                                escape_csv_formula(user.email or ""),
+                                escape_csv_formula(user.username or ""),
+                                escape_csv_formula(user.auth_provider or ""),
+                                escape_csv_formula(user.status or ""),
+                                user.created_at.isoformat() if user.created_at else "",
+                            ]
+                        )
+                        yield buf.getvalue()
+                        # Reaching this line means the preceding body chunk was
+                        # accepted by the ASGI send loop.
+                        row_count += 1
+                        buf.seek(0)
+                        buf.truncate(0)
+        except BaseException:  # record disconnects/cancellation as failed exports
+            await record_outcome("failed", row_count)
+            raise
+        else:
+            await record_outcome("completed", row_count)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d")
+    filename = f"users-export-{ts}.csv"
+    return StreamingResponse(
+        csv_generator(),
+        media_type="text/csv",
+        headers={"Content-Disposition": safe_content_disposition(filename)},
+    )
+
+
+@router.get(
+    "/users/names",
+    response_model=list[UserNameItem],
+    dependencies=[Depends(require_permission("manage_users"))],
+    include_in_schema=False,
+)
+@router.get(
+    "/users/names/",
+    response_model=list[UserNameItem],
+    dependencies=[Depends(require_permission("manage_users"))],
+)
+async def list_user_names(
+    db: AsyncSession = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=1000),
+) -> list[UserNameItem]:
+    """Return lightweight id+username list for filter dropdowns.
+
+    Paginated to bound response size on deployments with many users. Default
+    page size of 500 is enough for typical admin dropdowns; the limit cap of
+    1000 matches the previous hard cap. Clients needing the full list should
+    page by incrementing ``skip``.
+    """
+    result = await db.execute(
+        select(User.id, User.username).order_by(User.username).offset(skip).limit(limit)
+    )
+    return [UserNameItem(id=row.id, username=row.username) for row in result.all()]
+
+
+@router.get(
+    "/users/{user_id}",
+    response_model=UserResponse,
+    dependencies=[Depends(require_permission("manage_users"))],
+)
+async def get_user(
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Get a specific user by ID (admin only)."""
+    service = AdminService(db)
+    try:
+        user = await service.get_user(user_id)
+    except ValueError as exc:
+        _raise_on_error(exc, status.HTTP_404_NOT_FOUND)
+    return _user_response(user)
+
+
+@router.patch(
+    "/users/{user_id}",
+    response_model=UserResponse,
+)
+@limiter.limit("30/minute")
+async def update_user(
+    user_id: uuid.UUID,
+    body: UserUpdate,
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Update a user's fields and/or role (admin only)."""
+    if user_id == current_user.id and (
+        body.role is not None
+        or body.is_active is False
+        or body.status in {"suspended", "deactivated"}
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot change your own role or disable your own account",
+        )
+    service = AdminService(db)
+    try:
+        user, before, after = await service.update_user_with_snapshot(
+            user_id, body, current_user_id=current_user.id
+        )
+    except PendingUserMutationError as exc:
+        _raise_on_error(exc, status.HTTP_422_UNPROCESSABLE_ENTITY)
+    except ValueError as exc:
+        _raise_on_error(exc, status.HTTP_409_CONFLICT)
+    ip = get_client_ip(request)
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=current_user.id,
+            action="user.update",
+            resource_type="user",
+            resource_id=user_id,
+            details={"before": before, "after": after},
+            ip_address=ip,
+        ),
+    )
+    await db.commit()
+    return _user_response(user)
+
+
+@router.post(
+    "/users/{user_id}/deactivate",
+    response_model=UserResponse,
+    include_in_schema=False,
+)
+@router.post(
+    "/users/{user_id}/deactivate/",
+    response_model=UserResponse,
+)
+@limiter.limit("30/minute")
+async def deactivate_user(
+    user_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Deactivate a user (admin only)."""
+    service = AdminService(db)
+    try:
+        user = await service.deactivate_user(user_id, current_user.id)
+    except PendingUserTransitionConflict as exc:
+        _raise_on_error(exc, status.HTTP_409_CONFLICT)
+    except ValueError as exc:
+        _raise_on_error(exc, status.HTTP_400_BAD_REQUEST)
+    ip = get_client_ip(request)
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=current_user.id,
+            action="user.deactivate",
+            resource_type="user",
+            resource_id=user_id,
+            details={"username": user.username},
+            ip_address=ip,
+        ),
+    )
+    await db.commit()
+    return _user_response(user)
+
+
+@router.post(
+    "/users/{user_id}/reset-password",
+    response_model=UserResponse,
+    include_in_schema=False,
+)
+@router.post(
+    "/users/{user_id}/reset-password/",
+    response_model=UserResponse,
+    responses={404: NOT_FOUND_RESPONSE},
+)
+@limiter.limit("30/minute")
+async def reset_user_password(
+    user_id: uuid.UUID,
+    body: AdminPasswordReset,
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Set a user's password (admin only).
+
+    The ``manage_users`` permission authorizes this recovery path, so no current
+    password is required. The submitted password is stored only as a hash and
+    is omitted from audit details, logs, and the response.
+
+    Returns 422 when the target signs in through an identity provider and has
+    no local password, or 404 when the user does not exist.
+
+    Resetting your own password is permitted and ends every session the
+    account holds, including the one making this request, because the reset
+    revokes the account's credentials.
+    """
+    service = AdminService(db)
+    try:
+        user = await service.reset_user_password(user_id, body.password)
+    except ValueError as exc:
+        _raise_on_error(exc, status.HTTP_422_UNPROCESSABLE_ENTITY)
+    ip = get_client_ip(request)
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=current_user.id,
+            action="user.password_reset",
+            resource_type="user",
+            resource_id=user_id,
+            details={"username": user.username},
+            ip_address=ip,
+        ),
+    )
+    await db.commit()
+    return _user_response(user)
+
+
+@router.post(
+    "/users/{user_id}/convert-saml-to-local",
+    response_model=UserResponse,
+    include_in_schema=False,
+)
+@router.post(
+    "/users/{user_id}/convert-saml-to-local/",
+    response_model=UserResponse,
+    include_in_schema=False,
+)
+@limiter.limit("30/minute")
+async def convert_saml_to_local(
+    user_id: uuid.UUID,
+    body: SamlToLocalConversion,
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Convert a SAML-authenticated user to local-password (admin only).
+
+    The conversion happens in a single DB transaction:
+    validate -> set password -> flip auth_provider -> delete SAML oauth_accounts
+    row -> write audit_log row. The audit_log write is the LAST step before
+    commit so failed conversions never leave an orphan audit entry.
+
+    Audit details are an explicit allow-list ({"from", "to", "provider_slug"})
+    -- password material is never logged.
+
+    Self-conversion is blocked with 422 to prevent admin self-lockout when an
+    admin fat-fingers the new password.
+    """
+    # Self-conversion guard, like update_user's self-action guard; 422 (NOT
+    # 400/403) per the existing convention.
+    if user_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot convert your own account; use a different admin account",
+        )
+
+    service = AdminService(db)
+    try:
+        user, provider_slug = await service.convert_saml_user_to_local(
+            user_id, body.password
+        )
+    except ValueError as exc:
+        # Every other ValueError (auth_provider mismatch, no SAML linkage) is
+        # a 422.
+        _raise_on_error(exc, status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+    ip = get_client_ip(request)
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=current_user.id,
+            action="user.convert_saml_to_local",
+            resource_type="user",
+            resource_id=user_id,
+            details={"from": "saml", "to": "local", "provider_slug": provider_slug},
+            ip_address=ip,
+        ),
+    )
+    try:
+        await db.commit()
+    except Exception:  # broad: commit can fail with diverse asyncpg/transaction errors; log and bubble for handler
+        # A failed commit may still have landed (a lost acknowledgement), so
+        # whether the conversion and its audit row persisted is unknown.
+        # Logged so operators can reconcile against the database.
+        logger.exception(
+            "convert_saml_to_local commit failed",
+            user_id=str(user_id),
+            admin_id=str(current_user.id),
+            provider_slug=provider_slug,
+        )
+        raise
+    return _user_response(user)
+
+
+@router.post(
+    "/users/{user_id}/approve",
+    response_model=UserResponse,
+    include_in_schema=False,
+)
+@router.post(
+    "/users/{user_id}/approve/",
+    response_model=UserResponse,
+)
+@limiter.limit("30/minute")
+async def approve_user(
+    user_id: uuid.UUID,
+    body: ApproveRequest,
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Approve a pending user with the specified role (admin only)."""
+    service = AdminService(db)
+    try:
+        user = await service.approve_user(user_id, body.role)
+    except PendingUserTransitionConflict as exc:
+        _raise_on_error(exc, status.HTTP_409_CONFLICT)
+    except ValueError as exc:
+        _raise_on_error(exc, status.HTTP_400_BAD_REQUEST)
+    ip = get_client_ip(request)
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=current_user.id,
+            action="user.approve",
+            resource_type="user",
+            resource_id=user_id,
+            details={"username": user.username, "role": body.role},
+            ip_address=ip,
+        ),
+    )
+    await db.commit()
+    return _user_response(user)
+
+
+@router.post(
+    "/users/{user_id}/reject",
+    status_code=status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+@router.post(
+    "/users/{user_id}/reject/",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+@limiter.limit("30/minute")
+async def reject_user(
+    user_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Reject a pending user by hard-deleting them (admin only)."""
+    service = AdminService(db)
+    try:
+        await service.reject_user(user_id)
+    except PendingUserTransitionConflict as exc:
+        _raise_on_error(exc, status.HTTP_409_CONFLICT)
+    except ValueError as exc:
+        _raise_on_error(exc, status.HTTP_400_BAD_REQUEST)
+    ip = get_client_ip(request)
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=current_user.id,
+            action="user.reject",
+            resource_type="user",
+            resource_id=user_id,
+            ip_address=ip,
+        ),
+    )
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete(
+    "/users/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+@limiter.limit("30/minute")
+async def delete_user(
+    user_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Hard-delete a user (admin only). Returns 400 for self-deletion or last-admin."""
+    service = AdminService(db)
+    try:
+        deleted_username = await service.delete_user(user_id, current_user.id)
+    except ValueError as exc:
+        _raise_on_error(exc, status.HTTP_400_BAD_REQUEST)
+    ip = get_client_ip(request)
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=current_user.id,
+            action="user.delete",
+            resource_type="user",
+            resource_id=user_id,
+            details={"username": deleted_username},
+            ip_address=ip,
+        ),
+    )
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/stats",
+    response_model=CatalogStatsResponse,
+    include_in_schema=False,
+)
+@router.get(
+    "/stats/",
+    response_model=CatalogStatsResponse,
+)
+async def get_catalog_stats(
+    user: User = Depends(require_permission("manage_users")),
+    db: AsyncSession = Depends(get_db),
+) -> CatalogStatsResponse:
+    """Return catalog statistics: counts, storage, breakdowns (admin only)."""
+    service = AdminService(db)
+    return await service.get_catalog_stats()
+
+
+@router.get(
+    "/jobs",
+    response_model=AdminJobListResponse,
+    dependencies=[Depends(require_permission("manage_users"))],
+    include_in_schema=False,
+)
+@router.get(
+    "/jobs/",
+    response_model=AdminJobListResponse,
+    dependencies=[Depends(require_permission("manage_users"))],
+)
+async def list_admin_jobs(
+    status: str | None = Query(
+        None,
+        description=(
+            "Job status to match. 'failed' leaves out replacements held for "
+            "review, which 'awaiting_review' lists while their run still needs "
+            "a decision."
+        ),
+    ),
+    user_id: uuid.UUID | None = Query(None),
+    search: str | None = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    sort: JobSortField = Query(
+        "created_at",
+        description=(
+            "Column to order by. Duration orders by the completed_at - "
+            "started_at interval, so unfinished jobs sort last either way."
+        ),
+    ),
+    order: SortDirection = Query("desc", description="Sort direction."),
+    db: AsyncSession = Depends(get_db),
+) -> AdminJobListResponse:
+    """List all ingestion jobs with optional status/user/search/sort filters (admin only).
+
+    `sort` and `order` are closed enums, so an unrecognised value is refused
+    with a 422 and never reaches the query.
+    """
+    service = AdminService(db)
+    rows, total = await service.list_jobs(
+        status=status,
+        user_id=user_id,
+        search=search,
+        skip=skip,
+        limit=limit,
+        sort=sort,
+        order=order,
+    )
+    retry_capabilities = await asyncio.gather(
+        *(get_retry_capability(job) for job, _username in rows)
+    )
+    held = [job.id for job, _ in rows if job.error_code == REVIEW_REQUIRED]
+    states = await review_states(db, held)
+    jobs = [
+        AdminJobResponse(
+            id=job.id,
+            status=job.status,
+            source_filename=job.source_filename,
+            dataset_id=job.dataset_id,
+            error_message=job.error_message,
+            error_code=job.error_code,
+            review_state=states.get(job.id),
+            can_retry=can_retry,
+            retry_reason=retry_reason,
+            source_url=_listed_source_url(job),
+            restart_source=None if can_retry else _restart_source(job),
+            user_metadata=public_job_metadata(job.user_metadata),
+            created_by=job.created_by,
+            username=username,
+            started_at=job.started_at,
+            completed_at=job.completed_at,
+            created_at=job.created_at,
+        )
+        for (job, username), (can_retry, retry_reason) in zip(
+            rows, retry_capabilities, strict=True
+        )
+    ]
+    return AdminJobListResponse(jobs=jobs, total=total)
+
+
+# Jobs that write to an existing dataset or are not imports at all; starting one
+# again from the import page would create a second dataset.
+_NOT_NEW_DATASET_MARKERS = (
+    "reupload",
+    "refresh",
+    "manifest_key",
+    "analysis",
+    EMBEDDING_BACKFILL_METADATA_KEY,
+    FAN_OUT_INTERRUPTED_METADATA_KEY,
+)
+
+
+def _restart_source(job: IngestJob) -> Literal["url", "service"] | None:
+    metadata = job.user_metadata or {}
+    if job.status != "failed" or any(metadata.get(m) for m in _NOT_NEW_DATASET_MARKERS):
+        return None
+    if job.source_url and not job.file_path:
+        return "service"
+    if metadata.get(URL_IMPORT_METADATA_KEY) or metadata.get(
+        URL_DOWNLOAD_IN_FLIGHT_METADATA_KEY
+    ):
+        return "url"
+    return None
+
+
+def _listed_source_url(job: IngestJob) -> str | None:
+    url = job.source_url or (job.user_metadata or {}).get(URL_IMPORT_METADATA_KEY)
+    return redact_url_credentials(url) if isinstance(url, str) and url else None
+
+
+def _ai_status(
+    enabled: bool,
+    provider: str,
+    semantic_search_enabled: bool = False,
+    has_embeddings: bool = False,
+    model: str | None = None,
+) -> AIStatusResponse:
+    """Build AIStatusResponse from the SELECTED provider + DB toggle.
+
+    ``configured`` reflects only the SELECTED ``LLM_PROVIDER``'s key, matching
+    what ``_check_ai_available`` gates chat on — the other provider's key is
+    metadata only and never flips ``configured``/``provider``.
+    """
+    keys = {
+        "anthropic": anthropic_configured(),
+        "openai_compatible": app_settings.openai_api_key,
+    }
+    display_names = {"anthropic": "anthropic", "openai_compatible": "openai"}
+
+    selected_key = keys.get(provider)
+    # "" means the provider has no default model (Bedrock, Vertex) and no override.
+    configured = bool(selected_key) and model != ""
+    return AIStatusResponse(
+        provider=display_names.get(provider) if configured else None,
+        model=model if configured else None,
+        enabled=enabled,
+        configured=configured,
+        semantic_search_enabled=semantic_search_enabled,
+        has_embeddings=has_embeddings,
+    )
+
+
+# exclude_unset so the `probe` field appears ONLY when the caller
+# opted in; the default response keeps its probe-less JSON shape.
+# Safe because _ai_status passes every other field explicitly.
+@router.get(
+    "/ai-status",
+    response_model=AIStatusResponse,
+    response_model_exclude_unset=True,
+    dependencies=[Depends(require_ai_status_reader)],
+    include_in_schema=False,
+)
+@router.get(
+    "/ai-status/",
+    response_model=AIStatusResponse,
+    response_model_exclude_unset=True,
+    dependencies=[Depends(require_ai_status_reader)],
+)
+# probe=true spends real provider quota and can hold a worker for
+# the probe timeout — same 30/minute cap as the PATCH sibling; plain status
+# reads share it too, but dashboards fetch far less than 30/minute.
+@limiter.limit("30/minute")
+async def get_ai_status(
+    request: Request,
+    probe: bool = Query(
+        default=False,
+        description="When true, run a minimal LIVE provider call per purpose "
+        "(chat + embeddings) to verify the configured key actually works. "
+        "Costs a real provider API call — never enabled by dashboards.",
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> AIStatusResponse:
+    """Return single-deployment AI status; no provider-routing policy controls (admin only)."""
+    from app.core.persistent_config import (
+        AI_ENABLED,
+        LLM_MODEL,
+        LLM_PROVIDER,
+        SEMANTIC_SEARCH_ENABLED,
+    )
+
+    from app.processing.embeddings.helpers import has_embeddings
+
+    enabled = await AI_ENABLED.get(db)
+    provider = await LLM_PROVIDER.get(db)
+    semantic = await SEMANTIC_SEARCH_ENABLED.get(db)
+    has_embeds = await has_embeddings(db)
+    result = _ai_status(
+        enabled,
+        provider,
+        semantic_search_enabled=semantic,
+        has_embeddings=has_embeds,
+        model=await LLM_MODEL.for_provider(db, provider),
+    )
+    if probe:
+        from app.processing.ai.probe import run_ai_probe
+
+        result.probe = await run_ai_probe(db)
+    return result
+
+
+# exclude_unset for shape parity with GET (probe is never set here).
+@router.patch(
+    "/ai-status",
+    response_model=AIStatusResponse,
+    response_model_exclude_unset=True,
+    include_in_schema=False,
+)
+@router.patch(
+    "/ai-status/",
+    response_model=AIStatusResponse,
+    response_model_exclude_unset=True,
+)
+@limiter.limit("30/minute")
+async def update_ai_status(
+    body: AIStatusUpdate,
+    request: Request,
+    user: User = Depends(require_ai_status_writer),
+    db: AsyncSession = Depends(get_db),
+) -> AIStatusResponse:
+    """Toggle base AI features on/off at runtime; no provider-routing policy controls (admin only)."""
+    from app.processing.embeddings.helpers import has_embeddings
+    from app.core.persistent_config import (
+        AI_ENABLED,
+        LLM_MODEL,
+        LLM_PROVIDER,
+        SEMANTIC_SEARCH_ENABLED,
+    )
+
+    await AI_ENABLED.set(
+        db,
+        body.enabled,
+        user_id=user.id,
+        ip_address=get_client_ip(request),
+    )
+    provider = await LLM_PROVIDER.get(db)
+    semantic = await SEMANTIC_SEARCH_ENABLED.get(db)
+    has_embeds = await has_embeddings(db)
+    return _ai_status(
+        body.enabled,
+        provider,
+        semantic_search_enabled=semantic,
+        has_embeddings=has_embeds,
+        model=await LLM_MODEL.for_provider(db, provider),
+    )
+
+
+@router.get(
+    "/embedding-stats",
+    response_model=EmbeddingStatsResponse,
+    dependencies=[Depends(require_permission("manage_users"))],
+    include_in_schema=False,
+)
+@router.get(
+    "/embedding-stats/",
+    response_model=EmbeddingStatsResponse,
+    dependencies=[Depends(require_permission("manage_users"))],
+)
+async def get_embedding_stats(
+    db: AsyncSession = Depends(get_db),
+) -> EmbeddingStatsResponse:
+    """Return embedding coverage and the state of the backfill runs (admin only)."""
+    service = AdminService(db)
+    return await service.get_embedding_stats()
+
+
+async def _settle_undispatched_backfill(
+    db: AsyncSession, job_uuid: uuid.UUID, audit_context: dict[str, Any]
+) -> None:
+    """Close a backfill whose request ended before a worker took it.
+
+    Shielded so the cancellation that triggered it cannot cancel the cleanup,
+    and bounded so a hung database cannot stall a deploy. Never raises: the
+    caller re-raises the cancellation, and the stale-pending sweep is the
+    backstop for anything this could not reach.
+    """
+    from app.modules.admin.backfill_jobs import settle_undispatched_run
+
+    try:
+        await asyncio.shield(
+            asyncio.wait_for(
+                settle_undispatched_run(
+                    job_uuid, audit_context=audit_context, caller_session=db
+                ),
+                timeout=15,
+            )
+        )
+    except (
+        BaseException
+    ):  # broad: best-effort during shutdown; the caller's raise preserves the abort
+        logger.warning(
+            "embedding_backfill_dispatch_cancel_cleanup_failed",
+            job_id=audit_context["job_id"],
+            exc_info=True,
+        )
+
+
+async def _require_backfill_permission(
+    request: Request,
+    all_tenants: bool = False,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Require manage_users, or manage_tenants for a hosted all-tenant backfill.
+
+    A hosted fleet operator can change the shared embedding settings with
+    manage_tenants alone, so regenerating every tenant must not also demand
+    the per-tenant manage_users.
+    """
+    from app.core.tenancy import is_multi_tenant
+
+    capability = MANAGE_TENANTS if all_tenants and is_multi_tenant() else "manage_users"
+    return await require_permission(capability)(
+        request=request, current_user=current_user, db=db
+    )
+
+
+@router.post(
+    "/backfill-embeddings",
+    response_model=BackfillResponse,
+    include_in_schema=False,
+)
+@router.post(
+    "/backfill-embeddings/",
+    response_model=BackfillResponse,
+    responses={409: CONFLICT_RESPONSE, 503: QUEUE_UNAVAILABLE_RESPONSE},
+)
+@limiter.limit("30/minute")
+async def trigger_backfill(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    force: bool = False,
+    all_tenants: bool = False,
+    current_user: User = Depends(_require_backfill_permission),
+) -> BackfillResponse:
+    """Queue semantic-search embedding generation for records (admin only).
+
+    Pass ?force=true to regenerate every record and replace its stored vectors.
+    Without it, the run embeds only records that lack a current-model embedding.
+
+    The run covers the calling tenant's records. In a multi-tenant deployment
+    the embedding model and width are shared by every tenant, so a change
+    leaves each tenant to regenerate. Pass ?all_tenants=true to also queue a
+    run for every other registered tenant; there it needs
+    manage_tenants instead of manage_users, and ``other_tenants`` reports
+    each run. When the calling tenant already has a run in flight, the status
+    is ``already_running``, ``job_id`` is that run (null when the caller may
+    not read it) and the other tenants are still queued. This request did not queue that run and it may predate the
+    change, so run the backfill again once it ends. A single-tenant
+    deployment ignores the flag.
+
+    The run happens on the job queue because a full regeneration can exceed
+    request timeouts. This endpoint returns the job id; poll
+    ``GET /jobs/{job_id}`` for the outcome.
+    """
+    from app.core.tenancy import is_multi_tenant
+
+    every_tenant = all_tenants and is_multi_tenant()
+    ip_address = get_client_ip(request)
+    # One operation id across every tenant's run ties the system runs queued
+    # elsewhere to this request's audited actor.
+    operation_id = str(uuid.uuid4())
+    try:
+        job = await _queue_backfill_run(
+            db,
+            force=force,
+            requested_by=current_user.id,
+            ip_address=ip_address,
+            operation_id=operation_id,
+        )
+    except HTTPException as exc:
+        if not every_tenant or exc.status_code != status.HTTP_409_CONFLICT:
+            raise
+        from app.modules.admin.backfill_jobs import find_active_embedding_backfill
+
+        # The run may have ended since it refused this one; the fleet still
+        # goes ahead and this tenant is left for a rerun either way.
+        active = await find_active_embedding_backfill(db)
+        readable = active is not None and (
+            active.created_by == current_user.id
+            or await _can_access_another_users_job(
+                request, db, current_user, active, log_denial=False
+            )
+        )
+        job_id = active.id if active is not None and readable else None
+        job_status = "already_running"
+    else:
+        job_id, job_status = job.id, "pending"
+    other_tenants = (
+        await _queue_backfill_for_other_tenants(force=force, operation_id=operation_id)
+        if every_tenant
+        else []
+    )
+    return BackfillResponse(
+        job_id=job_id, status=job_status, other_tenants=other_tenants
+    )
+
+
+async def _queue_backfill_run(
+    db: AsyncSession,
+    *,
+    force: bool,
+    requested_by: uuid.UUID | None,
+    ip_address: str | None,
+    operation_id: str,
+) -> IngestJob:
+    """Queue one backfill run for the tenant ``db`` is scoped to.
+
+    ``requested_by`` is None for a run queued on another tenant's behalf: the
+    database refuses a job or audit row whose user belongs to a different
+    tenant. Raises 409 when that tenant already has a run in flight and 503
+    when the queue refuses the job.
+    """
+    from app.modules.admin.backfill_jobs import (
+        UNRESOLVED_OUTCOME,
+        find_active_embedding_backfill,
+        run_embedding_backfill,
+    )
+
+    requester = str(requested_by) if requested_by is not None else None
+
+    # Retrying after a 504 could start a second regenerate (a second DELETE on
+    # the force path), and the pre-flight guards don't see concurrent runs.
+    # This SELECT is the FRIENDLY half; the real guard is the partial unique
+    # index from migration 0050, since a check-then-insert is a TOCTOU the
+    # database must serialize, not the application.
+    active = await find_active_embedding_backfill(db)
+    if active is not None:
+        _refuse_backfill_in_flight(
+            active_job_id=str(active.id),
+            user_id=requester,
+            force=force,
+            detected_by="preflight_query",
+        )
+
+    audit_context = {
+        "user_id": requester,
+        "ip_address": ip_address,
+        "operation_id": operation_id,
+        "force": force,
+    }
+
+    # The insert lands with null user_metadata; only the later UPDATE that sets
+    # the backfill marker makes the partial unique index reject a duplicate,
+    # and that UPDATE flushes on this session's first flush, well before commit.
+    pending_job_id: uuid.UUID | None = None
+    try:
+        job = await get_catalog_port().create_ingest_job(
+            db, "embedding-backfill", "", requested_by
+        )
+        pending_job_id = job.id
+        job.user_metadata = {
+            EMBEDDING_BACKFILL_METADATA_KEY: {
+                "force": force,
+                "operation_id": operation_id,
+            }
+        }
+        # As analysis does: a pending job that says "queued" reads as waiting
+        # rather than as a job with nothing to say for itself.
+        job.current_step = "queued"
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=requested_by,
+                action="embedding.backfill",
+                resource_type="record_embedding",
+                details={
+                    "force": force,
+                    "operation_id": operation_id,
+                    "job_id": str(job.id),
+                    "outcome": "requested",
+                },
+                ip_address=ip_address,
+            ),
+        )
+        # One commit for the job row and the operator's request: the row is what
+        # a concurrent request is refused against, and it must be durable before
+        # anything can pick the run up.
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if ACTIVE_BACKFILL_INDEX_NAME not in str(getattr(exc, "orig", exc)):
+            # Some other constraint: reporting it as a concurrency refusal
+            # would be a fabricated answer.
+            raise
+        # The index refused it: another request won the race between the
+        # SELECT above and this write. The transaction rolled back job row and
+        # audit entry together, so the loser leaves no trace of a run that
+        # never started.
+        winner = await find_active_embedding_backfill(db)
+        _refuse_backfill_in_flight(
+            active_job_id=str(winner.id) if winner is not None else None,
+            user_id=requester,
+            force=force,
+            detected_by="unique_index",
+        )
+    except BaseException:
+        # ANY failure of that commit can be a lost acknowledgement, not only a
+        # cancellation, and one that never landed matches no row, so the fenced
+        # cleanup is right for the whole class.
+        if pending_job_id is not None:
+            await _settle_undispatched_backfill(
+                db, pending_job_id, {**audit_context, "job_id": str(pending_job_id)}
+            )
+        raise
+
+    async def _defer() -> None:
+        await defer_async_with_tenant(
+            run_embedding_backfill,
+            job_id=str(job.id),
+            attempt_id=str(job.attempt_id),
+            force=force,
+            user_id=requester,
+            ip_address=ip_address,
+            operation_id=operation_id,
+        )
+
+    job_id = str(job.id)
+    try:
+        await defer_with_orphan_guard(
+            _defer,
+            rollback=make_ingest_job_failed_rollback(
+                job,
+                message_prefix="Failed to queue embedding backfill",
+                ip_address=ip_address,
+            ),
+            db=db,
+            job=job,
+        )
+    except DeferFailed as dispatch_exc:
+        # A landed rollback closed the trail with the row, and a missed one
+        # leaves both to the worker. Only an unlanded rollback leaves the row
+        # pending, so the trail says the outcome is unresolved.
+        if not dispatch_exc.rolled_back:
+            logger.error(
+                "embedding_backfill_dispatch_rollback_failed",
+                user_id=requester,
+                operation_id=operation_id,
+                job_id=job_id,
+            )
+            try:
+                await audit_emit_durable(
+                    AuditEvent(
+                        user_id=requested_by,
+                        action="embedding.backfill",
+                        resource_type="record_embedding",
+                        details={
+                            "force": force,
+                            "operation_id": operation_id,
+                            "job_id": job_id,
+                            "outcome": UNRESOLVED_OUTCOME,
+                            "error_code": "dispatch_rollback_failed",
+                            "intended_outcome": "failed",
+                        },
+                        ip_address=ip_address,
+                    ),
+                )
+            except Exception:  # broad: the audit write must not mask the 503
+                logger.exception(
+                    "embedding_backfill_dispatch_audit_failed",
+                    user_id=requester,
+                    operation_id=operation_id,
+                    job_id=job_id,
+                )
+        raise
+    except asyncio.CancelledError:
+        # The orphan guard catches `Exception`, so cancellation here bypasses
+        # it and `DeferFailed` above. Cleanup is fenced on `pending` and
+        # shielded, and the cancellation is re-raised so shutdown still works.
+        await _settle_undispatched_backfill(
+            db, job.id, {**audit_context, "job_id": job_id}
+        )
+        raise
+    return job
+
+
+async def _queue_backfill_for_other_tenants(
+    *, force: bool, operation_id: str
+) -> list[BackfillTenantRun]:
+    """Queue a backfill in every registered tenant except the caller's.
+
+    Tenants come from the registry rather than the request, and each run is
+    queued in its own session under that tenant's context, as a system run
+    with no user or client address, which belong to the caller's tenant. A
+    tenant with nothing to embed still gets a run, which finishes at once;
+    checking for records first would scan the shared table per tenant. A
+    refusal or failure in one tenant is reported and the loop moves on.
+    """
+    from app.core.db import async_session
+
+    caller = current_tenant_var.get()
+    async with async_session() as registry_session:
+        tenant_ids = [
+            str(tenant_id)
+            for tenant_id in (
+                await registry_session.execute(
+                    text("SELECT id FROM catalog.tenants ORDER BY id")
+                )
+            ).scalars()
+        ]
+
+    runs: list[BackfillTenantRun] = []
+    for tenant_id in tenant_ids:
+        if caller is not None and tenant_id == str(uuid.UUID(caller)):
+            continue
+        try:
+            with tenant_job_context(tenant_id):
+                async with async_session() as tenant_db:
+                    job = await _queue_backfill_run(
+                        tenant_db,
+                        force=force,
+                        requested_by=None,
+                        ip_address=None,
+                        operation_id=operation_id,
+                    )
+        except HTTPException as exc:
+            refused = exc.status_code == status.HTTP_409_CONFLICT
+            runs.append(
+                BackfillTenantRun(
+                    tenant_id=uuid.UUID(tenant_id),
+                    job_id=None,
+                    status="already_running" if refused else "not_queued",
+                )
+            )
+            continue
+        except Exception:  # broad: one tenant's failure must not stop the rest
+            logger.exception(
+                "embedding_backfill_tenant_queue_failed", tenant_id=tenant_id
+            )
+            runs.append(
+                BackfillTenantRun(
+                    tenant_id=uuid.UUID(tenant_id), job_id=None, status="not_queued"
+                )
+            )
+            continue
+        runs.append(
+            BackfillTenantRun(
+                tenant_id=uuid.UUID(tenant_id), job_id=job.id, status="pending"
+            )
+        )
+    return runs

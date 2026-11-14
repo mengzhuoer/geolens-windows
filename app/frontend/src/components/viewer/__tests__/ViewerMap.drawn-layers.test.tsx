@@ -1,0 +1,224 @@
+// The viewer reports what it draws each layer as once any bounded cluster GeoJSON has settled.
+import { useState, type ReactNode } from 'react';
+import { act, render, screen, waitFor, within } from '@/test/test-utils';
+import { BLANK_BASEMAP_ID } from '@/lib/basemap-utils';
+import { fetchBoundedGeoJson, type BoundedGeoJsonResponse } from '@/api/geojson-z';
+import { recordTileSampling } from '@/lib/tile-sampling';
+import type { DrawnLayer } from '@/components/map/legend-facts';
+import type { SharedLayerResponse } from '@/types/api';
+import { SAVED_LAYERS, toSharedLayer } from '@/test/fixtures/saved-layers';
+import { LayerLegend } from '../LayerLegend';
+import { ViewerMap } from '../ViewerMap';
+
+const mapState = vi.hoisted(() => {
+  const canvas = {
+    width: 800, height: 600, clientWidth: 800, clientHeight: 600,
+    style: { cursor: '' },
+    addEventListener: vi.fn(), removeEventListener: vi.fn(),
+  };
+  return {
+    fakeMap: {
+      isStyleLoaded: vi.fn(() => true),
+      on: vi.fn(),
+      off: vi.fn(),
+      once: vi.fn(),
+      setTransformRequest: vi.fn(),
+      getLayer: vi.fn(() => ({ id: 'x' })),
+      getSource: vi.fn(() => null),
+      getStyle: vi.fn(() => ({ version: 8, sources: {}, layers: [] })),
+      queryRenderedFeatures: vi.fn(() => []),
+      getCanvas: vi.fn(() => canvas),
+      getZoom: vi.fn(() => 5),
+      coveringTiles: vi.fn(() => [] as { canonical: { z: number; x: number; y: number } }[]),
+      setMissingStyleImageResolver: vi.fn(),
+      setLayoutProperty: vi.fn(),
+      setTerrain: vi.fn(),
+      triggerRepaint: vi.fn(),
+    },
+  };
+});
+
+vi.mock('@vis.gl/react-maplibre', async () => {
+  const React = await import('react');
+  return {
+    Map: ({ children, onLoad }: { children?: ReactNode; onLoad?: (e: { target: unknown }) => void }) => {
+      React.useEffect(() => { onLoad?.({ target: mapState.fakeMap }); }, [onLoad]);
+      return <div data-testid="mapgl">{children}</div>;
+    },
+    NavigationControl: () => null,
+    ScaleControl: () => null,
+    FullscreenControl: () => null,
+    AttributionControl: () => null,
+    TerrainControl: () => null,
+    Popup: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  };
+});
+vi.mock('@/hooks/use-settings', () => ({
+  useBasemaps: () => ({ data: [] }),
+  useTileConfig: () => ({ data: { cdn_base_url: null, mvt_source_layer_prefix: 'data' } }),
+  useBranding: () => ({ data: undefined }),
+}));
+vi.mock('@/hooks/use-webgl-recovery', () => ({
+  useWebGLRecovery: () => ({ contextLost: false, reload: vi.fn() }),
+}));
+vi.mock('@/components/viewer/hooks/use-viewer-tokens', () => ({
+  useViewerTokens: () => ({ tokenMap: new Map() }),
+}));
+vi.mock('@/components/viewer/hooks/use-viewer-terrain', () => ({
+  useViewerTerrain: () => ({ terrainReady: false, reseedTerrainOnStyleLoad: vi.fn() }),
+  isViewerTerrainExpected: () => false,
+}));
+vi.mock('@/components/map/MapCoordReadout', () => ({ MapCoordReadout: () => null }));
+vi.mock('@/api/geojson-z', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/api/geojson-z')>(),
+  fetchBoundedGeoJson: vi.fn(),
+}));
+vi.mock('@/components/builder/map-composition-sync', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/components/builder/map-composition-sync')>(),
+  applyMapBasemapAppearance: vi.fn(),
+  syncMapComposition: vi.fn(),
+}));
+
+const EMPTY_GEOJSON: BoundedGeoJsonResponse = { type: 'FeatureCollection', features: [], truncated: false, total_count: 0 };
+const { polygon, boundedCluster: cluster } = SAVED_LAYERS;
+
+function renderViewer(onDrawnChange: (drawn: ReadonlyMap<string, unknown>) => void) {
+  const layers = [polygon, cluster];
+  return render(
+    <ViewerMap
+      layers={layers.map(toSharedLayer)}
+      basemapStyle={BLANK_BASEMAP_ID}
+      initialViewState={{ center_lng: 0, center_lat: 0, zoom: 2, bearing: 0, pitch: 0 }}
+      visibleLayers={new Set(layers.map((layer) => layer.id))}
+      onDrawnChange={onDrawnChange}
+    />,
+  );
+}
+
+const SHARED_LAYERS = [polygon, cluster].map(toSharedLayer);
+const VISIBLE = new Set([polygon.id, cluster.id]);
+
+/** The map and its legend, joined through state the way the viewer pages join them. */
+function ViewerWithLegend({ embedToken }: { embedToken: string }) {
+  const [drawn, setDrawn] = useState<ReadonlyMap<string, DrawnLayer>>();
+  return (
+    <>
+      <ViewerMap
+        layers={SHARED_LAYERS}
+        basemapStyle={BLANK_BASEMAP_ID}
+        initialViewState={{ center_lng: 0, center_lat: 0, zoom: 2, bearing: 0, pitch: 0 }}
+        visibleLayers={VISIBLE}
+        embedToken={embedToken}
+        onDrawnChange={setDrawn}
+      />
+      <LayerLegend layers={SHARED_LAYERS} visibleLayers={VISIBLE} onToggleVisibility={vi.fn()} isOpen onToggle={vi.fn()} drawn={drawn} />
+    </>
+  );
+}
+
+describe('ViewerMap drawn layers', () => {
+  afterEach(() => {
+    vi.mocked(fetchBoundedGeoJson).mockReset();
+  });
+
+  it('reports a bounded cluster whose GeoJSON arrived as a cluster', async () => {
+    vi.mocked(fetchBoundedGeoJson).mockResolvedValue(EMPTY_GEOJSON);
+    const onDrawnChange = vi.fn();
+    renderViewer(onDrawnChange);
+
+    await waitFor(() => expect(onDrawnChange).toHaveBeenCalled());
+    expect(onDrawnChange.mock.lastCall![0]).toEqual(new Map([
+      [polygon.id, { drawsAs: 'fill' }],
+      [cluster.id, { drawsAs: 'cluster' }],
+    ]));
+  });
+
+  it('refetches a bounded cluster\'s GeoJSON for a new data version, not for a filter change', async () => {
+    vi.mocked(fetchBoundedGeoJson).mockResolvedValue(EMPTY_GEOJSON);
+    const view = { center_lng: 0, center_lat: 0, zoom: 2, bearing: 0, pitch: 0 };
+    const withCluster = (changes: Partial<SharedLayerResponse>) =>
+      SHARED_LAYERS.map((layer) => (layer.id === cluster.id ? { ...layer, ...changes } : layer));
+    const viewer = (layers: SharedLayerResponse[]) => (
+      <ViewerMap layers={layers} basemapStyle={BLANK_BASEMAP_ID} initialViewState={view} visibleLayers={VISIBLE} />
+    );
+    const { rerender } = render(viewer(withCluster({ filter: null, tile_version: 1 })));
+    await waitFor(() => expect(fetchBoundedGeoJson).toHaveBeenCalledTimes(1));
+
+    // A dashboard pick hands the map new layer objects with a new filter.
+    rerender(viewer(withCluster({ filter: ['==', ['get', 'kind'], 'park'], tile_version: 1 })));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fetchBoundedGeoJson).toHaveBeenCalledTimes(1);
+
+    // The dataset changed while the viewer stayed open.
+    rerender(viewer(withCluster({ filter: ['==', ['get', 'kind'], 'park'], tile_version: 2 })));
+    await waitFor(() => expect(fetchBoundedGeoJson).toHaveBeenCalledTimes(2));
+  });
+
+  it('reports a layer as sampled while a sampled tile of it is in view', async () => {
+    vi.mocked(fetchBoundedGeoJson).mockResolvedValue(EMPTY_GEOJSON);
+    const template = 'https://geolens.test/api/tiles/data.parcels/{z}/{x}/{y}.pbf';
+    const tileUrl = 'https://geolens.test/api/tiles/data.parcels/2/1/1.pbf';
+    mapState.fakeMap.getSource.mockImplementation(((id: string) =>
+      id.endsWith(`source-data-${polygon.dataset_table_name}`)
+        ? { type: 'vector', tiles: [template], tileSize: 512, minzoom: 0, maxzoom: 14 }
+        : null) as () => null);
+    mapState.fakeMap.coveringTiles.mockReturnValue([{ canonical: { z: 2, x: 1, y: 1 } }]);
+    const onDrawnChange = vi.fn();
+    try {
+      renderViewer(onDrawnChange);
+      await waitFor(() => expect(onDrawnChange).toHaveBeenCalled());
+
+      act(() => recordTileSampling(tileUrl, true));
+      await waitFor(() =>
+        expect(onDrawnChange.mock.lastCall![0].get(polygon.id)).toEqual({ drawsAs: 'fill', sampled: true }));
+      expect(onDrawnChange.mock.lastCall![0].get(cluster.id)).toEqual({ drawsAs: 'cluster' });
+
+      act(() => recordTileSampling(tileUrl, false));
+      await waitFor(() => expect(onDrawnChange.mock.lastCall![0].get(polygon.id)).toEqual({ drawsAs: 'fill' }));
+    } finally {
+      mapState.fakeMap.getSource.mockImplementation(() => null);
+      mapState.fakeMap.coveringTiles.mockReturnValue([]);
+    }
+  });
+
+  it('reports a bounded cluster whose GeoJSON fetch failed as single points', async () => {
+    vi.mocked(fetchBoundedGeoJson).mockRejectedValue(new Error('offline'));
+    const onDrawnChange = vi.fn();
+    renderViewer(onDrawnChange);
+
+    await waitFor(() => expect(onDrawnChange).toHaveBeenCalled());
+    expect(onDrawnChange.mock.lastCall![0].get(cluster.id)).toEqual({ drawsAs: 'circle' });
+  });
+
+  it('lets the legend name the saved strategy again while a new bounded GeoJSON request loads', async () => {
+    vi.mocked(fetchBoundedGeoJson).mockRejectedValue(new Error('offline'));
+    const { rerender } = render(<ViewerWithLegend embedToken="first" />);
+    const bikeRacks = () => within(within(screen.getByRole('region', { name: 'Layers' })).getByText('Bike racks').closest('li')!);
+    await waitFor(() => expect(bikeRacks().getByText('Point fallback')).toBeInTheDocument());
+
+    vi.mocked(fetchBoundedGeoJson).mockReturnValue(new Promise(() => {}));
+    rerender(<ViewerWithLegend embedToken="second" />);
+
+    await waitFor(() => expect(bikeRacks().getByText('Bounded cluster')).toBeInTheDocument());
+  });
+
+  it('reports nothing while the bounded GeoJSON is loading', async () => {
+    vi.mocked(fetchBoundedGeoJson).mockReturnValue(new Promise(() => {}));
+    const onDrawnChange = vi.fn();
+    renderViewer(onDrawnChange);
+
+    await waitFor(() => expect(fetchBoundedGeoJson).toHaveBeenCalled());
+    expect(onDrawnChange).not.toHaveBeenCalled();
+  });
+
+  it('cancels the bounded GeoJSON read when the viewer unmounts', async () => {
+    vi.mocked(fetchBoundedGeoJson).mockReturnValue(new Promise(() => {}));
+    const { unmount } = renderViewer(vi.fn());
+
+    await waitFor(() => expect(fetchBoundedGeoJson).toHaveBeenCalled());
+    const options = vi.mocked(fetchBoundedGeoJson).mock.calls[0][1];
+    expect(options?.signal?.aborted).toBe(false);
+    unmount();
+    expect(options?.signal?.aborted).toBe(true);
+  });
+});

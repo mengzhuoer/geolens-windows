@@ -1,0 +1,179 @@
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { AlertCircle, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { useValidation } from '@/components/dataset/hooks/use-dataset';
+import { useFeatureFlags } from '@/hooks/use-settings';
+import { useAuthStore } from '@/stores/auth-store';
+import { semanticBadgeColors, validationLevelColors } from '@/lib/status-colors';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import {
+  getValidationFieldLabel,
+  getValidationNavigationAction,
+} from '@/lib/dataset-validation-navigation';
+import type { ValidationIssue } from '@/types/api';
+import {
+  deriveLikelyValidationCauses,
+  ValidationTroubleshootPanel,
+} from '@/components/dataset/ValidationTroubleshootPanel';
+
+interface ValidationStatusProps {
+  datasetId: string;
+  mode?: 'detailed' | 'compact';
+  canEdit?: boolean;
+  onNavigateToField?: (field: string) => void;
+}
+
+export function ValidationStatus({
+  datasetId,
+  mode = 'detailed',
+  canEdit = false,
+  onNavigateToField,
+}: ValidationStatusProps) {
+  const { t } = useTranslation('dataset');
+  const token = useAuthStore((s) => s.token);
+  const { data, isLoading } = useValidation(token ? datasetId : undefined);
+  const [troubleshootOpen, setTroubleshootOpen] = useState(false);
+  // require_metadata_for_publish is exposed by the PUBLIC
+  // /settings/feature-flags/ endpoint; the admin-only /settings/all/ endpoint
+  // 403s for non-admin/guest viewers on the dataset detail page.
+  const { data: featureFlags } = useFeatureFlags();
+  const requireMetadata = featureFlags?.require_metadata_for_publish ?? false;
+
+  if (isLoading || !data) return null;
+
+  const errorCount = data.errors.length;
+  const warningCount = data.warnings.length;
+  const hasIssues = errorCount > 0 || warningCount > 0;
+  const renderFieldLabel = (issue: ValidationIssue) => {
+    const label = getValidationFieldLabel(issue.field, t);
+    if (!canEdit || !onNavigateToField || !getValidationNavigationAction(issue.field)) {
+      return <span className="font-medium">{label}:</span>;
+    }
+    return (
+      <button
+        type="button"
+        className="font-medium underline underline-offset-2 rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2"
+        onClick={() => onNavigateToField(issue.field)}
+        aria-label={`${t('validation.goToField')}: ${label}`}
+      >
+        {label}:
+      </button>
+    );
+  };
+
+  const helperText = errorCount > 0
+    ? t(requireMetadata ? 'validation.helperBlocking' : 'validation.helperIssues')
+    : t('validation.helperWarnings');
+
+  const statusBadge = errorCount > 0 ? (
+    <Badge className={`${semanticBadgeColors.destructive} gap-1`}>
+      <AlertCircle className={`h-3.5 w-3.5 ${validationLevelColors.error}`} />
+      {t(requireMetadata ? 'validation.issuesBlocking' : 'validation.issuesFound', { count: errorCount })}
+    </Badge>
+  ) : warningCount > 0 ? (
+    <Badge className={`${semanticBadgeColors.warning} gap-1`}>
+      <AlertTriangle className={`h-3.5 w-3.5 ${validationLevelColors.warning}`} />
+      {t('validation.warnings', { count: warningCount })}
+    </Badge>
+  ) : (
+    <Badge className={`${semanticBadgeColors.success} gap-1`}>
+      <CheckCircle2 className={`h-3.5 w-3.5 ${validationLevelColors.success}`} />
+      {t('validation.readyToPublish')}
+    </Badge>
+  );
+
+  if (mode === 'compact') {
+    const likelyCauses = deriveLikelyValidationCauses([...data.errors, ...data.warnings], 2, t);
+    return (
+      <div className="flex flex-wrap items-center gap-2" data-testid="validation-status-compact">
+        {statusBadge}
+        {hasIssues && likelyCauses.length > 0 && (
+          <span className="text-xs text-muted-foreground" data-testid="validation-likely-causes-compact">
+            {t('validation.likelyCompact')} {likelyCauses.join(' · ')}
+          </span>
+        )}
+        {hasIssues && (
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="h-auto px-0"
+            onClick={() => setTroubleshootOpen(true)}
+            data-testid="validation-troubleshoot-trigger"
+          >
+            {t(canEdit ? 'validation.troubleshootAction' : 'overview.reviewIssues')}
+          </Button>
+        )}
+        <ValidationTroubleshootPanel
+          open={troubleshootOpen}
+          onOpenChange={setTroubleshootOpen}
+          errors={data.errors}
+          warnings={data.warnings}
+          canEdit={canEdit}
+          onNavigateToField={onNavigateToField}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {statusBadge}
+
+      {hasIssues && (
+        <div className="space-y-2 rounded-md border border-border/70 bg-muted/30 px-3 py-2">
+          <p className="text-sm text-foreground" data-testid="validation-helper-text">
+            {canEdit ? helperText : t('validation.readOnlyGuidance')}
+          </p>
+
+          <Button
+            type="button"
+            variant="link"
+            size="sm"
+            className="h-auto px-0"
+            onClick={() => setTroubleshootOpen(true)}
+            data-testid="validation-troubleshoot-trigger"
+          >
+            {t(canEdit ? 'validation.troubleshootAction' : 'overview.reviewIssues')}
+          </Button>
+        </div>
+      )}
+
+      {errorCount > 0 && (
+        <ul className="space-y-1">
+          {data.errors.map((issue, i) => (
+            <li key={`err-${i}`} className="flex items-start gap-1.5 text-sm text-destructive">
+              <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+              <span>
+                {renderFieldLabel(issue)} {issue.message}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {warningCount > 0 && (
+        <ul className="space-y-1">
+          {data.warnings.map((issue, i) => (
+            <li key={`warn-${i}`} className="flex items-start gap-1.5 text-sm text-warning">
+              <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+              <span>
+                {renderFieldLabel(issue)} {issue.message}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <ValidationTroubleshootPanel
+        open={troubleshootOpen}
+        onOpenChange={setTroubleshootOpen}
+        errors={data.errors}
+        warnings={data.warnings}
+        canEdit={canEdit}
+        onNavigateToField={onNavigateToField}
+      />
+    </div>
+  );
+}

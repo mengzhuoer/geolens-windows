@@ -1,0 +1,158 @@
+"""Tests for the Titiler COG URL helper.
+
+Pins:
+- Helper output shape for every Titiler call site (info, statistics, tiles).
+- URL-encoding of caller-supplied query parameters (the `url=` key in
+  particular, which carries user-supplied STAC asset hrefs).
+- raw_query_suffix passthrough for the pre-built render-params string
+  (which uses repeated `bidx` keys that urlencode would dedupe).
+- Structural regression: every caller imports the helper and contains
+  zero literal `http://titiler:8000` strings.
+"""
+
+from app.platform.storage.titiler_url import build_titiler_cog_url
+
+
+def test_build_titiler_cog_url_no_query():
+    """Bare endpoint — no query — produces canonical Titiler info URL."""
+    assert build_titiler_cog_url("info") == "http://titiler:8000/cog/info"
+
+
+def test_build_titiler_cog_url_with_query(monkeypatch):
+    """The source path is URL-encoded into the query string."""
+    monkeypatch.setattr(
+        "app.platform.storage.titiler_url._managed_prefix", lambda: "/vsis3/bucket/"
+    )
+    result = build_titiler_cog_url("info", query={"url": "/vsis3/bucket/a b.tif"})
+    assert result == "http://titiler:8000/cog/info?url=%2Fvsis3%2Fbucket%2Fa+b.tif"
+
+
+def test_build_titiler_cog_url_with_raw_suffix():
+    """raw_query_suffix is preserved verbatim (supports repeated keys like bidx)."""
+    result = build_titiler_cog_url(
+        "tiles/WebMercatorQuad/5/10/15.png",
+        raw_query_suffix="bidx=1&bidx=2&rescale=0,255",
+    )
+    assert result == (
+        "http://titiler:8000/cog/tiles/WebMercatorQuad/5/10/15.png"
+        "?bidx=1&bidx=2&rescale=0,255"
+    )
+
+
+def test_build_titiler_cog_url_combines_query_and_raw_suffix(monkeypatch):
+    """Both query and raw_query_suffix supplied — combined with `&`."""
+    monkeypatch.setattr(
+        "app.platform.storage.titiler_url._managed_prefix", lambda: "/vsis3/bucket/"
+    )
+    result = build_titiler_cog_url(
+        "tiles/WebMercatorQuad/5/10/15.png",
+        query={"url": "/vsis3/bucket/foo.tif"},
+        raw_query_suffix="bidx=1&bidx=2&rescale=0,255",
+    )
+    assert result == (
+        "http://titiler:8000/cog/tiles/WebMercatorQuad/5/10/15.png"
+        "?url=%2Fvsis3%2Fbucket%2Ffoo.tif"
+        "&bidx=1&bidx=2&rescale=0,255"
+    )
+
+
+def test_build_titiler_cog_url_strips_leading_question_or_amp_from_raw_suffix():
+    """raw_query_suffix tolerates a leading `?` or `&` (caller may pre-mark it).
+
+    Output must never produce `??bidx=1` or `?&bidx=1`.
+    """
+    # leading ?
+    result_q = build_titiler_cog_url("info", raw_query_suffix="?bidx=1")
+    assert result_q == "http://titiler:8000/cog/info?bidx=1"
+
+    # leading &
+    result_amp = build_titiler_cog_url("info", raw_query_suffix="&bidx=1")
+    assert result_amp == "http://titiler:8000/cog/info?bidx=1"
+
+
+def test_build_titiler_cog_url_handles_tiles_path():
+    """Endpoint with nested slashes (Titiler tiles route) is preserved verbatim."""
+    result = build_titiler_cog_url("tiles/WebMercatorQuad/5/10/15.png")
+    assert result == "http://titiler:8000/cog/tiles/WebMercatorQuad/5/10/15.png"
+
+
+# ---------------------------------------------------------------------------
+# Structural regression pins
+#
+# These tests fail if a future hand silently re-inlines `http://titiler:8000`
+# into either caller file or drops the helper import. The combination of
+# "import exists" + "no literal in non-comment lines" guards against both
+# import-but-also-inline and inline-without-import shapes.
+# ---------------------------------------------------------------------------
+
+
+def test_tiles_router_uses_helper():
+    """Pin: backend/app/processing/tiles/router.py imports + uses build_titiler_cog_url."""
+    from pathlib import Path
+
+    source = Path(__file__).parent.parent / "app" / "processing" / "tiles" / "router.py"
+    text = source.read_text()
+    # Strip comments before checking for literal Titiler hosts. A
+    # comment names "Titiler" in prose but never the
+    # literal "http://titiler:8000" host string.
+    non_comment_lines = [
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    ]
+    non_comment_text = "\n".join(non_comment_lines)
+    assert "from app.platform.storage.titiler_url import build_titiler_cog_url" in text
+    assert "http://titiler:8000" not in non_comment_text, (
+        "tiles/router.py must NOT inline http://titiler:8000 -- use build_titiler_cog_url"
+    )
+
+
+def test_stac_cog_info_uses_helper():
+    """Pin: the STAC import path's Titiler calls go through build_titiler_cog_url.
+
+    The calls moved from ``stac_router`` to ``sources/cog_info``
+    when the refresh strategy needed to reach them — importing an API-edge
+    module executes route registration as a side effect. The pin follows the
+    code; the property it protects is unchanged. The router keeps its own
+    no-inlined-host assertion below, so the host cannot come back either side
+    of the split.
+    """
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parent.parent
+        / "app"
+        / "modules"
+        / "catalog"
+        / "sources"
+        / "cog_info.py"
+    )
+    text = source.read_text()
+    non_comment_lines = [
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    ]
+    non_comment_text = "\n".join(non_comment_lines)
+    assert "from app.platform.storage.titiler_url import build_titiler_cog_url" in text
+    assert "http://titiler:8000" not in non_comment_text, (
+        "cog_info.py must NOT inline http://titiler:8000 -- use build_titiler_cog_url"
+    )
+
+
+def test_stac_router_inlines_no_titiler_host():
+    """The router composes no Titiler URL of its own, and must not start."""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parent.parent
+        / "app"
+        / "modules"
+        / "catalog"
+        / "sources"
+        / "stac_router.py"
+    )
+    non_comment_text = "\n".join(
+        line
+        for line in source.read_text().splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "http://titiler:8000" not in non_comment_text, (
+        "stac_router.py must NOT inline http://titiler:8000 -- use build_titiler_cog_url"
+    )

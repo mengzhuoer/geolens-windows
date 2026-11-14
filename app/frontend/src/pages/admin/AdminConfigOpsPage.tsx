@@ -1,0 +1,674 @@
+import { useState, useRef, useCallback } from 'react';
+import { Trans, useTranslation } from 'react-i18next';
+import { PageHeader } from '@/components/layout/PageHeader';
+import { useDocumentTitle } from '@/hooks/use-document-title';
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import {
+  Download,
+  Upload,
+  CheckCircle2,
+  Loader2,
+  AlertTriangle,
+  ShieldCheck,
+  XCircle,
+} from 'lucide-react';
+import {
+  useExportConfig,
+  useDryRunImport,
+  useImportConfig,
+  useValidateConnectivity,
+} from '@/hooks/use-config-ops';
+import { Input } from '@/components/ui/input';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { formatNumber } from '@/lib/format';
+import { truncateGraphemes } from '@/lib/text';
+import type {
+  ImportMode,
+  ConfigImportRequest,
+  DryRunResult,
+  ServiceProbeResult,
+} from '@/api/config-ops';
+
+function truncateValue(val: unknown, maxLen = 60): string {
+  const s = typeof val === 'string' ? val : JSON.stringify(val);
+  if (s == null) return '(null)';
+  return truncateGraphemes(s, maxLen);
+}
+
+function actionBadgeVariant(action: string): 'default' | 'secondary' | 'destructive' | 'outline' {
+  switch (action) {
+    case 'update':
+    case 'create':
+      return 'default';
+    case 'delete':
+    case 'replace':
+    case 'reset':
+      return 'destructive';
+    default:
+      return 'secondary';
+  }
+}
+
+function ExportSection() {
+  const { t } = useTranslation();
+  const exportMutation = useExportConfig();
+
+  return (
+    <Card className="border border-border">
+      <CardHeader>
+        <CardTitle level={2} className="flex items-center gap-2">
+          <Download className="h-4 w-4" />
+          {t('configOps.export.title')}
+        </CardTitle>
+        <CardDescription>
+          {t('configOps.export.description')}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <Button
+          onClick={() => exportMutation.mutate()}
+          disabled={exportMutation.isPending}
+        >
+          {exportMutation.isPending ? (
+            <Loader2 className="h-4 w-4 animate-spin me-2" />
+          ) : (
+            <Download className="h-4 w-4 me-2" />
+          )}
+          {t('configOps.export.button')}
+        </Button>
+        <div className="rounded-md border border-border bg-muted/30 p-3 text-sm space-y-2">
+          <p className="font-medium">{t('configOps.export.notIncludedTitle')}</p>
+          <ul
+            aria-label={t('configOps.export.notIncludedListLabel')}
+            className="list-disc ps-5 space-y-1 text-muted-foreground"
+          >
+            <li>{t('configOps.export.notIncludedUsers')}</li>
+            <li>{t('configOps.export.notIncludedIdentities')}</li>
+            <li>{t('configOps.export.notIncludedSessions')}</li>
+            <li>{t('configOps.export.notIncludedData')}</li>
+            <li>{t('configOps.export.notIncludedSecrets')}</li>
+          </ul>
+          <p className="text-muted-foreground">
+            <Trans
+              i18nKey="configOps.export.backupNote"
+              t={t}
+              components={{
+                1: (
+                  // Trans fills this element's text from the translation at render time.
+                  // eslint-disable-next-line jsx-a11y/anchor-has-content
+                  <a
+                    href="https://docs.getgeolens.com/guides/admin/backups/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline"
+                  />
+                ),
+              }}
+            />
+          </p>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ServiceRow({ name, probe }: { name: string; probe: ServiceProbeResult }) {
+  const { t } = useTranslation();
+  const isOk = probe.status === 'ok';
+  return (
+    <TableRow>
+      <TableCell className="font-medium">{name}</TableCell>
+      <TableCell>
+        <span className={`flex items-center gap-1 ${isOk ? 'text-success' : 'text-destructive'}`}>
+          {isOk ? (
+            <CheckCircle2 className="h-4 w-4" />
+          ) : (
+            <XCircle className="h-4 w-4" />
+          )}
+          {isOk ? t('configOps.validate.statusOk') : t('configOps.validate.statusError')}
+        </span>
+      </TableCell>
+      <TableCell className="text-muted-foreground text-sm">
+        {t('configOps.validate.latency', {
+          ms: formatNumber(probe.latency_ms, { minimumFractionDigits: 1, maximumFractionDigits: 1 }),
+        })}
+      </TableCell>
+      <TableCell className="text-sm text-destructive">
+        {probe.error ?? ''}
+      </TableCell>
+    </TableRow>
+  );
+}
+
+function ValidateSection() {
+  const { t } = useTranslation();
+  const validateMutation = useValidateConnectivity();
+
+  const result = validateMutation.data;
+  const oidcEntries = result ? Object.entries(result.oidc_providers) : [];
+
+  return (
+    <Card className="border border-border">
+      <CardHeader>
+        <CardTitle level={2} className="flex items-center gap-2">
+          <ShieldCheck className="h-4 w-4" />
+          {t('configOps.validate.title')}
+        </CardTitle>
+        <CardDescription>
+          {t('configOps.validate.description')}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <Button
+          onClick={() => validateMutation.mutate()}
+          disabled={validateMutation.isPending}
+        >
+          {validateMutation.isPending ? (
+            <Loader2 className="h-4 w-4 animate-spin me-2" />
+          ) : (
+            <ShieldCheck className="h-4 w-4 me-2" />
+          )}
+          {t('configOps.validate.button')}
+        </Button>
+
+        {result && (
+          <div className="space-y-2">
+            <Table aria-label={t('configOps.validate.resultsLabel', { defaultValue: 'Connectivity results' })}>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t('configOps.validate.serviceHeader')}</TableHead>
+                  <TableHead>{t('configOps.validate.statusHeader')}</TableHead>
+                  <TableHead>{t('configOps.validate.latencyHeader')}</TableHead>
+                  <TableHead>{t('configOps.validate.errorHeader')}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                <ServiceRow name="Storage" probe={result.storage} />
+                <ServiceRow name="Cache" probe={result.cache} />
+                <ServiceRow
+                  name={t('configOps.validate.credentialStore')}
+                  probe={result.credential_store}
+                />
+                {oidcEntries.length > 0 ? (
+                  oidcEntries.map(([providerName, probe]) => (
+                    <ServiceRow key={providerName} name={`OIDC: ${providerName}`} probe={probe} />
+                  ))
+                ) : (
+                  <TableRow>
+                    <TableCell colSpan={4} className="text-sm text-muted-foreground">
+                      {t('configOps.validate.noOidc')}
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ImportSection() {
+  const { t } = useTranslation();
+  // An unknown or missing code shows nothing rather than the backend's English.
+  const reasonText = (code?: string | null) =>
+    code ? t(`configOps.reason.${code}`, { defaultValue: '' }) : '';
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [mode, setMode] = useState<ImportMode>('merge');
+  const [fileData, setFileData] = useState<ConfigImportRequest | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [parseError, setParseError] = useState<string | null>(null);
+  const [dryRunResult, setDryRunResult] = useState<DryRunResult | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [overwriteConfirm, setOverwriteConfirm] = useState('');
+  // Keyword the admin types to confirm a full overwrite.
+  const OVERWRITE_KEYWORD = 'OVERWRITE';
+
+  const dryRunMutation = useDryRunImport();
+  const importMutation = useImportConfig();
+
+  const pickingRef = useRef(false);
+  // React Query's mutation reset clears visible mutation state but does not
+  // cancel a request already on the wire. A monotonically increasing
+  // generation prevents an older file/mode preview callback from becoming the
+  // confirmation for newer input.
+  const previewGenerationRef = useRef(0);
+
+  const openFilePicker = useCallback(() => {
+    if (pickingRef.current) return;
+    pickingRef.current = true;
+    fileInputRef.current?.click();
+    // Reset after a short delay to allow the dialog to open
+    setTimeout(() => { pickingRef.current = false; }, 1000);
+  }, []);
+
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    pickingRef.current = false;
+    const generation = ++previewGenerationRef.current;
+    dryRunMutation.reset();
+    importMutation.reset();
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setParseError(null);
+    setDryRunResult(null);
+    setFileData(null);
+    setFileName(file.name);
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (generation !== previewGenerationRef.current) return;
+      try {
+        const parsed = JSON.parse(reader.result as string);
+        // Accept either a full export (with version/exported_at) or a plain import payload
+        const importData: ConfigImportRequest = {
+          settings: parsed.settings ?? null,
+          oauth_providers: parsed.oauth_providers ?? null,
+        };
+        if (!importData.settings && !importData.oauth_providers) {
+          setParseError(t('configOps.import.parseErrorKeys'));
+          setFileData(null);
+          return;
+        }
+        setFileData(importData);
+      } catch {
+        setParseError(t('configOps.import.parseErrorInvalid'));
+        setFileData(null);
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function handlePreview() {
+    if (!fileData) return;
+    const generation = ++previewGenerationRef.current;
+    const previewData = fileData;
+    const previewMode = mode;
+    setDryRunResult(null);
+    dryRunMutation.mutate(
+      { data: previewData, mode: previewMode },
+      {
+        onSuccess: (result) => {
+          if (generation === previewGenerationRef.current) {
+            setDryRunResult(result);
+          }
+        },
+      },
+    );
+  }
+
+  function runImport() {
+    if (!fileData) return;
+    const previewToken = dryRunResult?.preview_token ?? null;
+    if (mode === 'overwrite' && !previewToken) return;
+    importMutation.mutate(
+      { data: fileData, mode, previewToken },
+      {
+        onSuccess: () => {
+          previewGenerationRef.current += 1;
+          setDryRunResult(null);
+          setFileData(null);
+          setFileName(null);
+          if (fileInputRef.current) fileInputRef.current.value = '';
+        },
+        onError: () => {
+          if (previewToken) setDryRunResult(null);
+        },
+      },
+    );
+  }
+
+  function handleModeChange(nextMode: ImportMode) {
+    previewGenerationRef.current += 1;
+    setMode(nextMode);
+    setDryRunResult(null);
+    setConfirmOpen(false);
+    setOverwriteConfirm('');
+    dryRunMutation.reset();
+    importMutation.reset();
+  }
+
+  // Overwrite replaces the whole config and cannot be undone,
+  // so it is the one import path that warrants type-to-confirm. Merge applies
+  // directly.
+  function handleApply() {
+    if (!fileData) return;
+    if (mode === 'overwrite') {
+      setOverwriteConfirm('');
+      setConfirmOpen(true);
+      return;
+    }
+    runImport();
+  }
+
+  const hasChanges =
+    dryRunResult &&
+    (dryRunResult.settings.changes.some((c) =>
+      ['update', 'reset'].includes(c.action),
+    ) ||
+      dryRunResult.oauth_providers.changes.some((c) =>
+        ['create', 'update', 'delete', 'replace'].includes(c.action),
+      ));
+
+  const overwriteConfirmed = overwriteConfirm.trim() === OVERWRITE_KEYWORD;
+  const hasBoundOverwritePreview =
+    mode !== 'overwrite' || Boolean(dryRunResult?.preview_token);
+
+  return (
+    <>
+    <Card className="border border-border">
+      <CardHeader>
+        <CardTitle level={2} className="flex items-center gap-2">
+          <Upload className="h-4 w-4" />
+          {t('configOps.import.title')}
+        </CardTitle>
+        <CardDescription>
+          {t('configOps.import.description')}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".json"
+          onChange={handleFileChange}
+          className="hidden"
+        />
+        {/* File input */}
+        <div className="space-y-2">
+          <span className="text-sm font-medium">
+            {t('configOps.import.fileLabel')}
+          </span>
+          <div className="flex items-center gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={openFilePicker}
+            >
+              <Upload className="h-4 w-4 me-2" />
+              {t('configOps.import.chooseFile')}
+            </Button>
+            {fileName && fileData && (
+              <p className="text-sm text-muted-foreground">{fileName}</p>
+            )}
+            {!fileName && (
+              <p className="text-sm text-muted-foreground">
+                {t('configOps.import.noFile')}
+              </p>
+            )}
+          </div>
+          {parseError && (
+            <p className="text-sm text-destructive">{parseError}</p>
+          )}
+        </div>
+
+        {/* Mode selector */}
+        <div className="space-y-2">
+          <Label>{t('configOps.import.modeLabel')}</Label>
+          <Select value={mode} onValueChange={(v) => handleModeChange(v as ImportMode)}>
+            <SelectTrigger className="w-[260px]" aria-label={t('configOps.import.modeLabel')}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="merge">
+                {t('configOps.import.modeMerge')}
+              </SelectItem>
+              <SelectItem value="overwrite">
+                {t('configOps.import.modeOverwrite')}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        {/* Overwrite warning */}
+        {mode === 'overwrite' && (
+          <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+            <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+            <span>
+              {t('configOps.import.overwriteWarning')}
+            </span>
+          </div>
+        )}
+
+        {/* Action buttons */}
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            onClick={handlePreview}
+            disabled={!fileData || dryRunMutation.isPending}
+          >
+            {dryRunMutation.isPending && (
+              <Loader2 className="h-4 w-4 animate-spin me-2" />
+            )}
+            {t('configOps.import.preview')}
+          </Button>
+          <Button
+            onClick={handleApply}
+            disabled={
+              !dryRunResult ||
+              !hasChanges ||
+              !hasBoundOverwritePreview ||
+              importMutation.isPending
+            }
+          >
+            {importMutation.isPending && (
+              <Loader2 className="h-4 w-4 animate-spin me-2" />
+            )}
+            {t('configOps.import.apply')}
+          </Button>
+        </div>
+
+        {mode === 'overwrite' && dryRunResult && !hasBoundOverwritePreview && (
+          <p className="text-sm text-destructive" role="alert">
+            {t('configOps.import.overwritePreviewRequired')}
+          </p>
+        )}
+
+        {/* Dry-run results */}
+        {dryRunResult && (
+          <div className="space-y-4 pt-2">
+            {/* Settings changes */}
+            {dryRunResult.settings.changes.length > 0 && (
+              <div className="space-y-2">
+                <h3 className="text-sm font-medium">
+                  {t('configOps.import.settingsChanges')}
+                </h3>
+                <Table aria-label={t('configOps.import.settingsChanges')}>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>{t('configOps.import.key')}</TableHead>
+                      <TableHead>{t('configOps.import.current')}</TableHead>
+                      <TableHead>{t('configOps.import.imported')}</TableHead>
+                      <TableHead>{t('configOps.import.action')}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {dryRunResult.settings.changes.map((c) => (
+                      <TableRow key={c.key}>
+                        <TableCell className="font-mono text-xs">{c.key}</TableCell>
+                        <TableCell className="text-xs max-w-[200px] truncate">
+                          {truncateValue(c.current)}
+                        </TableCell>
+                        <TableCell className="text-xs max-w-[200px] truncate">
+                          {truncateValue(c.imported)}
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant={actionBadgeVariant(c.action)}>
+                            {c.action}
+                          </Badge>
+                          {reasonText(c.reason_code) && (
+                            <p className="mt-1 max-w-xs whitespace-normal text-xs text-muted-foreground">
+                              {reasonText(c.reason_code)}
+                            </p>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+
+            {/* OAuth provider changes */}
+            {dryRunResult.oauth_providers.changes.length > 0 && (
+              <div className="space-y-2">
+                <h3 className="text-sm font-medium">
+                  {t('configOps.import.oauthChanges')}
+                </h3>
+                {dryRunResult.oauth_providers.dependent_accounts_deleted > 0 && (
+                  <p
+                    className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
+                    role="alert"
+                  >
+                    {t('configOps.import.oauthAccountDeletionWarning', {
+                      count: dryRunResult.oauth_providers.dependent_accounts_deleted,
+                    })}
+                  </p>
+                )}
+                <Table aria-label={t('configOps.import.oauthChanges')}>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>{t('configOps.import.slug')}</TableHead>
+                      <TableHead>{t('configOps.import.action')}</TableHead>
+                      <TableHead>{t('configOps.import.changedFields')}</TableHead>
+                      <TableHead>{t('configOps.import.linkedAccountsDeleted')}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {dryRunResult.oauth_providers.changes.map((c) => (
+                      <TableRow key={c.slug}>
+                        <TableCell className="font-mono text-xs">{c.slug}</TableCell>
+                        <TableCell>
+                          <Badge variant={actionBadgeVariant(c.action)}>
+                            {c.action}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-xs">
+                          {c.changed_fields?.join(', ') || '-'}
+                        </TableCell>
+                        <TableCell className="text-xs">
+                          {c.dependent_accounts_deleted}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+
+            {!hasChanges && (
+              <p className="text-sm text-muted-foreground">
+                {t('configOps.import.noChanges')}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Import result summary */}
+        {importMutation.isSuccess && importMutation.data && (
+          <div className="flex items-start gap-2 rounded-md border border-success/30 bg-success/5 p-3 text-sm">
+            <CheckCircle2 className="h-4 w-4 mt-0.5 text-success flex-shrink-0" />
+            <span>
+              {t('configOps.import.success')}{' '}
+              {t('configOps.import.successDetail', {
+                settingsApplied: importMutation.data.settings_applied,
+                settingsSkipped: importMutation.data.settings_skipped,
+                oauthCreated: importMutation.data.oauth_created,
+                oauthUpdated: importMutation.data.oauth_updated,
+                oauthDeleted: importMutation.data.oauth_deleted,
+                oauthAccountsDeleted: importMutation.data.oauth_accounts_deleted,
+              })}
+            </span>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+
+    {/* Type-to-confirm gate for the irreversible overwrite. */}
+    <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{t('configOps.import.confirmTitle')}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {t('configOps.import.confirmDescription', { keyword: OVERWRITE_KEYWORD })}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <Input
+          value={overwriteConfirm}
+          onChange={(e) => setOverwriteConfirm(e.target.value)}
+          placeholder={OVERWRITE_KEYWORD}
+          aria-label={t('configOps.import.confirmTitle')}
+          autoComplete="off"
+        />
+        <AlertDialogFooter>
+          <AlertDialogCancel>{t('common:cancel')}</AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            disabled={!overwriteConfirmed}
+            onClick={() => {
+              setConfirmOpen(false);
+              runImport();
+            }}
+          >
+            {t('configOps.import.apply')}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+    </>
+  );
+}
+
+export function AdminConfigOpsPage() {
+  const { t } = useTranslation();
+  useDocumentTitle(t('common:pageTitle.adminConfigOps'));
+
+  return (
+    <>
+      <PageHeader
+        title={t('configOps.page.title')}
+        description={t('configOps.page.description')}
+        breadcrumbs={[{ label: t('adminNav.admin'), to: '/admin' }]}
+      />
+      <div className="space-y-6 mt-6">
+        <ExportSection />
+        <ValidateSection />
+        <ImportSection />
+      </div>
+    </>
+  );
+}

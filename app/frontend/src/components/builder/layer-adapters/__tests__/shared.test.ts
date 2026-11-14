@@ -1,0 +1,393 @@
+import { describe, it, expect, vi } from 'vitest';
+import {
+  syncOwnedLayoutProperties,
+  syncOwnedPaintProperties,
+  simplifyPaint,
+  classifyGeometry,
+  getLayerType,
+  normalizeRasterBounds,
+  applyMasterOpacity,
+  getExpressionSafeOpacity,
+  getFeatureOpacity,
+} from '../shared';
+import type { LayoutPropertyName, PaintPropertyName } from '../shared';
+
+// The ownership options now carry the real MapLibre key unions, which is
+// accurate for every production caller (each passes a curated `as const` tuple). The
+// two tests below deliberately feed a builder-private `_`-prefixed key to prove the
+// runtime guards still drop it, so they assert past the narrowed type on purpose.
+const asPaintProperty = (key: string) => key as PaintPropertyName;
+const asLayoutProperty = (key: string) => key as LayoutPropertyName;
+
+function createMockMapForReconciler() {
+  const paintState = new Map<string, unknown>();
+  const layoutState = new Map<string, unknown>();
+  return {
+    getLayer: vi.fn().mockReturnValue({ id: 'L' }),
+    getPaintProperty: vi.fn((_layerId: string, prop: string) => paintState.get(prop)),
+    setPaintProperty: vi.fn((_layerId: string, prop: string, value: unknown) => {
+      paintState.set(prop, value);
+    }),
+    getLayoutProperty: vi.fn((_layerId: string, prop: string) => layoutState.get(prop)),
+    setLayoutProperty: vi.fn((_layerId: string, prop: string, value: unknown) => {
+      layoutState.set(prop, value);
+    }),
+    paintState,
+    layoutState,
+  };
+}
+
+describe('syncOwnedPaintProperties', () => {
+  it('sets changed owned paint properties', () => {
+    const map = createMockMapForReconciler();
+    map.paintState.set('line-color', '#111111');
+
+    syncOwnedPaintProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      { 'line-color': '#ff0000' },
+      { geomType: 'line', ownedProperties: ['line-color'] },
+    );
+
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'line-color', '#ff0000');
+  });
+
+  it('does not rewrite unchanged owned paint properties', () => {
+    const map = createMockMapForReconciler();
+    map.paintState.set('circle-radius', 8);
+
+    syncOwnedPaintProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      { 'circle-radius': 8 },
+      { geomType: 'circle', ownedProperties: ['circle-radius'] },
+    );
+
+    expect(map.setPaintProperty).not.toHaveBeenCalled();
+  });
+
+  it('clears missing owned paint properties', () => {
+    const map = createMockMapForReconciler();
+    map.paintState.set('line-gradient', ['interpolate', ['linear'], ['line-progress'], 0, '#00f', 1, '#0f0']);
+
+    syncOwnedPaintProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      { 'line-color': '#f97316' },
+      { geomType: 'line', ownedProperties: ['line-color', 'line-gradient'] },
+    );
+
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'line-gradient', undefined);
+  });
+
+  it('filters custom metadata and cross-geometry paint properties', () => {
+    const map = createMockMapForReconciler();
+
+    syncOwnedPaintProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      {
+        'line-color': '#ff0000',
+        'circle-radius': 8,
+        '_outline-width': 4,
+      },
+      {
+        geomType: 'line',
+        ownedProperties: ['line-color', 'circle-radius', asPaintProperty('_outline-width')],
+      },
+    );
+
+    expect(map.setPaintProperty).toHaveBeenCalledTimes(1);
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'line-color', '#ff0000');
+  });
+
+  it('preserves expression value identity when setting paint', () => {
+    const map = createMockMapForReconciler();
+    const expression = ['interpolate', ['linear'], ['zoom'], 5, 1, 12, 8];
+
+    syncOwnedPaintProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      { 'line-width': expression },
+      { geomType: 'line', ownedProperties: ['line-width'] },
+    );
+
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'line-width', expression);
+    expect(map.setPaintProperty.mock.calls[0][2]).toBe(expression);
+  });
+
+  it('isolates MapLibre paint errors per property', () => {
+    const map = createMockMapForReconciler();
+    map.setPaintProperty.mockImplementation((_layerId: string, prop: string, value: unknown) => {
+      if (prop === 'line-color') throw new Error('bad color');
+      map.paintState.set(prop, value);
+    });
+
+    expect(() => syncOwnedPaintProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      { 'line-color': '#ff0000', 'line-width': 4 },
+      { geomType: 'line', ownedProperties: ['line-color', 'line-width'] },
+    )).not.toThrow();
+
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'line-width', 4);
+  });
+
+  it('is a no-op when the target layer is missing', () => {
+    const map = createMockMapForReconciler();
+    map.getLayer.mockReturnValue(undefined);
+
+    syncOwnedPaintProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'missing',
+      { 'line-color': '#ff0000' },
+      { geomType: 'line', ownedProperties: ['line-color'] },
+    );
+
+    expect(map.setPaintProperty).not.toHaveBeenCalled();
+  });
+});
+
+describe('simplifyPaint (ADAPT-08 / SPEC-10 shape guards)', () => {
+  it('passes scalar and boolean values through unchanged', () => {
+    expect(simplifyPaint({ 'fill-color': '#abc', 'fill-antialias': true, 'circle-radius': 5 }))
+      .toEqual({ 'fill-color': '#abc', 'fill-antialias': true, 'circle-radius': 5 });
+  });
+
+  it('interpolate: returns the first output stop (index 4)', () => {
+    const expr = ['interpolate', ['linear'], ['zoom'], 5, '#111111', 12, '#222222'];
+    expect(simplifyPaint({ 'line-color': expr })).toEqual({ 'line-color': '#111111' });
+  });
+
+  it('interpolate-hcl is treated like interpolate (index 4)', () => {
+    const expr = ['interpolate-hcl', ['linear'], ['get', 'v'], 0, '#0000ff', 1, '#ff0000'];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': '#0000ff' });
+  });
+
+  it('interpolate with fewer than 5 elements degrades to undefined', () => {
+    const expr = ['interpolate', ['linear'], ['zoom']]; // malformed: no stops
+    expect(simplifyPaint({ 'line-color': expr })).toEqual({ 'line-color': undefined });
+  });
+
+  it('step: returns the default output (index 2)', () => {
+    const expr = ['step', ['get', 'pop'], '#cccccc', 100, '#ff0000'];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': '#cccccc' });
+  });
+
+  it('step with a single output (length 3) still returns index 2', () => {
+    const expr = ['step', ['get', 'x'], 7];
+    expect(simplifyPaint({ 'circle-radius': expr })).toEqual({ 'circle-radius': 7 });
+  });
+
+  it('match: returns the last element (fallback) when well-formed', () => {
+    const expr = ['match', ['get', 'cat'], 'a', '#aaaaaa', 'b', '#bbbbbb', '#000000'];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': '#000000' });
+  });
+
+  it('match shorter than 5 elements degrades to undefined', () => {
+    const expr = ['match', ['get', 'cat'], '#fallback']; // no label/output pair
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': undefined });
+  });
+
+  it('nested case wrapping interpolate: pulls the inner interpolate fallback', () => {
+    const inner = ['interpolate', ['linear'], ['get', 'v'], 0, '#111111', 1, '#222222'];
+    const expr = ['case', ['==', ['get', 'v'], null], '#999999', inner];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': '#111111' });
+  });
+
+  it('nested case wrapping step: pulls the inner step default', () => {
+    const inner = ['step', ['get', 'pop'], '#cccccc', 100, '#ff0000'];
+    const expr = ['case', ['==', ['get', 'pop'], null], '#999999', inner];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': '#cccccc' });
+  });
+
+  it('nested case wrapping match: pulls the inner match fallback', () => {
+    const inner = ['match', ['get', 'cat'], 'a', '#aaaaaa', '#000000'];
+    const expr = ['case', ['==', ['get', 'cat'], null], '#999999', inner];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': '#000000' });
+  });
+
+  it('case with a scalar last element uses the case literal fallback (index 2)', () => {
+    const expr = ['case', ['==', ['get', 'x'], null], '#999999', '#777777'];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': '#999999' });
+  });
+
+  it('unknown op degrades to undefined instead of mis-indexing', () => {
+    const expr = ['coalesce', ['get', 'h'], 0];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': undefined });
+  });
+
+  it('array shorter than 3 elements degrades to undefined', () => {
+    expect(simplifyPaint({ 'fill-color': ['get', 'x'] })).toEqual({ 'fill-color': undefined });
+  });
+
+  it('non-scalar expression fallback collapses to undefined', () => {
+    // step whose default output is itself an array (e.g. an rgb expression)
+    const expr = ['step', ['get', 'x'], ['rgb', 1, 2, 3], 100, '#fff'];
+    expect(simplifyPaint({ 'fill-color': expr })).toEqual({ 'fill-color': undefined });
+  });
+});
+
+describe('classifyGeometry / getLayerType (ADAPT-02 / DRY-05)', () => {
+  it.each([
+    ['POINT', 'point', 'circle'],
+    ['MULTIPOINT', 'point', 'circle'],
+    ['LINESTRING', 'line', 'line'],
+    ['MULTILINESTRING', 'line', 'line'],
+    ['POLYGON', 'polygon', 'fill'],
+    ['MULTIPOLYGON', 'polygon', 'fill'],
+    ['GEOMETRYCOLLECTION', 'other', 'fill'],
+    ['', 'other', 'fill'],
+  ] as const)('classifies %s as %s / layer type %s', (geom, family, layerType) => {
+    expect(classifyGeometry(geom)).toBe(family);
+    expect(getLayerType(geom)).toBe(layerType);
+  });
+
+  it('classifies null as other / fill', () => {
+    expect(classifyGeometry(null)).toBe('other');
+    expect(getLayerType(null)).toBe('fill');
+  });
+
+  it('is case-insensitive', () => {
+    expect(classifyGeometry('multipolygon')).toBe('polygon');
+    expect(getLayerType('point')).toBe('circle');
+  });
+});
+
+describe('normalizeRasterBounds (ADAPT-01)', () => {
+  it('returns the four-number tuple unchanged', () => {
+    expect(normalizeRasterBounds([-1, -2, 3, 4])).toEqual([-1, -2, 3, 4]);
+  });
+
+  it('returns undefined when not an array', () => {
+    expect(normalizeRasterBounds(null)).toBeUndefined();
+    expect(normalizeRasterBounds(undefined)).toBeUndefined();
+  });
+
+  it('returns undefined when length is not 4', () => {
+    expect(normalizeRasterBounds([1, 2, 3])).toBeUndefined();
+    expect(normalizeRasterBounds([1, 2, 3, 4, 5])).toBeUndefined();
+  });
+
+  // A MapLibre source `bounds` takes one increasing box, so an
+  // antimeridian-crossing pair matches no tile and the layer renders blank.
+  it('widens a seam-crossing pair to the monotonic world span', () => {
+    expect(normalizeRasterBounds([178.5, -20, -178.5, -15])).toEqual([-180, -20, 180, -15]);
+  });
+
+  it('leaves every non-crossing pair exactly as it was', () => {
+    expect(normalizeRasterBounds([-74.5, 40.5, -73.5, 41.5])).toEqual([-74.5, 40.5, -73.5, 41.5]);
+    expect(normalizeRasterBounds([-180, -90, 180, 90])).toEqual([-180, -90, 180, 90]);
+  });
+
+  it('returns undefined when any element is not finite', () => {
+    expect(normalizeRasterBounds([1, 2, 3, NaN])).toBeUndefined();
+    expect(normalizeRasterBounds([1, Infinity, 3, 4])).toBeUndefined();
+  });
+});
+
+describe('syncOwnedLayoutProperties', () => {
+  it('sets changed owned layout properties', () => {
+    const map = createMockMapForReconciler();
+
+    syncOwnedLayoutProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      { 'line-cap': 'square' },
+      { ownedProperties: ['line-cap'] },
+    );
+
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('L', 'line-cap', 'square');
+  });
+
+  it('clears missing owned layout properties', () => {
+    const map = createMockMapForReconciler();
+    map.layoutState.set('line-cap', 'round');
+
+    syncOwnedLayoutProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      {},
+      { ownedProperties: ['line-cap'] },
+    );
+
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('L', 'line-cap', undefined);
+  });
+
+  it('filters builder-only layout metadata', () => {
+    const map = createMockMapForReconciler();
+
+    syncOwnedLayoutProperties(
+      map as unknown as import('maplibre-gl').Map,
+      'L',
+      { '_minzoom': 5, visibility: 'none' },
+      { ownedProperties: [asLayoutProperty('_minzoom'), 'visibility'] },
+    );
+
+    expect(map.setLayoutProperty).toHaveBeenCalledTimes(1);
+    expect(map.setLayoutProperty).toHaveBeenCalledWith('L', 'visibility', 'none');
+  });
+});
+
+// The single branch point for the master-opacity split.
+describe('applyMasterOpacity (#1625)', () => {
+  const expr = ['step', ['zoom'], 0.2, 9, 0.7];
+
+  it('fill: writes the per-feature fill-opacity unmultiplied and the master on fill-layer-opacity', () => {
+    const map = { setPaintProperty: vi.fn() };
+    applyMasterOpacity(map, 'L', { 'fill-opacity': 0.3 }, 'fill', 0.5);
+    expect(map.setPaintProperty.mock.calls).toEqual([
+      ['L', 'fill-opacity', 0.3],
+      ['L', 'fill-layer-opacity', 0.5],
+    ]);
+  });
+
+  it('line: an expression per-feature opacity passes through untouched', () => {
+    const map = { setPaintProperty: vi.fn() };
+    applyMasterOpacity(map, 'L', { 'line-opacity': expr }, 'line', 0.5);
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'line-opacity', expr);
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'line-layer-opacity', 0.5);
+  });
+
+  it('fill: master 1 still writes fill-layer-opacity 1 so a previous lower value is reset', () => {
+    const map = { setPaintProperty: vi.fn() };
+    applyMasterOpacity(map, 'L', {}, 'fill', 1);
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'fill-opacity', 0.3);
+    expect(map.setPaintProperty).toHaveBeenCalledWith('L', 'fill-layer-opacity', 1);
+  });
+
+  it('circle: no -layer-opacity exists, so the master is multiplied into circle-opacity', () => {
+    const map = { setPaintProperty: vi.fn() };
+    applyMasterOpacity(map, 'L', { 'circle-opacity': 0.8 }, 'circle', 0.5);
+    expect(map.setPaintProperty.mock.calls).toEqual([['L', 'circle-opacity', 0.4]]);
+  });
+
+  it('circle: a zoom-stepped per-feature opacity has its outputs scaled by the master', () => {
+    const map = { setPaintProperty: vi.fn() };
+    applyMasterOpacity(map, 'L', { 'circle-opacity': expr }, 'circle', 0.5);
+    expect(map.setPaintProperty.mock.calls).toEqual([['L', 'circle-opacity', ['step', ['zoom'], 0.1, 9, 0.35]]]);
+  });
+});
+
+describe('getFeatureOpacity / getExpressionSafeOpacity', () => {
+  it('getFeatureOpacity returns the stored number, the stored expression, or the builder default', () => {
+    const expr = ['step', ['zoom'], 0.2, 9, 0.7];
+    expect(getFeatureOpacity({ 'fill-opacity': 0.45 }, 'fill')).toBe(0.45);
+    expect(getFeatureOpacity({ 'fill-opacity': expr }, 'fill')).toBe(expr);
+    expect(getFeatureOpacity({}, 'fill')).toBe(0.3);
+    expect(getFeatureOpacity({}, 'line')).toBe(1);
+    expect(getFeatureOpacity({}, 'circle')).toBe(1);
+    // A wrong-typed scalar counts as absent.
+    expect(getFeatureOpacity({ 'fill-opacity': '0.5' }, 'fill')).toBe(0.3);
+  });
+
+  it('getExpressionSafeOpacity multiplies a number, scales a zoom step, and wraps a data expression (skipping both at master 1)', () => {
+    const expr = ['step', ['zoom'], 0.2, 9, 0.7];
+    const byValue = ['get', 'opacity'];
+    expect(getExpressionSafeOpacity({ 'circle-opacity': 0.8 }, 'circle', 0.5)).toBeCloseTo(0.4);
+    expect(getExpressionSafeOpacity({ 'circle-opacity': expr }, 'circle', 0.5)).toEqual(['step', ['zoom'], 0.1, 9, 0.35]);
+    expect(getExpressionSafeOpacity({ 'circle-opacity': byValue }, 'circle', 0.5)).toEqual(['*', byValue, 0.5]);
+    expect(getExpressionSafeOpacity({ 'circle-opacity': expr }, 'circle', 1)).toBe(expr);
+    expect(getExpressionSafeOpacity({}, 'fill', 0.5)).toBeCloseTo(0.15);
+  });
+});

@@ -1,0 +1,300 @@
+import { describe, it, expect, vi } from 'vitest';
+import { act } from '@testing-library/react';
+import { renderHook } from '@/test/test-utils';
+import { useBuilderLayers } from '@/components/builder/hooks/use-builder-layers';
+import {
+  makeBuilderLayer,
+  makeBuilderMap,
+} from '@/components/builder/__tests__/fixtures/map-builder-fixtures';
+import type { MapLayerResponse, MapResponse } from '@/types/api';
+
+type MaplibreMap = import('maplibre-gl').Map;
+
+/**
+ * A banner Revert restored the saved layer through the ordinary
+ * mutation handlers, all of which mark the map dirty — so the revert itself
+ * re-dirtied the map and the header kept claiming unsaved work. The recheck
+ * clears the flag only when the WHOLE map matches its saved state.
+ */
+function render(mapData: MapResponse) {
+  const mapRef = { current: null } as React.RefObject<MaplibreMap | null>;
+  return renderHook(() =>
+    useBuilderLayers(
+      mapData,
+      mapRef,
+      'map-1',
+      { mutate: vi.fn() } as unknown as Parameters<typeof useBuilderLayers>[3],
+      { mutate: vi.fn() } as unknown as Parameters<typeof useBuilderLayers>[4],
+      { current: { add: () => {}, remove: () => {} } } as unknown as Parameters<typeof useBuilderLayers>[5],
+    ),
+  );
+}
+
+describe('useBuilderLayers — clean-state recheck', () => {
+  it('clears the flag when a layer edit is undone back to the baseline', () => {
+    const layer = makeBuilderLayer();
+    const { result } = render(makeBuilderMap([layer]));
+
+    act(() => result.current.handlePaintChange(layer.id, { 'fill-color': '#123456' }));
+    expect(result.current.hasUnsavedChanges).toBe(true);
+
+    act(() => {
+      result.current.handlePaintChange(layer.id, layer.paint as Record<string, unknown>);
+      result.current.requestCleanRecheck();
+    });
+    expect(result.current.hasUnsavedChanges).toBe(false);
+  });
+
+  it('is clean again once a dashboard edit is put back', () => {
+    // A widget counts only on a layer it can summarize.
+    const layer = makeBuilderLayer({ id: '0b7d2f4e-3c1a-4e8b-9f6d-5a2c7e1b9d34' });
+    const widget = {
+      id: '6f1c3a52-8d1e-4a57-9b1f-2c4e7a9d0b11',
+      type: 'indicator' as const,
+      v: 1 as const,
+      layer_id: '0b7d2f4e-3c1a-4e8b-9f6d-5a2c7e1b9d34',
+      scope: 'layer' as const,
+      config: { stat: 'count' as const, column: null },
+    };
+    const { result } = render({
+      ...makeBuilderMap([layer]),
+      dashboard_config: {
+        version: 1,
+        panel: 'right',
+        map_hidden: false,
+        theme: 'follow',
+        widgets: [widget],
+      },
+    });
+
+    act(() => result.current.handleDashboardChange({ panel: 'bottom', widgets: [widget] }));
+    expect(result.current.hasUnsavedChanges).toBe(true);
+
+    act(() => result.current.handleDashboardChange({ panel: 'right', widgets: [widget] }));
+    expect(result.current.hasUnsavedChanges).toBe(false);
+  });
+
+  it('keeps the flag when a dashboard edit is put back but a layer edit remains', () => {
+    const layer = makeBuilderLayer({ id: '0b7d2f4e-3c1a-4e8b-9f6d-5a2c7e1b9d34' });
+    const { result } = render(makeBuilderMap([layer]));
+
+    const widget = {
+      id: '6f1c3a52-8d1e-4a57-9b1f-2c4e7a9d0b11',
+      type: 'indicator',
+      v: 1,
+      layer_id: '0b7d2f4e-3c1a-4e8b-9f6d-5a2c7e1b9d34',
+      scope: 'layer' as const,
+      config: { stat: 'count', column: null },
+    };
+
+    act(() => {
+      result.current.handlePaintChange(layer.id, { 'fill-color': '#123456' });
+      result.current.handleDashboardChange({ panel: 'right', widgets: [widget] });
+    });
+    act(() => result.current.handleDashboardChange({ panel: 'right', widgets: [] }));
+
+    expect(result.current.hasUnsavedChanges).toBe(true);
+  });
+
+  it('is dirty after a visibility toggle off and clean once toggled back on', () => {
+    const layer = makeBuilderLayer({ visible: true });
+    const { result } = render(makeBuilderMap([layer]));
+
+    act(() => result.current.handleToggleVisibility(layer.id));
+    expect(result.current.hasUnsavedChanges).toBe(true);
+
+    act(() => result.current.handleToggleVisibility(layer.id));
+    expect(result.current.hasUnsavedChanges).toBe(false);
+  });
+
+  it('is dirty after a bulk hide and clean once the bulk show undoes it', () => {
+    const a = makeBuilderLayer({ id: 'layer-a', visible: true });
+    const b = makeBuilderLayer({ id: 'layer-b', visible: true });
+    const { result } = render(makeBuilderMap([a, b]));
+    const ids = new Set(['layer-a', 'layer-b']);
+
+    act(() => result.current.handleBulkVisibility(ids));
+    expect(result.current.hasUnsavedChanges).toBe(true);
+
+    act(() => result.current.handleBulkVisibility(ids));
+    expect(result.current.hasUnsavedChanges).toBe(false);
+  });
+
+  it('is clean once a hidden folder has each child shown again', () => {
+    const group = { ...makeBuilderLayer({ id: 'group-1' }), layer_type: 'group:folder' } as unknown as MapLayerResponse;
+    const a = { ...makeBuilderLayer({ id: 'layer-a' }), parent_group_id: 'group-1' } as MapLayerResponse;
+    const b = { ...makeBuilderLayer({ id: 'layer-b' }), parent_group_id: 'group-1' } as MapLayerResponse;
+    const { result } = render(makeBuilderMap([group, a, b]));
+
+    act(() => result.current.dispatchLayerAction({ type: 'toggle_group_visibility', source: 'manual', groupId: 'group-1' }));
+    expect(result.current.hasUnsavedChanges).toBe(true);
+
+    act(() => result.current.handleToggleVisibility('layer-a'));
+    act(() => result.current.handleToggleVisibility('layer-b'));
+
+    expect(result.current.hasUnsavedChanges).toBe(false);
+  });
+
+  it('keeps the flag when a visibility toggle is undone but another edit remains', () => {
+    const layer = makeBuilderLayer({ visible: true });
+    const { result } = render(makeBuilderMap([layer]));
+
+    act(() => {
+      result.current.setLocalName('Renamed');
+      result.current.handleToggleVisibility(layer.id);
+    });
+    act(() => result.current.handleToggleVisibility(layer.id));
+
+    expect(result.current.hasUnsavedChanges).toBe(true);
+  });
+
+  it('keeps the flag when another layer still has pending edits', () => {
+    const a = makeBuilderLayer({ id: 'layer-a' });
+    const b = makeBuilderLayer({ id: 'layer-b' });
+    const { result } = render(makeBuilderMap([a, b]));
+
+    act(() => {
+      result.current.handlePaintChange('layer-a', { 'fill-color': '#123456' });
+      result.current.handlePaintChange('layer-b', { 'fill-color': '#654321' });
+    });
+    act(() => {
+      result.current.handlePaintChange('layer-b', b.paint as Record<string, unknown>);
+      result.current.requestCleanRecheck();
+    });
+
+    expect(result.current.hasUnsavedChanges).toBe(true);
+  });
+
+  it('keeps the flag when the map name is still renamed', () => {
+    const layer = makeBuilderLayer();
+    const { result } = render(makeBuilderMap([layer]));
+
+    act(() => {
+      result.current.setLocalName('Renamed');
+      result.current.handlePaintChange(layer.id, { 'fill-color': '#123456' });
+    });
+    act(() => {
+      result.current.handlePaintChange(layer.id, layer.paint as Record<string, unknown>);
+      result.current.requestCleanRecheck();
+    });
+
+    expect(result.current.hasUnsavedChanges).toBe(true);
+  });
+
+  it('keeps the flag for an outstanding opacity change on another layer', () => {
+    const a = makeBuilderLayer({ id: 'layer-a' });
+    const b = makeBuilderLayer({ id: 'layer-b' });
+    const { result } = render(makeBuilderMap([a, b]));
+
+    act(() => {
+      result.current.handleOpacityChange('layer-a', 0.4);
+      result.current.handlePaintChange('layer-b', { 'fill-color': '#654321' });
+    });
+    act(() => {
+      result.current.handlePaintChange('layer-b', b.paint as Record<string, unknown>);
+      result.current.requestCleanRecheck();
+    });
+
+    expect(result.current.hasUnsavedChanges).toBe(true);
+  });
+
+  it('clears the flag after a re-derivable edit is put back (markDirty)', () => {
+    const layer = makeBuilderLayer();
+    const { result } = render(makeBuilderMap([layer]));
+
+    // MapTitleBar / basemap controls mark dirty for fields the hook DOES compare;
+    // treating those as opaque made the indicator unclearable for the session.
+    act(() => {
+      result.current.markDirty();
+      result.current.handlePaintChange(layer.id, { 'fill-color': '#123456' });
+    });
+    act(() => {
+      result.current.handlePaintChange(layer.id, layer.paint as Record<string, unknown>);
+      result.current.requestCleanRecheck();
+    });
+
+    expect(result.current.hasUnsavedChanges).toBe(false);
+  });
+
+  // Text fields hydrate RAW but save as `value.trim() || null`, so "dirty" means
+  // "saving would change the stored value" — not raw inequality, and not trimmed
+  // equality either.
+  describe.each([
+    ['untouched whitespace in the saved value', '  notes  ', (d: string) => d, false],
+    ['the user trimming that whitespace', '  notes  ', () => 'notes', true],
+    ['a whitespace-only local value over an empty server one', null, () => '   ', false],
+    ['a whitespace-only local value over a real server one', '  x  ', () => '   ', true],
+  ])('description: %s', (_name, saved, edit, expectDirty) => {
+    it(`reports ${expectDirty ? 'dirty' : 'clean'}`, () => {
+      const layer = makeBuilderLayer();
+      const { result } = render({ ...makeBuilderMap([layer]), description: saved } as MapResponse);
+
+      act(() => {
+        result.current.setLocalDescription(edit(saved ?? ''));
+        result.current.handlePaintChange(layer.id, { 'fill-color': '#123456' });
+      });
+      act(() => {
+        result.current.handlePaintChange(layer.id, layer.paint as Record<string, unknown>);
+        result.current.requestCleanRecheck();
+      });
+
+      expect(result.current.hasUnsavedChanges).toBe(expectDirty);
+    });
+  });
+
+  it('keeps the flag when a folder expansion is still pending', () => {
+    // Folder expansion IS persisted (prepareLayersForPersistence reads groupMeta),
+    // so a still-expanded folder must not read as clean.
+    const group = { ...makeBuilderLayer({ id: 'group-1' }), layer_type: 'group:folder' } as unknown as MapLayerResponse;
+    const child = makeBuilderLayer({ id: 'layer-1' });
+    const { result } = render(makeBuilderMap([group, child]));
+
+    act(() => {
+      result.current.handleToggleGroupExpand('group-1');
+      result.current.handlePaintChange('layer-1', { 'fill-color': '#123456' });
+    });
+    expect(result.current.hasUnsavedChanges).toBe(true);
+
+    act(() => {
+      result.current.handlePaintChange('layer-1', child.paint as Record<string, unknown>);
+      result.current.requestCleanRecheck();
+    });
+
+    expect(result.current.hasUnsavedChanges).toBe(true);
+  });
+
+  it('ignores the UI-only basemap row expansion', () => {
+    // handleToggleGroupExpand writes a groupMeta entry for the basemap row but
+    // deliberately does NOT dirty the map — it has no persisted carrier — so a
+    // whole-object compare would pin the flag on forever.
+    const layer = makeBuilderLayer();
+    const { result } = render(makeBuilderMap([layer]));
+
+    act(() => {
+      result.current.handleToggleGroupExpand('basemap-group');
+      result.current.handlePaintChange(layer.id, { 'fill-color': '#123456' });
+    });
+    act(() => {
+      result.current.handlePaintChange(layer.id, layer.paint as Record<string, unknown>);
+      result.current.requestCleanRecheck();
+    });
+
+    expect(result.current.hasUnsavedChanges).toBe(false);
+  });
+
+  it('keeps the flag for page-owned dirt it cannot re-derive (markOpaqueDirty)', () => {
+    const layer = makeBuilderLayer();
+    const { result } = render(makeBuilderMap([layer]));
+
+    act(() => {
+      result.current.markOpaqueDirty();
+      result.current.handlePaintChange(layer.id, { 'fill-color': '#123456' });
+    });
+    act(() => {
+      result.current.handlePaintChange(layer.id, layer.paint as Record<string, unknown>);
+      result.current.requestCleanRecheck();
+    });
+
+    expect(result.current.hasUnsavedChanges).toBe(true);
+  });
+});

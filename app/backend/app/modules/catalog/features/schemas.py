@@ -1,0 +1,397 @@
+"""GeoJSON response models following OGC API Features conventions."""
+
+import math
+from typing import Annotated, Any, Literal
+
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainValidator,
+    StrictInt,
+    model_validator,
+)
+
+
+MAX_COORDINATE_TUPLES = 100_000
+MAX_COORDINATE_DEPTH = 8
+MAX_GEOMETRY_COLLECTION_MEMBERS = 1_000
+MAX_POSITION_DIMENSIONS = 4
+MAX_FEATURES_PER_BATCH = 1_000
+
+
+def inline_json_schema(model: type[BaseModel]) -> dict:
+    """``model_json_schema()`` with local ``$defs`` inlined.
+
+    Route ``responses=`` embed schemas verbatim in the exported OpenAPI doc,
+    where pydantic's ``#/$defs/...`` pointers dangle. Only safe
+    for non-recursive models; a recursive one raises instead of looping.
+    """
+    schema = model.model_json_schema()
+    defs = schema.pop("$defs", {})
+
+    def resolve(node: Any, expanding: frozenset[str] = frozenset()) -> Any:
+        if isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref.rsplit("/", 1)[-1]
+                if name in expanding:
+                    raise ValueError(
+                        f"inline_json_schema({model.__name__}): recursive "
+                        f"$ref to {name!r}; only acyclic models can be inlined"
+                    )
+                target = resolve(defs[name], expanding | {name})
+                # Keep sibling keys (description, default) over the target's.
+                extras = {
+                    k: resolve(v, expanding) for k, v in node.items() if k != "$ref"
+                }
+                return {**target, **extras}
+            return {k: resolve(v, expanding) for k, v in node.items()}
+        if isinstance(node, list):
+            return [resolve(item, expanding) for item in node]
+        return node
+
+    return resolve(schema)
+
+
+def _coordinate_tuple_count(coordinates: object) -> int:
+    """Validate a GeoJSON coordinate tree and return its position count."""
+    if not isinstance(coordinates, list):
+        raise ValueError("GeoJSON coordinates must be arrays.")
+
+    count = 0
+    stack: list[tuple[list[Any], int]] = [(coordinates, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > MAX_COORDINATE_DEPTH:
+            raise ValueError(
+                f"GeoJSON coordinate nesting exceeds {MAX_COORDINATE_DEPTH} levels."
+            )
+        if not current:
+            continue
+
+        first = current[0]
+        if isinstance(first, (int, float)) and not isinstance(first, bool):
+            if not 2 <= len(current) <= MAX_POSITION_DIMENSIONS:
+                raise ValueError(
+                    "GeoJSON positions must contain between 2 and "
+                    f"{MAX_POSITION_DIMENSIONS} numeric values."
+                )
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or (isinstance(value, float) and not math.isfinite(value))
+                for value in current
+            ):
+                raise ValueError("GeoJSON positions must contain finite numbers.")
+            longitude = current[0]
+            latitude = current[1]
+            if not -180 <= longitude <= 180 or not -90 <= latitude <= 90:
+                raise ValueError(
+                    "GeoJSON longitude/latitude must be within WGS84 bounds."
+                )
+            count += 1
+            if count > MAX_COORDINATE_TUPLES:
+                raise ValueError(
+                    "GeoJSON geometry exceeds the "
+                    f"{MAX_COORDINATE_TUPLES} coordinate limit."
+                )
+            continue
+
+        for child in current:
+            if not isinstance(child, list):
+                raise ValueError(
+                    "GeoJSON coordinate arrays may contain only positions or arrays."
+                )
+            stack.append((child, depth + 1))
+
+    return count
+
+
+class GeoJSONGeometry(BaseModel):
+    """A GeoJSON geometry object (RFC 7946)."""
+
+    type: Literal[
+        "Point",
+        "MultiPoint",
+        "LineString",
+        "MultiLineString",
+        "Polygon",
+        "MultiPolygon",
+    ]
+    coordinates: list[Any]
+
+
+def _bounded_geometry(value: GeoJSONGeometry) -> GeoJSONGeometry:
+    """Apply coordinate budgets to a geometry at the feature-write boundary."""
+    _coordinate_tuple_count(value.coordinates)
+    return value
+
+
+BoundedGeoJSONGeometry = Annotated[
+    GeoJSONGeometry,
+    AfterValidator(_bounded_geometry),
+]
+
+
+class GeoJSONGeometryCollection(BaseModel):
+    """A GeoJSON GeometryCollection (RFC 7946 §3.1.8).
+
+    Geometry collections carry ``geometries`` instead of ``coordinates``.
+    Only generic-geometry datasets accept them on write.
+
+    Nested collections are rejected because PostGIS cannot round-trip them
+    through the GeoJSON boundary.
+    """
+
+    type: Literal["GeometryCollection"]
+    geometries: list[GeoJSONGeometry]
+
+
+def _bounded_geometry_collection(
+    value: GeoJSONGeometryCollection,
+) -> GeoJSONGeometryCollection:
+    """Apply member and aggregate budgets at the feature-write boundary."""
+    if len(value.geometries) > MAX_GEOMETRY_COLLECTION_MEMBERS:
+        raise ValueError(
+            "GeometryCollection exceeds the "
+            f"{MAX_GEOMETRY_COLLECTION_MEMBERS} member limit."
+        )
+    total = sum(
+        _coordinate_tuple_count(geometry.coordinates) for geometry in value.geometries
+    )
+    if total > MAX_COORDINATE_TUPLES:
+        raise ValueError(
+            f"GeometryCollection exceeds the {MAX_COORDINATE_TUPLES} coordinate limit."
+        )
+    return value
+
+
+BoundedGeoJSONGeometryCollection = Annotated[
+    GeoJSONGeometryCollection,
+    AfterValidator(_bounded_geometry_collection),
+]
+
+
+# Discriminated by the Literal type on the collection variant.
+GeoJSONGeometryLike = GeoJSONGeometryCollection | GeoJSONGeometry
+BoundedGeoJSONGeometryLike = BoundedGeoJSONGeometryCollection | BoundedGeoJSONGeometry
+
+
+class GeoJSONFeature(BaseModel):
+    """A single GeoJSON Feature."""
+
+    type: Literal["Feature"] = "Feature"
+    id: int
+    geometry: GeoJSONGeometryLike | None = None
+    properties: dict
+
+
+# The tile routes treat `_v` as a freshness signal only when it is a stored
+# tile_cache_version or a record updated_at timestamp, so a write's response
+# carries the version for the caller's next tile reload.
+TILE_CACHE_VERSION_DESCRIPTION = (
+    "The dataset's tile_cache_version after this write committed. Send it "
+    "as the tile routes' `_v` query parameter when reloading tiles, so a "
+    "request that reaches a different API worker is forced to re-read the "
+    "dataset instead of serving that worker's own cached snapshot."
+)
+
+# The delete endpoint answers 204 with no body, so it carries the version on
+# this header instead.
+TILE_CACHE_VERSION_HEADER = "X-GeoLens-Tile-Cache-Version"
+
+TABLE_ID_DESCRIPTION = (
+    "Opaque id of the data table this feature was read from or written to. "
+    "A reupload or an overwrite of the dataset's data replaces the table, and "
+    "the replacement can reuse feature ids. Send it back as the `table_id` "
+    "query parameter of a PUT, PATCH or DELETE of this feature, or of a batch "
+    "delete, to have the write refused if the table was replaced since."
+)
+
+
+class GeoJSONFeatureRead(GeoJSONFeature):
+    """A GeoJSON Feature, plus the id of the table it was read from."""
+
+    # Same title as the base, so the generated SDK model name is unchanged.
+    model_config = ConfigDict(title="GeoJSONFeature")
+
+    table_id: str | None = Field(default=None, description=TABLE_ID_DESCRIPTION)
+
+
+class GeoJSONFeatureWrite(GeoJSONFeatureRead):
+    """A written GeoJSON Feature, plus the dataset's committed tile version."""
+
+    # The SDK generators name this route's response model from the inlined
+    # schema's "title" (inline_json_schema() flattens $defs, so no $ref
+    # component name exists). Keeping "GeoJSONFeature" leaves the generated
+    # class name unchanged.
+    model_config = ConfigDict(title="GeoJSONFeature")
+
+    tile_cache_version: int | None = Field(
+        default=None, description=TILE_CACHE_VERSION_DESCRIPTION
+    )
+
+
+class Link(BaseModel):
+    rel: str
+    href: str
+    type: str
+
+
+class GeoJSONFeatureCollection(BaseModel):
+    """A GeoJSON FeatureCollection with OGC API Features pagination fields."""
+
+    type: Literal["FeatureCollection"] = "FeatureCollection"
+    numberMatched: int
+    numberReturned: int
+    features: list[GeoJSONFeature]
+    links: list[Link]
+
+
+def _reject_nested_collections(data: object) -> object:
+    """Raw-payload guard for GeometryCollection writes, runs mode='before'.
+
+    A nested collection gets a clear 422 instead of a misleading
+    'coordinates: Field required'; a collection missing 'geometries' would
+    otherwise sneak through the union's broad GeoJSONGeometry member and
+    blow up inside ST_GeomFromGeoJSON as a raw database error.
+    """
+    if isinstance(data, dict):
+        geometry = data.get("geometry")
+        if isinstance(geometry, dict) and geometry.get("type") == "GeometryCollection":
+            geometries = geometry.get("geometries")
+            if not isinstance(geometries, list):
+                raise ValueError("GeometryCollection requires a 'geometries' array.")
+            for child in geometries:
+                if (
+                    isinstance(child, dict)
+                    and child.get("type") == "GeometryCollection"
+                ):
+                    raise ValueError(
+                        "Nested GeometryCollections are not supported; "
+                        "flatten the collection into a single level."
+                    )
+    return data
+
+
+class FeatureCreate(BaseModel):
+    """GeoJSON-style feature for insertion."""
+
+    geometry: BoundedGeoJSONGeometryLike
+    properties: dict | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_nested_collections(cls, data: object) -> object:
+        return _reject_nested_collections(data)
+
+
+class FeatureCollectionCreate(BaseModel):
+    """A GeoJSON FeatureCollection whose features are inserted together."""
+
+    type: Literal["FeatureCollection"]
+    features: list[FeatureCreate] = Field(
+        min_length=1,
+        max_length=MAX_FEATURES_PER_BATCH,
+        description=(
+            "Features to insert in one transaction, at most "
+            f"{MAX_FEATURES_PER_BATCH}. If any is refused, none is inserted."
+        ),
+    )
+
+
+class FeatureBatchDelete(BaseModel):
+    """The features a batch delete removes."""
+
+    # Strict: lax mode would read JSON true/false as gids 1 and 0.
+    gids: list[StrictInt] = Field(
+        min_length=1,
+        max_length=MAX_FEATURES_PER_BATCH,
+        description=(
+            f"Ids of the features to delete, at most {MAX_FEATURES_PER_BATCH}. "
+            "If any does not exist, none is deleted."
+        ),
+    )
+
+
+class FeatureBatchDeleted(BaseModel):
+    """The result of a batch delete."""
+
+    deleted: int = Field(description="Number of features deleted.")
+    tile_cache_version: int | None = Field(
+        default=None, description=TILE_CACHE_VERSION_DESCRIPTION
+    )
+
+
+def _feature_create_body(value: object) -> FeatureCreate | FeatureCollectionCreate:
+    """Validate as a collection only when the body says it is one.
+
+    A union would prefix every error location with the member it was tried
+    as, which would change the errors a single-feature body already gets.
+    """
+    if isinstance(value, (FeatureCreate, FeatureCollectionCreate)):
+        return value
+    if isinstance(value, dict) and value.get("type") == "FeatureCollection":
+        return FeatureCollectionCreate.model_validate(value)
+    return FeatureCreate.model_validate(value)
+
+
+FeatureCreateBody = Annotated[
+    FeatureCreate | FeatureCollectionCreate,
+    PlainValidator(
+        _feature_create_body,
+        json_schema_input_type=FeatureCreate | FeatureCollectionCreate,
+    ),
+]
+
+
+class GeoJSONFeatureCollectionWrite(BaseModel):
+    """The features a FeatureCollection create inserted, in request order."""
+
+    type: Literal["FeatureCollection"] = "FeatureCollection"
+    features: list[GeoJSONFeatureWrite]
+    table_id: str | None = Field(default=None, description=TABLE_ID_DESCRIPTION)
+    tile_cache_version: int | None = Field(
+        default=None, description=TILE_CACHE_VERSION_DESCRIPTION
+    )
+
+
+class GeoJSONFeatureDryRun(BaseModel):
+    """A feature as a create would store it, from a dry run that stored nothing."""
+
+    type: Literal["Feature"] = "Feature"
+    geometry: GeoJSONGeometryLike | None = None
+    properties: dict
+
+
+class GeoJSONFeatureCollectionDryRun(BaseModel):
+    """The features a FeatureCollection create would store, in request order."""
+
+    type: Literal["FeatureCollection"] = "FeatureCollection"
+    features: list[GeoJSONFeatureDryRun]
+
+
+class FeatureReplace(BaseModel):
+    """Full feature replacement (PUT semantics)."""
+
+    geometry: BoundedGeoJSONGeometryLike  # Required for full replacement
+    properties: dict  # Required — set fields to null explicitly
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_nested_collections(cls, data: object) -> object:
+        return _reject_nested_collections(data)
+
+
+class FeatureUpdate(BaseModel):
+    """Partial feature update (PATCH semantics)."""
+
+    geometry: BoundedGeoJSONGeometryLike | None = None
+    properties: dict | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_nested_collections(cls, data: object) -> object:
+        return _reject_nested_collections(data)

@@ -1,0 +1,894 @@
+"""SMTP channel + webhook channel + EnvConfiguredNotificationSink tests.
+
+Covers:
+  - SMTP channel (stdlib smtplib, STARTTLS/SSL, asyncio.to_thread)
+  - Webhook channel (httpx, Slack-compatible JSON, bounded timeout)
+  - EnvConfiguredNotificationSink fail-safe routing
+  - Secrets revealed only at call boundary, never in logs
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+import structlog
+
+from tests._logging_state import configured_logging
+from app.platform.extensions.protocols import Notification
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_TEST_NOTIFICATION = Notification(
+    event_type="test.event",
+    subject="Test Subject",
+    body="Test body text",
+    data=None,
+)
+
+_SECRET_PASSWORD = "s3cr3t-smtp-pass"
+_SECRET_WEBHOOK = "webhook-hmac-secret"
+
+# Emitted through the same structlog path the channels would use, to prove the
+# channel is live before anything is asserted about its contents.
+_LIVENESS_MARKER = "notification_log_liveness_probe"
+
+
+class _LiveLogs:
+    """Real log output for one test, with a liveness proof attached.
+
+    Replaces a loop over ``caplog.records`` that asserted a secret
+    was absent from each record. caplog captures ZERO structlog records in
+    this suite, so the loop body never ran and the assertion passed vacuously
+    — it has never been able to fail, and would not have fired if the leak it
+    guards against actually happened.
+
+    Reads real emitted output rather than using a recorder, deliberately: a
+    recorder can only observe a logger that already exists, and
+    ``smtp_channel.py`` has none. This tripwire has to catch a logger nobody
+    has written yet.
+    """
+
+    def __init__(self, records: list[str]) -> None:
+        self._records = records
+
+    def assert_no_secrets(self, *secrets: str) -> None:
+        """Both halves. The first is the one that was missing."""
+        assert any(_LIVENESS_MARKER in r for r in self._records), (
+            "log channel is not live: no structured record arrived, so a leak "
+            "assertion here would pass vacuously. That missing check is why "
+            "the previous caplog version never tested anything."
+        )
+        for secret in secrets:
+            offenders = [r for r in self._records if secret in r]
+            assert not offenders, (
+                f"secret leaked into log output: {secret!r} in {offenders}"
+            )
+
+
+@contextlib.contextmanager
+def _live_logs(capsys: pytest.CaptureFixture[str]) -> Any:
+    """Configure real logging bound to the captured stream, then restore it.
+
+    Must be entered INSIDE the test body. pytest swaps ``sys.stdout``/``stderr``
+    for the call phase only, so a handler created during fixture setup binds to
+    a stream that is not the one being captured and every write fails with
+    ``--- Logging error ---`` instead of landing anywhere assertable.
+
+    On exit every logger `setup_logging()` touches is put back exactly as it
+    was, via `configured_logging()` — root AND the three uvicorn loggers,
+    handlers, propagate and level, plus the whole structlog config. That helper
+    also disables `cache_logger_on_first_use` for the window, which is what
+    stops this test from freezing a module-level proxy and manufacturing the
+    very hazard it exists to catch (#1063's mechanism).
+
+    An earlier version called `structlog.reset_defaults()`
+    instead, reasoning that the library default leaves
+    `cache_logger_on_first_use` False and is therefore the safe end. That was
+    wrong, and wrong in a security-relevant direction: `reset_defaults()`
+    replaces the WHOLE chain, so it drops `_redact_sensitive_fields` and the
+    stdlib routing `setup_logging` installed, and any later test on the worker
+    would log unredacted. Restoring what was actually there is the only
+    version that leaves no trace — resetting to a default is still changing
+    state the caller established.
+
+    Captured at DEBUG, not INFO: a channel logging a
+    revealed credential at debug level would otherwise be filtered out before
+    this saw it, and the test would pass while a deployment running
+    LOG_LEVEL=DEBUG emitted the secret. The assertions this replaced used
+    `caplog.at_level(logging.DEBUG)`, so anything narrower is a regression.
+    """
+    # The setup_logging call and the cache disable that has
+    # to follow it now live together in configured_logging(); composing them
+    # here by hand is the ordering trap that helper exists to remove.
+    with configured_logging(log_level="DEBUG"):
+        records: list[str] = []
+        live = _LiveLogs(records)
+        try:
+            yield live
+        finally:
+            structlog.stdlib.get_logger("app.platform.notifications.liveness").info(
+                _LIVENESS_MARKER
+            )
+            captured = capsys.readouterr()
+            for line in (captured.out + captured.err).splitlines():
+                line = line.strip()
+                if not line.startswith("{"):
+                    # pytest writes tracebacks to the same stream; a traceback
+                    # carrying a secret is a different finding from a LOG
+                    # carrying one. A traceback rendered INTO a record is still
+                    # caught, because format_exc_info puts it inside the JSON.
+                    continue
+                try:
+                    parsed = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(parsed, dict) and "event" in parsed:
+                    records.append(line)
+
+
+# ---------------------------------------------------------------------------
+# SMTP channel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_smtp_sends_message_with_starttls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """send_email builds correct message, calls starttls, calls login, sends."""
+    import smtplib
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_port", 587)
+    monkeypatch.setattr(settings, "smtp_username", "user@example.com")
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(settings, "smtp_password", SecretStr(_SECRET_PASSWORD))
+    monkeypatch.setattr(settings, "smtp_from_address", "user@example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", True)
+
+    calls: dict[str, Any] = {
+        "starttls": False,
+        "login_user": None,
+        "login_pass": None,
+        "send_message": None,
+        "quit": False,
+    }
+
+    class FakeSMTP:
+        def __init__(self, host: str, port: int, *_args: Any, **_kwargs: Any) -> None:
+            calls["host"] = host
+            calls["port"] = port
+
+        def starttls(self, *_args: Any, **_kwargs: Any) -> None:
+            calls["starttls"] = True
+
+        def login(self, user: str, password: str) -> None:
+            calls["login_user"] = user
+            calls["login_pass"] = password
+
+        def send_message(self, msg: Any) -> None:
+            calls["send_message"] = msg
+
+        def quit(self) -> None:
+            calls["quit"] = True
+
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+
+    from app.platform.notifications.smtp_channel import send_email
+
+    await send_email(_TEST_NOTIFICATION)
+
+    assert calls["starttls"] is True, "starttls() must be called when smtp_use_tls=True"
+    assert calls["login_user"] == "user@example.com"
+    assert calls["login_pass"] == _SECRET_PASSWORD, (
+        "revealed password must be passed to login()"
+    )
+    assert calls["send_message"] is not None
+    assert calls["quit"] is True
+
+    msg = calls["send_message"]
+    assert msg["Subject"] == "Test Subject"
+    assert msg["From"] == "user@example.com"
+
+
+@pytest.mark.anyio
+async def test_smtp_uses_verified_tls_context_and_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SMTP must use a verifying TLS context + a bounded timeout.
+
+    The stdlib smtplib defaults leave the cert unverified (MITM exposes the
+    password) and the socket unbounded (an unreachable host pins a thread).
+    """
+    import smtplib
+    import ssl
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_port", 587)
+    monkeypatch.setattr(settings, "smtp_username", "user@example.com")
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(settings, "smtp_password", SecretStr(_SECRET_PASSWORD))
+    monkeypatch.setattr(settings, "smtp_from_address", "user@example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", True)
+
+    rec: dict[str, Any] = {"init_kwargs": None, "starttls_context": None}
+
+    class RecordingSMTP:
+        def __init__(self, host: str, port: int, *args: Any, **kwargs: Any) -> None:
+            rec["init_kwargs"] = kwargs
+
+        def starttls(self, *args: Any, **kwargs: Any) -> None:
+            rec["starttls_context"] = kwargs.get("context")
+
+        def login(self, user: str, password: str) -> None:
+            pass
+
+        def send_message(self, msg: Any) -> None:
+            pass
+
+        def quit(self) -> None:
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP", RecordingSMTP)
+
+    from app.platform.notifications.smtp_channel import send_email
+
+    await send_email(_TEST_NOTIFICATION)
+
+    assert rec["init_kwargs"] is not None
+    assert rec["init_kwargs"].get("timeout") == 15.0, (
+        "SMTP must be constructed with a bounded timeout (WR-02)"
+    )
+    ctx = rec["starttls_context"]
+    assert isinstance(ctx, ssl.SSLContext), (
+        "starttls must receive an SSLContext (WR-01)"
+    )
+    assert ctx.verify_mode == ssl.CERT_REQUIRED, (
+        "TLS context must verify the cert (WR-01)"
+    )
+    assert ctx.check_hostname is True, "TLS context must check the hostname (WR-01)"
+
+
+@pytest.mark.anyio
+async def test_smtp_uses_smtp_ssl_on_port_465(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Port 465 → SMTP_SSL (implicit TLS), no starttls() call."""
+    import smtplib
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_port", 465)
+    monkeypatch.setattr(settings, "smtp_username", "user@example.com")
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(settings, "smtp_password", SecretStr(_SECRET_PASSWORD))
+    monkeypatch.setattr(settings, "smtp_from_address", "user@example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", True)
+
+    ssl_calls: dict[str, Any] = {"starttls": False, "used_ssl": False}
+
+    class FakeSMTPSSL:
+        def __init__(self, host: str, port: int, *_args: Any, **_kwargs: Any) -> None:
+            ssl_calls["used_ssl"] = True
+
+        def starttls(self, *_args: Any, **_kwargs: Any) -> None:
+            ssl_calls["starttls"] = True
+
+        def login(self, user: str, password: str) -> None:
+            pass
+
+        def send_message(self, msg: Any) -> None:
+            pass
+
+        def quit(self) -> None:
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP_SSL", FakeSMTPSSL)
+    # ensure plain SMTP is not used
+    monkeypatch.setattr(
+        smtplib,
+        "SMTP",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("Should not use SMTP for port 465")
+        ),
+    )
+
+    from app.platform.notifications.smtp_channel import send_email
+
+    await send_email(_TEST_NOTIFICATION)
+
+    assert ssl_calls["used_ssl"] is True, "SMTP_SSL must be used on port 465"
+    assert ssl_calls["starttls"] is False, (
+        "starttls() must NOT be called when using SMTP_SSL"
+    )
+
+
+@pytest.mark.anyio
+async def test_smtp_no_login_when_no_username(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No login() call when smtp_username is None."""
+    import smtplib
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_port", 587)
+    monkeypatch.setattr(settings, "smtp_username", None)
+    monkeypatch.setattr(settings, "smtp_password", None)
+    monkeypatch.setattr(settings, "smtp_from_address", "noreply@example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", False)
+
+    login_called = {"v": False}
+
+    class FakeSMTP:
+        def __init__(self, host: str, port: int, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def starttls(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def login(self, user: str, password: str) -> None:
+            login_called["v"] = True
+
+        def send_message(self, msg: Any) -> None:
+            pass
+
+        def quit(self) -> None:
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+
+    from app.platform.notifications.smtp_channel import send_email
+
+    await send_email(_TEST_NOTIFICATION)
+
+    assert login_called["v"] is False, (
+        "login() must not be called when smtp_username is None"
+    )
+
+
+@pytest.mark.anyio
+async def test_smtp_password_not_in_logs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SMTP password must not appear in any log output."""
+    import smtplib
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_port", 587)
+    monkeypatch.setattr(settings, "smtp_username", "user@example.com")
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(settings, "smtp_password", SecretStr(_SECRET_PASSWORD))
+    monkeypatch.setattr(settings, "smtp_from_address", "user@example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", True)
+
+    class FakeSMTP:
+        def __init__(self, host: str, port: int, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def starttls(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def login(self, user: str, password: str) -> None:
+            pass
+
+        def send_message(self, msg: Any) -> None:
+            pass
+
+        def quit(self) -> None:
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+
+    from app.platform.notifications.smtp_channel import send_email
+
+    with _live_logs(capsys) as logs:
+        await send_email(_TEST_NOTIFICATION)
+
+    logs.assert_no_secrets(_SECRET_PASSWORD)
+
+
+@pytest.mark.anyio
+async def test_smtp_uses_to_from_notification_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Notification.data contains 'to', it is used as the To address."""
+    import smtplib
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_port", 587)
+    monkeypatch.setattr(settings, "smtp_username", "user@example.com")
+    from pydantic import SecretStr
+
+    monkeypatch.setattr(settings, "smtp_password", SecretStr(_SECRET_PASSWORD))
+    monkeypatch.setattr(settings, "smtp_from_address", "user@example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", False)
+
+    received_to: dict[str, Any] = {}
+
+    class FakeSMTP:
+        def __init__(self, host: str, port: int, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def login(self, user: str, password: str) -> None:
+            pass
+
+        def send_message(self, msg: Any) -> None:
+            received_to["to"] = msg["To"]
+
+        def quit(self) -> None:
+            pass
+
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+
+    notif_with_recipient = Notification(
+        event_type="test.event",
+        subject="Hello",
+        body="World",
+        data={"to": "recipient@example.com"},
+    )
+
+    from app.platform.notifications.smtp_channel import send_email
+
+    await send_email(notif_with_recipient)
+
+    assert received_to["to"] == "recipient@example.com"
+
+
+# ---------------------------------------------------------------------------
+# Webhook channel
+# ---------------------------------------------------------------------------
+
+# Helper: build an httpx.AsyncClient wired to a fake transport without
+# triggering the recursion bug from patching httpx.AsyncClient globally.
+# We import the real class once at module level so helpers can reference it.
+import httpx as _httpx  # noqa: E402  (after other imports — needed for helpers)
+
+
+def _make_fake_client(transport: _httpx.AsyncBaseTransport) -> _httpx.AsyncClient:
+    """Return a real httpx.AsyncClient wired to *transport* (no patching needed)."""
+    return _httpx.AsyncClient(
+        transport=transport, timeout=_httpx.Timeout(10.0, connect=5.0)
+    )
+
+
+@pytest.mark.anyio
+async def test_webhook_posts_correct_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """post_webhook POSTs JSON with event_type, subject, body, data, and text."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/webhook"
+    )
+    monkeypatch.setattr(settings, "notification_webhook_secret", None)
+
+    captured: dict[str, Any] = {}
+
+    class FakeTransport(_httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: _httpx.Request
+        ) -> _httpx.Response:
+            import json as _json
+
+            captured["url"] = str(request.url)
+            captured["body"] = _json.loads(request.content)
+            captured["headers"] = dict(request.headers)
+            return _httpx.Response(200, text="ok")
+
+    import app.platform.notifications.webhook_channel as _wc
+
+    monkeypatch.setattr(
+        _wc,
+        "_make_client",
+        lambda timeout: _make_fake_client(FakeTransport()),
+    )
+
+    from app.platform.notifications.webhook_channel import post_webhook
+
+    await post_webhook(_TEST_NOTIFICATION)
+
+    assert captured["url"] == "https://hooks.example.com/webhook"
+    body = captured["body"]
+    assert body["event_type"] == "test.event"
+    assert body["subject"] == "Test Subject"
+    assert body["body"] == "Test body text"
+    assert body["data"] == {}
+    assert "text" in body, "Slack-compatible 'text' field must be present"
+    assert "Test Subject" in body["text"]
+    assert "Test body text" in body["text"]
+
+
+@pytest.mark.anyio
+async def test_webhook_sends_secret_as_header_not_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Webhook secret is sent as X-Webhook-Secret header, never in the URL."""
+    from pydantic import SecretStr
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/webhook"
+    )
+    monkeypatch.setattr(
+        settings, "notification_webhook_secret", SecretStr(_SECRET_WEBHOOK)
+    )
+
+    captured: dict[str, Any] = {}
+
+    class FakeTransport(_httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: _httpx.Request
+        ) -> _httpx.Response:
+            captured["url"] = str(request.url)
+            captured["headers"] = dict(request.headers)
+            return _httpx.Response(200, text="ok")
+
+    import app.platform.notifications.webhook_channel as _wc
+
+    monkeypatch.setattr(
+        _wc, "_make_client", lambda timeout: _make_fake_client(FakeTransport())
+    )
+
+    from app.platform.notifications.webhook_channel import post_webhook
+
+    await post_webhook(_TEST_NOTIFICATION)
+
+    # Secret must be in X-Webhook-Secret header
+    assert "x-webhook-secret" in captured["headers"], (
+        "Webhook secret must be sent as X-Webhook-Secret header"
+    )
+    assert captured["headers"]["x-webhook-secret"] == _SECRET_WEBHOOK
+
+    # Secret must NOT appear in the URL
+    assert _SECRET_WEBHOOK not in captured["url"], (
+        "Webhook secret must NOT appear in the request URL"
+    )
+
+
+@pytest.mark.anyio
+async def test_webhook_raises_on_non_2xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """post_webhook raises on non-2xx response."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/webhook"
+    )
+    monkeypatch.setattr(settings, "notification_webhook_secret", None)
+
+    class FakeTransport(_httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: _httpx.Request
+        ) -> _httpx.Response:
+            return _httpx.Response(500, text="Server Error")
+
+    import app.platform.notifications.webhook_channel as _wc
+
+    monkeypatch.setattr(
+        _wc, "_make_client", lambda timeout: _make_fake_client(FakeTransport())
+    )
+
+    from app.platform.notifications.webhook_channel import post_webhook
+
+    with pytest.raises(_httpx.HTTPStatusError):
+        await post_webhook(_TEST_NOTIFICATION)
+
+
+@pytest.mark.anyio
+async def test_webhook_secret_not_in_logs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Webhook secret must not appear in any log output."""
+    from pydantic import SecretStr
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/webhook"
+    )
+    monkeypatch.setattr(
+        settings, "notification_webhook_secret", SecretStr(_SECRET_WEBHOOK)
+    )
+
+    class FakeTransport(_httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: _httpx.Request
+        ) -> _httpx.Response:
+            return _httpx.Response(200, text="ok")
+
+    import app.platform.notifications.webhook_channel as _wc
+
+    monkeypatch.setattr(
+        _wc, "_make_client", lambda timeout: _make_fake_client(FakeTransport())
+    )
+
+    from app.platform.notifications.webhook_channel import post_webhook
+
+    with _live_logs(capsys) as logs:
+        await post_webhook(_TEST_NOTIFICATION)
+
+    logs.assert_no_secrets(_SECRET_WEBHOOK)
+
+
+@pytest.mark.anyio
+async def test_webhook_no_secret_header_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no webhook secret is configured, X-Webhook-Secret header is absent."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/webhook"
+    )
+    monkeypatch.setattr(settings, "notification_webhook_secret", None)
+
+    captured: dict[str, Any] = {}
+
+    class FakeTransport(_httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: _httpx.Request
+        ) -> _httpx.Response:
+            captured["headers"] = dict(request.headers)
+            return _httpx.Response(200, text="ok")
+
+    import app.platform.notifications.webhook_channel as _wc
+
+    monkeypatch.setattr(
+        _wc, "_make_client", lambda timeout: _make_fake_client(FakeTransport())
+    )
+
+    from app.platform.notifications.webhook_channel import post_webhook
+
+    await post_webhook(_TEST_NOTIFICATION)
+
+    assert "x-webhook-secret" not in captured["headers"], (
+        "X-Webhook-Secret must not be sent when no secret is configured"
+    )
+
+
+# ---------------------------------------------------------------------------
+# EnvConfiguredNotificationSink
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_env_sink_disabled_when_notifications_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With notifications_enabled=False, no channel is called."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "notifications_enabled", False)
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/w"
+    )
+
+    send_email_called = {"v": False}
+    post_webhook_called = {"v": False}
+
+    async def fake_send_email(n: Any) -> None:
+        send_email_called["v"] = True
+
+    async def fake_post_webhook(n: Any) -> None:
+        post_webhook_called["v"] = True
+
+    with (
+        patch("app.platform.notifications.env_sink.send_email", fake_send_email),
+        patch("app.platform.notifications.env_sink.post_webhook", fake_post_webhook),
+    ):
+        from app.platform.notifications.env_sink import EnvConfiguredNotificationSink
+
+        sink = EnvConfiguredNotificationSink()
+        await sink.deliver(_TEST_NOTIFICATION)
+
+    assert send_email_called["v"] is False, (
+        "send_email must not be called when disabled"
+    )
+    assert post_webhook_called["v"] is False, (
+        "post_webhook must not be called when disabled"
+    )
+
+
+@pytest.mark.anyio
+async def test_env_sink_only_smtp_when_only_smtp_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With only smtp_host set, only SMTP channel is called."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "notifications_enabled", True)
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "notification_webhook_url", None)
+
+    send_email_called = {"v": False}
+    post_webhook_called = {"v": False}
+
+    async def fake_send_email(n: Any) -> None:
+        send_email_called["v"] = True
+
+    async def fake_post_webhook(n: Any) -> None:
+        post_webhook_called["v"] = True
+
+    with (
+        patch("app.platform.notifications.env_sink.send_email", fake_send_email),
+        patch("app.platform.notifications.env_sink.post_webhook", fake_post_webhook),
+    ):
+        from app.platform.notifications.env_sink import EnvConfiguredNotificationSink
+
+        sink = EnvConfiguredNotificationSink()
+        await sink.deliver(_TEST_NOTIFICATION)
+
+    assert send_email_called["v"] is True, (
+        "send_email must be called when smtp_host is set"
+    )
+    assert post_webhook_called["v"] is False, (
+        "post_webhook must NOT be called when webhook_url is None"
+    )
+
+
+@pytest.mark.anyio
+async def test_env_sink_partial_success_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When webhook fails but SMTP succeeds, deliver() does not raise."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "notifications_enabled", True)
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/w"
+    )
+
+    async def fake_send_email(n: Any) -> None:
+        pass  # succeeds
+
+    async def fake_post_webhook(n: Any) -> None:
+        raise ConnectionError("hook unreachable")
+
+    with (
+        patch("app.platform.notifications.env_sink.send_email", fake_send_email),
+        patch("app.platform.notifications.env_sink.post_webhook", fake_post_webhook),
+    ):
+        from app.platform.notifications.env_sink import EnvConfiguredNotificationSink
+
+        sink = EnvConfiguredNotificationSink()
+        # Must NOT raise — partial success (SMTP delivered) is success
+        await sink.deliver(_TEST_NOTIFICATION)
+
+
+@pytest.mark.anyio
+async def test_env_sink_all_channels_failed_raises_secret_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ALL configured channels fail, raises NotificationDeliveryError without secrets."""
+    from pydantic import SecretStr
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "notifications_enabled", True)
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_password", SecretStr(_SECRET_PASSWORD))
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/w"
+    )
+    monkeypatch.setattr(
+        settings, "notification_webhook_secret", SecretStr(_SECRET_WEBHOOK)
+    )
+
+    async def failing_send_email(n: Any) -> None:
+        raise ConnectionRefusedError("smtp refused")
+
+    async def failing_post_webhook(n: Any) -> None:
+        raise ConnectionRefusedError("hook unreachable")
+
+    with (
+        patch("app.platform.notifications.env_sink.send_email", failing_send_email),
+        patch("app.platform.notifications.env_sink.post_webhook", failing_post_webhook),
+    ):
+        from app.platform.notifications.env_sink import (
+            EnvConfiguredNotificationSink,
+            NotificationDeliveryError,
+        )
+
+        sink = EnvConfiguredNotificationSink()
+        with pytest.raises(NotificationDeliveryError) as exc_info:
+            await sink.deliver(_TEST_NOTIFICATION)
+
+    error_str = str(exc_info.value)
+    assert _SECRET_PASSWORD not in error_str, (
+        "SMTP password must not appear in error message"
+    )
+    assert _SECRET_WEBHOOK not in error_str, (
+        "Webhook secret must not appear in error message"
+    )
+
+
+@pytest.mark.anyio
+async def test_env_sink_no_channels_configured_returns_silently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When no channel is configured, deliver() returns without raising."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "notifications_enabled", True)
+    monkeypatch.setattr(settings, "smtp_host", None)
+    monkeypatch.setattr(settings, "notification_webhook_url", None)
+
+    from app.platform.notifications.env_sink import EnvConfiguredNotificationSink
+
+    sink = EnvConfiguredNotificationSink()
+    # Must NOT raise
+    await sink.deliver(_TEST_NOTIFICATION)
+
+
+@pytest.mark.anyio
+async def test_env_sink_all_failed_error_message_has_no_secrets_in_logs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Secrets must not appear in logs during channel failures."""
+    from pydantic import SecretStr
+
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "notifications_enabled", True)
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_password", SecretStr(_SECRET_PASSWORD))
+    monkeypatch.setattr(
+        settings, "notification_webhook_url", "https://hooks.example.com/w"
+    )
+    monkeypatch.setattr(
+        settings, "notification_webhook_secret", SecretStr(_SECRET_WEBHOOK)
+    )
+
+    async def failing_send_email(n: Any) -> None:
+        raise RuntimeError(
+            f"error with password {_SECRET_PASSWORD}"
+        )  # simulates a leaky error
+
+    async def failing_post_webhook(n: Any) -> None:
+        raise RuntimeError(f"error with secret {_SECRET_WEBHOOK}")
+
+    with (
+        patch("app.platform.notifications.env_sink.send_email", failing_send_email),
+        patch("app.platform.notifications.env_sink.post_webhook", failing_post_webhook),
+    ):
+        from app.platform.notifications.env_sink import (
+            EnvConfiguredNotificationSink,
+            NotificationDeliveryError,
+        )
+
+        sink = EnvConfiguredNotificationSink()
+        with _live_logs(capsys) as logs:
+            with pytest.raises(NotificationDeliveryError):
+                await sink.deliver(_TEST_NOTIFICATION)
+
+    logs.assert_no_secrets(_SECRET_PASSWORD, _SECRET_WEBHOOK)
+
+
+@pytest.mark.anyio
+async def test_env_sink_satisfies_notification_sink_protocol() -> None:
+    """EnvConfiguredNotificationSink is isinstance NotificationSink."""
+    from app.platform.extensions.protocols import NotificationSink
+    from app.platform.notifications.env_sink import EnvConfiguredNotificationSink
+
+    sink = EnvConfiguredNotificationSink()
+    assert isinstance(sink, NotificationSink), (
+        "EnvConfiguredNotificationSink must satisfy NotificationSink Protocol"
+    )

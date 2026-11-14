@@ -1,0 +1,70 @@
+"""Asset URL resolution with security-aware routing.
+
+Rules:
+  - Absolute http(s) hrefs (by-reference origin assets): passed through
+  - Published assets on S3: presigned URL (time-limited)
+  - Anything else, including every asset on local or Azure storage: ``None``
+
+nginx's ``location /assets/`` serves the SPA bundle, not storage files, so a
+bare ``/assets/{key}`` URL is dead. ``None`` lets a caller such as
+``_build_stac_assets`` substitute the API route that serves the file, or omit
+the asset rather than emit a broken href.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.platform.storage.provider import StorageProvider
+
+
+def is_remote_href(href: str) -> bool:
+    """True for an absolute http(s) URL, which names no managed storage object."""
+    return href.startswith(("http://", "https://"))
+
+
+def resolve_asset_url(
+    href: str,
+    *,
+    storage_backend: str,
+    record_status: str,
+    roles: list[str] | None = None,
+    public_api_url: str,
+    storage_provider: "StorageProvider | None" = None,
+    presign_ttl: int = 3600,
+) -> str | None:
+    """Resolve an asset href to the correct URL form.
+
+    Returns None when no safe authorized URL exists (e.g. a local-storage
+    path that would collide with the SPA /assets/ nginx location).
+    """
+    # A by-reference origin asset (STAC import) stores the publisher's
+    # already-public absolute URL, not a managed storage key, so it is passed
+    # through before either branch below can mishandle it.
+    if is_remote_href(href):
+        return href
+
+    is_published = record_status == "published"
+    if is_published and storage_backend == "s3" and storage_provider is not None:
+        from app.platform.storage.titiler_url import resolve_current_storage_key
+
+        key = _extract_storage_key(href)
+        physical_key = resolve_current_storage_key(key)
+        presign_options = {"expiration": presign_ttl}
+        return storage_provider.generate_presigned_get_url(
+            physical_key, **presign_options
+        )
+
+    # No backend route serves /assets/{key} (nginx returns the SPA index or a
+    # 404), so callers omit the asset rather than publish a dead href.
+    return None
+
+
+def _extract_storage_key(href: str) -> str:
+    if href.startswith("s3://"):
+        # s3://bucket/key -> key
+        parts = href.split("/", 3)
+        return parts[3] if len(parts) > 3 else ""
+
+    return href.lstrip("/")

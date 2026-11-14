@@ -1,0 +1,145 @@
+import i18n from 'i18next';
+import { initReactI18next } from 'react-i18next';
+
+import { detectionOptions, defaultNS, fallbackLng, namespaces, supportedLngs } from './config';
+import { getBrowserI18nOptions } from './options';
+import { loadLocaleResources, resources } from './resources';
+
+// RTL infrastructure is live (the <html dir> below flips for these languages),
+// but no RTL locale ships yet, so no logical-property (start/end vs left/right)
+// audit has run. Adding an RTL locale must be paired with that audit.
+const rtlLanguages = new Set(['ar', 'he', 'fa', 'ur']);
+
+function updateDocumentLanguage(lng?: string) {
+  if (typeof document === 'undefined') {
+    return;
+  }
+
+  const resolvedLng = lng ?? fallbackLng;
+  document.documentElement.lang = resolvedLng;
+  document.documentElement.dir = rtlLanguages.has(resolvedLng) ? 'rtl' : 'ltr';
+}
+
+// `zh` here is Simplified Chinese only. Ask Intl.Locale for the tag's script
+// (zh-MY maximizes to Hans, zh-TW to Hant) rather than guessing from a region allowlist.
+function isSimplifiedChineseTag(tag: string): boolean {
+  try {
+    return new Intl.Locale(tag).maximize().script === 'Hans';
+  } catch {
+    return false;
+  }
+}
+
+function matchSupportedLanguage(value: string): (typeof supportedLngs)[number] | undefined {
+  const lowerTag = value.toLowerCase();
+  if (lowerTag === 'zh' || lowerTag.startsWith('zh-')) {
+    return isSimplifiedChineseTag(value) ? 'zh' : undefined;
+  }
+  const baseLanguage = lowerTag.split('-')[0];
+  return supportedLngs.find((lng) => lng === baseLanguage);
+}
+
+function normalizeLanguage(value?: string | null) {
+  if (!value) return fallbackLng;
+  return matchSupportedLanguage(value) ?? fallbackLng;
+}
+
+function detectInitialLanguage() {
+  if (typeof window === 'undefined') {
+    return fallbackLng;
+  }
+
+  try {
+    const storedLanguage = window.localStorage.getItem(detectionOptions.lookupLocalStorage);
+    if (storedLanguage) {
+      return normalizeLanguage(storedLanguage);
+    }
+  } catch {
+    // Ignore storage access issues and fall back to browser settings.
+  }
+
+  const browserLanguage =
+    window.navigator.languages?.find((candidate) => matchSupportedLanguage(candidate) !== undefined) ??
+    window.navigator.language;
+
+  return normalizeLanguage(browserLanguage);
+}
+
+async function buildInitialResources() {
+  const initialLanguage = detectInitialLanguage();
+
+  if (initialLanguage === fallbackLng) {
+    // `resources` is frozen/non-extensible; passed by reference, a later
+    // addResourceBundle() for another language throws. Clone it.
+    return {
+      initialLanguage,
+      initialResources: { ...resources },
+    };
+  }
+
+  return {
+    initialLanguage,
+    initialResources: {
+      ...resources,
+      [initialLanguage]: await loadLocaleResources(initialLanguage),
+    },
+  };
+}
+
+let initializationPromise: Promise<typeof i18n> | null = null;
+
+export async function initializeI18n() {
+  if (i18n.isInitialized) {
+    return i18n;
+  }
+
+  if (!initializationPromise) {
+    initializationPromise = (async () => {
+      const { initialLanguage, initialResources } = await buildInitialResources();
+
+      await i18n
+        .use(initReactI18next)
+        .init({
+          ...getBrowserI18nOptions(),
+          lng: initialLanguage,
+          resources: initialResources,
+        });
+
+      i18n.off('languageChanged', updateDocumentLanguage);
+      i18n.on('languageChanged', updateDocumentLanguage);
+      updateDocumentLanguage(i18n.resolvedLanguage ?? i18n.language);
+
+      return i18n;
+    })();
+  }
+
+  return initializationPromise;
+}
+
+export async function changeAppLanguage(lng: string) {
+  const nextLanguage = normalizeLanguage(lng);
+  await initializeI18n();
+
+  // hasLoadedNamespace resolves through the fallback chain and falsely reports an
+  // unregistered language "loaded"; hasResourceBundle checks the actual store.
+  if (!i18n.hasResourceBundle(nextLanguage, defaultNS)) {
+    const localeResources = await loadLocaleResources(nextLanguage);
+    for (const ns of namespaces) {
+      i18n.addResourceBundle(nextLanguage, ns, localeResources[ns], true, true);
+    }
+  }
+
+  await i18n.changeLanguage(nextLanguage);
+
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.setItem(detectionOptions.lookupLocalStorage, nextLanguage);
+    } catch {
+      // Ignore storage access issues; language will still change for this session.
+    }
+  }
+}
+
+export { fallbackLng, normalizeLanguage };
+
+export default i18n;

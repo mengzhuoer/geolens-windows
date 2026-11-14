@@ -1,0 +1,253 @@
+/* eslint-disable jsx-a11y/no-static-element-interactions, jsx-a11y/no-noninteractive-tabindex -- stack rows are composite focus targets with nested controls, so role="button"/listbox roles are intentionally avoided. */
+import { memo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { ChevronRight, Eye, EyeOff, MoreVertical, Repeat, RotateCcw } from 'lucide-react';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { cn } from '@/lib/utils';
+import {
+  DragGripButton,
+  STACK_ROW_GRID,
+  rowStateClasses,
+  useKebabContextMenu,
+  type DragHandleProps,
+} from '@/components/builder/row-chrome';
+
+interface BasemapGroupRowProps {
+  groupId: string;
+  presetName: string;
+  providerLabel?: string;
+  visible: boolean;
+  selected: boolean;
+  isExpanded: boolean;
+  isDragging?: boolean;
+  dragHandleProps: DragHandleProps;
+  onSelectGroup: (id: string) => void;
+  onToggleExpand: (id: string) => void;
+  onToggleVisibility: (id: string) => void;
+  onSwapBasemap: () => void;
+  onResetAppearance: () => void;
+  /** True when basemap_config holds appearance customizations —
+   *  false disables "Reset appearance" (nothing to reset). Defaults to true so
+   *  an unwired call site never blocks the action. */
+  hasCustomAppearance?: boolean;
+  // Boundary signal — shows cursor-not-allowed when multi-selection is active
+  isMultiSelectionActive?: boolean;
+}
+
+export const BasemapGroupRow = memo(function BasemapGroupRow({
+  groupId,
+  presetName,
+  providerLabel,
+  visible,
+  selected,
+  isExpanded,
+  isDragging = false,
+  dragHandleProps,
+  onSelectGroup,
+  onToggleExpand,
+  onToggleVisibility,
+  onSwapBasemap,
+  onResetAppearance,
+  hasCustomAppearance = true,
+  isMultiSelectionActive = false,
+}: BasemapGroupRowProps) {
+  const { t } = useTranslation('builder');
+  const kebabMenu = useKebabContextMenu();
+
+  // Single source for the display name string, used by the visibility toggle's
+  // aria-label, the kebab trigger's aria-label and the visible row name in Cell
+  // 5.
+  const rowName = t('basemapGroup.rowName', {
+    defaultValue: 'Basemap · {{name}}',
+    name: presetName,
+  });
+
+  function handleRowClick(_e: React.MouseEvent) {
+    // The cursor-not-allowed class and the suppressed drag listeners below
+    // advertise the row as non-interactive during multi-selection; without this
+    // guard the click would still fire onSelectGroup and unmount the
+    // BulkActionBar mid-selection.
+    if (isMultiSelectionActive) return;
+    onSelectGroup(groupId);
+  }
+
+  return (
+    <div
+      id={`stack-row-${groupId}`}
+      data-selected={selected ? 'true' : undefined}
+      aria-current={selected ? 'true' : undefined}
+      tabIndex={0}
+      className={cn(
+        // Shared grid template + state classes.
+        'group/row grid', STACK_ROW_GRID, 'gap-2 items-center py-2 px-2 cursor-pointer select-none',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
+        rowStateClasses({ selected, isDragging }),
+        // Cursor-not-allowed signals basemap boundary during multi-selection mode
+        isMultiSelectionActive && 'cursor-not-allowed',
+      )}
+      onClick={handleRowClick}
+      onContextMenu={(e) => {
+        // The basemap row is non-interactive during
+        // multi-selection — the context menu honors the same boundary.
+        if (isMultiSelectionActive) return;
+        kebabMenu.onContextMenu(e);
+      }}
+      onKeyDown={(e) => {
+        // Mirror handleRowClick — keyboard activation must
+        // honor the multi-selection boundary, matching the visual signal.
+        if (isMultiSelectionActive) return;
+        if (kebabMenu.handleContextMenuKey(e)) return;
+        // WCAG 2.1.1: only handle keys aimed at the row itself; otherwise the
+        // container's preventDefault on descendant keys cancels native button
+        // activation (Enter on the caret or eye). Placed AFTER the context-menu
+        // branch so Shift+F10 works from descendants.
+        if (e.target !== e.currentTarget) return;
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onSelectGroup(groupId);
+        }
+      }}
+    >
+      {/* Cell 1: Caret, visible and functional for the basemap group. h-6 w-6
+          (24×24 hit target) + -mx-1 extends the visual box 4px past each side
+          of the 16px grid column without altering the grid template. */}
+      <button
+        type="button"
+        aria-expanded={isExpanded}
+        aria-controls={`basemap-group-children-${groupId}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleExpand(groupId);
+        }}
+        className={cn(
+          'flex items-center justify-center h-6 w-6 -mx-1 rounded-sm text-muted-foreground',
+          'transition-transform duration-[--motion-fast]',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+          isExpanded && 'rotate-90',
+        )}
+        aria-label={t('basemapGroup.toggleExpand', { defaultValue: 'Toggle basemap group' })}
+      >
+        <ChevronRight className={cn('h-4 w-4', !isExpanded && 'rtl-mirror')} aria-hidden="true" />
+      </button>
+
+      {/* Cell 2: Grip. The basemap group IS user-draggable for top/bottom
+          reordering (3D maps need the basemap rendered above data). When
+          isMultiSelectionActive is true the listeners are suppressed (drag and
+          multi-select are mutually exclusive). Shared DragGripButton; revealed
+          on coarse-pointer/touch. */}
+      <DragGripButton
+        dragHandleProps={dragHandleProps}
+        ariaLabel={t('basemapGroup.dragHandle', { defaultValue: 'Drag to reorder basemap' })}
+        testId="basemap-drag-handle"
+        touchReveal
+        listenersSuppressed={isMultiSelectionActive}
+      />
+
+      {/* Cell 3: Eye visibility toggle. aria-pressed reflects the visible state
+          so AT users hear "Basemap pressed". */}
+      <button
+        type="button"
+        aria-label={t('stackRow.toggleVisibility', {
+          defaultValue: 'Toggle visibility for {{name}}',
+          name: rowName,
+        })}
+        aria-pressed={visible}
+        className="flex items-center justify-center h-[22px] w-[22px] rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleVisibility(groupId);
+        }}
+      >
+        {visible ? (
+          <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+        ) : (
+          <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
+        )}
+      </button>
+
+      {/* Cell 4: Type icon — fixed ⊞ glyph with primary colors */}
+      <div className="flex items-center justify-center h-[22px] w-[22px]">
+        <span
+          className="flex items-center justify-center h-[22px] w-[22px] rounded-sm text-xs font-medium"
+          style={{
+            backgroundColor: 'var(--primary-50)',
+            color: 'var(--primary-700)',
+          }}
+          aria-hidden="true"
+        >
+          ⊞
+        </span>
+      </div>
+
+      {/* Cell 5: Layer name — static, no inline rename for basemap */}
+      <div className="min-w-0">
+        <span className="truncate text-sm block">
+          {rowName}
+          {providerLabel && (
+            <span className="text-muted-foreground"> · {providerLabel}</span>
+          )}
+        </span>
+      </div>
+
+      {/* Cell 6: Kebab menu — basemap variant with only 2 items */}
+      {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events */}
+      <div onClick={(e) => e.stopPropagation()}>
+        <DropdownMenu open={kebabMenu.open} onOpenChange={kebabMenu.onOpenChange}>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              data-kebab-trigger=""
+              // Reveal the kebab on coarse-pointer/touch.
+              data-touch-reveal=""
+              aria-label={t('stackRow.kebabTrigger', {
+                defaultValue: 'Layer options for {{name}}',
+                name: rowName,
+              })}
+              className={cn(
+                'flex items-center justify-center h-[22px] w-[22px] rounded-sm text-muted-foreground',
+                'opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                'hover:text-foreground hover:bg-[var(--surface-2)]',
+                'data-[state=open]:opacity-100',
+                selected && 'opacity-100',
+              )}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <MoreVertical className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-52">
+            {/* Kebab items carry icons, matching StackRow. */}
+            <DropdownMenuItem onSelect={() => onSwapBasemap()}>
+              <Repeat className="h-3.5 w-3.5 me-2" aria-hidden="true" />
+              {t('basemapGroup.swapBasemap', { defaultValue: 'Swap basemap' })}
+            </DropdownMenuItem>
+            {/* Disabled when there is nothing to reset; the reason
+                is inline muted text (tooltips don't fire on disabled items). */}
+            <DropdownMenuItem
+              data-testid="basemap-reset-appearance"
+              disabled={!hasCustomAppearance}
+              onSelect={() => {
+                if (hasCustomAppearance) onResetAppearance();
+              }}
+            >
+              <RotateCcw className="h-3.5 w-3.5 me-2" aria-hidden="true" />
+              <span className="flex flex-col items-start">
+                {t('basemapGroup.resetAppearance', { defaultValue: 'Reset appearance' })}
+                {!hasCustomAppearance && (
+                  <span className="text-2xs text-muted-foreground">
+                    {t('basemapGroup.resetAppearanceHint', { defaultValue: 'Appearance is already at defaults' })}
+                  </span>
+                )}
+              </span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+    </div>
+  );
+});

@@ -1,0 +1,214 @@
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { queryKeys } from '@/lib/query-keys';
+import { useAuthStore } from '@/stores/auth-store';
+import { formatMutationError } from '@/lib/error-map';
+import { toast } from 'sonner';
+import i18n from '@/i18n/i18n';
+import {
+  getBasemaps,
+  getMapDefaults,
+  getTileConfig,
+  getFeatureFlags,
+  getAllSettings,
+  updateSettings,
+  resetSettings,
+  getConfigMode,
+  getApiKeyStatus,
+  getBranding,
+  updateBranding,
+  getEnabledPlugins,
+  getEnterpriseOnlyTabs,
+  getNotificationStatus,
+  sendTestNotification,
+} from '@/api/settings';
+
+export function useBasemaps() {
+  return useQuery({
+    queryKey: queryKeys.settings.basemaps,
+    queryFn: getBasemaps,
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+export function useMapDefaults() {
+  return useQuery({
+    queryKey: queryKeys.settings.mapDefaults,
+    queryFn: getMapDefaults,
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+export function useTileConfig() {
+  return useQuery({
+    queryKey: queryKeys.settings.tileConfig,
+    queryFn: getTileConfig,
+    staleTime: 300_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+export function useEnabledPlugins() {
+  return useQuery({
+    queryKey: queryKeys.settings.enabledPlugins,
+    queryFn: getEnabledPlugins,
+    staleTime: 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+export function useFeatureFlags() {
+  return useQuery({
+    queryKey: queryKeys.settings.featureFlags,
+    queryFn: getFeatureFlags,
+    staleTime: 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+/**
+ * Whether the current user may set `visibility: public`.
+ *
+ * False only when the `restrict_public_visibility` instance setting is on
+ * AND the user is not an admin. The server enforces the rule with a 403 at
+ * every visibility-writing mutation — this hook only drives UI affordances
+ * (hiding/disabling the Public option).
+ */
+export function useCanSetPublicVisibility(): boolean {
+  const { data: featureFlags } = useFeatureFlags();
+  const isAdmin = useAuthStore((s) => s.isAdmin());
+  return isAdmin || !(featureFlags?.restrict_public_visibility ?? false);
+}
+
+export function useAllSettings(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.settings.allSettings,
+    queryFn: getAllSettings,
+    enabled: options?.enabled,
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+export function useConfigMode() {
+  return useQuery({
+    queryKey: queryKeys.settings.configMode,
+    queryFn: getConfigMode,
+    staleTime: Infinity,
+  });
+}
+
+export function useApiKeyStatus() {
+  return useQuery({
+    queryKey: queryKeys.settings.apiKeyStatus,
+    queryFn: getApiKeyStatus,
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+// Server-driven enterprise-tab list; the backend _ENTERPRISE_ONLY_TABS frozenset
+// is canonical. AdminSidebar falls back to a local default when the API is
+// unavailable. Tabs rarely change, so a long staleTime avoids refetching on every
+// admin navigation.
+export function useEnterpriseOnlyTabs(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.settings.enterpriseTabs,
+    queryFn: getEnterpriseOnlyTabs,
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+    retry: 1,
+    enabled: options?.enabled,
+  });
+}
+
+// Surface the specific API error alongside the generic "save failed" copy so the
+// user can tell validation errors from network/auth errors.
+
+export function useUpdateSettings() {
+  const qc = useQueryClient();
+  const refetchSettingsViews = () => {
+    qc.invalidateQueries({ queryKey: queryKeys.settings.all });
+    // Several settings (banner_text/color, landing_first) surface through
+    // /auth/config, which mounted banners read with a 5-min staleTime; refetch it
+    // so saves apply immediately
+    qc.invalidateQueries({ queryKey: queryKeys.authConfig.config });
+    // The AI status card reports semantic_search_enabled and ai_enabled.
+    qc.invalidateQueries({ queryKey: queryKeys.admin.aiStatus });
+  };
+  return useMutation({
+    mutationFn: (settings: Record<string, unknown>) => updateSettings(settings),
+    onSuccess: () => {
+      refetchSettingsViews();
+      toast.success(i18n.t('settingsToasts.saved'));
+    },
+    onError: (err) => {
+      // A failed embedding-column rebuild reports an error after the rest of
+      // the batch is committed, so the cached values can already be stale.
+      refetchSettingsViews();
+      toast.error(formatMutationError('settingsToasts.saveFailed', err));
+    },
+  });
+}
+
+export function useBranding() {
+  return useQuery({
+    queryKey: queryKeys.settings.branding,
+    queryFn: getBranding,
+    staleTime: 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+export function useUpdateBranding() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: updateBranding,
+    onSuccess: () => {
+      // Branding is also served inside the unified `settings.allSettings` payload,
+      // a sibling of `settings.branding`; the `settings.all` prefix covers both.
+      qc.invalidateQueries({ queryKey: queryKeys.settings.all });
+      toast.success(i18n.t('settingsToasts.saved'));
+    },
+    onError: (err) => {
+      toast.error(formatMutationError('settingsToasts.saveFailed', err));
+    },
+  });
+}
+
+export function useResetSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (keys: string[]) => resetSettings(keys),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.settings.all });
+      // Same as useUpdateSettings: banner/landing_first resets surface through
+      // /auth/config
+      qc.invalidateQueries({ queryKey: queryKeys.authConfig.config });
+      toast.success(i18n.t('settingsToasts.resetSuccess'));
+    },
+    onError: (err) => {
+      toast.error(formatMutationError('settingsToasts.resetFailed', err));
+    },
+  });
+}
+
+// Notification status + test-send hooks.
+
+/** Query: GET /settings/notifications/status/ — booleans only, no secrets. */
+export function useNotificationStatus() {
+  return useQuery({
+    queryKey: queryKeys.settings.notificationStatus,
+    queryFn: getNotificationStatus,
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+/** Mutation: POST /settings/notifications/test/ — triggers a canned test send through configured channels. */
+export function useSendTestNotification() {
+  return useMutation({
+    mutationFn: sendTestNotification,
+  });
+}

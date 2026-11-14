@@ -1,0 +1,350 @@
+"""Browser refresh-token cookie + CSRF primitives.
+
+The refresh token is the only credential that moves into a cookie. Access
+tokens keep travelling as ``Authorization: Bearer`` headers, so the cookie
+only ever authenticates ``POST /auth/refresh`` and ``POST /auth/logout``
+(credential of last resort). CSRF enforcement is scoped to exactly those
+requests.
+
+Browser mode is negotiated explicitly via the ``X-GeoLens-Auth-Mode: cookie``
+header, not by sniffing ``Accept``/``Sec-Fetch-Mode``, which proxies rewrite
+and non-browser callers can spoof. Without the header every response keeps
+the bearer-token contract, so the CLI and generated SDKs keep working.
+"""
+
+import hashlib
+import secrets
+from urllib.parse import urlsplit
+
+from fastapi import HTTPException, Request, Response, status
+
+from app.core.config import settings
+
+REFRESH_COOKIE_NAME = "geolens_refresh"
+CSRF_COOKIE_NAME = "geolens_csrf"
+CSRF_HEADER_NAME = "X-CSRF-Token"
+AUTH_MODE_HEADER = "X-GeoLens-Auth-Mode"
+COOKIE_AUTH_MODE = "cookie"
+
+# The CSRF cookie must be readable by the SPA (double-submit), so it is NOT
+# HttpOnly. It is not a credential: possession alone authenticates nothing.
+_CSRF_TOKEN_BYTES = 32
+
+
+def wants_cookie_auth(request: Request) -> bool:
+    header = request.headers.get(AUTH_MODE_HEADER, "")
+    return header.strip().lower() == COOKIE_AUTH_MODE
+
+
+def refresh_cookie_path(request: Request) -> str:
+    """Externally-visible ``Path=`` scope for the refresh cookie.
+
+    The app runs with ``root_path="/api"`` behind both the dev proxy and prod
+    nginx, neither of which forwards the prefix upstream — deriving from
+    ``root_path`` keeps the cookie scoped correctly under any mount point.
+
+    Scoped to ``/auth`` (not ``/``) so the cookie never touches catalog/tile/
+    upload/export traffic — it can't leak through hot-path logs or proxies,
+    and can't be replayed outside this router.
+
+    Scoped to the whole auth router rather than ``/auth/refresh``: RFC 6265
+    path-matching would keep the browser from sending the cookie to
+    ``/auth/logout``, so cookie-authenticated logout (revoking a session whose
+    access token already expired) couldn't fire. It still never touches the
+    data plane.
+    """
+    root_path = request.scope.get("root_path", "").rstrip("/")
+    return f"{root_path}/auth"
+
+
+def _secure_cookies() -> bool:
+    """Same production switch that hides the API docs and sets
+    ``https_only`` on SessionMiddleware. Development and test runs have no TLS
+    terminator, so a ``Secure`` cookie there would be silently dropped."""
+    return settings.is_production
+
+
+def issue_browser_session(
+    response: Response,
+    request: Request,
+    refresh_token: str,
+    expire_days: int,
+) -> None:
+    """Attach the refresh + CSRF cookies to *response*.
+
+    ``SameSite=Lax``: the refresh cookie only authenticates POSTs, and Lax and
+    Strict are identical for a same-origin XHR POST.
+    """
+    max_age = expire_days * 24 * 60 * 60
+    secure = _secure_cookies()
+    path = refresh_cookie_path(request)
+
+    response.set_cookie(
+        REFRESH_COOKIE_NAME,
+        refresh_token,
+        max_age=max_age,
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        path=path,
+    )
+
+    csrf_token = secrets.token_urlsafe(_CSRF_TOKEN_BYTES)
+    # Path="/" so any tab on the app can read it, whatever route it loaded on.
+    response.set_cookie(
+        CSRF_COOKIE_NAME,
+        csrf_token,
+        max_age=max_age,
+        httponly=False,
+        secure=secure,
+        samesite="lax",
+        path="/",
+    )
+
+
+def clear_browser_session(response: Response, request: Request) -> None:
+    """Expire both cookies. Safe to call when no cookie was ever set.
+
+    Deletion works from any request path: the browser applies a ``Set-Cookie``
+    whose name/path/domain match regardless of where the response came from,
+    so this can run from ``/auth/logout`` and the OAuth callback alike.
+    """
+    response.delete_cookie(
+        REFRESH_COOKIE_NAME,
+        path=refresh_cookie_path(request),
+        httponly=True,
+        secure=_secure_cookies(),
+        samesite="lax",
+    )
+    response.delete_cookie(
+        CSRF_COOKIE_NAME,
+        path="/",
+        secure=_secure_cookies(),
+        samesite="lax",
+    )
+
+
+def _sso_exchange_cookie_path(request: Request) -> str:
+    root_path = request.scope.get("root_path", "").rstrip("/")
+    return f"{root_path}/auth/oauth/exchange"
+
+
+def sso_exchange_cookie_name(code: str) -> str:
+    """One cookie per pending sign-in, so a second callback in this browser
+    leaves the first one's binding in place."""
+    return "geolens_sso_" + hashlib.sha256(code.encode()).hexdigest()[:16]
+
+
+def set_sso_exchange_cookie(
+    response: Response, request: Request, code: str, binding: str, max_age: int
+) -> None:
+    """Bind a staged SSO sign-in to this browser.
+
+    Scoped to the exchange route, so no refresh response ever rewrites it, and
+    ``SameSite=Lax`` keeps it off a cross-site POST to that route.
+    """
+    response.set_cookie(
+        sso_exchange_cookie_name(code),
+        binding,
+        max_age=max_age,
+        httponly=True,
+        secure=_secure_cookies(),
+        samesite="lax",
+        path=_sso_exchange_cookie_path(request),
+    )
+
+
+def read_sso_exchange_cookie(request: Request, code: str) -> str | None:
+    """The binding value, or None when absent or duplicated (see read_refresh_cookie)."""
+    name = sso_exchange_cookie_name(code)
+    if _cookie_occurrences(request, name) > 1:
+        return None
+    return request.cookies.get(name)
+
+
+def clear_sso_exchange_cookie(response: Response, request: Request, code: str) -> None:
+    response.delete_cookie(
+        sso_exchange_cookie_name(code),
+        path=_sso_exchange_cookie_path(request),
+        httponly=True,
+        secure=_secure_cookies(),
+        samesite="lax",
+    )
+
+
+def _login_device_cookie_path(request: Request) -> str:
+    root_path = request.scope.get("root_path", "").rstrip("/")
+    return f"{root_path}/auth/login"
+
+
+def set_login_device_cookie(
+    response: Response, request: Request, name: str, value: str, max_age: int
+) -> None:
+    """Remember this browser for one account's sign-in throttle.
+
+    Scoped to the sign-in route and ``SameSite=Strict``, so it only rides a
+    same-site sign-in POST. Logout leaves it in place: remembering the browser
+    past a sign-out is what it is for.
+    """
+    response.set_cookie(
+        name,
+        value,
+        max_age=max_age,
+        httponly=True,
+        secure=_secure_cookies(),
+        samesite="strict",
+        path=_login_device_cookie_path(request),
+    )
+
+
+def clear_login_device_cookie(response: Response, request: Request, name: str) -> None:
+    response.delete_cookie(
+        name,
+        path=_login_device_cookie_path(request),
+        httponly=True,
+        secure=_secure_cookies(),
+        samesite="strict",
+    )
+
+
+def cookies_with_prefix(request: Request, prefix: str) -> list[tuple[str, str]]:
+    """Every (name, value) in the raw ``Cookie:`` header whose name starts with *prefix*."""
+    pairs = []
+    for part in request.headers.get("cookie", "").split(";"):
+        key, sep, value = part.partition("=")
+        if sep and key.strip().startswith(prefix):
+            pairs.append((key.strip(), value.strip()))
+    return pairs
+
+
+def cookie_values(request: Request, name: str) -> list[str]:
+    """Every value *name* carries in the raw ``Cookie:`` header, in order."""
+    return [value for key, value in cookies_with_prefix(request, name) if key == name]
+
+
+def read_refresh_cookie(request: Request) -> str | None:
+    """The refresh cookie's value, or None when absent or not trustworthy.
+
+    Refuses DUPLICATE cookies of this name: an attacker on a sibling
+    subdomain with their own valid refresh token can add a parent-``Domain``
+    cookie of the same name; the browser sends both, a parser keeps one, and
+    the victim's refresh could rotate the attacker's token (login CSRF). The
+    attacker can only ADD a shadow, never remove the victim's host cookie, so
+    duplicates are the attack's fingerprint.
+    """
+    if _cookie_occurrences(request, REFRESH_COOKIE_NAME) > 1:
+        return None
+    return request.cookies.get(REFRESH_COOKIE_NAME)
+
+
+def _cookie_occurrences(request: Request, name: str) -> int:
+    """How many times *name* appears in the raw ``Cookie:`` header.
+
+    ``request.cookies`` is a dict, so it answers "which of the duplicates did
+    the parser keep", never "were there duplicates". Only the raw header can
+    tell the two apart.
+    """
+    raw = request.headers.get("cookie", "")
+    seen = 0
+    for part in raw.split(";"):
+        if part.split("=", 1)[0].strip() == name:
+            seen += 1
+    return seen
+
+
+def _origin_parts(url: str) -> tuple[str, str, int | None] | None:
+    """(scheme, host, effective port), or None when *url* has no usable origin."""
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or not host:
+        return None
+    scheme = parts.scheme.lower()
+    # Effective port: a URL that spells out its default port
+    # ("https://example.com:443") is the same origin as one that omits it.
+    effective = port if port is not None else {"https": 443, "http": 80}.get(scheme)
+    return scheme, host.lower(), effective
+
+
+def api_path_is_cookie_scoped(request: Request, api_url: str) -> bool:
+    """Whether *api_url*'s path is the mount point this cookie is scoped under.
+
+    Same origin is necessary but not sufficient: ``root_path`` is fixed at
+    ``/api``, so the cookie is always scoped to ``/api/auth``, while
+    ``PUBLIC_API_URL``/``FRONTEND_API_BASE_URL`` accept any path form.
+    A deployment mounted elsewhere would get a cookie the browser never
+    sends back, and cookie mode has no fragment fallback, so refresh would
+    silently stop. Mirrors the SPA's ``cookieAuthAvailable()``.
+    """
+    root_path = request.scope.get("root_path", "").rstrip("/")
+    try:
+        configured = urlsplit(api_url).path
+    except ValueError:
+        return False
+    return configured.rstrip("/") == root_path
+
+
+def is_same_origin(url_a: str, url_b: str) -> bool:
+    """Whether two absolute URLs share scheme, host, and effective port.
+
+    Used by the OAuth callback to decide cookie-vs-fragment delivery: a
+    cookie is scoped to the host the browser used to reach the API, so it's
+    only usable when the SPA lives on that same origin.
+
+    Both sides are the deployment's CONFIGURED public URLs, not the live
+    request's host: a proxy that rewrites Host (the Vite dev proxy's
+    ``changeOrigin`` keeps the real host only in ``X-Forwarded-Host``) would
+    report a false mismatch.
+
+    A false answer degrades to fragment delivery rather than handing the
+    browser a cookie it will never send back.
+    """
+    origin_a = _origin_parts(url_a)
+    origin_b = _origin_parts(url_b)
+    if origin_a is None or origin_b is None:
+        return False
+    return origin_a == origin_b
+
+
+def enforce_csrf(request: Request) -> None:
+    """Double-submit check for cookie-authenticated refresh. Raises 403.
+
+    Double-submit over a bare custom-header rule because this deployment's
+    CORS allowlist is operator-configurable at runtime
+    (``DynamicCORSMiddleware`` emits ``Access-Control-Allow-Credentials:
+    true`` per listed origin), and a "custom header implies a preflight"
+    guarantee is only as strong as that list. Comparing a value the attacker
+    can't read doesn't depend on it, and is directly exercisable by a plain
+    HTTP client with no preflight to simulate.
+    """
+    # read_refresh_cookie's duplicate-cookie refusal, applied to the CSRF
+    # cookie. A sibling subdomain can CHOOSE its value: set geolens_csrf=KNOWN
+    # with a parent Domain, and the browser sends two geolens_csrf cookies.
+    # Starlette keeps the last occurrence, and a freshly-set Domain cookie
+    # sharing Path=/ sorts after the older host-only one (RFC 6265), so the
+    # attacker's value wins the comparison while the victim's host-only
+    # geolens_refresh stays single and would still be accepted.
+    #
+    # Refusing turns that into a 403 the victim clears by signing in again,
+    # the same trade the refresh cookie makes. Naming alone can't fix it in
+    # dev: __Host- (which browsers refuse on a Domain cookie) needs TLS, and
+    # _secure_cookies() is False without a terminator.
+    if _cookie_occurrences(request, CSRF_COOKIE_NAME) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid CSRF token",
+        )
+    header_token = request.headers.get(CSRF_HEADER_NAME)
+    cookie_token = request.cookies.get(CSRF_COOKIE_NAME)
+    if not header_token or not cookie_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Missing CSRF token",
+        )
+    if not secrets.compare_digest(header_token, cookie_token):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid CSRF token",
+        )

@@ -1,0 +1,396 @@
+import { classifyGeometry } from '@/components/builder/layer-adapters/shared';
+import type { StyleConfig } from '@/types/api';
+import { expressionReadsColumn } from '@/lib/maplibre-expressions';
+
+// cvdSafe designations sourced from ColorBrewer 2.0 (colorbrewer2.org), which
+// publishes per-palette colorblind-safe flags based on empirical testing:
+//   Sequential single-hue (Blues, Greens, Oranges, etc.) — safe.
+//   Sequential multi-hue (YlOrRd, BuGn, etc.) — safe.
+//   Viridis family (Viridis, Inferno, Plasma) — perceptually uniform, CVD-safe.
+//   Diverging: BrBG, PiYG, PRGn, PuOr, RdBu, RdYlBu — safe per ColorBrewer.
+//   Diverging: RdYlGn, Spectral — NOT safe (red-green / rainbow confusion).
+//   Qualitative: Set2, Dark2, Paired — listed safe at small N per ColorBrewer.
+//   Qualitative: Set1, Set3, Accent, Pastel1, Pastel2 — NOT safe.
+
+export const SEQUENTIAL_RAMPS = [
+  { name: 'YlOrRd', labelKey: 'dataDriven.colorRamps.yellowOrangeRed', cvdSafe: true },
+  { name: 'YlGnBu', labelKey: 'dataDriven.colorRamps.yellowGreenBlue', cvdSafe: true },
+  { name: 'Viridis', labelKey: 'dataDriven.colorRamps.viridis', cvdSafe: true },
+  { name: 'Inferno', labelKey: 'dataDriven.colorRamps.inferno', cvdSafe: true },
+  { name: 'Plasma', labelKey: 'dataDriven.colorRamps.plasma', cvdSafe: true },
+  { name: 'Blues', labelKey: 'dataDriven.colorRamps.blues', cvdSafe: true },
+  { name: 'Greens', labelKey: 'dataDriven.colorRamps.greens', cvdSafe: true },
+  { name: 'Oranges', labelKey: 'dataDriven.colorRamps.oranges', cvdSafe: true },
+  { name: 'Reds', labelKey: 'dataDriven.colorRamps.reds', cvdSafe: true },
+  { name: 'Purples', labelKey: 'dataDriven.colorRamps.purples', cvdSafe: true },
+  { name: 'BuGn', labelKey: 'dataDriven.colorRamps.blueGreen', cvdSafe: true },
+  { name: 'BuPu', labelKey: 'dataDriven.colorRamps.bluePurple', cvdSafe: true },
+  { name: 'OrRd', labelKey: 'dataDriven.colorRamps.orangeRed', cvdSafe: true },
+  { name: 'YlGn', labelKey: 'dataDriven.colorRamps.yellowGreen', cvdSafe: true },
+] as const;
+
+export const DIVERGING_RAMPS = [
+  { name: 'RdYlBu', labelKey: 'dataDriven.colorRamps.redYellowBlue', cvdSafe: true },
+  // RdYlGn uses red-green contrast — NOT colorblind-safe per ColorBrewer.
+  { name: 'RdYlGn', labelKey: 'dataDriven.colorRamps.redYellowGreen', cvdSafe: false },
+  { name: 'RdBu', labelKey: 'dataDriven.colorRamps.redBlue', cvdSafe: true },
+  { name: 'BrBG', labelKey: 'dataDriven.colorRamps.brownBlueGreen', cvdSafe: true },
+  { name: 'PiYG', labelKey: 'dataDriven.colorRamps.pinkYellowGreen', cvdSafe: true },
+  { name: 'PRGn', labelKey: 'dataDriven.colorRamps.purpleGreen', cvdSafe: true },
+  // Spectral is a rainbow-like multi-hue — NOT colorblind-safe per ColorBrewer.
+  { name: 'Spectral', labelKey: 'dataDriven.colorRamps.spectral', cvdSafe: false },
+] as const;
+
+export const QUALITATIVE_RAMPS = [
+  // Set1 and Set3 use problematic red-green pairings — NOT colorblind-safe.
+  { name: 'Set1', labelKey: 'dataDriven.colorRamps.set1', cvdSafe: false },
+  // Set2 and Dark2 are listed as colorblind-safe at small N per ColorBrewer.
+  { name: 'Set2', labelKey: 'dataDriven.colorRamps.set2', cvdSafe: true },
+  { name: 'Set3', labelKey: 'dataDriven.colorRamps.set3', cvdSafe: false },
+  // Paired is listed as colorblind-safe per ColorBrewer.
+  { name: 'Paired', labelKey: 'dataDriven.colorRamps.paired', cvdSafe: true },
+  { name: 'Dark2', labelKey: 'dataDriven.colorRamps.dark2', cvdSafe: true },
+  // Accent, Pastel1, Pastel2 include red-green pairs — NOT colorblind-safe.
+  { name: 'Accent', labelKey: 'dataDriven.colorRamps.accent', cvdSafe: false },
+  { name: 'Pastel1', labelKey: 'dataDriven.colorRamps.pastel1', cvdSafe: false },
+  { name: 'Pastel2', labelKey: 'dataDriven.colorRamps.pastel2', cvdSafe: false },
+] as const;
+
+// Rotation lists are CVD-safe-first so the default works for colour-blind
+// users without any explicit preference.
+//
+// GRADUATED: every SEQUENTIAL_RAMP is cvdSafe; the order maximises hue contrast
+// between successive layers.
+//
+// CATEGORICAL: CVD-safe ramps first, the non-safe ones appended so they are
+// still reachable.
+const GRADUATED_ROTATION: readonly string[] = [
+  'YlOrRd',
+  'Blues',
+  'Greens',
+  'Viridis',
+  'Oranges',
+  'Purples',
+  'YlGnBu',
+  'Inferno',
+  'BuGn',
+  'Reds',
+  'Plasma',
+  'BuPu',
+  'OrRd',
+  'YlGn',
+] as const;
+
+const CATEGORICAL_ROTATION: readonly string[] = [
+  // CVD-safe first
+  'Set2',
+  'Paired',
+  'Dark2',
+  // Non-CVD-safe (still useful at small N, included for completeness)
+  'Set1',
+  'Set3',
+  'Accent',
+] as const;
+
+/**
+ * Maps a zero-based `index` to a ramp name by cycling through the rotation for
+ * `mode`. The first listLength calls produce distinct names.
+ */
+export function nextRotatingRamp(
+  mode: 'categorical' | 'graduated',
+  index: number,
+): string {
+  const list = mode === 'graduated' ? GRADUATED_ROTATION : CATEGORICAL_ROTATION;
+  return list[((index % list.length) + list.length) % list.length];
+}
+
+/**
+ * Default ramp by data character: first sequential ('graduated') or
+ * qualitative ('categorical') ramp in the rotation.
+ */
+export function suggestRampForMode(mode: 'categorical' | 'graduated'): string {
+  return nextRotatingRamp(mode, 0);
+}
+
+/** Reverse an array of color strings without mutating it. */
+export function reverseRamp(colors: string[]): string[] {
+  return [...colors].reverse();
+}
+
+/** Filter ramps (or a spread combination of the three arrays) to cvdSafe entries. */
+export function cvdSafeRamps<T extends { cvdSafe: boolean }>(ramps: T[] | readonly T[]): T[] {
+  return (ramps as T[]).filter((r) => r.cvdSafe);
+}
+
+// Keep production independent of chroma-js while preserving its
+// ColorBrewer output bit-for-bit; the parity test retains chroma as test data.
+const BREWER_STOPS: Record<string, readonly string[]> = {
+  YlOrRd: ['#ffffcc', '#ffeda0', '#fed976', '#feb24c', '#fd8d3c', '#fc4e2a', '#e31a1c', '#bd0026', '#800026'],
+  YlGnBu: ['#ffffd9', '#edf8b1', '#c7e9b4', '#7fcdbb', '#41b6c4', '#1d91c0', '#225ea8', '#253494', '#081d58'],
+  Viridis: ['#440154', '#482777', '#3f4a8a', '#31678e', '#26838f', '#1f9d8a', '#6cce5a', '#b6de2b', '#fee825'],
+  Blues: ['#f7fbff', '#deebf7', '#c6dbef', '#9ecae1', '#6baed6', '#4292c6', '#2171b5', '#08519c', '#08306b'],
+  Greens: ['#f7fcf5', '#e5f5e0', '#c7e9c0', '#a1d99b', '#74c476', '#41ab5d', '#238b45', '#006d2c', '#00441b'],
+  Oranges: ['#fff5eb', '#fee6ce', '#fdd0a2', '#fdae6b', '#fd8d3c', '#f16913', '#d94801', '#a63603', '#7f2704'],
+  Reds: ['#fff5f0', '#fee0d2', '#fcbba1', '#fc9272', '#fb6a4a', '#ef3b2c', '#cb181d', '#a50f15', '#67000d'],
+  Purples: ['#fcfbfd', '#efedf5', '#dadaeb', '#bcbddc', '#9e9ac8', '#807dba', '#6a51a3', '#54278f', '#3f007d'],
+  BuGn: ['#f7fcfd', '#e5f5f9', '#ccece6', '#99d8c9', '#66c2a4', '#41ae76', '#238b45', '#006d2c', '#00441b'],
+  BuPu: ['#f7fcfd', '#e0ecf4', '#bfd3e6', '#9ebcda', '#8c96c6', '#8c6bb1', '#88419d', '#810f7c', '#4d004b'],
+  OrRd: ['#fff7ec', '#fee8c8', '#fdd49e', '#fdbb84', '#fc8d59', '#ef6548', '#d7301f', '#b30000', '#7f0000'],
+  YlGn: ['#ffffe5', '#f7fcb9', '#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443', '#006837', '#004529'],
+  RdYlBu: ['#a50026', '#d73027', '#f46d43', '#fdae61', '#fee090', '#ffffbf', '#e0f3f8', '#abd9e9', '#74add1', '#4575b4', '#313695'],
+  RdYlGn: ['#a50026', '#d73027', '#f46d43', '#fdae61', '#fee08b', '#ffffbf', '#d9ef8b', '#a6d96a', '#66bd63', '#1a9850', '#006837'],
+  RdBu: ['#67001f', '#b2182b', '#d6604d', '#f4a582', '#fddbc7', '#f7f7f7', '#d1e5f0', '#92c5de', '#4393c3', '#2166ac', '#053061'],
+  BrBG: ['#543005', '#8c510a', '#bf812d', '#dfc27d', '#f6e8c3', '#f5f5f5', '#c7eae5', '#80cdc1', '#35978f', '#01665e', '#003c30'],
+  PiYG: ['#8e0152', '#c51b7d', '#de77ae', '#f1b6da', '#fde0ef', '#f7f7f7', '#e6f5d0', '#b8e186', '#7fbc41', '#4d9221', '#276419'],
+  PRGn: ['#40004b', '#762a83', '#9970ab', '#c2a5cf', '#e7d4e8', '#f7f7f7', '#d9f0d3', '#a6dba0', '#5aae61', '#1b7837', '#00441b'],
+  Spectral: ['#9e0142', '#d53e4f', '#f46d43', '#fdae61', '#fee08b', '#ffffbf', '#e6f598', '#abdda4', '#66c2a5', '#3288bd', '#5e4fa2'],
+  Set1: ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33', '#a65628', '#f781bf', '#999999'],
+  Set2: ['#66c2a5', '#fc8d62', '#8da0cb', '#e78ac3', '#a6d854', '#ffd92f', '#e5c494', '#b3b3b3'],
+  Set3: ['#8dd3c7', '#ffffb3', '#bebada', '#fb8072', '#80b1d3', '#fdb462', '#b3de69', '#fccde5', '#d9d9d9', '#bc80bd', '#ccebc5', '#ffed6f'],
+  Paired: ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00', '#cab2d6', '#6a3d9a', '#ffff99', '#b15928'],
+  Dark2: ['#1b9e77', '#d95f02', '#7570b3', '#e7298a', '#66a61e', '#e6ab02', '#a6761d', '#666666'],
+  Accent: ['#7fc97f', '#beaed4', '#fdc086', '#ffff99', '#386cb0', '#f0027f', '#bf5b17', '#666666'],
+  Pastel1: ['#fbb4ae', '#b3cde3', '#ccebc5', '#decbe4', '#fed9a6', '#ffffcc', '#e5d8bd', '#fddaec', '#f2f2f2'],
+  Pastel2: ['#b3e2cd', '#fdcdac', '#cbd5e8', '#f4cae4', '#e6f5c9', '#fff2ae', '#f1e2cc', '#cccccc'],
+};
+
+function hexToRgb(hex: string): [number, number, number] {
+  return [
+    parseInt(hex.slice(1, 3), 16),
+    parseInt(hex.slice(3, 5), 16),
+    parseInt(hex.slice(5, 7), 16),
+  ];
+}
+
+function rgbToHex(r: number, g: number, b: number): string {
+  return (
+    '#' +
+    [r, g, b].map((v) => Math.round(v).toString(16).padStart(2, '0')).join('')
+  );
+}
+
+/** Sample a stop array at t ∈ [0,1] with chroma-compatible RGB interpolation. */
+function sampleStops(stops: readonly string[], t: number): string {
+  const n = stops.length;
+  if (t <= 0) return stops[0];
+  if (t >= 1) return stops[n - 1];
+  // chroma.scale places stops at k/(n-1) breakpoints and derives the segment
+  // fraction from those (inexact) binary fractions; mirror that arithmetic
+  // so rounding matches chroma's output bit-for-bit.
+  let k = 0;
+  while (t >= (k + 1) / (n - 1)) k++;
+  if (k > n - 2) k = n - 2;
+  const f = (t - k / (n - 1)) / ((k + 1) / (n - 1) - k / (n - 1));
+  const a = hexToRgb(stops[k]);
+  const b = hexToRgb(stops[k + 1]);
+  return rgbToHex(
+    a[0] + (b[0] - a[0]) * f,
+    a[1] + (b[1] - a[1]) * f,
+    a[2] + (b[2] - a[2]) * f,
+  );
+}
+
+// chroma.scale() resolves brewer names case-insensitively
+// (chroma.brewer carries lowercase aliases), and legacy/imported style configs
+// can hold lowercase ramp names like 'viridis' — keep matching them.
+const BREWER_STOPS_BY_LOWER: Record<string, readonly string[]> = Object.fromEntries(
+  Object.entries(BREWER_STOPS).map(([name, stops]) => [name.toLowerCase(), stops]),
+);
+
+// Lowercase qualitative palette names so getRampColors
+// can tell a discrete category palette from a continuous gradient.
+const QUALITATIVE_NAMES = new Set(QUALITATIVE_RAMPS.map((r) => r.name.toLowerCase()));
+
+/**
+ * Hex color strings from a named ColorBrewer scale (case-insensitive, matching
+ * chroma.scale()'s name resolution). `reversed` flips the order.
+ *
+ * Unknown ramp names fall back to YlOrRd, including 'Inferno' and 'Plasma'
+ * because chroma-js has no brewer entry for either.
+ */
+export function getRampColors(rampName: string, count: number, reversed = false): string[] {
+  const lower = rampName.toLowerCase();
+  const stops = BREWER_STOPS_BY_LOWER[lower] ?? BREWER_STOPS.YlOrRd;
+  let colors: string[];
+  if (QUALITATIVE_NAMES.has(lower)) {
+    // A qualitative palette is unrelated category colors, not a gradient:
+    // continuous sampling would blend adjacent hues. Assign entries directly,
+    // cycling past the palette length.
+    colors = Array.from({ length: count }, (_, i) => stops[i % stops.length]);
+  } else {
+    colors =
+      count === 1
+        ? [sampleStops(stops, 0.5)]
+        : Array.from({ length: count }, (_, i) => sampleStops(stops, i / (count - 1)));
+  }
+  return reversed ? reverseRamp(colors) : colors;
+}
+
+/**
+ * Build a MapLibre categorical (match) expression. `stringInput` matches on
+ * ['to-string', ['get', column]] for columns whose values cannot be match
+ * labels themselves (booleans).
+ */
+export function buildCategoricalExpression(
+  column: string,
+  valueColorMap: [unknown, string][],
+  fallback: string,
+  stringInput = false,
+): unknown[] | string {
+  const pairs: unknown[] = [];
+  for (const [value, color] of valueColorMap) {
+    pairs.push(value, color);
+  }
+  if (pairs.length === 0) {
+    // A zero-pair ['match', input, fallback] is below the spec's minimum arity,
+    // so addLayer would throw and the layer never render; emit the fallback.
+    return fallback;
+  }
+  const input = stringInput ? ['to-string', ['get', column]] : ['get', column];
+  const matchExpr = ['match', input, ...pairs, fallback];
+  return ['case', ['==', ['get', column], null], fallback, matchExpr];
+}
+
+/**
+ * The fallback colour of an expression `buildCategoricalExpression` produced,
+ * or null when the paint is not one (a plain colour, a different shape).
+ */
+export function categoricalFallbackOf(expression: unknown): string | null {
+  if (!Array.isArray(expression)) return null;
+  const last = expression[expression.length - 1];
+  if (expression[0] === 'case') {
+    if (typeof last === 'string') return last;
+    // Only the generated null guard hands over its nested match's catch-all.
+    const cond = expression[1];
+    const isNullGuard =
+      expression.length === 4 &&
+      Array.isArray(cond) &&
+      cond[0] === '==' &&
+      cond[2] === null &&
+      Array.isArray(cond[1]) &&
+      cond[1][0] === 'get';
+    return isNullGuard ? categoricalFallbackOf(last) : null;
+  }
+  return expression[0] === 'match' && typeof last === 'string' ? last : null;
+}
+
+/**
+ * Graduated (step) expression. Requires colors.length === breaks.length + 1.
+ */
+export function buildGraduatedExpression(
+  column: string,
+  breaks: number[],
+  colors: string[],
+  nullColor = '#cccccc',
+): unknown[] {
+  if (colors.length !== breaks.length + 1) {
+    throw new Error(
+      `colors.length (${colors.length}) must equal breaks.length + 1 (${breaks.length + 1})`,
+    );
+  }
+
+  const step: unknown[] = ['step', ['get', column], colors[0]];
+  for (let i = 0; i < breaks.length; i++) {
+    step.push(breaks[i], colors[i + 1]);
+  }
+  return ['case', ['==', ['get', column], null], nullColor, step];
+}
+
+/** Paint property name for coloring based on geometry type. */
+export function getColorProperty(geometryType: string | null): string {
+  // Derive from the shared geometry classifier.
+  switch (classifyGeometry(geometryType)) {
+    case 'point':
+      return 'circle-color';
+    case 'line':
+      return 'line-color';
+    default:
+      return 'fill-color';
+  }
+}
+
+/**
+ * Graduated (step) expression for numeric size properties; same shape as
+ * `buildGraduatedExpression`. Requires sizes.length === breaks.length + 1.
+ */
+export function buildGraduatedSizeExpression(
+  column: string,
+  breaks: number[],
+  sizes: number[],
+): unknown[] {
+  if (sizes.length !== breaks.length + 1) {
+    throw new Error(
+      `sizes.length (${sizes.length}) must equal breaks.length + 1 (${breaks.length + 1})`,
+    );
+  }
+
+  const expr: unknown[] = ['step', ['get', column], sizes[0]];
+  for (let i = 0; i < breaks.length; i++) {
+    expr.push(breaks[i], sizes[i + 1]);
+  }
+  // Guard null values: render at 0 size (invisible) instead of minimum size
+  return ['case', ['==', ['get', column], null], 0, expr];
+}
+
+/** Paint property name for size-based styling, or null when not applicable. */
+export function getSizeProperty(
+  geometryType: string | null,
+  target: 'color' | 'radius' | 'width',
+): string | null {
+  if (!geometryType || target === 'color') return null;
+
+  const gt = geometryType.toLowerCase().replace('multi', '');
+  if (target === 'radius' && gt.includes('point')) return 'circle-radius';
+  if (target === 'width' && (gt.includes('line') || gt.includes('linestring'))) return 'line-width';
+  return null;
+}
+
+/** The fields that constitute a colour classification — see `colorClassificationIsOrphaned`. */
+const COLOR_CLASSIFICATION_KEYS = ['mode', 'column', 'ramp', 'categories', 'colors', 'breaks'] as const;
+
+/**
+ * Detect a classification config that no longer matches the rendered paint.
+ * Empty class sets and heatmap or symbol modes require no color expression.
+ */
+export function colorClassificationIsOrphaned(
+  config: StyleConfig | null | undefined,
+  paint: Record<string, unknown>,
+  geometryType: string | null,
+): boolean {
+  if (!config) return false;
+  if (config.render_mode === 'heatmap' || config.render_mode === 'symbol') return false;
+  // A size target describes `circle-radius`/`line-width`; the colour keys are not its business.
+  const targetsColor =
+    (config.mode === 'categorical' || config.mode === 'graduated') &&
+    (config.target === undefined || config.target === 'color');
+  if (!targetsColor) return false;
+  const claimsClasses =
+    config.mode === 'categorical'
+      ? (config.categories?.length ?? 0) > 0
+      : (config.colors?.length ?? 0) > 0;
+  if (!claimsClasses) return false;
+  // Resolve the color property through the same helper used by the editor.
+  const painted = paint[getColorProperty(geometryType)];
+  if (!Array.isArray(painted)) return true;
+  // Require the expression to read the configured column. Do not infer which
+  // `get` in a hand-authored expression owns classification; that could discard
+  // valid custom colors.
+  return typeof config.column === 'string' && config.column !== ''
+    && !expressionReadsColumn(painted, config.column);
+}
+
+/**
+ * Strip a classification claim that `paint` no longer backs. Removes every
+ * classification key, including column and ramp, so a fresh editor cannot
+ * regenerate the stale expression; unrelated open-bag fields are preserved.
+ */
+export function reconcileColorClassification(
+  config: StyleConfig | null,
+  paint: Record<string, unknown>,
+  geometryType: string | null,
+): StyleConfig | null {
+  if (!colorClassificationIsOrphaned(config, paint, geometryType)) return config;
+  const next = { ...config } as StyleConfig;
+  for (const key of COLOR_CLASSIFICATION_KEYS) delete next[key];
+  return Object.keys(next).length > 0 ? next : null;
+}

@@ -1,0 +1,1111 @@
+"""OGC API Features Part 3 queryables, schema introspection, and CQL2
+filtering.
+
+Builds the `DatasetQueryables` JSON Schema from a dataset's `column_info`
+(`/collections/{id}/queryables`), parses CQL2-Text into SQL WHERE
+fragments, and validates queryables against the dataset schema before
+query execution.
+
+Only CQL2 is supported; the legacy CQL1/WFS 2.0 syntax is rejected.
+"""
+
+import functools
+import json
+import math
+import re
+import uuid
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
+from collections.abc import Callable
+from typing import Any
+
+from fastapi import HTTPException, status
+from pydantic import BaseModel, Field
+
+from app.core.db.pg_ranges import check_pg_value_range
+from app.modules.catalog.datasets.domain.models import Dataset, Record
+from app.standards.ogc.utils import build_url
+from app.modules.catalog.search.schemas import OGCRecordResponse
+
+
+class DatasetQueryables(BaseModel):
+    """Queryable properties for the datasets collection.
+
+    Each field corresponds to a filterable property exposed via the
+    /collections/datasets/queryables endpoint.
+    """
+
+    title: str = Field(description="Dataset title")
+    description: str | None = Field(default=None, description="Dataset description")
+    geometry_type: str | None = Field(default=None, description="Geometry type")
+    srid: int | None = Field(
+        default=None, description="Spatial Reference ID (EPSG code)"
+    )
+    source_organization: str | None = Field(
+        default=None, description="Data source organization"
+    )
+    license: str | None = Field(default=None, description="Data license")
+    created: datetime | None = Field(
+        default=None, description="Record creation timestamp"
+    )
+    updated: datetime | None = Field(
+        default=None, description="Record last update timestamp"
+    )
+    data_vintage_start: date | None = Field(
+        default=None, description="Data vintage start date"
+    )
+    data_vintage_end: date | None = Field(
+        default=None, description="Data vintage end date"
+    )
+
+
+# Maps OGC queryable property names to SQLAlchemy model columns. Shared
+# metadata fields live on Record.
+FIELD_MAPPING = {
+    "title": Record.title,
+    "description": Record.summary,
+    "geometry_type": Dataset.geometry_type,
+    "srid": Dataset.srid,
+    "source_organization": Record.source_organization,
+    "license": Record.license,
+    "created": Record.created_at,
+    "updated": Record.updated_at,
+    "data_vintage_start": Record.temporal_start,
+    "data_vintage_end": Record.temporal_end,
+    "geometry": Record.spatial_extent,  # spatial predicates
+}
+
+
+def parse_cql2_filter(filter_expr: str, filter_lang: str) -> Any:
+    """Parse a CQL2 filter expression into an AST.
+
+    Args:
+        filter_expr: The CQL2 filter expression string.
+        filter_lang: Either "cql2-text" or "cql2-json".
+
+    Returns:
+        Parsed AST from pygeofilter.
+
+    Raises:
+        HTTPException(400): On unsupported filter-lang or invalid expression.
+    """
+    from lark.exceptions import (
+        UnexpectedCharacters,
+        UnexpectedInput,
+        UnexpectedToken,
+    )
+
+    if filter_lang == "cql2-text":
+        from pygeofilter.parsers.cql2_text import parse
+
+        try:
+            return parse(filter_expr)
+        except (
+            UnexpectedToken,
+            UnexpectedCharacters,
+            UnexpectedInput,
+            ValueError,
+            KeyError,
+            RecursionError,
+        ) as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid CQL2 expression: {e}",
+            )
+    elif filter_lang == "cql2-json":
+        from pygeofilter.parsers.cql2_json import parse
+
+        try:
+            filter_dict = (
+                json.loads(filter_expr) if isinstance(filter_expr, str) else filter_expr
+            )
+            filter_dict = _normalize_cql2_json(filter_dict)
+        except (json.JSONDecodeError, RecursionError) as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid CQL2 expression: {e}",
+            )
+        # pygeofilter's json walker raises bare Exception on an embedded filter-lang
+        # key and RecursionError on deep nesting; every parse failure on caller input
+        # is a 400.
+        try:
+            return parse(filter_dict)
+        except HTTPException:
+            raise
+        except (
+            Exception
+        ) as e:  # broad: pygeofilter raises bare Exception on caller input
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid CQL2 expression: {e}",
+            )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported filter-lang: {filter_lang}. Use cql2-text or cql2-json.",
+        )
+
+
+_TIMESTAMPTZ_PROPERTIES = frozenset({"created", "updated"})
+
+
+def _read_as_utc(value):
+    """A naive date or datetime literal (or interval of them) as UTC.
+
+    A naive value binds in the database session's TimeZone, which moves the
+    day it names on a non-UTC server.
+    """
+    from pygeofilter.values import Interval
+
+    if isinstance(value, Interval):
+        value.start, value.end = _read_as_utc(value.start), _read_as_utc(value.end)
+    elif isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    elif isinstance(value, date):
+        return datetime.combine(value, time.min, tzinfo=timezone.utc)
+    return value
+
+
+def _pin_timestamptz_literals(root: Any) -> None:
+    """Read the literals compared with created/updated as UTC, in place.
+
+    Iterative: a filter near the length cap nests deeper than the stack allows.
+    """
+    from pygeofilter import ast as pgf_ast
+
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        sides = (getattr(node, "lhs", None), getattr(node, "rhs", None))
+        if any(
+            isinstance(side, pgf_ast.Attribute) and side.name in _TIMESTAMPTZ_PROPERTIES
+            for side in sides
+        ):
+            for field in ("lhs", "rhs", "low", "high"):
+                if hasattr(node, field):
+                    setattr(node, field, _read_as_utc(getattr(node, field)))
+            if isinstance(node, pgf_ast.In):
+                node.sub_nodes = [_read_as_utc(sub) for sub in node.sub_nodes]
+        pending.extend(
+            child for child in node.get_sub_nodes() if isinstance(child, pgf_ast.Node)
+        )
+
+
+# ``extent_match(match, missing_as_empty=True)``: rows whose extent satisfies
+# ``match``. A missing extent is tested as an empty geometry unless
+# ``missing_as_empty`` is False.
+ExtentMatch = Callable[..., Any]
+
+# The pygeofilter nodes that may name the ``geometry`` queryable. Comparing,
+# ordering or listing a geometry has no meaning in CQL2, and evaluated on the
+# stored column it would read a VRT's hidden extent.
+_GEOMETRY_PARENTS = (
+    "SpatialComparisonPredicate",
+    "SpatialDistancePredicate",
+    "Relate",
+    "BBox",
+    "IsNull",
+)
+
+
+def _refuse_scalar_geometry(node: Any, parent: Any = None) -> None:
+    """Raise ValueError where ``geometry`` is used outside a spatial or null test."""
+    from pygeofilter import ast as pgf_ast
+
+    if isinstance(node, pgf_ast.Attribute) and node.name == "geometry":
+        allowed = tuple(getattr(pgf_ast, name) for name in _GEOMETRY_PARENTS)
+        if not isinstance(parent, allowed):
+            raise ValueError("geometry can only be used in a spatial predicate")
+    subnodes = node.get_sub_nodes() if hasattr(node, "get_sub_nodes") else None
+    for sub in subnodes if isinstance(subnodes, list) else [subnodes]:
+        if sub is not None:
+            _refuse_scalar_geometry(sub, node)
+
+
+@functools.cache
+def _extent_evaluator() -> type:
+    from pygeofilter import ast as pgf_ast
+    from pygeofilter.backends.evaluator import handle
+    from pygeofilter.backends.sqlalchemy import filters
+    from pygeofilter.backends.sqlalchemy.evaluate import SQLAlchemyFilterEvaluator
+
+    class ExtentEvaluator(SQLAlchemyFilterEvaluator):
+        """Tests each spatial predicate on the extent ``extent_match`` resolves."""
+
+        def __init__(self, extent_match: ExtentMatch):
+            super().__init__(FIELD_MAPPING, None)
+            self.extent_match = extent_match
+
+        def _leaf(self, lhs, rhs, test):
+            extent = FIELD_MAPPING["geometry"]
+            if lhs is extent and rhs is extent:
+                return self.extent_match(lambda geom: test(geom, geom))
+            if lhs is extent:
+                return self.extent_match(lambda geom: test(geom, rhs))
+            if rhs is extent:
+                return self.extent_match(lambda geom: test(lhs, geom))
+            return test(lhs, rhs)
+
+        @handle(pgf_ast.IsNull)
+        def null(self, node, lhs):
+            if lhs is not FIELD_MAPPING["geometry"]:
+                return super().null(node, lhs)
+            op = "is_not_null" if node.not_ else "is_null"
+            return self.extent_match(
+                lambda geom: filters.runop(geom, None, op), missing_as_empty=False
+            )
+
+        @handle(pgf_ast.SpatialComparisonPredicate, subclasses=True)
+        def spatial_operation(self, node, lhs, rhs):
+            op = node.op.name
+            return self._leaf(
+                lhs,
+                rhs,
+                lambda a, b: filters.spatial(a, b, op),
+            )
+
+        @handle(pgf_ast.Relate)
+        def spatial_pattern(self, node, lhs, rhs):
+            return self._leaf(
+                lhs,
+                rhs,
+                lambda a, b: filters.spatial(a, b, "RELATE", pattern=node.pattern),
+            )
+
+        @handle(pgf_ast.SpatialDistancePredicate, subclasses=True)
+        def spatial_distance(self, node, lhs, rhs):
+            return self._leaf(
+                lhs,
+                rhs,
+                lambda a, b: filters.spatial(
+                    a, b, node.op.value, distance=node.distance, units=node.units
+                ),
+            )
+
+        @handle(pgf_ast.BBox)
+        def bbox(self, node, lhs):
+            box = filters.parse_bbox(
+                [node.minx, node.miny, node.maxx, node.maxy], node.crs
+            )
+            return self._leaf(
+                lhs, box, lambda a, b: filters.spatial(a, b, "INTERSECTS")
+            )
+
+    return ExtentEvaluator
+
+
+def apply_cql2_filter(
+    stmt: Any,
+    filter_expr: str,
+    filter_lang: str = "cql2-text",
+    *,
+    extent_match: ExtentMatch,
+) -> Any:
+    """Parse a CQL2 expression and apply it as a WHERE clause to a SQLAlchemy statement.
+
+    Args:
+        stmt: SQLAlchemy select statement to add the filter to.
+        filter_expr: The CQL2 filter expression string.
+        filter_lang: Either "cql2-text" or "cql2-json".
+        extent_match: Builds each spatial predicate on the ``geometry``
+            queryable, so a caller can test the extent its requester sees.
+
+    Returns:
+        The statement with the CQL2 filter applied.
+
+    Raises:
+        HTTPException(400): On invalid CQL2 expression or filter translation error.
+    """
+    ast = parse_cql2_filter(filter_expr, filter_lang)
+    _pin_timestamptz_literals(ast)
+    try:
+        _refuse_scalar_geometry(ast)
+        sa_filter = _extent_evaluator()(extent_match).evaluate(ast)
+    except Exception as e:  # broad: to_filter errors vary by unsupported CQL2 shape
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid CQL2 expression: {e}",
+        )
+    return stmt.where(sa_filter)
+
+
+def build_queryables_response(public_api_url: str) -> dict:
+    """Build a JSON Schema describing queryable properties (OGC Part 3)."""
+    schema = DatasetQueryables.model_json_schema()
+    schema["$id"] = build_url(
+        "/collections/datasets/queryables", base_url=public_api_url
+    )
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    schema["type"] = "object"
+    schema["additionalProperties"] = True
+
+    # Add geometry property (not on the Pydantic model since it's spatial-only)
+    props = schema.setdefault("properties", {})
+    props["geometry"] = {
+        "description": "Dataset spatial extent",
+        "format": "geometry-polygon",
+    }
+
+    return schema
+
+
+def build_record_schema_response(public_api_url: str) -> dict:
+    """Build a JSON Schema describing the full OGC Record structure."""
+    schema = OGCRecordResponse.model_json_schema()
+    schema["$id"] = build_url("/collections/datasets/schema", base_url=public_api_url)
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    return schema
+
+
+# Per-dataset feature-collection filtering (OGC Features Part 3)
+#
+# The Records collection above filters ORM columns through a static
+# FIELD_MAPPING. Feature collections filter *arbitrary per-dataset data
+# tables*, so the mapping is built per request from the live table schema and
+# the resulting SQLAlchemy expression is compiled into a parameterized SQL
+# fragment that features.service.get_features() appends to its WHERE clauses.
+# Identifiers only ever come from the live schema vetted by
+# _FEATURE_QUERYABLE_NAME_RE; values only ever travel as bind parameters.
+
+# The compiled fragment quotes any name that needs it ("Zone"), so ASCII
+# letters of either case are safe. Anything else stays out: a colon inside
+# text() reads as a bind parameter even when quoted (Socrata ships ':id'), and
+# the bind rename below would match it too.
+_FEATURE_QUERYABLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,62}$")
+
+# Cap caller filter size before parsing: deeply nested cql2-json otherwise
+# recurses arbitrarily and un-indexed predicates cost per byte anyway.
+MAX_FEATURE_FILTER_LENGTH = 10_000
+
+# Ceiling on COMPILED binds, which the character cap above
+# doesn't bound usefully. render_postcompile=True expands IN to one bind
+# per member, so the shortest members (one digit + separator) reach 4,995
+# binds inside a 9,998-character filter, measured. Each bind costs a
+# BindParameter, a wire parameter, and a term in the predicate.
+#
+# 1,000 sits well above what QGIS/pygeoapi emit (bbox, datetime, simple
+# attribute predicates, no long IN lists); a realistic-identifier list
+# hits the character cap around 2,000 members anyway.
+MAX_FEATURE_FILTER_BINDS = 1_000
+
+# One compiled scanner for the whole bind rename: a per-bind ``re.subn`` is N
+# passes over an O(N) string, which an anonymous caller could turn into
+# seconds of blocking. ``(?<!:)`` skips ``::casts``. The greedy ``\w+``
+# consumes the whole identifier, so ``:param_1`` can't match the leading half
+# of ``:param_10``. A name that is not a compiled bind is handed back as is.
+_BIND_NAME_RE = re.compile(r"(?<!:):(\w+)")
+
+# A filter can nest deeper than the interpreter recursion limit while staying
+# inside MAX_FEATURE_FILTER_LENGTH: ``a=1 OR `` is 8 chars, so a 10,000-char
+# filter reaches ~1,250 levels against a default limit of 1,000.
+# RecursionError subclasses RuntimeError, so it escapes every ValueError-only
+# except clause except ``parse_cql2_filter``, which covers only the parse. The
+# remaining recursive walks raise it through the same coded 400.
+_FILTER_TOO_DEEP_DETAIL = "Invalid CQL2 expression: filter nests too deeply"
+
+_GEOMETRY_MARKER = "geometry"
+
+# Postgres type -> JSON Schema fragment for the queryables document. A column
+# whose type is absent here is not filterable and is omitted from queryables.
+_PG_TYPE_TO_SCHEMA: dict[str, dict] = {
+    "text": {"type": "string"},
+    "character varying": {"type": "string"},
+    "character": {"type": "string"},
+    "smallint": {"type": "integer"},
+    "integer": {"type": "integer"},
+    "bigint": {"type": "integer"},
+    "real": {"type": "number"},
+    "double precision": {"type": "number"},
+    "numeric": {"type": "number"},
+    "boolean": {"type": "boolean"},
+    "date": {"type": "string", "format": "date"},
+    "timestamp without time zone": {"type": "string", "format": "date-time"},
+    "timestamp with time zone": {"type": "string", "format": "date-time"},
+    "uuid": {"type": "string", "format": "uuid"},
+}
+
+_STRING_PG_TYPES = {"text", "character varying", "character"}
+_INTEGER_PG_TYPES = {"smallint", "integer", "bigint"}
+_NUMBER_PG_TYPES = {"real", "double precision", "numeric"}
+_TEMPORAL_PG_TYPES = {
+    "date",
+    "timestamp without time zone",
+    "timestamp with time zone",
+}
+
+
+def feature_queryable_columns(
+    column_info: list[dict], geometry_type: str | None
+) -> dict[str, str]:
+    """Map queryable property name -> postgres type for one feature table.
+
+    ``column_info`` rows come from the live information_schema
+    (CatalogPort.get_column_info), NOT from the stored Dataset.column_info —
+    same authority rule as live_property_columns: stored metadata
+    can drift from the table on re-upload, and the filter's allowed set must
+    match what the SQL will see.
+
+    The spatial ``geometry`` queryable wins over any attribute column
+    literally named ``geometry`` (the attribute becomes non-filterable).
+    """
+    out: dict[str, str] = {}
+    for col in column_info:
+        name = col.get("name")
+        pg_type = col.get("type")
+        if (
+            isinstance(name, str)
+            and pg_type in _PG_TYPE_TO_SCHEMA
+            and _FEATURE_QUERYABLE_NAME_RE.match(name)
+        ):
+            out[name] = pg_type
+    if geometry_type:
+        out[_GEOMETRY_MARKER] = _GEOMETRY_MARKER
+    return out
+
+
+def build_feature_queryables_response(
+    dataset_id: str,
+    title: str | None,
+    queryables: dict[str, str],
+    public_api_url: str,
+) -> dict:
+    """JSON Schema queryables document for one feature collection (Part 3).
+
+    ``additionalProperties: false`` is deliberate: it is the Part 3 lever that
+    makes rejecting filters on non-queryable properties (400) spec-conformant.
+    """
+    props: dict[str, dict] = {}
+    for name, pg_type in sorted(queryables.items()):
+        if pg_type == _GEOMETRY_MARKER:
+            props[name] = {
+                "description": "Feature geometry",
+                "format": "geometry-any",
+            }
+        else:
+            props[name] = dict(_PG_TYPE_TO_SCHEMA[pg_type])
+    schema: dict = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": build_url(
+            f"/collections/{dataset_id}/queryables", base_url=public_api_url
+        ),
+        "type": "object",
+        "properties": props,
+        "additionalProperties": False,
+    }
+    if title:
+        schema["title"] = title
+    return schema
+
+
+def _is_finite_number(value) -> bool:
+    """True for a finite int/float; False for NaN/Infinity and for integers
+    too large for a C double (math.isfinite raises
+    OverflowError on those, which would 500 on caller input)."""
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
+
+
+def _finite_coords(obj) -> bool:
+    if isinstance(obj, (list, tuple)):
+        return all(_finite_coords(o) for o in obj)
+    return _is_finite_number(obj)
+
+
+def _finite_geojson(geom) -> bool:
+    """True when every coordinate in a GeoJSON geometry dict is finite.
+
+    The JSON normalizer returns geometry dicts verbatim, so a NaN coordinate
+    would otherwise compile to a degenerate geometry that silently matches
+    nothing.
+    """
+    if not isinstance(geom, dict):
+        return False
+    for sub in geom.get("geometries", []):
+        if not _finite_geojson(sub):
+            return False
+    return _finite_coords(geom.get("coordinates", []))
+
+
+def _bbox_ring(minx, miny, maxx, maxy) -> list:
+    return [
+        [
+            [minx, miny],
+            [maxx, miny],
+            [maxx, maxy],
+            [minx, maxy],
+            [minx, miny],
+        ]
+    ]
+
+
+def _bbox_geometry(minx, miny, maxx, maxy) -> dict:
+    """GeoJSON geometry for a BBox literal.
+
+    Minx > maxx is a legal antimeridian-crossing box (same
+    convention as ``bbox=``) — split at the dateline into a MultiPolygon
+    (mirroring get_features()) rather than inverting it into nearly the
+    whole globe as one rectangle would. Non-finite coordinates and
+    inverted latitude bounds are rejected rather than built into a
+    silently wrong geometry; degenerate boxes (equal bounds) become a
+    point/line instead of a zero-area ring PostGIS may reject.
+    """
+    for v in (minx, miny, maxx, maxy):
+        if not _is_finite_number(v):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="BBox coordinates must be finite numbers",
+            )
+    if miny > maxy:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="BBox miny must be less than or equal to maxy",
+        )
+    if minx > maxx:
+        if miny == maxy or minx == 180 or maxx == -180:
+            # A crossing box with a zero-dimension half would need mixed
+            # geometry types; an equivalent non-crossing box expresses it.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "degenerate antimeridian-crossing BBox is not supported; "
+                    "use a non-crossing box or two filters"
+                ),
+            )
+        return {
+            "type": "MultiPolygon",
+            "coordinates": [
+                _bbox_ring(minx, miny, 180, maxy),
+                _bbox_ring(-180, miny, maxx, maxy),
+            ],
+        }
+    if minx == maxx and miny == maxy:
+        return {"type": "Point", "coordinates": [minx, miny]}
+    if minx == maxx or miny == maxy:
+        return {
+            "type": "LineString",
+            "coordinates": [[minx, miny], [maxx, maxy]],
+        }
+    return {"type": "Polygon", "coordinates": _bbox_ring(minx, miny, maxx, maxy)}
+
+
+def _normalize_cql2_json(node):
+    """Rewrite final-spec (21-065r2) JSON shapes pygeofilter 0.4.0 mis-parses.
+
+    Verified against the vendored parser:
+    - ``between``: the spec defines flat 3-element ``args``; the parser reads
+      the draft nested ``[expr, [low, high]]`` and TypeErrors on the flat form.
+    - ``{"bbox": [...]}``: the parser unpacks GeoJSON bbox order into
+      ``values.Envelope(x1, x2, y1, y2)``, scrambling axes so the SQLAlchemy
+      backend renders a silently wrong polygon. Rewritten to an explicit
+      GeoJSON Polygon, which renders correctly via parse_geometry.
+    """
+    if isinstance(node, list):
+        return [_normalize_cql2_json(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+    if "type" in node and "coordinates" in node:
+        # A GeoJSON geometry may carry the optional
+        # ``bbox`` member; it is metadata, not a BBox literal — rewriting it
+        # would silently replace the shape with its bounding rectangle. Same
+        # precedence as pygeofilter's own walker (geometry before bbox).
+        return node
+    bbox = node.get("bbox")
+    if (
+        isinstance(bbox, list)
+        and len(bbox) in (4, 6)
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in bbox)
+    ):
+        if len(bbox) == 6:  # 3D bbox: Z bounds are ignored, like parse_bbox
+            bbox = [bbox[0], bbox[1], bbox[3], bbox[4]]
+        return _bbox_geometry(*bbox)
+    out = {k: _normalize_cql2_json(v) for k, v in node.items()}
+    args = out.get("args")
+    if out.get("op") == "between" and isinstance(args, list) and len(args) == 3:
+        out["args"] = [args[0], [args[1], args[2]]]
+    return out
+
+
+def _rewrite_text_bbox_literals(node):
+    """Rewrite cql2-text ``BBOX(minx,miny,maxx,maxy)`` geometry literals.
+
+    The text grammar only knows BBOX as the legacy 5-argument
+    *predicate*, so a Part 3 BBox literal inside e.g. S_INTERSECTS parses as a
+    generic ``Function("bbox", [4 numbers])`` that the SQLAlchemy backend
+    KeyErrors on. Rewrite it to a Polygon literal. Anything else is left
+    untouched for validation to reject.
+    """
+    from pygeofilter import ast as pgf_ast
+    from pygeofilter import values as pgf_values
+
+    if isinstance(node, (list, tuple)):
+        return type(node)(_rewrite_text_bbox_literals(n) for n in node)
+    if isinstance(node, pgf_ast.Function) and str(node.name).lower() == "bbox":
+        args = node.arguments
+        if len(args) == 4 and all(
+            isinstance(a, (int, float)) and not isinstance(a, bool) for a in args
+        ):
+            return pgf_values.Geometry(_bbox_geometry(*args))
+        return node
+    if isinstance(node, pgf_ast.BBox) and node.crs is None:
+        # The legacy BBOX(prop, ...) predicate renders a
+        # planar rectangle upstream, inverting antimeridian-crossing boxes.
+        # Route it through the same split geometry as the BBox literal.
+        return pgf_ast.GeometryIntersects(
+            node.lhs,
+            pgf_values.Geometry(
+                _bbox_geometry(node.minx, node.miny, node.maxx, node.maxy)
+            ),
+        )
+    if isinstance(node, pgf_ast.Node):
+        for field, value in vars(node).items():
+            setattr(node, field, _rewrite_text_bbox_literals(value))
+    return node
+
+
+def _require_attribute(node, queryables: dict[str, str], errors: list[str]):
+    """Return the pg type of an Attribute node, recording an error otherwise."""
+    from pygeofilter import ast as pgf_ast
+
+    if not isinstance(node, pgf_ast.Attribute):
+        errors.append("predicate operand must be a property name")
+        return None
+    pg_type = queryables.get(node.name)
+    if pg_type is None:
+        errors.append(f"unknown or non-filterable property {node.name!r}")
+    return pg_type
+
+
+def _checked_temporal(value, pg_type: str, errors: list[str]):
+    """``_checked_value`` for a date or timestamp property."""
+    if not isinstance(value, (date, datetime)):
+        errors.append(
+            f"property typed {pg_type!r} needs a DATE('...')/TIMESTAMP('...') "
+            'literal (cql2-json: {"date"/"timestamp": ...})'
+        )
+    elif (
+        pg_type == "timestamp without time zone"
+        and isinstance(value, datetime)
+        and value.tzinfo is not None
+    ):
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    elif pg_type == "timestamp with time zone":
+        # Naive values bind in the database session's TimeZone; pin UTC.
+        if isinstance(value, datetime) and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        if not isinstance(value, datetime):
+            return datetime.combine(value, time.min, tzinfo=timezone.utc)
+    return value
+
+
+def _checked_uuid(value, errors: list[str]):
+    """``_checked_value`` for a uuid property: the canonical string form.
+
+    A string, not a UUID: pygeofilter's evaluator has no handler for UUID
+    objects, so ``compile_feature_cql2_ast`` converts it at bind time.
+    """
+    if isinstance(value, str):
+        try:
+            return str(uuid.UUID(value))
+        except ValueError:
+            pass
+    errors.append(f"literal {value!r} is not a uuid")
+    return value
+
+
+def _checked_value(value, pg_type: str | None, errors: list[str]):
+    """Type-check a literal against a property's pg type; return it normalized.
+
+    Catching type mismatches here turns the mainline user typo (``name > 5``
+    on a text column) into a 400 naming the mismatch, instead of a database
+    error surfacing as a misleading 503/500. Also normalizes
+    tz-aware datetime literals for timestamp-without-tz columns, which asyncpg
+    would otherwise refuse at bind time.
+    """
+    from pygeofilter import ast as pgf_ast
+
+    if isinstance(value, pgf_ast.Node):
+        errors.append("nested expressions are not supported in comparisons")
+        return value
+    if pg_type is None:
+        return value  # the attribute side already recorded an error
+    if pg_type in _TEMPORAL_PG_TYPES:
+        return _checked_temporal(value, pg_type, errors)
+    if pg_type == "uuid":
+        return _checked_uuid(value, errors)
+    if pg_type in _STRING_PG_TYPES:
+        ok = isinstance(value, str)
+    elif pg_type in _INTEGER_PG_TYPES:
+        # An out-of-range literal raises inside the driver's encode path
+        # rather than comparing, so the bound is the column's OWN width,
+        # read from the same table the property-filter path uses.
+        # `cat = 2147483648` on an integer column is a legal int4/int8
+        # comparison no stored value can satisfy, so it would answer 200 with
+        # zero features instead of saying the literal was out of
+        # range.
+        ok = isinstance(value, int) and not isinstance(value, bool)
+    elif pg_type in _NUMBER_PG_TYPES:
+        # Python's JSON decoder accepts NaN/Infinity tokens; `height <
+        # Infinity` would otherwise match every finite row instead of being
+        # rejected as an invalid filter.
+        ok = (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and _is_finite_number(value)
+        )
+    elif pg_type == "boolean":
+        ok = isinstance(value, bool)
+    else:  # geometry marker in a scalar position
+        ok = False
+    if not ok:
+        errors.append(
+            f"literal {value!r} does not match the property's {pg_type!r} type"
+        )
+        return value
+    try:
+        check_pg_value_range(pg_type, value)
+    except ValueError as exc:
+        errors.append(f"literal {value!r} {exc}")
+    return value
+
+
+def _validate_scalar_predicate(node, queryables: dict[str, str], errors: list[str]):
+    """Comparison / BETWEEN / LIKE / IN / IS NULL over attribute columns."""
+    from pygeofilter import ast as pgf_ast
+
+    geom_error = "geometry needs a spatial predicate (e.g. S_INTERSECTS)"
+    if isinstance(node, pgf_ast.Comparison):
+        lhs_attr = isinstance(node.lhs, pgf_ast.Attribute)
+        rhs_attr = isinstance(node.rhs, pgf_ast.Attribute)
+        if not lhs_attr and not rhs_attr:
+            errors.append("comparison must reference a property")
+            return
+        lhs_t = _require_attribute(node.lhs, queryables, errors) if lhs_attr else None
+        rhs_t = _require_attribute(node.rhs, queryables, errors) if rhs_attr else None
+        if _GEOMETRY_MARKER in (lhs_t, rhs_t):
+            errors.append(geom_error)
+        elif lhs_attr and not rhs_attr:
+            node.rhs = _checked_value(node.rhs, lhs_t, errors)
+        elif rhs_attr and not lhs_attr:
+            node.lhs = _checked_value(node.lhs, rhs_t, errors)
+        # property-to-property comparisons pass through; the execute-time
+        # guard maps an incomparable pair to 400.
+    elif isinstance(node, pgf_ast.Between):
+        pg_type = _require_attribute(node.lhs, queryables, errors)
+        if pg_type == _GEOMETRY_MARKER:
+            errors.append(geom_error)
+            return
+        node.low = _checked_value(node.low, pg_type, errors)
+        node.high = _checked_value(node.high, pg_type, errors)
+    elif isinstance(node, pgf_ast.Like):
+        pg_type = _require_attribute(node.lhs, queryables, errors)
+        if pg_type is not None and pg_type not in _STRING_PG_TYPES:
+            errors.append("LIKE only applies to string properties")
+        if not isinstance(node.pattern, str):
+            errors.append("LIKE pattern must be a string")
+    elif isinstance(node, pgf_ast.In):
+        pg_type = _require_attribute(node.lhs, queryables, errors)
+        if pg_type == _GEOMETRY_MARKER:
+            errors.append(geom_error)
+            return
+        node.sub_nodes = [
+            _checked_value(sub, pg_type, errors) for sub in node.sub_nodes
+        ]
+    else:  # IsNull
+        _require_attribute(node.lhs, queryables, errors)
+
+
+def _validate_spatial_predicate(node, queryables: dict[str, str], errors: list[str]):
+    """S_* binary predicates and the legacy BBOX(prop, ...) predicate."""
+    from pygeofilter import ast as pgf_ast
+    from pygeofilter import values as pgf_values
+
+    if isinstance(node, pgf_ast.BBox):
+        # crs-less BBox predicates were rewritten to S_INTERSECTS above; only
+        # a crs-qualified form reaches here, and only CRS84 boxes are defined.
+        errors.append("BBOX with an explicit CRS is not supported")
+        return
+    attr_side, literal_side = node.lhs, node.rhs
+    if isinstance(literal_side, pgf_ast.Attribute) and not isinstance(
+        attr_side, pgf_ast.Attribute
+    ):
+        attr_side, literal_side = literal_side, attr_side
+    pg_type = _require_attribute(attr_side, queryables, errors)
+    if pg_type is not None and pg_type != _GEOMETRY_MARKER:
+        errors.append(
+            "spatial predicates apply to the geometry property"
+            if _GEOMETRY_MARKER in queryables
+            else "this collection has no geometry"
+        )
+    if not isinstance(literal_side, (pgf_values.Geometry, pgf_values.Envelope)):
+        errors.append(
+            "spatial predicates need a geometry literal (WKT, BBOX or GeoJSON)"
+        )
+    elif isinstance(literal_side, pgf_values.Geometry) and not _finite_geojson(
+        literal_side.geometry
+    ):
+        errors.append("geometry literal coordinates must be finite numbers")
+
+
+def _validate_feature_filter_node(node, queryables: dict[str, str], errors: list[str]):
+    """Whitelist walk: every supported predicate shape is handled explicitly.
+
+    Anything unlisted (functions, arithmetic, arrays, S_DWITHIN/S_BEYOND with
+    its inverted upstream unit math, T_* predicates with their collapsed
+    BETWEEN semantics) is rejected up front, so only constructs with tests
+    behind the advertised conformance classes ever reach SQL.
+    """
+    from pygeofilter import ast as pgf_ast
+
+    if isinstance(node, (pgf_ast.And, pgf_ast.Or)):
+        _validate_feature_filter_node(node.lhs, queryables, errors)
+        _validate_feature_filter_node(node.rhs, queryables, errors)
+    elif isinstance(node, pgf_ast.Not):
+        _validate_feature_filter_node(node.sub_node, queryables, errors)
+    elif isinstance(
+        node,
+        (pgf_ast.Comparison, pgf_ast.Between, pgf_ast.Like, pgf_ast.In, pgf_ast.IsNull),
+    ):
+        _validate_scalar_predicate(node, queryables, errors)
+    elif isinstance(node, pgf_ast.SpatialDistancePredicate):
+        errors.append("S_DWITHIN/S_BEYOND are not supported")
+    elif isinstance(node, pgf_ast.Relate):
+        errors.append("RELATE is not supported")
+    elif isinstance(node, (pgf_ast.SpatialComparisonPredicate, pgf_ast.BBox)):
+        _validate_spatial_predicate(node, queryables, errors)
+    elif isinstance(node, pgf_ast.TemporalPredicate):
+        errors.append(
+            "temporal predicates (T_*) are not supported; use >=/<= comparisons "
+            "on date/timestamp properties"
+        )
+    else:
+        errors.append(f"unsupported expression: {type(node).__name__}")
+
+
+def _quote_single_char_attributes(expr: str) -> str:
+    """Double-quote lone single-letter identifiers in a cql2-text filter.
+
+    pygeofilter's unquoted-attribute token needs at least two
+    characters, so a conforming client filtering on a common GIS column
+    like ``x`` gets a parse error even though queryables advertises it —
+    ``"x"`` parses fine, so quote the bare form. String literals are held
+    out verbatim; outside strings a lone letter can only be an identifier
+    (keywords/functions/units are longer, ``1e5``-style exponents are
+    protected by the lookarounds). Already-quoted or dotted names are
+    left alone.
+    """
+    parts = re.split(r"('[^']*')", expr)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r'(?<![\w".])([A-Za-z])(?![\w".(])', r'"\1"', parts[i])
+    return "".join(parts)
+
+
+def parse_feature_cql2(filter_expr: str, filter_lang: str) -> Any:
+    """Length-cap, parse, and shim-rewrite a feature-collection filter.
+
+    Split from compilation so the router can
+    order its checks precisely: a parse failure is the caller's bug and 400s
+    with no database access at all; table availability (503) is checked next;
+    only then does schema-dependent validation/compilation run.
+    """
+    if len(filter_expr) > MAX_FEATURE_FILTER_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(f"filter exceeds the {MAX_FEATURE_FILTER_LENGTH}-character limit"),
+        )
+    if filter_lang == "cql2-text":
+        filter_expr = _quote_single_char_attributes(filter_expr)
+    ast_root = parse_cql2_filter(filter_expr, filter_lang)
+    try:
+        return _rewrite_text_bbox_literals(ast_root)
+    except RecursionError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_FILTER_TOO_DEEP_DETAIL,
+        )
+
+
+def compile_feature_cql2(
+    filter_expr: str,
+    filter_lang: str,
+    queryables: dict[str, str],
+) -> tuple[str, dict]:
+    """Parse + compile in one step (kept for callers that need no ordering)."""
+    return compile_feature_cql2_ast(
+        parse_feature_cql2(filter_expr, filter_lang), queryables
+    )
+
+
+def _refuse_unsupported_filter(ast_root: Any, queryables: dict[str, str]) -> None:
+    """Run the whitelist walk and turn anything it refuses into a 400.
+
+    A function rather than an inline block so both refusals the walk can
+    produce -- the collected ``errors`` and the RecursionError a filter nested
+    past the interpreter limit raises out of the walk itself -- leave through
+    one place.
+    """
+    errors: list[str] = []
+    try:
+        _validate_feature_filter_node(ast_root, queryables, errors)
+    except RecursionError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=_FILTER_TOO_DEEP_DETAIL,
+        )
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported CQL2 filter: " + "; ".join(sorted(set(errors))),
+        )
+
+
+def compile_feature_cql2_ast(
+    ast_root: Any,
+    queryables: dict[str, str],
+    *,
+    bind_prefix: str = "cql2",
+) -> tuple[str, dict]:
+    """Compile a parsed CQL2 AST into a (sql_fragment, bind_params) pair.
+
+    The fragment references only unqualified, live-schema-vetted column names
+    (bare ``sqlalchemy.column()`` — a table-qualified column would not resolve
+    against the ``t`` alias both feature queries use) and carries every value
+    as a ``:<bind_prefix>_N`` bind parameter, so it can be appended verbatim
+    to get_features()'s WHERE clauses inside ``text()``. Distinct prefixes let
+    fragments compiled for different tables share one statement.
+
+    Raises HTTPException(400) on any unsupported or type-mismatched filter.
+    """
+    from geoalchemy2 import Geometry
+    from pygeofilter.backends.sqlalchemy import to_filter
+    from sqlalchemy import column as sa_column
+    from sqlalchemy import types as sa_types
+    from sqlalchemy.dialects import postgresql
+
+    _refuse_unsupported_filter(ast_root, queryables)
+
+    # The asyncpg dialect casts every bind to its
+    # SQLAlchemy type ($1::FLOAT ...), and a float8-cast bind against a REAL
+    # column promotes the stored float4 for comparison — 0.1::real =
+    # 0.1::float8 is FALSE. NUMERIC through float8 loses precision the same
+    # way. Each numeric family therefore keeps its own database type, and
+    # the compiled bind types are carried into execution (see the returned
+    # BindParameter list).
+    sa_type_for_pg = {
+        **{t: sa_types.Text() for t in _STRING_PG_TYPES},
+        **{t: sa_types.BigInteger() for t in _INTEGER_PG_TYPES},
+        "real": sa_types.REAL(),
+        "double precision": sa_types.Float(),
+        "numeric": sa_types.Numeric(),
+        "boolean": sa_types.Boolean(),
+        "date": sa_types.Date(),
+        "timestamp without time zone": sa_types.DateTime(),
+        "timestamp with time zone": sa_types.DateTime(timezone=True),
+        # A native uuid bind compiles to ``:name::UUID``, and text() does not
+        # read a name followed by a colon as a parameter.
+        "uuid": sa_types.Uuid(native_uuid=False),
+    }
+    field_mapping = {}
+    for name, pg_type in queryables.items():
+        if pg_type == _GEOMETRY_MARKER:
+            field_mapping[name] = sa_column("geom_4326", Geometry(srid=4326))
+        else:
+            field_mapping[name] = sa_column(name, sa_type_for_pg[pg_type])
+
+    try:
+        sa_filter = to_filter(ast_root, field_mapping, undefined_as_null=False)
+        compiled = sa_filter.compile(
+            dialect=postgresql.dialect(paramstyle="named"),
+            compile_kwargs={"render_postcompile": True},
+        )
+    except HTTPException:
+        raise
+    except (
+        Exception
+    ) as e:  # broad: same contract as apply_cql2_filter — 400 on caller input
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid CQL2 expression: {e}",
+        )
+
+    from sqlalchemy import bindparam
+
+    sql = str(compiled)
+    params = list(compiled.params.items())
+    if len(params) > MAX_FEATURE_FILTER_BINDS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"filter expands to more than {MAX_FEATURE_FILTER_BINDS} parameters"
+            ),
+        )
+
+    binds: list = []
+    # The rendered replacement per compiled bind name, applied in the single pass
+    # below so the rename cost doesn't grow with the square of the bind count.
+    rendered: dict[str, str] = {}
+    for i, (key, value) in enumerate(params):
+        new_key = f"{bind_prefix}_{i}"
+        # Keep the compiled bind's SQLAlchemy type so
+        # execution doesn't re-infer it from the Python value. A
+        # render_postcompile-expanded IN member is named <base>_<n>; its
+        # BindParameter lives under the base key. (Explicit None checks: a
+        # BindParameter defines no truthiness.)
+        bp = compiled.binds.get(key)
+        if bp is None:
+            bp = compiled.binds.get(re.sub(r"_\d+$", "", key))
+        if bp is not None and isinstance(bp.type, sa_types.REAL):
+            # Same float8-cast promotion as above (the asyncpg dialect renders the same
+            # ::FLOAT cast for REAL; verified against 2.0.52). An explicit outer cast is
+            # constant-folded at plan time, so the comparison happens in float4 and stays
+            # index-friendly.
+            rendered[key] = f"CAST(:{new_key} AS REAL)"
+        else:
+            rendered[key] = f":{new_key}"
+        if (
+            bp is not None
+            and isinstance(bp.type, sa_types.Numeric)
+            and not isinstance(bp.type, sa_types.Float)
+            and isinstance(value, float)
+        ):
+            # Binding the float raw sends its full
+            # binary expansion (19.99 -> 19.98999...) into the NUMERIC
+            # comparison; the decimal text form is what the caller wrote.
+            # (Done here, not in the AST walk — pygeofilter's evaluator has
+            # no handler for Decimal literals. Note Float subclasses Numeric
+            # and REAL subclasses Float, hence the isinstance pair.)
+            value = Decimal(str(value))
+        bind_type = bp.type if bp is not None else None
+        if isinstance(bind_type, sa_types.Uuid):
+            # Compiled non-native (see sa_type_for_pg), executed native.
+            bind_type = sa_types.Uuid()
+            value = uuid.UUID(value)
+        binds.append(
+            bindparam(new_key, value, type_=bind_type)
+            if bind_type is not None
+            else bindparam(new_key, value)
+        )
+
+    if rendered:
+        # ONE scan. re.sub never rescans what a replacement emitted, so a new
+        # ``:cql2_N`` name cannot be re-matched by a later bind.
+        seen: dict[str, int] = {}
+
+        def _rename(match: re.Match) -> str:
+            key = match.group(1)
+            replacement = rendered.get(key)
+            if replacement is None:
+                return match.group(0)
+            seen[key] = seen.get(key, 0) + 1
+            return replacement
+
+        sql = _BIND_NAME_RE.sub(_rename, sql)
+        # Every compiled bind must appear in the rendered statement exactly once, or
+        # the fragment is not safe to append and the request is refused.
+        if any(seen.get(key, 0) != 1 for key in rendered):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid CQL2 expression: parameter rendering failed",
+            )
+    return f"({sql})", binds

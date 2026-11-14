@@ -1,0 +1,979 @@
+"""Integration tests for FK relationship endpoints.
+
+Tests cover CRUD operations, auth enforcement, and visibility checks
+for the /datasets/{dataset_id}/relationships/ endpoints.
+"""
+
+import uuid
+
+import pytest
+from httpx import AsyncClient
+from sqlalchemy import select, text
+
+from app.modules.catalog.datasets.domain.models import (
+    AttributeMetadata,
+    DatasetRelationship,
+)
+from app.modules.catalog.datasets.domain.service import auto_detect_relationships
+from tests.factories import create_dataset as _create_dataset
+from tests.factories import get_user_id
+
+_JOIN_COLUMNS = [
+    {"name": name, "type": "integer"}
+    for name in (
+        "del_col",
+        "fk_col",
+        "private_ref_id",
+        "ref_a",
+        "ref_b",
+        "ref_id",
+        "target_id",
+        "test_col",
+    )
+]
+
+
+def create_dataset(*args, **kwargs):
+    kwargs.setdefault("column_info", _JOIN_COLUMNS)
+    return _create_dataset(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+class TestFKRelationships:
+    async def test_create_relationship(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """POST creates a relationship between two datasets, returns 201."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Source DS"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="Target DS"
+        )
+
+        resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "fk_col",
+                "target_column": "gid",
+                "label": "Links to target",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["source_column"] == "fk_col"
+        assert data["target_column"] == "gid"
+        assert data["label"] == "Links to target"
+        assert "id" in data
+
+        # The CREATE response must carry dereferenceable Dataset.id values,
+        # NOT the stored record_ids, matching the LIST contract. The DB
+        # still stores record_ids and the create INPUT still takes a record_id
+        # target — only the RESPONSE ids are Dataset.id.
+        assert data["source_dataset_id"] == str(source.id)
+        assert data["target_dataset_id"] == str(target.id)
+        assert data["target_dataset_id"] != str(target.record_id)
+
+        # The returned target id dereferences via /collections/{id} (was a
+        # non-resolvable record_id pre-fix).
+        deref = await client.get(
+            f"/collections/{data['target_dataset_id']}",
+            headers=admin_auth_header,
+        )
+        assert deref.status_code == 200, deref.text
+
+    async def test_create_relationship_accepts_dataset_id_input(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """A relationship target id round-trips back into create.
+
+        Responses serialize target_dataset_id as Dataset.id, so the create input
+        must accept a Dataset.id too (not just the underlying record_id).
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="RT Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="RT Target"
+        )
+
+        resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.id),  # Dataset.id, not record_id
+                "source_column": "fk_col",
+                "target_column": "gid",
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()
+        assert data["target_dataset_id"] == str(target.id)
+
+    async def test_list_relationships(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """GET returns array of relationships for a dataset."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="List Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="List Target"
+        )
+
+        # Create a relationship first
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "ref_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        # List relationships
+        resp = await client.get(
+            f"/datasets/{source.id}/relationships/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        # Standard list envelope {relationships: [...], total: N}.
+        body = resp.json()
+        assert isinstance(body, dict)
+        assert "total" in body
+        items = body["relationships"]
+        assert isinstance(items, list)
+        assert len(items) >= 1
+        assert body["total"] >= 1
+        rel = next(r for r in items if r["source_column"] == "ref_id")
+
+        # The response ids are Dataset.id (dereferenceable), NOT the stored
+        # record_id. Clients fetch /collections/{id} which resolves by Dataset.id.
+        assert rel["target_dataset_id"] == str(target.id)
+        assert rel["target_dataset_id"] != str(target.record_id)
+        assert rel["source_dataset_id"] == str(source.id)
+
+        # The returned target id dereferences via /collections/{id} (was 404
+        # pre-fix because the record_id is not a Dataset.id).
+        deref = await client.get(
+            f"/collections/{rel['target_dataset_id']}",
+            headers=admin_auth_header,
+        )
+        assert deref.status_code == 200, deref.text
+
+    async def test_list_relationships_envelope_total_reflects_full_count(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """The envelope `total` is the FULL visible count, not the page.
+
+        With limit=1 over 2 relationships the page holds 1 item but total is 2,
+        so a paginating client can detect that more pages exist. FAILS pre-fix
+        (the endpoint returned a bare array with no total), PASSES post-fix.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Envelope Source"
+        )
+        target_a = await create_dataset(
+            test_db_session, created_by=admin_id, name="Envelope Target A"
+        )
+        target_b = await create_dataset(
+            test_db_session, created_by=admin_id, name="Envelope Target B"
+        )
+        for target, col in ((target_a, "ref_a"), (target_b, "ref_b")):
+            create_resp = await client.post(
+                f"/datasets/{source.id}/relationships/",
+                json={
+                    "target_dataset_id": str(target.record_id),
+                    "source_column": col,
+                },
+                headers=admin_auth_header,
+            )
+            assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.get(
+            f"/datasets/{source.id}/relationships/?limit=1",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert set(body) >= {"relationships", "total"}
+        assert len(body["relationships"]) == 1  # page bounded by limit
+        assert body["total"] == 2  # total reflects the full visible count
+
+    async def test_list_relationships_hides_private_targets_from_anonymous(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Anonymous source access must not reveal private target metadata."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Public Relationship Source",
+            visibility="public",
+            record_status="published",
+        )
+        target = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Private Relationship Target",
+            visibility="private",
+            record_status="published",
+        )
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "private_ref_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.get(f"/datasets/{source.id}/relationships/")
+
+        assert resp.status_code == 200, resp.text
+        # envelope: private target is filtered out, total reflects the
+        # visible count (0), not the raw row count.
+        body = resp.json()
+        assert body["relationships"] == []
+        assert body["total"] == 0
+
+    async def test_related_records_rejects_private_target_for_anonymous(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Related-record reads require access to both source and target datasets."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Public Related Source",
+            visibility="public",
+            record_status="published",
+        )
+        target = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Private Related Target",
+            visibility="private",
+            record_status="published",
+        )
+        await test_db_session.execute(
+            text(
+                f"CREATE TABLE data.{source.table_name} "
+                "(gid integer PRIMARY KEY, private_ref_id integer)"
+            )
+        )
+        await test_db_session.execute(
+            text(
+                f"CREATE TABLE data.{target.table_name} "
+                "(gid integer PRIMARY KEY, private_ref_id integer, secret text)"
+            )
+        )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{source.table_name} "
+                "(gid, private_ref_id) VALUES (1, 7)"
+            )
+        )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{target.table_name} "
+                "(gid, private_ref_id, secret) VALUES (1, 7, 'hidden')"
+            )
+        )
+        await test_db_session.commit()
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "private_ref_id",
+                "target_column": "private_ref_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        rel_id = create_resp.json()["id"]
+
+        resp = await client.get(f"/datasets/{source.id}/features/1/related/{rel_id}/")
+
+        assert resp.status_code == 404, resp.text
+
+    async def test_related_records_missing_target_table_returns_503(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """A relationship whose target has no backing table returns 503, not 500.
+
+        The related-records traversal queries
+        data.<target_table> directly. If the target dataset is a raster/VRT (no
+        feature table) or its table was cold-evicted, that query raises
+        UndefinedTableError. The service must map ProgrammingError ->
+        HTTPException(503) so the connection is released cleanly instead of
+        bubbling an uncaught 500.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Missing-Tbl Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="Missing-Tbl Target"
+        )
+        # Create ONLY the source table + a row with a resolvable FK value. The
+        # target table is intentionally NOT created, so the target-side query
+        # hits data.<missing> -> UndefinedTableError.
+        await test_db_session.execute(
+            text(
+                f"CREATE TABLE data.{source.table_name} "
+                "(gid integer PRIMARY KEY, target_id integer)"
+            )
+        )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{source.table_name} (gid, target_id) VALUES (1, 42)"
+            )
+        )
+        await test_db_session.commit()
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "target_id",
+                "target_column": "target_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        rel_id = create_resp.json()["id"]
+
+        resp = await client.get(
+            f"/datasets/{source.id}/features/1/related/{rel_id}/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 503, resp.text
+
+    async def test_related_records_dropped_column_is_409_and_list_marks_broken(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """A join column dropped after the relationship was saved is a permanent 409."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Dropped-Col Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="Dropped-Col Target"
+        )
+        for ds in (source, target):
+            await test_db_session.execute(
+                text(
+                    f"CREATE TABLE data.{ds.table_name} "
+                    "(gid integer PRIMARY KEY, target_id integer)"
+                )
+            )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{source.table_name} (gid, target_id) VALUES (1, 42)"
+            )
+        )
+        await test_db_session.commit()
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "target_id",
+                "target_column": "target_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        assert create_resp.json()["broken"] is False
+        rel_id = create_resp.json()["id"]
+
+        listed = await client.get(
+            f"/datasets/{source.id}/relationships/", headers=admin_auth_header
+        )
+        assert listed.json()["relationships"][0]["broken"] is False
+
+        # A replacement drops the target's join column.
+        await test_db_session.execute(
+            text(f"ALTER TABLE data.{target.table_name} DROP COLUMN target_id")
+        )
+        target.column_info = [c for c in target.column_info if c["name"] != "target_id"]
+        await test_db_session.commit()
+
+        resp = await client.get(
+            f"/datasets/{source.id}/features/1/related/{rel_id}/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["code"] == "relationship_column_missing"
+        assert detail["column"] == "target_id"
+
+        listed = await client.get(
+            f"/datasets/{source.id}/relationships/", headers=admin_auth_header
+        )
+        assert listed.json()["relationships"][0]["broken"] is True
+
+    async def test_related_records_column_dropped_live_is_409_and_list_marks_broken(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """A join column dropped in the database, with stored column_info untouched, ends in 409."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Live-Drop Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="Live-Drop Target"
+        )
+        for ds in (source, target):
+            await test_db_session.execute(
+                text(
+                    f"CREATE TABLE data.{ds.table_name} "
+                    "(gid integer PRIMARY KEY, target_id integer)"
+                )
+            )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{source.table_name} (gid, target_id) VALUES (1, 42)"
+            )
+        )
+        await test_db_session.commit()
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "target_id",
+                "target_column": "target_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        assert create_resp.json()["broken"] is False
+        rel_id = create_resp.json()["id"]
+
+        listed = await client.get(
+            f"/datasets/{source.id}/relationships/", headers=admin_auth_header
+        )
+        assert listed.json()["relationships"][0]["broken"] is False
+
+        test_db_session.add(
+            AttributeMetadata(
+                dataset_id=target.id, field_name="target_id", is_current=True
+            )
+        )
+        await test_db_session.commit()
+
+        # A replacement drops the target's join column.
+        await test_db_session.execute(
+            text(f"ALTER TABLE data.{target.table_name} DROP COLUMN target_id")
+        )
+        await test_db_session.commit()
+
+        resp = await client.get(
+            f"/datasets/{source.id}/features/1/related/{rel_id}/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["code"] == "relationship_column_missing"
+        assert detail["column"] == "target_id"
+
+        listed = await client.get(
+            f"/datasets/{source.id}/relationships/", headers=admin_auth_header
+        )
+        assert listed.json()["relationships"][0]["broken"] is True
+
+        current = await test_db_session.execute(
+            select(AttributeMetadata.field_name).where(
+                AttributeMetadata.dataset_id == target.id,
+                AttributeMetadata.is_current.is_(True),
+            )
+        )
+        assert current.scalars().all() == []
+
+        again = await client.get(
+            f"/datasets/{source.id}/features/1/related/{rel_id}/",
+            headers=admin_auth_header,
+        )
+        assert again.status_code == 409, again.text
+
+    async def test_related_records_column_dropped_live_read_by_anonymous_does_not_write(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """A read alone reports the dropped join column but never repairs the catalog."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Anon-Drop Source",
+            visibility="public",
+            record_status="published",
+        )
+        target = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Anon-Drop Target",
+            visibility="public",
+            record_status="published",
+        )
+        for ds in (source, target):
+            await test_db_session.execute(
+                text(
+                    f"CREATE TABLE data.{ds.table_name} "
+                    "(gid integer PRIMARY KEY, target_id integer)"
+                )
+            )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{source.table_name} (gid, target_id) VALUES (1, 42)"
+            )
+        )
+        await test_db_session.commit()
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "target_id",
+                "target_column": "target_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        assert create_resp.json()["broken"] is False
+        rel_id = create_resp.json()["id"]
+
+        listed = await client.get(
+            f"/datasets/{source.id}/relationships/", headers=admin_auth_header
+        )
+        assert listed.json()["relationships"][0]["broken"] is False
+
+        test_db_session.add(
+            AttributeMetadata(
+                dataset_id=target.id, field_name="target_id", is_current=True
+            )
+        )
+        await test_db_session.commit()
+
+        # A replacement drops the target's join column.
+        await test_db_session.execute(
+            text(f"ALTER TABLE data.{target.table_name} DROP COLUMN target_id")
+        )
+        await test_db_session.commit()
+
+        resp = await client.get(f"/datasets/{source.id}/features/1/related/{rel_id}/")
+        assert resp.status_code == 409, resp.text
+
+        listed = await client.get(
+            f"/datasets/{source.id}/relationships/", headers=admin_auth_header
+        )
+        assert listed.json()["relationships"][0]["broken"] is False
+
+    async def test_related_records_column_dropped_live_read_with_api_key_does_not_write(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """An API key never reaches the catalog repair, even for the dataset owner."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Key-Drop Source",
+            visibility="public",
+            record_status="published",
+        )
+        target = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Key-Drop Target",
+            visibility="public",
+            record_status="published",
+        )
+        for ds in (source, target):
+            await test_db_session.execute(
+                text(
+                    f"CREATE TABLE data.{ds.table_name} "
+                    "(gid integer PRIMARY KEY, target_id integer)"
+                )
+            )
+        await test_db_session.execute(
+            text(
+                f"INSERT INTO data.{source.table_name} (gid, target_id) VALUES (1, 42)"
+            )
+        )
+        await test_db_session.commit()
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "target_id",
+                "target_column": "target_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        assert create_resp.json()["broken"] is False
+        rel_id = create_resp.json()["id"]
+
+        listed = await client.get(
+            f"/datasets/{source.id}/relationships/", headers=admin_auth_header
+        )
+        assert listed.json()["relationships"][0]["broken"] is False
+
+        test_db_session.add(
+            AttributeMetadata(
+                dataset_id=target.id, field_name="target_id", is_current=True
+            )
+        )
+        await test_db_session.commit()
+
+        # A replacement drops the target's join column.
+        await test_db_session.execute(
+            text(f"ALTER TABLE data.{target.table_name} DROP COLUMN target_id")
+        )
+        await test_db_session.commit()
+
+        key = await client.post(
+            "/auth/api-keys/",
+            json={"name": "Related Key", "scope": "read_only"},
+            headers=admin_auth_header,
+        )
+        assert key.status_code == 201, key.text
+        # Revoked here: an active read_only key makes the 0032 downgrade refuse,
+        # failing any later migration test in the same database.
+        try:
+            resp = await client.get(
+                f"/datasets/{source.id}/features/1/related/{rel_id}/",
+                headers={"X-Api-Key": key.json()["key"]},
+            )
+        finally:
+            revoked = await client.delete(
+                f"/auth/api-keys/{key.json()['id']}", headers=admin_auth_header
+            )
+        assert revoked.status_code == 204, revoked.text
+        assert resp.status_code == 409, resp.text
+
+        listed = await client.get(
+            f"/datasets/{source.id}/relationships/", headers=admin_auth_header
+        )
+        assert listed.json()["relationships"][0]["broken"] is False
+
+    async def test_related_records_missing_non_join_column_stays_503(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """An undefined column that is not a join column is not a relationship fault."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="No-Gid Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="No-Gid Target"
+        )
+        await test_db_session.execute(
+            text(f"CREATE TABLE data.{source.table_name} (target_id integer)")
+        )
+        await test_db_session.commit()
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "target_id",
+                "target_column": "gid",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.get(
+            f"/datasets/{source.id}/features/1/related/{create_resp.json()['id']}/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 503, resp.text
+
+    async def test_related_records_mixed_case_join_column_resolves(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """A mixed-case join column is quoted, not folded into a missing one."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        cols = [{"name": "CustomerID", "type": "integer"}]
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Case Source", column_info=cols
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="Case Target", column_info=cols
+        )
+        for ds in (source, target):
+            await test_db_session.execute(
+                text(
+                    f"CREATE TABLE data.{ds.table_name} "
+                    '(gid integer PRIMARY KEY, "CustomerID" integer)'
+                )
+            )
+            await test_db_session.execute(
+                text(
+                    f'INSERT INTO data.{ds.table_name} (gid, "CustomerID") VALUES (1, 7)'
+                )
+            )
+        await test_db_session.commit()
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "CustomerID",
+                "target_column": "CustomerID",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.get(
+            f"/datasets/{source.id}/features/1/related/{create_resp.json()['id']}/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["approximate_total"] == 1
+
+    async def test_related_records_rejects_relationship_for_different_source(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Relationship ids cannot be replayed through a different source dataset URL."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Bound Source"
+        )
+        other_source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Wrong Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="Bound Target"
+        )
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "target_id",
+                "target_column": "target_id",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        rel_id = create_resp.json()["id"]
+
+        resp = await client.get(
+            f"/datasets/{other_source.id}/features/1/related/{rel_id}/",
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == 404, resp.text
+
+    async def test_auto_detect_relationships_skips_private_targets_for_public_source(
+        self,
+        test_db_session,
+    ):
+        """Auto-detection must not create public-to-private relationships."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Public Auto Source",
+            visibility="public",
+            record_status="published",
+        )
+        target = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Private Auto Target",
+            visibility="private",
+            record_status="published",
+        )
+        test_db_session.add(
+            AttributeMetadata(
+                dataset_id=target.id,
+                field_name="private_ref_id",
+                semantic_role="identifier",
+            )
+        )
+        await test_db_session.commit()
+
+        created = await auto_detect_relationships(
+            test_db_session,
+            source.id,
+            source.record_id,
+            [{"name": "private_ref_id"}],
+        )
+        await test_db_session.commit()
+
+        relationships = (
+            (
+                await test_db_session.execute(
+                    select(DatasetRelationship).where(
+                        DatasetRelationship.source_dataset_id == source.record_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert created == []
+        assert relationships == []
+
+    async def test_delete_relationship(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """DELETE removes a relationship, returns 204."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Del Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="Del Target"
+        )
+
+        create_resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "del_col",
+            },
+            headers=admin_auth_header,
+        )
+        assert create_resp.status_code == 201
+        rel_id = create_resp.json()["id"]
+
+        # Delete the relationship
+        resp = await client.delete(
+            f"/datasets/relationships/{rel_id}/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 204
+
+    async def test_list_relationships_private_dataset_anonymous(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Anonymous user cannot list relationships on a private dataset."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        private_ds = await create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Private DS",
+            visibility="private",
+        )
+
+        resp = await client.get(f"/datasets/{private_ds.id}/relationships/")
+        assert resp.status_code in (403, 404), resp.text
+
+    async def test_create_relationship_requires_auth(
+        self,
+        client: AsyncClient,
+        test_db_session,
+    ):
+        """Unauthenticated POST returns 401/403."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        source = await create_dataset(
+            test_db_session, created_by=admin_id, name="Auth Source"
+        )
+        target = await create_dataset(
+            test_db_session, created_by=admin_id, name="Auth Target"
+        )
+
+        resp = await client.post(
+            f"/datasets/{source.id}/relationships/",
+            json={
+                "target_dataset_id": str(target.record_id),
+                "source_column": "test_col",
+            },
+        )
+        assert resp.status_code in (401, 403), resp.text
+
+    async def test_delete_nonexistent_relationship(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+    ):
+        """DELETE unknown UUID returns 404."""
+        fake_id = str(uuid.uuid4())
+        resp = await client.delete(
+            f"/datasets/relationships/{fake_id}/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 404
+
+
+@pytest.mark.parametrize("column", ["gid", "geom", "geom_4326"])
+def test_internal_columns_are_never_reported_missing(column):
+    from types import SimpleNamespace
+
+    from app.modules.catalog.datasets.domain.relationship_columns import (
+        has_missing_column,
+    )
+
+    dataset = SimpleNamespace(column_info=[{"name": "other", "type": "text"}])
+    rel = SimpleNamespace(source_column=column, target_column=column)
+    assert not has_missing_column(dataset, dataset, rel)

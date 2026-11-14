@@ -1,0 +1,121 @@
+import { fetchBoundedGeoJson, asFeatureCollection } from '@/api/geojson-z';
+import { useAuthStore } from '@/stores/auth-store';
+
+vi.mock('@/api/auth', () => ({
+  refreshAccessToken: vi.fn(),
+}));
+
+const mockFetch = vi.fn();
+globalThis.fetch = mockFetch;
+
+function jsonResponse(data: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: 'OK',
+    json: () => Promise.resolve(data),
+    headers: new Headers(),
+  } as Response;
+}
+
+const boundedGeoJson = {
+  type: 'FeatureCollection' as const,
+  features: [
+    {
+      type: 'Feature' as const,
+      geometry: { type: 'Point' as const, coordinates: [0, 0] },
+      properties: { id: 1 },
+    },
+  ],
+  truncated: false,
+  total_count: 1,
+};
+
+describe('fetchBoundedGeoJson', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAuthStore.setState({ token: null, refreshToken: null, expiresAt: null, user: null });
+  });
+
+  it('uses the authenticated API path without duplicating the /api prefix', async () => {
+    useAuthStore.setState({ token: 'jwt-token' });
+    mockFetch.mockResolvedValueOnce(jsonResponse(boundedGeoJson));
+
+    await fetchBoundedGeoJson('dataset-1');
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/datasets/dataset-1/features.geojson',
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    );
+
+    const headers: Headers = mockFetch.mock.calls[0][1].headers;
+    expect(headers.get('Authorization')).toBe('Bearer jwt-token');
+    expect(headers.get('Content-Type')).toBe('application/json');
+  });
+
+  it('uses the embed-token header for public embed contexts', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse(boundedGeoJson));
+
+    await fetchBoundedGeoJson('dataset-1', { embedToken: 'embed-token' });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/datasets/dataset-1/features.geojson',
+      { headers: { 'X-Embed-Token': 'embed-token' }, signal: expect.any(AbortSignal) },
+    );
+  });
+
+  it('converts bounded GeoJSON responses to plain FeatureCollections for MapLibre', () => {
+    expect(asFeatureCollection(boundedGeoJson)).toEqual({
+      type: 'FeatureCollection',
+      features: boundedGeoJson.features,
+    });
+  });
+
+  it('flattens MultiPoint features to Point so clustering (Supercluster) renders them', () => {
+    const multiPoint = {
+      type: 'FeatureCollection' as const,
+      features: [
+        {
+          type: 'Feature' as const,
+          geometry: { type: 'MultiPoint' as const, coordinates: [[1, 2], [3, 4]] },
+          properties: { id: 7, name: 'airport' },
+        },
+      ],
+      truncated: false,
+      total_count: 1,
+    };
+
+    expect(asFeatureCollection(multiPoint).features).toEqual([
+      { type: 'Feature', geometry: { type: 'Point', coordinates: [1, 2] }, properties: { id: 7, name: 'airport' } },
+      { type: 'Feature', geometry: { type: 'Point', coordinates: [3, 4] }, properties: { id: 7, name: 'airport' } },
+    ]);
+  });
+
+  it('throws for failed direct bounded GeoJSON requests', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse({ detail: 'Forbidden' }, 403));
+
+    await expect(fetchBoundedGeoJson('dataset-1', { embedToken: 'bad' }))
+      .rejects
+      .toThrow('Access denied');
+  });
+
+  it('aborts direct reads when the caller signal aborts', async () => {
+    const controller = new AbortController();
+    mockFetch.mockImplementationOnce((_url: string, init: RequestInit) => new Promise((_, reject) => {
+      init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+    }));
+
+    const pending = fetchBoundedGeoJson('dataset-1', { embedToken: 'k', signal: controller.signal });
+    controller.abort(new Error('stale'));
+
+    await expect(pending).rejects.toThrow('stale');
+  });
+
+  it('gives direct reads a deadline even without a caller signal', async () => {
+    mockFetch.mockResolvedValueOnce(jsonResponse(boundedGeoJson));
+
+    await fetchBoundedGeoJson('dataset-1', { embedToken: 't' });
+
+    expect(mockFetch.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+  });
+});

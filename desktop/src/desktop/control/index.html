@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GeoLens 本地版 · 控制台</title>
+<link rel="stylesheet" href="/__desktop/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <img class="logo-img" src="/__desktop/app-icon.png" alt="" />
+    <div>
+      <h1>GeoLens 本地版</h1>
+      <p class="sub">遥感影像自动整理与入库</p>
+    </div>
+  </div>
+  <div class="view-switch" id="view-switch">
+    <button class="view-btn active" data-view="control">控制台</button>
+    <button class="view-btn" data-view="catalog">数据目录</button>
+  </div>
+  <div class="top-actions">
+    <span id="status-pill" class="pill pill-wait">启动中</span>
+    <button class="btn" id="btn-scan">扫描本地影像</button>
+    <button class="btn btn-ghost" id="btn-quit">退出</button>
+  </div>
+</header>
+
+<div class="catalog-view" id="catalog-view">
+  <iframe id="catalog-frame" title="GeoLens 数据目录"></iframe>
+</div>
+
+<main>
+  <section id="boot-banner" class="banner banner-info">
+    <div class="spinner"></div>
+    <div>
+      <strong id="boot-title">正在启动服务…</strong>
+      <div id="boot-detail" class="muted">首次启动会初始化数据库，可能需要 1–2 分钟。</div>
+    </div>
+  </section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview">概览</button>
+    <button class="tab" data-tab="library">本地影像库设置</button>
+    <button class="tab" data-tab="records">入库记录</button>
+    <button class="tab" data-tab="logs">运行日志</button>
+  </nav>
+
+  <section class="panel-tab active" id="tab-overview">
+    <div class="grid">
+      <div class="card">
+        <h2>服务状态</h2>
+        <ul class="service-list" id="service-list"></ul>
+        <div class="muted small" id="revision"></div>
+      </div>
+      <div class="card">
+        <h2>本地影像库</h2>
+        <dl class="kv" id="library-kv"></dl>
+        <div class="row">
+          <button class="btn btn-sm" data-open="library">打开影像库文件夹</button>
+          <button class="btn btn-sm" data-open="data">打开数据目录</button>
+          <button class="btn btn-sm" data-open="logs">打开日志目录</button>
+        </div>
+      </div>
+      <div class="card">
+        <h2>登录账号</h2>
+        <dl class="kv">
+          <dt>用户名</dt><dd id="admin-user">—</dd>
+          <dt>密码</dt><dd><code id="admin-pass">—</code> <button class="btn btn-tiny" id="btn-copy-pass">复制</button></dd>
+        </dl>
+        <p class="muted small">首次启动自动生成，用于登录数据目录。</p>
+      </div>
+      <div class="card">
+        <h2>自动整理进度</h2>
+        <div id="scan-state" class="scan-state">空闲</div>
+        <div class="progress"><div id="progress-bar"></div></div>
+        <p class="muted small" id="scan-current"></p>
+        <div class="counters" id="counters"></div>
+      </div>
+    </div>
+
+    <div class="card network-card">
+      <h2>局域网访问</h2>
+      <div class="form-grid">
+        <label class="check span-2">
+          <input id="lan-access" type="checkbox" />
+          允许同一局域网的设备访问（只开放 8080 网页端口；数据库/API/切片仍只监听本机）
+        </label>
+        <label class="span-2">对外地址（可选）
+          <input id="public-host" type="text" placeholder="留空则自动使用本机局域网 IP，例如 192.168.1.20" />
+        </label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn btn-primary" id="btn-apply-network">保存并应用</button>
+        <button class="btn" id="btn-firewall">添加防火墙规则</button>
+        <button class="btn" id="btn-firewall-admin">以管理员身份添加</button>
+        <span class="muted small" id="network-note"></span>
+      </div>
+      <div class="network-url" id="network-url">—</div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn btn-sm" id="btn-copy-lan">复制地址</button>
+      </div>
+      <p class="hint" id="network-firewall"></p>
+      <p class="muted small">仅开放 8080；控制台始终只允许本机。请使用强密码，勿直接暴露公网。</p>
+    </div>
+  </section>
+
+  <section class="panel-tab" id="tab-library">
+    <div class="card">
+      <h2>自动扫描的文件夹</h2>
+      <p class="muted small">添加后自动保存；程序会扫描、整理并入库。</p>
+      <ul class="dir-list" id="source-list"></ul>
+      <div class="input-row">
+        <input id="new-source" type="text" placeholder="例如 D:\遥感影像\山西" />
+        <button class="btn" id="btn-add-source">添加并保存</button>
+        <button class="btn" id="btn-browse-source">浏览…</button>
+      </div>
+      <p class="hint" id="source-note"></p>
+    </div>
+
+    <div class="card">
+      <h2>指定文件夹立即扫描</h2>
+      <p class="muted small">只扫描这一次，不加入自动列表。</p>
+      <div class="input-row">
+        <input id="scan-folder-path" type="text" placeholder="例如 D:\下载\遥感影像" />
+        <button class="btn" id="btn-browse-scan">浏览…</button>
+        <button class="btn btn-primary" id="btn-scan-folder">立即扫描</button>
+      </div>
+      <div class="scan-live">
+        <div class="progress"><div id="lib-progress-bar"></div></div>
+        <div class="row space-between">
+          <span class="muted small" id="lib-scan-detail">空闲</span>
+          <button class="btn btn-sm" id="btn-cancel-scan" style="display:none">停止扫描</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>影像库与入库策略</h2>
+      <div class="form-grid">
+        <label class="span-2">影像库目录
+          <div class="input-row">
+            <input id="library-dir" type="text" />
+            <button class="btn" id="btn-browse-library">浏览…</button>
+          </div>
+        </label>
+        <label>整理方式
+          <select id="mode">
+            <option value="copy">复制（推荐，保留原文件）</option>
+            <option value="move">移动（原文件移入影像库）</option>
+            <option value="link">硬链接（同一磁盘时节省空间）</option>
+          </select>
+        </label>
+        <label>扫描间隔（秒）
+          <input id="interval" type="number" min="15" step="15" />
+        </label>
+        <label>单文件上限（MB）
+          <input id="max-size" type="number" min="1" step="64" />
+        </label>
+        <label class="check"><input id="auto-ingest" type="checkbox" /> 整理后自动入库</label>
+        <label class="check"><input id="convert" type="checkbox" /> ENVI/JP2/BMP 等转换为 GeoTIFF 后入库</label>
+        <label class="check"><input id="scan-on-startup" type="checkbox" /> 启动后立即扫描（大目录建议关闭）</label>
+        <label class="check"><input id="recursive" type="checkbox" /> 递归子文件夹</label>
+        <label class="check"><input id="skip-hidden" type="checkbox" /> 跳过隐藏文件/文件夹</label>
+        <label class="check"><input id="skip-system" type="checkbox" /> 跳过系统目录（全盘扫描更快）</label>
+      </div>
+      <label class="full">识别扩展名（逗号分隔）
+        <input id="extensions" type="text" />
+      </label>
+      <div class="row">
+        <button class="btn btn-primary" id="btn-save">保存设置</button>
+        <button class="btn" id="btn-save-scan">保存并立即扫描</button>
+        <span id="save-note" class="muted small"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel-tab" id="tab-records">
+    <div class="card">
+      <div class="row space-between">
+        <h2>入库记录</h2>
+        <div class="row">
+          <button class="btn btn-sm" id="btn-refresh-records">刷新</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>状态</th><th>文件</th><th>影像库路径</th><th>数据集 ID</th><th>更新时间</th><th>说明</th></tr></thead>
+          <tbody id="records-body"><tr><td colspan="6" class="muted">暂无记录</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel-tab" id="tab-logs">
+    <div class="card">
+      <div class="row space-between">
+        <h2>运行日志</h2>
+        <div class="row">
+          <select id="log-select">
+            <option value="librarian">影像库扫描</option>
+            <option value="api">API 服务</option>
+            <option value="worker">入库任务</option>
+          </select>
+          <button class="btn btn-sm" id="btn-refresh-logs">刷新</button>
+        </div>
+      </div>
+      <pre class="logbox" id="logbox"></pre>
+    </div>
+  </section>
+  <p class="muted small" style="margin-top:18px">后台服务会持续运行；关闭浏览器标签不会停止服务，请点右上角“退出”。</p>
+</main>
+
+<div id="toast" class="toast"></div>
+<script src="/__desktop/app.js"></script>
+</body>
+</html>

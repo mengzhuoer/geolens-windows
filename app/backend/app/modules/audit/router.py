@@ -1,0 +1,517 @@
+"""Audit log API endpoints: query audit logs (admin-only).
+
+CSV/JSON exports stream via `stream_audit_logs` with a server-side cursor,
+not `query_audit_logs` (which materializes a list): audit logs can grow to
+millions of rows.
+
+The admin endpoints require `manage_settings`: the audit log contains
+resource/user IDs that would otherwise bypass RBAC.
+"""
+
+import csv
+import io
+import json
+import uuid
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+import anyio
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import StreamingResponse
+
+from app.core.db.tenant_session import tenant_job_context
+from app.modules.audit.schemas import (
+    AuditLogListResponse,
+    AuditLogResponse,
+    AuditSortField,
+    ColumnDdlEntry,
+    ColumnDdlFeedResponse,
+    SortDirection,
+)
+from app.modules.audit.service import (
+    AuditEvent,
+    audit_emit,
+    audit_emit_durable,
+    query_audit_logs,
+    query_column_ddl_history,
+    resolve_resource_names,
+    stream_audit_logs,
+)
+from app.platform.binary_response import binary_response
+from app.core.identity import Identity
+from app.modules.auth.dependencies import get_current_active_user, require_permission
+from app.core.csv_safety import escape_csv_formula
+from app.core.dependencies import get_client_ip, get_db
+from app.processing.export.service import safe_content_disposition
+from app.standards.ogc.errors import ERROR_RESPONSES_AUTH
+
+logger = structlog.stdlib.get_logger(__name__)
+
+# Shares /admin prefix with admin/router.py — kept separate for module organization.
+router = APIRouter(prefix="/admin", tags=["Admin"], responses=ERROR_RESPONSES_AUTH)
+
+# Owner-facing column-DDL feed at /audit/*, a separate prefix so non-admin
+# dataset owners can reach it.
+audit_datasets_router = APIRouter(
+    prefix="/audit", tags=["Audit"], responses=ERROR_RESPONSES_AUTH
+)
+
+
+# Community includes bounded CSV and JSON export. Enterprise automation uses
+# separate extension sinks and routes.
+FORMAT_HANDLERS: dict[str, str] = {
+    "csv": "text/csv",
+    "json": "application/json",
+}
+_EXPORT_OUTCOME_TIMEOUT_SECONDS = 5
+# Rows buffered per resource-name lookup batch. Bounds export memory while
+# amortizing name resolution to a few IN queries per chunk.
+_EXPORT_NAME_CHUNK_ROWS = 500
+
+
+# The formula-escaping rule the admin user export and the dataset CSV export
+# also use (core/csv_safety.py).
+_safe_csv_cell = escape_csv_formula
+
+
+@dataclass(frozen=True)
+class _AuditExportStream:
+    """Own one audit export's fresh-session stream and outcome bookkeeping."""
+
+    actor_id: uuid.UUID
+    export_id: uuid.UUID
+    ip_address: str | None
+    audit_context: dict[str, object]
+    user_id: uuid.UUID | None
+    action: str | None
+    resource_type: str | None
+    resource_id: uuid.UUID | None
+    date_from: datetime | None
+    date_to: datetime | None
+    search: str | None
+    max_rows: int
+    tenant_id: str | None
+
+    async def _record_outcome(self, outcome: str, selected_rows: int) -> None:
+        details: dict[str, object] = {
+            **self.audit_context,
+            "outcome": outcome,
+            "selected_rows": selected_rows,
+        }
+        if outcome == "failed":
+            details["error_code"] = "stream_failed"
+        # Shield terminal bookkeeping from level-triggered disconnect
+        # cancellation, but cap it so a broken audit store cannot retain the
+        # response task indefinitely.
+        with tenant_job_context(self.tenant_id):
+            with anyio.move_on_after(_EXPORT_OUTCOME_TIMEOUT_SECONDS, shield=True):
+                try:
+                    await audit_emit_durable(
+                        AuditEvent(
+                            user_id=self.actor_id,
+                            action="audit.export",
+                            resource_type="audit_log",
+                            resource_id=self.export_id,
+                            details=details,
+                            ip_address=self.ip_address,
+                        )
+                    )
+                except Exception:  # broad: response bytes may already have been sent
+                    logger.exception(
+                        "Failed to persist audit export stream outcome",
+                        operation_id=str(self.export_id),
+                        outcome=outcome,
+                    )
+
+    async def _logs(self):
+        from app.core.db import async_session
+
+        with tenant_job_context(self.tenant_id):
+            async with async_session() as stream_db:
+                async for log in stream_audit_logs(
+                    stream_db,
+                    user_id=self.user_id,
+                    action=self.action,
+                    resource_type=self.resource_type,
+                    resource_id=self.resource_id,
+                    exclude_resource_id=self.export_id,
+                    date_from=self.date_from,
+                    date_to=self.date_to,
+                    search=self.search,
+                    max_rows=self.max_rows,
+                ):
+                    yield log
+
+    async def _named_logs(self):
+        """Yield ``(log, resource_name)`` with names batch-resolved per chunk.
+
+        Name lookups run on their own session: the log stream holds a
+        server-side cursor that can't execute other statements mid-iteration.
+        Buffering _EXPORT_NAME_CHUNK_ROWS rows bounds memory.
+        """
+        from app.core.db import async_session
+
+        with tenant_job_context(self.tenant_id):
+            async with async_session() as names_db:
+                chunk: list = []
+                async with aclosing(self._logs()) as logs:
+                    async for log in logs:
+                        chunk.append(log)
+                        if len(chunk) >= _EXPORT_NAME_CHUNK_ROWS:
+                            names = await resolve_resource_names(names_db, chunk)
+                            for row in chunk:
+                                yield (
+                                    row,
+                                    names.get((row.resource_type, row.resource_id)),
+                                )
+                            chunk = []
+                if chunk:
+                    names = await resolve_resource_names(names_db, chunk)
+                    for row in chunk:
+                        yield row, names.get((row.resource_type, row.resource_id))
+
+    async def csv_generator(self) -> AsyncGenerator[str, None]:
+        """Yield hardened CSV chunks and record the actual emitted row count."""
+        row_count = 0
+        try:
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(
+                [
+                    "timestamp",
+                    "username",
+                    "action",
+                    "resource_type",
+                    "resource_id",
+                    "ip_address",
+                    "details",
+                    # Last, so positional CSV consumers of the earlier
+                    # column layout keep working.
+                    "resource_name",
+                ]
+            )
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+            async with aclosing(self._named_logs()) as logs:
+                async for log, resource_name in logs:
+                    if row_count >= self.max_rows:
+                        break
+                    writer.writerow(
+                        [
+                            _safe_csv_cell(
+                                log.created_at.isoformat() if log.created_at else ""
+                            ),
+                            _safe_csv_cell(log.user.username if log.user else ""),
+                            _safe_csv_cell(log.action),
+                            _safe_csv_cell(log.resource_type),
+                            _safe_csv_cell(
+                                str(log.resource_id) if log.resource_id else ""
+                            ),
+                            _safe_csv_cell(log.ip_address or ""),
+                            _safe_csv_cell(
+                                json.dumps(log.details) if log.details else ""
+                            ),
+                            _safe_csv_cell(resource_name or ""),
+                        ]
+                    )
+                    yield buf.getvalue()
+                    row_count += 1
+                    buf.seek(0)
+                    buf.truncate(0)
+        except BaseException:  # record disconnects/cancellation as failed exports
+            await self._record_outcome("failed", row_count)
+            raise
+        else:
+            await self._record_outcome("completed", row_count)
+
+    async def json_generator(self) -> AsyncGenerator[str, None]:
+        """Yield JSON chunks and record the actual emitted row count."""
+        row_count = 0
+        try:
+            yield "["
+            first = True
+            async with aclosing(self._named_logs()) as logs:
+                async for log, resource_name in logs:
+                    if row_count >= self.max_rows:
+                        break
+                    row = {
+                        # The row's own PK, so an archive can be checked
+                        # against the rows a retention run is about to
+                        # delete: without it, scripts/audit_retention.sh
+                        # can't tell two same-sized slices from different
+                        # tenants apart.
+                        "id": str(log.id),
+                        "timestamp": (
+                            log.created_at.isoformat() if log.created_at else None
+                        ),
+                        "username": log.user.username if log.user else None,
+                        "action": log.action,
+                        "resource_type": log.resource_type,
+                        "resource_id": (
+                            str(log.resource_id) if log.resource_id else None
+                        ),
+                        "resource_name": resource_name,
+                        "ip_address": log.ip_address,
+                        "details": log.details,
+                    }
+                    prefix = "" if first else ","
+                    yield prefix + json.dumps(row)
+                    row_count += 1
+                    first = False
+            yield "]"
+        except BaseException:  # record disconnects/cancellation as failed exports
+            await self._record_outcome("failed", row_count)
+            raise
+        else:
+            await self._record_outcome("completed", row_count)
+
+
+# Trailing slash is canonical (in OpenAPI); the no-slash form is a hidden alias
+# because api/main.py sets redirect_slashes=False.
+@router.get(
+    "/audit-logs",
+    response_model=AuditLogListResponse,
+    include_in_schema=False,
+)
+@router.get("/audit-logs/", response_model=AuditLogListResponse)
+async def list_audit_logs(
+    user_id: uuid.UUID | None = Query(None),
+    action: str | None = Query(None, max_length=200),
+    resource_type: str | None = Query(None, max_length=200),
+    resource_id: uuid.UUID | None = Query(None),
+    date_from: datetime | None = Query(None),
+    date_to: datetime | None = Query(None),
+    search: str | None = Query(None, max_length=200),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    sort: AuditSortField = Query(
+        "created_at",
+        description=(
+            "Column to order by. Resource name is not sortable: it is resolved "
+            "per page after the query, so the database cannot order by it."
+        ),
+    ),
+    order: SortDirection = Query("desc", description="Sort direction."),
+    user: Identity = Depends(require_permission("manage_settings")),
+    db: AsyncSession = Depends(get_db),
+) -> AuditLogListResponse:
+    """Query audit logs with optional filters and sort (admin only).
+
+    `sort` and `order` are closed enums, so an unrecognised value is refused
+    with a 422 and never reaches the query.
+    """
+    logs, total = await query_audit_logs(
+        db,
+        user_id=user_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        date_from=date_from,
+        date_to=date_to,
+        search=search,
+        skip=skip,
+        limit=limit,
+        sort=sort,
+        order=order,
+    )
+    resource_names = await resolve_resource_names(db, logs)
+    return AuditLogListResponse(
+        logs=[
+            AuditLogResponse(
+                id=log.id,
+                user_id=log.user_id,
+                username=log.user.username if log.user else None,
+                action=log.action,
+                resource_type=log.resource_type,
+                resource_id=log.resource_id,
+                resource_name=resource_names.get((log.resource_type, log.resource_id)),
+                details=log.details,
+                ip_address=log.ip_address,
+                created_at=log.created_at,
+            )
+            for log in logs
+        ],
+        total=total,
+    )
+
+
+@router.get(
+    "/audit-logs/export/{format}",
+    response_class=StreamingResponse,
+    responses={
+        200: binary_response(
+            "The CSV file, or a JSON file when the format is json", "text/csv"
+        )
+    },
+    # Neutral summary: the auto-derived "Export Audit Logs" label is banned
+    # public copy; operationId and path unchanged.
+    summary="Download audit records",
+)
+async def export_audit_logs(
+    format: str,
+    request: Request,
+    user_id: uuid.UUID | None = Query(None),
+    action: str | None = Query(None, max_length=200),
+    resource_type: str | None = Query(None, max_length=200),
+    resource_id: uuid.UUID | None = Query(None),
+    date_from: datetime | None = Query(None),
+    date_to: datetime | None = Query(None),
+    search: str | None = Query(None, max_length=200),
+    max_rows: int = Query(100_000, ge=1, le=100_000),
+    user: Identity = Depends(require_permission("manage_settings")),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """Export up to 100,000 audit log rows as CSV or JSON, newest first."""
+    # No sort/order, unlike the list endpoint that shares these filters: the
+    # export streams through stream_audit_logs (its own created_at DESC), and
+    # an export is an archive the recipient reorders themselves. Adding sort
+    # would reorder every existing consumer's file. Pinned by
+    # test_admin_audit_sort.py::test_export_endpoint_takes_no_sort_parameters.
+    if format not in FORMAT_HANDLERS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    filename = f"audit-export-{timestamp}.{format}"
+
+    # Correlate both audit rows and exclude them from the export. The fresh
+    # streaming SELECT's PostgreSQL MVCC statement snapshot is the authoritative
+    # row boundary; no application-clock fence is needed.
+    export_id = uuid.uuid4()
+    actor_id = user.id
+    ip_address = get_client_ip(request)
+    tenant_id = getattr(getattr(request, "state", None), "tenant_id", None)
+    filters = {
+        "user_id": str(user_id) if user_id else None,
+        "action": action,
+        "resource_type": resource_type,
+        "resource_id": str(resource_id) if resource_id else None,
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
+        "search": search,
+    }
+    audit_context = {
+        "operation_id": str(export_id),
+        "format": format,
+        "mode": "stream",
+        "filters": filters,
+        "row_limit": max_rows,
+    }
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=actor_id,
+            action="audit.export",
+            resource_type="audit_log",
+            resource_id=export_id,
+            details={**audit_context, "outcome": "requested"},
+            ip_address=ip_address,
+        ),
+    )
+    # Persist authorization + intent before the response body is released.
+    await db.commit()
+
+    export_stream = _AuditExportStream(
+        actor_id=actor_id,
+        export_id=export_id,
+        ip_address=ip_address,
+        audit_context=audit_context,
+        user_id=user_id,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        date_from=date_from,
+        date_to=date_to,
+        search=search,
+        max_rows=max_rows,
+        tenant_id=tenant_id,
+    )
+    if format == "csv":
+        return StreamingResponse(
+            export_stream.csv_generator(),
+            media_type="text/csv",
+            headers={"Content-Disposition": safe_content_disposition(filename)},
+        )
+
+    return StreamingResponse(
+        export_stream.json_generator(),
+        media_type="application/json",
+        headers={"Content-Disposition": safe_content_disposition(filename)},
+    )
+
+
+@audit_datasets_router.get(
+    "/datasets/{dataset_id}/column-ddl",
+    response_model=ColumnDdlFeedResponse,
+)
+async def get_column_ddl_feed(
+    dataset_id: uuid.UUID,
+    limit: int = Query(50, ge=1, le=200),
+    skip: int = Query(
+        0,
+        ge=0,
+        description="Number of audit entries to skip.",
+    ),
+    offset: int | None = Query(
+        None,
+        ge=0,
+        deprecated=True,
+        description="Deprecated alias for skip; takes precedence when supplied.",
+    ),
+    user: Identity = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> ColumnDdlFeedResponse:
+    """Return the column-DDL audit history for a dataset.
+
+    Surfaces the column-DDL events to dataset owners so they can detect
+    editor-initiated schema changes.
+
+    Owners and administrators can read the feed, because the entries identify
+    editors. Other authenticated users receive 403 for a dataset they can see,
+    such as a public one, and 404 for one they can't. Anonymous callers
+    receive 401.
+
+    The dataset 404-before-auth-query ordering ensures non-existent datasets
+    return 404 without leaking audit log details.
+    """
+    from app.platform.extensions import get_processing_port
+
+    port = get_processing_port()
+
+    dataset = await port.get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+
+    # Owner-or-admin gate, matching the column-DDL write endpoints this feed
+    # reports on.
+    await port.check_dataset_write_access(db, dataset, dataset_id, user)
+
+    # Preserves the old `offset` param while new clients converge on the
+    # repository-wide skip/limit convention.
+    pagination_offset = offset if offset is not None else skip
+    rows, total = await query_column_ddl_history(
+        db, dataset_id, limit=limit, offset=pagination_offset
+    )
+
+    return ColumnDdlFeedResponse(
+        items=[
+            ColumnDdlEntry(
+                action=row.action,
+                created_at=row.created_at,
+                details=row.details,
+                user_id=row.user_id,
+                username=row.user.username if row.user else None,
+            )
+            for row in rows
+        ],
+        total=total,
+        limit=limit,
+        offset=pagination_offset,
+    )

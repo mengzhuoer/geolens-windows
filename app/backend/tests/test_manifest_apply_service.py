@@ -1,0 +1,1872 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from shutil import copyfile
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi import HTTPException, Request
+from httpx import AsyncByteStream, AsyncClient, MockTransport, Request as HttpxRequest
+from httpx import Response as HttpxResponse
+from sqlalchemy import func, select, text
+
+from app.modules.auth.models import User
+from app.modules.catalog.datasets.domain.models import Dataset
+from app.modules.quota.schemas import UserQuotaUsage
+from app.platform.jobs.models import IngestJob
+from app.processing.ingest.manifest_schemas import ManifestApplyRequest, ManifestSource
+from app.processing.ingest.manifest_service import _download_http_source, apply_manifest
+from app.processing.ingest.manifest_sources import (
+    ManifestSourceError,
+    classify_manifest_source,
+    derive_source_extension,
+    derive_source_filename,
+    manifest_dataset_fingerprint,
+    manifest_job_metadata,
+    parse_manifest_crs,
+    publication_to_catalog_fields,
+)
+from tests.factories import create_dataset
+
+
+class _StreamingBody(AsyncByteStream):
+    def __init__(self, *chunks: bytes) -> None:
+        self._chunks = chunks
+        self.iterated = False
+
+    async def __aiter__(self):
+        self.iterated = True
+        for chunk in self._chunks:
+            yield chunk
+
+
+def _manifest_dataset(
+    *,
+    key: str = "roads",
+    title: str = "Road centerlines",
+    uri: str = "tests/fixtures/ingest/basic_attrs.geojson",
+    source_type: str = "vector",
+    intent: str = "draft",
+    crs: str | None = "EPSG:4326",
+    tags: list[str] | None = None,
+    checksum: str | None = None,
+) -> dict:
+    metadata: dict[str, object] = {
+        "organization": "City GIS",
+        "license": "CC-BY-4.0",
+        "attribution": "City GIS",
+    }
+    if crs is not None:
+        metadata["crs"] = crs
+    if tags is not None:
+        metadata["tags"] = tags
+    source: dict[str, object] = {
+        "type": source_type,
+        "uri": uri,
+        "format": "geojson" if source_type == "vector" else "cog",
+    }
+    if checksum is not None:
+        source["checksum"] = checksum
+    return {
+        "key": key,
+        "title": title,
+        "description": f"{title} description",
+        "sources": [source],
+        "metadata": metadata,
+        "publication": {"intent": intent},
+    }
+
+
+def _request(
+    *datasets: dict,
+    dry_run: bool = False,
+) -> ManifestApplyRequest:
+    return ManifestApplyRequest.model_validate(
+        {
+            "manifest_version": "1",
+            "catalog": {"title": "Manifest catalog"},
+            "datasets": list(datasets),
+            "dry_run": dry_run,
+        }
+    )
+
+
+async def _admin_user(session):
+    result = await session.execute(select(User).where(User.username == "admin"))
+    return result.scalar_one()
+
+
+def _http_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/ingest/manifest/apply",
+            "headers": [],
+        }
+    )
+
+
+def _stage_basic_vector_fixture() -> Path:
+    from app.core.config import settings
+
+    relative = Path("tests/fixtures/ingest/basic_attrs.geojson")
+    destination = Path(settings.upload_staging_dir) / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    copyfile(Path(__file__).parent / "fixtures/ingest/basic_attrs.geojson", destination)
+    return destination
+
+
+async def _create_completed_manifest_job(
+    session,
+    *,
+    user: User,
+    dataset: Dataset,
+    manifest_dataset,
+) -> IngestJob:
+    prepared = await classify_manifest_source(manifest_dataset.sources[0])
+    fingerprint = manifest_dataset_fingerprint(manifest_dataset)
+    job = IngestJob(
+        dataset_id=dataset.id,
+        source_filename=prepared.source_filename,
+        file_path=prepared.file_path,
+        created_by=user.id,
+        status="complete",
+        completed_at=datetime.now(timezone.utc),
+        user_metadata=manifest_job_metadata(
+            manifest_dataset,
+            prepared,
+            fingerprint=fingerprint,
+        ),
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+@contextmanager
+def _workflow_overlay(*statuses: str):
+    """Register a workflow extension whose status_order is ``statuses``.
+
+    Saves and restores the whole registry rather than clearing it: the slot
+    may already hold something this test did not put there.
+    """
+    import app.platform.extensions as ext_mod
+    from app.platform.extensions.defaults import DefaultWorkflowExtension
+
+    class _OverlayWorkflow(DefaultWorkflowExtension):
+        def status_order(self):
+            return statuses
+
+    saved = dict(ext_mod._extensions)
+    ext_mod._extensions["workflow"] = _OverlayWorkflow()
+    try:
+        yield
+    finally:
+        ext_mod._extensions.clear()
+        ext_mod._extensions.update(saved)
+
+
+class TestManifestApplyHelpers:
+    def test_manifest_dataset_fingerprint_is_stable_and_sensitive(self):
+        first = _request(_manifest_dataset()).datasets[0]
+        second = _request(_manifest_dataset()).datasets[0]
+        changed = _request(_manifest_dataset(title="Roads 2026")).datasets[0]
+
+        assert manifest_dataset_fingerprint(first) == manifest_dataset_fingerprint(
+            second
+        )
+        assert manifest_dataset_fingerprint(first) != manifest_dataset_fingerprint(
+            changed
+        )
+
+    def test_absent_checksum_does_not_change_the_fingerprint(self):
+        """gh#1736: manifest_dataset_fingerprint dumps with exclude_none=True,
+        so a manifest entry that never sets checksum must fingerprint exactly
+        as it did before the field existed -- otherwise adding an optional
+        field would itself flip every stored fingerprint to "update"."""
+        dataset = _request(_manifest_dataset()).datasets[0]
+
+        payload = dataset.model_dump(mode="json", exclude_none=True)
+        assert "checksum" not in payload["sources"][0]
+        pre_checksum_field_fingerprint = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+        assert manifest_dataset_fingerprint(dataset) == pre_checksum_field_fingerprint
+
+    def test_changed_checksum_changes_the_fingerprint(self):
+        """gh#1736: a caller bumping checksum on an otherwise-identical entry
+        is the documented escape hatch for a stable URI whose bytes changed;
+        the fingerprint has to move for _classify_dataset to see it."""
+        unset = _request(_manifest_dataset()).datasets[0]
+        first = _request(_manifest_dataset(checksum=f"sha256:{'a' * 64}")).datasets[0]
+        second = _request(_manifest_dataset(checksum=f"sha256:{'b' * 64}")).datasets[0]
+
+        assert manifest_dataset_fingerprint(unset) != manifest_dataset_fingerprint(
+            first
+        )
+        assert manifest_dataset_fingerprint(first) != manifest_dataset_fingerprint(
+            second
+        )
+
+    def test_publication_mapping(self):
+        assert publication_to_catalog_fields("draft") == ("private", "draft")
+        assert publication_to_catalog_fields("ready") == ("private", "ready")
+        assert publication_to_catalog_fields("internal") == ("internal", "internal")
+        assert publication_to_catalog_fields("published") == (
+            "public",
+            "published",
+        )
+
+    def test_publication_intent_outside_the_live_status_order_is_refused(self):
+        with pytest.raises(ManifestSourceError) as exc:
+            publication_to_catalog_fields("approval_required")
+
+        message = str(exc.value)
+        assert "approval_required" in message
+        assert "draft, ready, internal, published" in message
+
+    def test_publication_intent_follows_an_overlay_defined_status_order(self):
+        """The allowed set is the live extension's, not a frozen one.
+
+        Both directions matter. `review` is not a community status and has to
+        pass while the overlay defines it; `internal` IS a community status
+        and has to fail while the overlay does not — which is what proves the
+        check reads `status_order()` rather than a union of both sets.
+        """
+        with _workflow_overlay("draft", "review", "published"):
+            assert publication_to_catalog_fields("review") == ("private", "review")
+            assert publication_to_catalog_fields("published") == (
+                "public",
+                "published",
+            )
+
+            with pytest.raises(ManifestSourceError, match="internal"):
+                publication_to_catalog_fields("internal")
+
+    def test_crs_parsing(self):
+        assert parse_manifest_crs("EPSG:3857") == 3857
+        assert parse_manifest_crs(None) is None
+
+    def test_source_filename_and_extension_derivation(self):
+        local = ManifestSource(type="vector", uri="./data/roads.geojson")
+        remote = ManifestSource(
+            type="raster_cog",
+            uri="s3://example-geolens-public/rasters/tile-001.tif",
+        )
+        assert derive_source_filename(local) == "roads.geojson"
+        assert derive_source_extension(local) == ".geojson"
+        assert derive_source_filename(remote) == "tile-001.tif"
+        assert derive_source_extension(remote) == ".tif"
+
+    @pytest.mark.parametrize(
+        ("uri", "expected_filename", "expected_extension"),
+        [
+            ("./data/trails.fgb", "trails.fgb", ".fgb"),
+            ("./data/poi.kml", "poi.kml", ".kml"),
+            ("./data/poi.kmz", "poi.kmz", ".kmz"),
+            ("./data/parcels.zip", "parcels.zip", ".zip"),
+            ("./data/parcels.parquet", "parcels.parquet", ".parquet"),
+        ],
+    )
+    def test_source_filename_and_extension_derivation_tier1_formats(
+        self, uri: str, expected_filename: str, expected_extension: str
+    ):
+        """FlatGeobuf, KML, KMZ, and zipped-FileGDB manifest
+        sources derive the same filename/extension as any other vector
+        source — the tier-1 upload formats."""
+        source = ManifestSource(type="vector", uri=uri)
+
+        assert derive_source_filename(source) == expected_filename
+        assert derive_source_extension(source) == expected_extension
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "./data/trails.fgb",
+            "./data/poi.kml",
+            "./data/poi.kmz",
+            "./data/parcels.parquet",
+        ],
+    )
+    async def test_classify_manifest_source_accepts_tier1_vector_formats(
+        self, uri: str
+    ):
+        """These formats must not be rejected by
+        `MANIFEST_SOURCE_EXTENSIONS` before reaching ingest, since the
+        upload door accepts the identical bytes."""
+        source = ManifestSource(type="vector", uri=uri)
+
+        prepared = await classify_manifest_source(source)
+
+        assert prepared.kind == "local"
+        assert prepared.extension == Path(uri).suffix.lower()
+
+    async def test_manifest_job_metadata_redacts_remote_credentials(self):
+        dataset = _request(
+            _manifest_dataset(
+                uri=(
+                    "https://alice:topsecret@example.test/roads.geojson"
+                    "?token=super-secret&version=1"
+                )
+            )
+        ).datasets[0]
+        with patch(
+            "app.platform.security.validate_url_for_ssrf",
+            new=AsyncMock(),
+        ):
+            prepared = await classify_manifest_source(dataset.sources[0])
+
+        metadata = manifest_job_metadata(
+            dataset,
+            prepared,
+            fingerprint=manifest_dataset_fingerprint(dataset),
+        )
+
+        persisted_uri = str(metadata["manifest_source_uri"])
+        assert "topsecret" not in persisted_uri
+        assert "super-secret" not in persisted_uri
+        assert "alice" not in persisted_uri
+        assert "version=1" in persisted_uri
+
+    async def test_local_seed_staging_uses_unique_job_owned_copies(
+        self, tmp_path, monkeypatch
+    ):
+        from app.core.config import settings
+        from app.processing.ingest.manifest_service import _stage_source_if_needed
+
+        seed = tmp_path / "seed.geojson"
+        seed.write_bytes(b'{"type":"FeatureCollection","features":[]}')
+        monkeypatch.setattr(settings, "upload_staging_dir", str(tmp_path))
+        dataset = _request(_manifest_dataset(uri="seed.geojson")).datasets[0]
+        prepared = await classify_manifest_source(dataset.sources[0])
+
+        first_job, second_job = uuid.uuid4(), uuid.uuid4()
+        first = await _stage_source_if_needed(
+            prepared, job_id=first_job, dry_run=False, max_size_bytes=1024 * 1024
+        )
+        second = await _stage_source_if_needed(
+            prepared, job_id=second_job, dry_run=False, max_size_bytes=1024 * 1024
+        )
+
+        assert first is not None and second is not None
+        assert Path(first).name.startswith(f"{first_job}_")
+        assert Path(second).name.startswith(f"{second_job}_")
+        assert first != str(seed)
+        assert Path(first).read_bytes() == seed.read_bytes()
+        assert Path(second).read_bytes() == seed.read_bytes()
+
+    @pytest.mark.anyio
+    async def test_classification_defends_against_forged_source_extension(self):
+        source = ManifestSource.model_construct(
+            type="raster_cog",
+            uri="./rasters/mosaic.vrt",
+            title=None,
+            description=None,
+            format=None,
+            layer=None,
+        )
+
+        with pytest.raises(ManifestSourceError, match="Standalone VRT"):
+            await classify_manifest_source(source)
+
+    @pytest.mark.anyio
+    async def test_unsafe_http_uri_is_rejected(self):
+        source = ManifestSource(
+            type="vector",
+            uri="http://127.0.0.1/private.geojson",
+        )
+
+        with pytest.raises(ManifestSourceError, match="private/internal"):
+            await classify_manifest_source(source)
+
+    @pytest.mark.anyio
+    async def test_storage_seed_key_under_staging_prefix_is_rejected(self, monkeypatch):
+        """`staging/` object keys are system-owned transient
+        presigned-upload storage — the ingest tail reaps them at terminal
+        job status, so an operator-declared manifest source under that
+        prefix would be deleted. Declaration must refuse the key."""
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "storage_provider", "s3")
+        monkeypatch.setattr(settings, "s3_bucket", "geolens-seed-bucket")
+        source = ManifestSource(
+            type="vector",
+            uri="s3://geolens-seed-bucket/staging/roads.geojson",
+        )
+
+        with pytest.raises(ManifestSourceError, match="staging/"):
+            await classify_manifest_source(source)
+
+    @pytest.mark.anyio
+    async def test_storage_seed_key_outside_staging_prefix_still_classifies(
+        self, monkeypatch
+    ):
+        """Control for #1216: an ordinary operator-owned key is unaffected."""
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "storage_provider", "s3")
+        monkeypatch.setattr(settings, "s3_bucket", "geolens-seed-bucket")
+        source = ManifestSource(
+            type="vector",
+            uri="s3://geolens-seed-bucket/operator/roads.geojson",
+        )
+
+        prepared = await classify_manifest_source(source)
+
+        assert prepared.kind == "storage"
+        assert prepared.file_path == "operator/roads.geojson"
+
+    def test_dotdot_traversal_rejected_at_schema_layer(self):
+        """ManifestSource must reject any URI containing
+        a `..` path segment. The Pydantic validator catches it before any
+        ingest classification runs."""
+        for unsafe in (
+            "../etc/passwd",
+            "../../app/.env",
+            "data/../../../proc/self/environ",
+            "./..",
+            "foo/../bar",
+            "tests/fixtures/../../etc/passwd",
+        ):
+            with pytest.raises(Exception) as exc_info:
+                ManifestSource(type="vector", uri=unsafe)
+            # Either the regex pattern OR the field validator should reject;
+            # both manifest as ValidationError.
+            err = str(exc_info.value)
+            assert (
+                "`..`" in err or ".." in err or "String should match pattern" in err
+            ), f"unexpected error for {unsafe!r}: {err}"
+
+    @pytest.mark.anyio
+    async def test_classify_manifest_source_rejects_paths_outside_staging_dir(
+        self, monkeypatch
+    ):
+        """Defense-in-depth — even if the regex/validator
+        is bypassed somehow, classify_manifest_source must refuse paths
+        whose resolved form escapes upload_staging_dir."""
+        # Construct a ManifestSource directly bypassing validation by
+        # patching the validator to a no-op, simulating any future
+        # accidental relaxation of the schema.
+        from app.processing.ingest import manifest_schemas
+        from app.processing.ingest.manifest_sources import classify_manifest_source
+
+        original_validator = manifest_schemas.ManifestSource._reject_dotdot_segments
+
+        def passthrough(cls, uri: str) -> str:
+            return uri
+
+        monkeypatch.setattr(
+            manifest_schemas.ManifestSource,
+            "_reject_dotdot_segments",
+            classmethod(passthrough),
+        )
+        # Also clear the regex pattern by constructing model_validate over
+        # a value that would have failed it; simpler: just call the runtime
+        # check directly via a forged-shaped object.
+        forged = manifest_schemas.ManifestSource.model_construct(
+            type="vector",
+            uri="../../etc/secrets.geojson",
+            title=None,
+            description=None,
+            format=None,
+            layer=None,
+        )
+
+        with pytest.raises(ManifestSourceError, match="upload_staging_dir"):
+            await classify_manifest_source(forged)
+
+        # Restore validator (defensive — monkeypatch teardown handles it
+        # but be explicit).
+        monkeypatch.setattr(
+            manifest_schemas.ManifestSource,
+            "_reject_dotdot_segments",
+            original_validator,
+        )
+
+    @pytest.mark.anyio
+    async def test_local_source_persists_canonical_validated_staging_path(
+        self, monkeypatch, tmp_path
+    ):
+        from app.core.config import settings
+
+        staging = tmp_path / "staging"
+        (staging / "nested").mkdir(parents=True)
+        source_path = staging / "nested" / "roads.geojson"
+        source_path.write_text('{"type":"FeatureCollection","features":[]}')
+        monkeypatch.setattr(settings, "upload_staging_dir", str(staging))
+
+        prepared = await classify_manifest_source(
+            ManifestSource(type="vector", uri="./nested/roads.geojson")
+        )
+
+        assert prepared.file_path == str(source_path.resolve())
+        assert prepared.source_uri == "./nested/roads.geojson"
+
+    @pytest.mark.anyio
+    async def test_local_source_accepts_explicit_staging_root_marker(
+        self, monkeypatch, tmp_path
+    ):
+        from app.core.config import settings
+
+        staging = tmp_path / "staging"
+        staging.mkdir()
+        source_path = staging / "roads.geojson"
+        source_path.write_text('{"type":"FeatureCollection","features":[]}')
+        monkeypatch.setattr(settings, "upload_staging_dir", str(staging))
+
+        prepared = await classify_manifest_source(
+            ManifestSource(type="vector", uri="staging/roads.geojson")
+        )
+
+        assert prepared.file_path == str(source_path.resolve())
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("with_content_length", [False, True])
+    async def test_http_download_stops_at_streaming_quota_budget(
+        self, test_db_session, monkeypatch, tmp_path, with_content_length: bool
+    ):
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "upload_staging_dir", str(tmp_path))
+        source = ManifestSource(
+            type="vector",
+            uri="https://data.example.test/roads.geojson",
+        )
+
+        body = _StreamingBody(b"123", b"456")
+
+        def handler(_request: HttpxRequest) -> HttpxResponse:
+            return HttpxResponse(
+                200,
+                headers={"content-length": "6"} if with_content_length else {},
+                stream=body,
+            )
+
+        client = AsyncClient(transport=MockTransport(handler))
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.platform.security.make_safe_client",
+                return_value=client,
+            ),
+        ):
+            prepared = await classify_manifest_source(source)
+            job_id = uuid.uuid4()
+            with pytest.raises(
+                ManifestSourceError,
+                match="remaining storage quota",
+            ):
+                await _download_http_source(
+                    prepared,
+                    job_id=job_id,
+                    max_size_bytes=100 * 1024 * 1024,
+                    quota_byte_limit=5,
+                )
+
+        assert list(tmp_path.glob(f"{job_id}_*")) == []
+        assert body.iterated is not with_content_length
+
+    @pytest.mark.anyio
+    async def test_http_download_closes_file_if_cancelled_during_open(
+        self, test_db_session, monkeypatch, tmp_path
+    ):
+        import asyncio
+        import threading
+
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "upload_staging_dir", str(tmp_path))
+        source = ManifestSource(
+            type="vector",
+            uri="https://data.example.test/roads.geojson",
+        )
+        body = _StreamingBody()
+
+        def handler(_request: HttpxRequest) -> HttpxResponse:
+            return HttpxResponse(200, stream=body)
+
+        client = AsyncClient(transport=MockTransport(handler))
+        original_open = Path.open
+        job_id = uuid.uuid4()
+        open_started = threading.Event()
+        release_open = threading.Event()
+        opened_files = []
+
+        def blocking_open(path: Path, *args, **kwargs):
+            file_obj = original_open(path, *args, **kwargs)
+            if path.parent == tmp_path and path.name.startswith(f"{job_id}_"):
+                opened_files.append(file_obj)
+                open_started.set()
+                release_open.wait(timeout=5)
+            return file_obj
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.platform.security.make_safe_client",
+                return_value=client,
+            ),
+            patch.object(Path, "open", new=blocking_open),
+        ):
+            prepared = await classify_manifest_source(source)
+            task = asyncio.create_task(
+                _download_http_source(
+                    prepared, job_id=job_id, max_size_bytes=100 * 1024 * 1024
+                )
+            )
+            assert await asyncio.to_thread(open_started.wait, 5)
+            task.cancel()
+            await asyncio.sleep(0)
+            cancellation_is_draining = not task.done()
+            release_open.set()
+            assert cancellation_is_draining, (
+                "cancellation returned before open released"
+            )
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert len(opened_files) == 1
+        assert opened_files[0].closed
+        assert list(tmp_path.glob(f"{job_id}_*")) == []
+
+
+@pytest.mark.anyio
+class TestManifestApplyService:
+    async def test_new_vector_entry_creates_job_and_queues_ingest(
+        self, test_db_session, clean_tables
+    ):
+        staged_source = _stage_basic_vector_fixture()
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-create-vector",
+                tags=["transportation", "roads"],
+                intent="ready",
+            )
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service.queue_ingest_job",
+            new=AsyncMock(),
+        ) as queue:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is True
+        result = response.results[0]
+        assert result.action == "create"
+        assert result.job_id is not None
+        queue.assert_awaited_once()
+
+        job = await test_db_session.get(IngestJob, result.job_id)
+        assert job is not None
+        assert job.file_path != str(staged_source.resolve())
+        assert Path(job.file_path).read_bytes() == staged_source.read_bytes()
+        assert job.user_metadata["manifest_key"] == "manifest-create-vector"
+        assert job.user_metadata["manifest_source_type"] == "vector"
+        assert job.user_metadata["manifest_tags"] == ["transportation", "roads"]
+        assert job.user_metadata["visibility"] == "private"
+        assert job.user_metadata["record_status"] == "ready"
+        assert job.user_metadata["srid_override"] == 4326
+
+    async def test_new_geoparquet_entry_queues_a_valid_job(
+        self, test_db_session, clean_tables
+    ):
+        import pyarrow.parquet as pq
+        from shapely.geometry import Point
+
+        from app.core.config import settings
+        from app.processing.export.parquet import build_geoparquet_table
+        from app.processing.ingest.validation import validate_file_content
+
+        staged = Path(settings.upload_staging_dir) / "tests/fixtures/ingest/pts.parquet"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        table = build_geoparquet_table(
+            [Point(0, 0).wkb, Point(1, 1).wkb], {"name": ["a", "b"]}, ["name"]
+        )
+        pq.write_table(table, staged)
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-create-geoparquet",
+                uri="tests/fixtures/ingest/pts.parquet",
+            )
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service.queue_ingest_job",
+            new=AsyncMock(),
+        ) as queue:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is True
+        assert response.results[0].action == "create"
+        queue.assert_awaited_once()
+        job = await test_db_session.get(IngestJob, response.results[0].job_id)
+        assert job.source_filename.endswith(".parquet")
+        validate_file_content(job.file_path, job.source_filename)
+
+    async def test_new_raster_entry_sets_raster_queue_metadata(
+        self, test_db_session, clean_tables
+    ):
+        from app.core.config import settings
+
+        user = await _admin_user(test_db_session)
+        staged_raster = Path(settings.upload_staging_dir) / "rasters/tile-001.tif"
+        staged_raster.parent.mkdir(parents=True, exist_ok=True)
+        staged_raster.write_bytes(b"test raster seed")
+        request = _request(
+            _manifest_dataset(
+                key="manifest-create-raster",
+                uri="rasters/tile-001.tif",
+                source_type="raster_cog",
+                intent="published",
+                crs="EPSG:32618",
+            )
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service.queue_ingest_job",
+            new=AsyncMock(),
+        ):
+            with patch(
+                "app.processing.ingest.manifest_service._manifest_source_size_bytes",
+                new=AsyncMock(return_value=1024),
+            ):
+                response = await apply_manifest(
+                    test_db_session, request, user, _http_request()
+                )
+
+        result = response.results[0]
+        assert result.action == "create"
+        job = await test_db_session.get(IngestJob, result.job_id)
+        assert job.user_metadata["file_type"] == "raster"
+        assert job.user_metadata["visibility"] == "public"
+        assert job.user_metadata["record_status"] == "published"
+        assert job.user_metadata["srid_override"] == 32618
+
+    async def test_completed_same_fingerprint_skips(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        request = _request(_manifest_dataset(key="manifest-skip-complete"))
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Existing roads",
+        )
+        job = await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=dataset,
+            manifest_dataset=request.datasets[0],
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service.queue_ingest_job",
+            new=AsyncMock(),
+        ) as queue:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        result = response.results[0]
+        assert result.action == "skip"
+        assert result.job_id == job.id
+        assert result.dataset_id == dataset.id
+        queue.assert_not_awaited()
+        # gh#1736: the message must not claim the source was checked, only
+        # that the manifest entry itself is unchanged. gh#1773:
+        # this is the vector branch, which does have a working checksum
+        # recovery path -- see test_completed_raster_fingerprint_skip_does_
+        # not_promise_checksum_recovery for the raster branch, which does not.
+        assert "not inspected" in result.message
+        assert "checksum" in result.message
+
+    async def test_completed_raster_fingerprint_skip_does_not_promise_checksum_recovery(
+        self, test_db_session, clean_tables
+    ):
+        """gh#1773: bumping checksum on a raster_cog entry does move
+        the fingerprint and reclassify skip_complete as update, but
+        _validate_existing_dataset_update then rejects a raster update
+        outright ("Manifest raster updates are not supported"). Naming
+        checksum in the skip message here would point a raster caller at a
+        recovery path that cannot succeed, so the raster branch must match
+        _validate_existing_dataset_update's own wording instead.
+        """
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-skip-complete-raster",
+                source_type="raster_cog",
+                uri="rasters/tile-001.tif",
+            )
+        )
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Existing raster",
+        )
+        job = await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=dataset,
+            manifest_dataset=request.datasets[0],
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service.queue_ingest_job",
+            new=AsyncMock(),
+        ) as queue:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        result = response.results[0]
+        assert result.action == "skip"
+        assert result.job_id == job.id
+        assert result.dataset_id == dataset.id
+        queue.assert_not_awaited()
+        assert "not inspected" in result.message
+        assert "checksum" not in result.message
+        assert "raster updates are not supported" in result.message
+
+    async def test_changed_raster_checksum_errors_instead_of_skipping(
+        self, test_db_session, clean_tables
+    ):
+        """gh#1773: fresh evidence from the docs fix itself.
+        The README/Field/CLI-schema text said a raster entry with a changed
+        checksum "still classifies as skip, not update" -- but
+        _classify_dataset does not look at source type, so a changed
+        checksum moves ANY entry's fingerprint and yields "update". For
+        raster_cog, _validate_existing_dataset_update then raises before any
+        staging happens, and apply_manifest's per-entry wrapper turns that
+        into an error result, not a skip. This pins the actual behavior so
+        the docs can't drift from it again.
+        """
+        user = await _admin_user(test_db_session)
+        original_request = _request(
+            _manifest_dataset(
+                key="manifest-raster-checksum-error",
+                source_type="raster_cog",
+                uri="rasters/tile-001.tif",
+                checksum=f"sha256:{'a' * 64}",
+            )
+        )
+        changed_request = _request(
+            _manifest_dataset(
+                key="manifest-raster-checksum-error",
+                source_type="raster_cog",
+                uri="rasters/tile-001.tif",
+                checksum=f"sha256:{'b' * 64}",
+            )
+        )
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Existing raster",
+        )
+        await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=dataset,
+            manifest_dataset=original_request.datasets[0],
+        )
+
+        with (
+            patch(
+                "app.processing.ingest.manifest_service._stage_source_if_needed",
+                new=AsyncMock(),
+            ) as stage,
+            patch(
+                "app.processing.ingest.manifest_service._queue_reupload_job",
+                new=AsyncMock(),
+            ) as queue,
+        ):
+            response = await apply_manifest(
+                test_db_session, changed_request, user, _http_request()
+            )
+
+        result = response.results[0]
+        assert result.action == "error"
+        assert "raster updates are not supported" in result.message
+        stage.assert_not_awaited()
+        queue.assert_not_awaited()
+
+    async def test_changed_checksum_reclassifies_skip_complete_as_update(
+        self, test_db_session, clean_tables
+    ):
+        """gh#1736: a caller-declared checksum is the escape hatch for a
+        stable URI whose bytes changed underneath it -- bumping it must move
+        the entry out of skip_complete even though nothing else changed."""
+        _stage_basic_vector_fixture()
+        user = await _admin_user(test_db_session)
+        original_request = _request(
+            _manifest_dataset(
+                key="manifest-checksum-update", checksum=f"sha256:{'a' * 64}"
+            )
+        )
+        changed_request = _request(
+            _manifest_dataset(
+                key="manifest-checksum-update", checksum=f"sha256:{'b' * 64}"
+            )
+        )
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Existing roads",
+        )
+        await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=dataset,
+            manifest_dataset=original_request.datasets[0],
+        )
+        task = MagicMock()
+        task.defer_async = AsyncMock()
+        port = MagicMock()
+        port.reupload_file_task.return_value = task
+
+        with patch(
+            "app.processing.ingest.manifest_service.get_catalog_port",
+            return_value=port,
+        ):
+            response = await apply_manifest(
+                test_db_session, changed_request, user, _http_request()
+            )
+
+        result = response.results[0]
+        assert result.action == "update"
+        assert result.dataset_id == dataset.id
+        task.defer_async.assert_awaited_once()
+
+    async def test_changed_completed_fingerprint_creates_reupload_job(
+        self, test_db_session, clean_tables
+    ):
+        _stage_basic_vector_fixture()
+        user = await _admin_user(test_db_session)
+        original_request = _request(_manifest_dataset(key="manifest-update"))
+        changed_request = _request(
+            _manifest_dataset(key="manifest-update", title="Updated roads")
+        )
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Existing roads",
+        )
+        await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=dataset,
+            manifest_dataset=original_request.datasets[0],
+        )
+        task = MagicMock()
+        task.defer_async = AsyncMock()
+        port = MagicMock()
+        port.reupload_file_task.return_value = task
+
+        with patch(
+            "app.processing.ingest.manifest_service.get_catalog_port",
+            return_value=port,
+        ):
+            response = await apply_manifest(
+                test_db_session, changed_request, user, _http_request()
+            )
+
+        result = response.results[0]
+        assert result.action == "update"
+        assert result.dataset_id == dataset.id
+        assert result.job_id is not None
+        task.defer_async.assert_awaited_once()
+
+        job = await test_db_session.get(IngestJob, result.job_id)
+        assert job.dataset_id == dataset.id
+        assert job.user_metadata["reupload"] is True
+        assert job.user_metadata["manifest_key"] == "manifest-update"
+        assert job.user_metadata["title"] == "Updated roads"
+
+    async def test_raster_update_is_rejected_before_staging_or_queue(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        original_request = _request(_manifest_dataset(key="manifest-raster-update"))
+        changed_request = _request(
+            _manifest_dataset(
+                key="manifest-raster-update",
+                title="Replacement raster",
+                source_type="raster_cog",
+                uri="rasters/replacement.tif",
+            )
+        )
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Existing roads",
+        )
+        await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=dataset,
+            manifest_dataset=original_request.datasets[0],
+        )
+
+        with (
+            patch(
+                "app.processing.ingest.manifest_service._stage_source_if_needed",
+                new=AsyncMock(),
+            ) as stage,
+            patch(
+                "app.processing.ingest.manifest_service._queue_reupload_job",
+                new=AsyncMock(),
+            ) as queue,
+        ):
+            response = await apply_manifest(
+                test_db_session, changed_request, user, _http_request()
+            )
+
+        assert response.results[0].action == "error"
+        assert "raster updates are not supported" in response.results[0].message
+        stage.assert_not_awaited()
+        queue.assert_not_awaited()
+
+    async def test_vector_update_cannot_replace_existing_raster_dataset(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        original_request = _request(_manifest_dataset(key="manifest-type-mismatch"))
+        changed_request = _request(
+            _manifest_dataset(
+                key="manifest-type-mismatch",
+                title="Vector replacement",
+            )
+        )
+        dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Existing raster",
+        )
+        dataset.record.record_type = "raster_dataset"
+        await test_db_session.commit()
+        await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=dataset,
+            manifest_dataset=original_request.datasets[0],
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service._stage_source_if_needed",
+            new=AsyncMock(),
+        ) as stage:
+            response = await apply_manifest(
+                test_db_session, changed_request, user, _http_request()
+            )
+
+        assert response.results[0].action == "error"
+        assert (
+            "cannot replace an existing raster_dataset" in response.results[0].message
+        )
+        stage.assert_not_awaited()
+
+    async def test_dataset_quota_is_checked_before_http_download(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-http-count-quota",
+                uri="https://data.example.test/roads.geojson",
+            )
+        )
+        usage = UserQuotaUsage(
+            bytes_used=0,
+            dataset_count=5,
+            storage_cap=0,
+            count_cap=5,
+        )
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.modules.quota.service.get_user_quota_usage",
+                new=AsyncMock(return_value=usage),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service._download_http_source",
+                new=AsyncMock(),
+            ) as download,
+            patch(
+                "app.processing.ingest.manifest_service.queue_ingest_job",
+                new=AsyncMock(),
+            ) as queue,
+        ):
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is False
+        assert response.results[0].action == "error"
+        assert "Dataset quota exceeded" in response.results[0].message
+        download.assert_not_awaited()
+        queue.assert_not_awaited()
+
+    async def test_batch_count_quota_includes_jobs_admitted_earlier_in_request(
+        self, test_db_session, clean_tables, tmp_path
+    ):
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-batch-count-a",
+                uri="https://data.example.test/a.geojson",
+            ),
+            _manifest_dataset(
+                key="manifest-batch-count-b",
+                uri="https://data.example.test/b.geojson",
+            ),
+        )
+        staged = tmp_path / "a.geojson"
+        staged.write_bytes(b"a")
+        usage = UserQuotaUsage(
+            bytes_used=0,
+            dataset_count=0,
+            storage_cap=0,
+            count_cap=1,
+        )
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.modules.quota.service.get_user_quota_usage",
+                new=AsyncMock(return_value=usage),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service._download_http_source",
+                new=AsyncMock(return_value=str(staged)),
+            ) as download,
+            patch(
+                "app.modules.quota.service.check_upload_quota",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service.queue_ingest_job",
+                new=AsyncMock(),
+            ),
+        ):
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert [result.action for result in response.results] == ["create", "error"]
+        assert "Dataset quota exceeded" in response.results[1].message
+        download.assert_awaited_once()
+
+    async def test_batch_byte_quota_includes_sources_admitted_earlier_in_request(
+        self, test_db_session, clean_tables, tmp_path
+    ):
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-batch-bytes-a",
+                uri="https://data.example.test/a.geojson",
+            ),
+            _manifest_dataset(
+                key="manifest-batch-bytes-b",
+                uri="https://data.example.test/b.geojson",
+            ),
+        )
+        first = tmp_path / "a.geojson"
+        second = tmp_path / "b.geojson"
+        first.write_bytes(b"a" * 6)
+        second.write_bytes(b"b" * 6)
+        usage = UserQuotaUsage(
+            bytes_used=0,
+            dataset_count=0,
+            storage_cap=10,
+            count_cap=0,
+        )
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.modules.quota.service.get_user_quota_usage",
+                new=AsyncMock(return_value=usage),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service._download_http_source",
+                new=AsyncMock(side_effect=[str(first), str(second)]),
+            ),
+            patch(
+                "app.modules.quota.service.check_upload_quota",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service.queue_ingest_job",
+                new=AsyncMock(),
+            ),
+        ):
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert [result.action for result in response.results] == ["create", "error"]
+        assert "Storage quota exceeded" in response.results[1].message
+        assert not second.exists()
+
+    async def test_tenant_admin_cannot_use_unowned_raw_seed_source(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        request = _request(_manifest_dataset(key="tenant-admin-raw-seed"))
+
+        with (
+            patch("app.core.tenancy.is_multi_tenant", return_value=True),
+            patch(
+                "app.processing.ingest.manifest_service.queue_ingest_job",
+                new=AsyncMock(),
+            ) as queue,
+        ):
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.results[0].action == "error"
+        assert "disabled in multi-tenant mode" in response.results[0].message
+        queue.assert_not_awaited()
+
+    async def test_downloaded_http_vector_is_quota_checked_and_removed_on_denial(
+        self, test_db_session, clean_tables, tmp_path
+    ):
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-http-quota",
+                uri="https://data.example.test/roads.geojson",
+            )
+        )
+        staged = tmp_path / "manifest_http_roads.geojson"
+        staged.write_bytes(b"x" * 4096)
+        user_id = user.id
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service._download_http_source",
+                new=AsyncMock(return_value=str(staged)),
+            ),
+            patch(
+                "app.modules.quota.service.check_upload_quota",
+                new=AsyncMock(
+                    side_effect=HTTPException(status_code=413, detail="quota denied")
+                ),
+            ) as quota_check,
+            patch(
+                "app.processing.ingest.manifest_service.queue_ingest_job",
+                new=AsyncMock(),
+            ) as queue,
+        ):
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is False
+        assert response.results[0].action == "error"
+        assert "quota denied" in response.results[0].message
+        assert not staged.exists()
+        quota_check.assert_awaited_once()
+        assert quota_check.await_args.args[1] == user_id
+        assert quota_check.await_args.args[2] == 4096
+        queue.assert_not_awaited()
+        # The reservation is inserted before the download, so a
+        # denial after it leaves that row settled rather than leaving none.
+        # Scoped to this key, not order-dependent on a lone row.
+        reservation = (
+            await test_db_session.execute(
+                select(IngestJob).where(
+                    IngestJob.user_metadata["manifest_key"].astext
+                    == "manifest-http-quota"
+                )
+            )
+        ).scalar_one()
+        assert reservation.status == "failed"
+        assert reservation.file_path is None
+        assert reservation.user_metadata["manifest_key"] == "manifest-http-quota"
+
+    async def test_admin_same_bucket_seed_is_sized_and_quota_checked(
+        self, test_db_session, clean_tables, monkeypatch
+    ):
+        from app.core.config import settings
+
+        user = await _admin_user(test_db_session)
+        user_id = user.id
+        monkeypatch.setattr(settings, "storage_provider", "s3")
+        monkeypatch.setattr(settings, "s3_bucket", "geolens-seed-bucket")
+        request = _request(
+            _manifest_dataset(
+                key="manifest-admin-storage-seed",
+                uri="s3://geolens-seed-bucket/operator/roads.geojson",
+            )
+        )
+
+        with (
+            patch(
+                "app.processing.ingest.manifest_service._manifest_source_size_bytes",
+                new=AsyncMock(return_value=8192),
+            ) as source_size,
+            patch(
+                "app.modules.quota.service.check_upload_quota",
+                new=AsyncMock(),
+            ) as quota_check,
+            patch(
+                "app.processing.ingest.manifest_service.queue_ingest_job",
+                new=AsyncMock(),
+            ) as queue,
+        ):
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is True
+        assert response.results[0].action == "create"
+        source_size.assert_awaited_once()
+        quota_check.assert_awaited_once()
+        assert quota_check.await_args.args[1:3] == (user_id, 8192)
+        queue.assert_awaited_once()
+
+    async def test_downloaded_http_source_is_removed_if_staging_bind_fails(
+        self, test_db_session, clean_tables, tmp_path
+    ):
+        """The row is durable before the download, so the write
+        that can still fail is the one binding the staged path to it. The
+        downloaded bytes belong to that attempt and must not outlive it."""
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(
+                key="manifest-http-persist-failure",
+                uri="https://data.example.test/persist-failure.geojson",
+            )
+        )
+        staged = tmp_path / "manifest_http_persist_failure.geojson"
+        staged.write_bytes(b"valid-enough-for-admission")
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service._download_http_source",
+                new=AsyncMock(return_value=str(staged)),
+            ),
+            patch(
+                "app.modules.quota.service.check_upload_quota",
+                new=AsyncMock(),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service."
+                "bind_reservation_to_staged_source",
+                new=AsyncMock(side_effect=RuntimeError("database unavailable")),
+            ),
+            patch(
+                "app.processing.ingest.manifest_service.queue_ingest_job",
+                new=AsyncMock(),
+            ) as queue,
+        ):
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is False
+        assert response.results[0].action == "error"
+        assert "database unavailable" in response.results[0].message
+        assert not staged.exists()
+        queue.assert_not_awaited()
+        # Scoped to this key, not order-dependent on a lone row.
+        reservation = (
+            await test_db_session.execute(
+                select(IngestJob).where(
+                    IngestJob.user_metadata["manifest_key"].astext
+                    == "manifest-http-persist-failure"
+                )
+            )
+        ).scalar_one()
+        assert reservation.status == "failed"
+        assert reservation.file_path is None
+
+
+@pytest.mark.anyio
+class TestManifestInFlightIdempotency:
+    async def test_same_fingerprint_in_flight_skips(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        request = _request(_manifest_dataset(key="manifest-in-flight"))
+        prepared = await classify_manifest_source(request.datasets[0].sources[0])
+        fingerprint = manifest_dataset_fingerprint(request.datasets[0])
+        pending = IngestJob(
+            source_filename=prepared.source_filename,
+            file_path=prepared.file_path,
+            created_by=user.id,
+            status="pending",
+            user_metadata=manifest_job_metadata(
+                request.datasets[0],
+                prepared,
+                fingerprint=fingerprint,
+            ),
+        )
+        test_db_session.add(pending)
+        await test_db_session.commit()
+        await test_db_session.refresh(pending)
+
+        with patch(
+            "app.processing.ingest.manifest_service.queue_ingest_job",
+            new=AsyncMock(),
+        ) as queue:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        result = response.results[0]
+        assert result.action == "skip"
+        assert result.job_id == pending.id
+        assert "queued or running" in result.message
+        queue.assert_not_awaited()
+
+    async def test_different_fingerprint_in_flight_errors_without_new_job(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        original = _request(_manifest_dataset(key="manifest-in-flight-conflict"))
+        changed = _request(
+            _manifest_dataset(
+                key="manifest-in-flight-conflict",
+                title="Competing roads",
+            )
+        )
+        prepared = await classify_manifest_source(original.datasets[0].sources[0])
+        pending = IngestJob(
+            source_filename=prepared.source_filename,
+            file_path=prepared.file_path,
+            created_by=user.id,
+            status="running",
+            user_metadata=manifest_job_metadata(
+                original.datasets[0],
+                prepared,
+                fingerprint=manifest_dataset_fingerprint(original.datasets[0]),
+            ),
+        )
+        test_db_session.add(pending)
+        await test_db_session.commit()
+        before = await test_db_session.scalar(select(func.count(IngestJob.id)))
+
+        response = await apply_manifest(test_db_session, changed, user, _http_request())
+
+        after = await test_db_session.scalar(select(func.count(IngestJob.id)))
+        result = response.results[0]
+        assert result.action == "error"
+        assert "in-flight apply" in result.message
+        assert after == before
+
+
+@pytest.mark.anyio
+class TestManifestDryRun:
+    async def test_dry_run_previews_create_update_skip_without_writes(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        existing_request = _request(_manifest_dataset(key="manifest-dry-skip"))
+        changed_request = _request(
+            _manifest_dataset(key="manifest-dry-update", title="Original")
+        )
+        skip_dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Skip dataset",
+        )
+        update_dataset = await create_dataset(
+            test_db_session,
+            created_by=user.id,
+            name="Update dataset",
+        )
+        await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=skip_dataset,
+            manifest_dataset=existing_request.datasets[0],
+        )
+        await _create_completed_manifest_job(
+            test_db_session,
+            user=user,
+            dataset=update_dataset,
+            manifest_dataset=changed_request.datasets[0],
+        )
+        request = _request(
+            _manifest_dataset(key="manifest-dry-create"),
+            _manifest_dataset(key="manifest-dry-update", title="Changed"),
+            _manifest_dataset(key="manifest-dry-skip"),
+            dry_run=True,
+        )
+        before = await test_db_session.scalar(select(func.count(IngestJob.id)))
+
+        with patch(
+            "app.processing.ingest.manifest_service.queue_ingest_job",
+            new=AsyncMock(),
+        ) as queue:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        after = await test_db_session.scalar(select(func.count(IngestJob.id)))
+        actions = {result.dataset_key: result.action for result in response.results}
+        assert response.dry_run is True
+        assert actions == {
+            "manifest-dry-create": "create",
+            "manifest-dry-update": "update",
+            "manifest-dry-skip": "skip",
+        }
+        assert response.results[0].job_id is None
+        assert response.results[1].job_id is None
+        assert response.results[1].dataset_id == update_dataset.id
+        assert after == before
+        queue.assert_not_awaited()
+
+    async def test_dry_run_reports_an_intent_the_extension_does_not_define(
+        self, test_db_session, clean_tables
+    ):
+        """dry_run is how an operator validates a manifest.
+
+        The intent check therefore has to run before the dry-run early
+        return, or the branch built for validation is the one branch that
+        validates nothing.
+        """
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(key="manifest-dry-intent", intent="approval_required"),
+            dry_run=True,
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service._stage_source_if_needed",
+            new=AsyncMock(),
+        ) as stage:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is False
+        assert response.results[0].action == "error"
+        assert "approval_required" in response.results[0].message
+        assert "draft, ready, internal, published" in response.results[0].message
+        stage.assert_not_awaited()
+
+    async def test_dry_run_reports_a_crs_the_database_does_not_know(
+        self, test_db_session, clean_tables
+    ):
+        """The manifest's spelling of srid_override, refused before staging."""
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(key="manifest-dry-crs", crs="EPSG:99999"),
+            dry_run=True,
+        )
+
+        with patch(
+            "app.processing.ingest.manifest_service._stage_source_if_needed",
+            new=AsyncMock(),
+        ) as stage:
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is False
+        assert response.results[0].action == "error"
+        assert "metadata.crs" in response.results[0].message
+        assert "99999" in response.results[0].message
+        stage.assert_not_awaited()
+
+    async def test_dry_run_accepts_an_overlay_defined_intent(
+        self, test_db_session, clean_tables
+    ):
+        user = await _admin_user(test_db_session)
+        request = _request(
+            _manifest_dataset(key="manifest-dry-overlay", intent="review"),
+            dry_run=True,
+        )
+
+        with _workflow_overlay("draft", "review", "published"):
+            response = await apply_manifest(
+                test_db_session, request, user, _http_request()
+            )
+
+        assert response.accepted is True
+        assert response.results[0].action == "create"
+
+
+@pytest.mark.anyio
+class TestManifestMetadataPropagation:
+    async def test_vector_finalize_uses_manifest_record_status(
+        self, test_db_session, clean_tables
+    ):
+        from app.processing.ingest.tasks_common import IngestContext, _finalize_ingest
+
+        user = await _admin_user(test_db_session)
+        table_name = f"manifest_meta_{uuid.uuid4().hex[:10]}"
+        await test_db_session.execute(
+            text(f"CREATE TABLE data.{table_name} (gid serial PRIMARY KEY, name text)")
+        )
+        await test_db_session.commit()
+        job = IngestJob(
+            source_filename="roads.geojson",
+            file_path="tests/fixtures/ingest/basic_attrs.geojson",
+            created_by=user.id,
+            status="running",
+            user_metadata={
+                "title": "Manifest roads",
+                "summary": "Manifest summary",
+                "visibility": "private",
+                "record_status": "ready",
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.flush()
+
+        try:
+            with (
+                patch(
+                    "app.processing.ingest.publish_followups.invalidate_catalog_cache",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.processing.embeddings.helpers.defer_embedding",
+                    new=AsyncMock(),
+                ),
+            ):
+                dataset = await _finalize_ingest(
+                    IngestContext(
+                        session=test_db_session,
+                        job=job,
+                        table_name=table_name,
+                        user_id=str(user.id),
+                        has_geometry=False,
+                        effective_srid=None,
+                        source_format="geojson",
+                        source_filename="roads.geojson",
+                        original_srid=None,
+                        user_metadata=job.user_metadata,
+                    )
+                )
+            assert dataset.record.summary == "Manifest summary"
+            assert dataset.record.visibility == "private"
+            assert dataset.record.record_status == "ready"
+        finally:
+            await test_db_session.execute(
+                text(f'DROP TABLE IF EXISTS data."{table_name}" CASCADE')
+            )
+            await test_db_session.commit()
+
+    async def test_vector_finalize_applies_license_organization_and_tags(
+        self, test_db_session, clean_tables
+    ):
+        """The ledger's other three metadata fields reach the record."""
+        from app.modules.catalog.datasets.domain.models import RecordKeyword
+        from app.processing.ingest.tasks_common import IngestContext, _finalize_ingest
+
+        user = await _admin_user(test_db_session)
+        table_name = f"manifest_meta_{uuid.uuid4().hex[:10]}"
+        await test_db_session.execute(
+            text(f"CREATE TABLE data.{table_name} (gid serial PRIMARY KEY, name text)")
+        )
+        await test_db_session.commit()
+        request = _request(
+            _manifest_dataset(key="manifest-metadata", tags=["Trails", "recreation"])
+        )
+        prepared = await classify_manifest_source(request.datasets[0].sources[0])
+        ledger = manifest_job_metadata(
+            request.datasets[0], prepared, fingerprint="deadbeef"
+        )
+        job = IngestJob(
+            source_filename="roads.geojson",
+            file_path="tests/fixtures/ingest/basic_attrs.geojson",
+            created_by=user.id,
+            status="running",
+            user_metadata=ledger,
+        )
+        test_db_session.add(job)
+        await test_db_session.flush()
+
+        try:
+            with (
+                patch(
+                    "app.processing.ingest.publish_followups.invalidate_catalog_cache",
+                    new=AsyncMock(),
+                ),
+                patch(
+                    "app.processing.embeddings.helpers.defer_embedding",
+                    new=AsyncMock(),
+                ),
+            ):
+                dataset = await _finalize_ingest(
+                    IngestContext(
+                        session=test_db_session,
+                        job=job,
+                        table_name=table_name,
+                        user_id=str(user.id),
+                        has_geometry=False,
+                        effective_srid=None,
+                        source_format="geojson",
+                        source_filename="roads.geojson",
+                        original_srid=None,
+                        user_metadata=job.user_metadata,
+                    )
+                )
+            assert dataset.record.license == "CC-BY-4.0"
+            assert dataset.record.source_organization == "City GIS"
+            assert dataset.record.attribution == "City GIS"
+            keywords = await test_db_session.scalars(
+                select(RecordKeyword.keyword).where(
+                    RecordKeyword.record_id == dataset.record.id
+                )
+            )
+            assert sorted(keywords) == ["recreation", "trails"]
+        finally:
+            await test_db_session.execute(
+                text(f'DROP TABLE IF EXISTS data."{table_name}" CASCADE')
+            )
+            await test_db_session.commit()
+
+    async def test_manifest_tags_are_not_reinserted_on_a_reapply(
+        self, test_db_session, clean_tables
+    ):
+        """uq_record_keyword would fail the whole swap transaction."""
+        from app.modules.catalog.datasets.domain.models import RecordKeyword
+        from app.processing.ingest.tasks_common import apply_manifest_record_metadata
+
+        user = await _admin_user(test_db_session)
+        dataset = await create_dataset(test_db_session, created_by=user.id)
+        ledger = {"manifest_tags": ["Trails", "recreation"]}
+
+        for _ in range(2):
+            await apply_manifest_record_metadata(
+                test_db_session, dataset.record, ledger
+            )
+            await test_db_session.flush()
+
+        keywords = await test_db_session.scalars(
+            select(RecordKeyword.keyword).where(
+                RecordKeyword.record_id == dataset.record.id
+            )
+        )
+        assert sorted(keywords) == ["recreation", "trails"]
+
+    async def test_manifest_tags_dedupe_only_against_theme_keywords(
+        self, test_db_session, clean_tables
+    ):
+        """`uq_record_keyword` is per keyword_type, case-sensitive."""
+        from app.modules.catalog.datasets.domain.models import RecordKeyword
+        from app.processing.ingest.tasks_common import apply_manifest_record_metadata
+
+        user = await _admin_user(test_db_session)
+        dataset = await create_dataset(test_db_session, created_by=user.id)
+        test_db_session.add_all(
+            [
+                RecordKeyword(
+                    record_id=dataset.record.id, keyword="parks", keyword_type="place"
+                ),
+                RecordKeyword(
+                    record_id=dataset.record.id, keyword="Transit", keyword_type="theme"
+                ),
+                # `uq_record_keyword` COALESCEs this to '',
+                # so the row collides with the NULL the read-back would write.
+                RecordKeyword(
+                    record_id=dataset.record.id,
+                    keyword="ferry",
+                    keyword_type="theme",
+                    vocabulary_uri="",
+                ),
+            ]
+        )
+        await test_db_session.flush()
+
+        await apply_manifest_record_metadata(
+            test_db_session,
+            dataset.record,
+            {"manifest_tags": ["Parks", "transit", "ferry"]},
+        )
+        await test_db_session.flush()
+
+        rows = (
+            await test_db_session.execute(
+                select(RecordKeyword.keyword, RecordKeyword.keyword_type).where(
+                    RecordKeyword.record_id == dataset.record.id
+                )
+            )
+        ).all()
+        # The place row does not block the theme insert; the theme row blocks a
+        # second one whatever its case.
+        assert sorted(rows) == [
+            ("Transit", "theme"),
+            ("ferry", "theme"),
+            ("parks", "place"),
+            ("parks", "theme"),
+        ]
+
+    async def test_raster_dataset_creation_uses_manifest_record_status(
+        self, test_db_session, clean_tables
+    ):
+        from app.processing.ingest.tasks_raster import create_raster_dataset
+
+        user = await _admin_user(test_db_session)
+        record, dataset, _asset = await create_raster_dataset(
+            test_db_session,
+            meta={
+                "driver": "GTiff",
+                "epsg": 4326,
+                "band_count": 1,
+                "dtype": "uint8",
+                "width": 16,
+                "height": 16,
+            },
+            source_sha256="0" * 64,
+            asset_sha256="1" * 64,
+            cog_status="verified",
+            cog_size=128,
+            source_filename="tile.tif",
+            created_by=user.id,
+            title="Manifest raster",
+            summary="Raster summary",
+            visibility="internal",
+            record_status="internal",
+        )
+
+        assert record.record_status == "internal"
+        assert record.visibility == "internal"
+        assert dataset.source_filename == "tile.tif"

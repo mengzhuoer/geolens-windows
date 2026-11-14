@@ -1,0 +1,404 @@
+import { memo } from 'react';
+import { Link } from 'react-router';
+import type { TFunction } from 'i18next';
+import { useTranslation } from 'react-i18next';
+import { useQueryClient } from '@tanstack/react-query';
+import { Combine, FolderOpen, Globe, Hash, Layers, Ruler, Shapes, Table2, type LucideIcon } from 'lucide-react';
+import { Card } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { BBoxPreview } from '@/components/layout/BBoxPreview';
+import { OriginBadge, datasetOrigin } from '@/components/dataset/OriginBadge';
+import { FreshnessChip, HealthChip } from '@/components/dataset/SourceStateChips';
+import { RecordTypeBadge } from './RecordTypeBadge';
+import { formatProvenanceTime } from '@/lib/provenance-attribution';
+import { formatGsd } from '@/lib/format';
+import { extractBbox, geometryIcon } from '@/lib/geo-utils';
+import { getGeometryTypeLabel } from '@/i18n/labels';
+import { ingestionStatusColors, syntheticBadgeColor } from '@/lib/status-colors';
+import { useQuicklook } from '@/components/maps/hooks/use-quicklook';
+import { queryKeys } from '@/lib/query-keys';
+import { distinctDescription } from '@/lib/text';
+import { getDataset } from '@/api/datasets';
+import type { OGCRecordResponse } from '@/types/api';
+
+const statusStyles: Record<string, string> = {
+  draft: `text-xs ${ingestionStatusColors.draft}`,
+  ready: `text-xs ${ingestionStatusColors.ready}`,
+  internal: `text-xs ${ingestionStatusColors.internal}`,
+  archived: 'text-xs',
+  deprecated: 'text-xs text-muted-foreground',
+};
+const statusVariants: Record<string, 'outline' | 'secondary'> = {
+  draft: 'outline',
+  ready: 'outline',
+  internal: 'outline',
+  archived: 'secondary',
+  deprecated: 'outline',
+};
+
+function capitalizeVrtType(vrtType: string): string {
+  // 'mosaic' -> 'Mosaic', 'band_stack' -> 'Band Stack'
+  return vrtType
+    .split('_')
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+interface CardSpec {
+  icon: LucideIcon;
+  label: string;
+}
+
+function buildCardSpecs(
+  properties: OGCRecordResponse['properties'],
+  t: TFunction<'search'>,
+  locale: string,
+): CardSpec[] {
+  const recordType = properties.record_type ?? 'vector_dataset';
+  const isRaster = recordType === 'raster_dataset';
+  const isVrt = recordType === 'vrt_dataset';
+  const specs: CardSpec[] = [];
+
+  if (!isRaster && !isVrt && properties.geometry_type) {
+    const icon = geometryIcon(properties.geometry_type) ?? Shapes;
+    specs.push({ icon, label: getGeometryTypeLabel(t, properties.geometry_type) });
+  }
+
+  if (isRaster && properties.band_count != null) {
+    specs.push({ icon: Layers, label: t('card.bandCount', { count: properties.band_count, defaultValue: '{{count}} bands' }) });
+  }
+
+  if (isRaster && properties.gsd != null) {
+    const label = formatGsd(properties.gsd, { isGeographic: properties.crs_is_geographic, crs: properties.crs }, locale);
+    if (label) specs.push({ icon: Ruler, label });
+  }
+
+  if (isVrt && properties.vrt_type) {
+    specs.push({ icon: Combine, label: capitalizeVrtType(properties.vrt_type) });
+  }
+
+  if (isVrt && properties.source_count) {
+    specs.push({ icon: FolderOpen, label: t('card.sourceCount', { count: properties.source_count, defaultValue: '{{count}} sources' }) });
+  }
+
+  if (isVrt && properties.band_count != null) {
+    specs.push({ icon: Layers, label: t('card.bandCount', { count: properties.band_count, defaultValue: '{{count}} bands' }) });
+  }
+
+  if (!isRaster && !isVrt && properties.feature_count != null) {
+    const isTable = recordType === 'table';
+    specs.push({
+      icon: Hash,
+      label: isTable
+        ? t('card.rowCount', { count: properties.feature_count })
+        : t('card.featureCount', { count: properties.feature_count }),
+    });
+  }
+
+  if (properties.crs) specs.push({ icon: Globe, label: properties.crs });
+
+  return specs;
+}
+
+function buildAutoDescription(
+  properties: OGCRecordResponse['properties'],
+  t: TFunction<'search'>,
+  locale: string,
+): string {
+  const description = distinctDescription(properties.title, properties.description);
+  if (description) return description;
+  const recordType = properties.record_type ?? 'vector_dataset';
+  switch (recordType) {
+    case 'vector_dataset':
+      if (properties.geometry_type) {
+        return t('card.autoDesc.vector', {
+          geometryType: getGeometryTypeLabel(t, properties.geometry_type),
+          count: properties.feature_count ?? 0,
+          crs: properties.crs ?? '',
+        });
+      }
+      break;
+    case 'raster_dataset':
+      return t('card.autoDesc.raster', {
+        count: properties.band_count ?? 0,
+        gsd: properties.gsd != null ? formatGsd(properties.gsd, { isGeographic: properties.crs_is_geographic, crs: properties.crs }, locale) : '',
+      });
+    case 'vrt_dataset':
+      // A zero count means the viewer can't read any member, not that the VRT is empty.
+      if (!properties.source_count) break;
+      return t('card.autoDesc.vrt', {
+        vrtType: properties.vrt_type ? capitalizeVrtType(properties.vrt_type) : '',
+        count: properties.source_count,
+      });
+    case 'table':
+      return t('card.autoDesc.table', { count: properties.feature_count ?? 0 });
+    case 'tiles3d_dataset':
+      return t('card.autoDesc.tiles3d');
+    default:
+      break;
+  }
+  return t('card.autoDesc.fallback');
+}
+
+export const SearchResultCard = memo(function SearchResultCard({ feature }: { feature: OGCRecordResponse }) {
+  const { t, i18n } = useTranslation('search');
+  const queryClient = useQueryClient();
+  const { properties } = feature;
+  const recordType = properties.record_type ?? 'vector_dataset';
+  const isCollection = recordType === 'collection';
+  const isTable = recordType === 'table';
+  const collectionDescription = isCollection ? distinctDescription(properties.title, properties.description) : undefined;
+  const origin = datasetOrigin(properties);
+  const linkPath = isCollection ? `/collections/${feature.id}` : `/datasets/${feature.id}`;
+  const bbox = extractBbox(feature);
+
+  // <img src> requests carry no Authorization header, so private-dataset
+  // quicklooks would 404 anonymously. useQuicklook fetches through apiFetchBlob
+  // (Bearer attached) and returns a blob URL; genuine file-missing 404s are
+  // cached in quicklook-cache.ts for the session.
+  const featureId = feature.id as string;
+  const enableQuicklook = !isCollection && !isTable && Boolean(properties.has_quicklook);
+  const { url: quicklookBlobUrl } = useQuicklook(
+    enableQuicklook ? featureId : null,
+    256,
+    properties.quicklook_version ?? null,
+  );
+
+  const neverEditedLabel = t('card.neverEdited', { defaultValue: 'Never' });
+  const noUpdateMetadataLabel = t('card.noUpdateMetadata', { defaultValue: 'No update metadata' });
+
+  const updatedTime = formatProvenanceTime(properties.updated, {
+    fallbackRelative: neverEditedLabel,
+    fallbackAbsolute: neverEditedLabel,
+    locale: i18n.language,
+  });
+  const createdTime = formatProvenanceTime(properties.created, {
+    fallbackRelative: neverEditedLabel,
+    fallbackAbsolute: neverEditedLabel,
+    locale: i18n.language,
+  });
+  const updatedRelative = properties.never_edited ? neverEditedLabel : updatedTime.relative;
+  const updatedAbsolute = properties.never_edited ? neverEditedLabel : updatedTime.absolute;
+  const hasMissingProvenance =
+    properties.never_edited &&
+    !properties.updated_by_display;
+
+  const recordStatus = properties.record_status;
+  const cardSpecs = isCollection ? [] : buildCardSpecs(properties, t, i18n.language);
+  const sourceOrganization =
+    !isCollection && typeof properties.source_organization === 'string'
+      ? properties.source_organization.trim()
+      : '';
+  const displayKeywords = !isCollection
+    ? properties.keywords
+      ?.map((keyword) => keyword.trim())
+      .filter((keyword) => keyword !== '' && keyword !== 'synthetic' && keyword !== 'perf-seed') ?? []
+    : [];
+
+  const showStatusBadge = !isCollection && !!recordStatus && recordStatus !== 'published';
+
+  // Warms the detail query on hover/focus so navigation doesn't pay chunk and
+  // query serially; prefetchQuery is a no-op when the data is fresh.
+  const prefetchDetail = () => {
+    if (isCollection) return;
+    queryClient.prefetchQuery({
+      queryKey: queryKeys.datasets.detail(feature.id),
+      queryFn: () => getDataset(feature.id),
+      staleTime: 60_000,
+    });
+  };
+
+  return (
+    <Link
+      to={linkPath}
+      className="group block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      data-testid="search-result-card"
+      onMouseEnter={prefetchDetail}
+      onFocus={prefetchDetail}
+    >
+      <Card density="flush" className="cursor-pointer overflow-hidden border-border/50 bg-card/95 transition-[transform,color,background-color,box-shadow,border-color] duration-200 ease-out group-hover:-translate-y-0.5 group-hover:border-primary/20 group-hover:shadow-md">
+        <div className="p-3 sm:p-4 lg:p-3.5">
+          <div className="flex flex-col gap-1.5">
+
+            {/* Band 1 — Header */}
+            {isCollection ? (
+              /* Collection: compact single-column layout */
+              <div className="min-w-0 flex flex-col gap-1.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <RecordTypeBadge recordType={recordType} />
+                  {properties.dataset_count != null && (
+                    <Badge variant="secondary" className="text-xs">
+                      {t('collection.datasetCount', { count: properties.dataset_count, defaultValue: '{{count}} datasets' })}
+                    </Badge>
+                  )}
+                </div>
+                <h3 className="block text-base font-semibold leading-tight text-foreground transition-colors group-hover:text-primary line-clamp-1">
+                  {properties.title}
+                </h3>
+                {collectionDescription && (
+                  <p className="text-sm leading-5 text-muted-foreground line-clamp-1">
+                    {collectionDescription}
+                  </p>
+                )}
+              </div>
+            ) : (
+              /* Dataset: grid with fixed square thumbnail */
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_132px] xl:grid-cols-[minmax(0,1fr)_148px]">
+                <div className="min-w-0 flex flex-col gap-1.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <RecordTypeBadge recordType={recordType} />
+                    {origin && <OriginBadge origin={origin} />}
+                    <FreshnessChip state={properties.source_freshness} />
+                    <HealthChip state={properties.source_health} />
+                    {properties.keywords?.includes('synthetic') && (
+                      <Badge variant="outline" className={`text-xs ${syntheticBadgeColor}`}>
+                        {t('card.testData', { defaultValue: 'Test Data' })}
+                      </Badge>
+                    )}
+                  </div>
+                  <h3 className="block text-base font-semibold leading-tight text-foreground transition-colors group-hover:text-primary line-clamp-2">
+                    {properties.title}
+                  </h3>
+                  {sourceOrganization && (
+                    <p
+                      className="text-xs leading-4 text-muted-foreground line-clamp-1"
+                      data-testid="dataset-card-source"
+                      title={sourceOrganization}
+                    >
+                      {sourceOrganization}
+                    </p>
+                  )}
+                  <p
+                    className="text-sm leading-5 text-muted-foreground line-clamp-2"
+                    data-testid="dataset-card-description"
+                  >
+                    {buildAutoDescription(properties, t, i18n.language)}
+                  </p>
+
+                  {/* Specs row */}
+                  {cardSpecs.length > 0 && (
+                    <div className="flex flex-wrap gap-y-1" data-testid="dataset-card-specs">
+                      {cardSpecs.map((item, index) => (
+                        <span key={item.label} className="inline-flex items-center gap-1 text-xs font-medium font-mono tracking-wide text-muted-foreground">
+                          <item.icon className="size-3 shrink-0" aria-hidden="true" />
+                          {item.label}
+                          {index < cardSpecs.length - 1 && (
+                            <span className="mx-1.5 text-muted-foreground/40" aria-hidden="true">&middot;</span>
+                          )}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Tags */}
+                  {displayKeywords.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {displayKeywords.slice(0, 3).map((tag, index) => (
+                        <span
+                          key={`${tag}-${index}`}
+                          className="inline-flex items-center rounded-md border border-border/30 bg-muted/15 px-2.5 py-0.5 text-mini text-muted-foreground"
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                      {displayKeywords.length > 3 && (
+                        <span className="self-center text-xs text-muted-foreground">
+                          {t('card.moretags', { count: displayKeywords.length - 3 })}
+                        </span>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Updated time */}
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    {hasMissingProvenance ? (
+                      <span data-testid="dataset-card-updated-attribution" title={createdTime.absolute}>
+                        {properties.created
+                          ? t('card.updatedFallback', { time: createdTime.relative, defaultValue: 'Updated {{time}}' })
+                          : noUpdateMetadataLabel}
+                      </span>
+                    ) : (
+                      <span
+                        data-testid="dataset-card-updated-attribution"
+                        title={updatedAbsolute}
+                      >
+                        {t('card.updatedFallback', { time: updatedRelative, defaultValue: 'Updated {{time}}' })}
+                      </span>
+                    )}
+                    {showStatusBadge && recordStatus && (
+                      <Badge
+                        variant={statusVariants[recordStatus] ?? 'outline'}
+                        className={statusStyles[recordStatus] ?? 'text-xs'}
+                      >
+                        {t(`card.status.${recordStatus}`, {
+                          defaultValue: recordStatus.charAt(0).toUpperCase() + recordStatus.slice(1),
+                        })}
+                      </Badge>
+                    )}
+                  </div>
+                </div>
+
+                {/* Right: 160x160 square preview — hidden on mobile */}
+                <div className="hidden md:flex md:items-start">
+                  <div className="size-[132px] shrink-0 overflow-hidden rounded-lg border border-border/40 xl:size-[148px]">
+                    {isTable ? (
+                      <div
+                        className="flex size-[132px] flex-col items-center justify-center gap-2 bg-type-table-bg text-type-table xl:size-[148px]"
+                        role="img"
+                        aria-label={
+                          properties.column_count
+                            ? t('card.tableAriaLabel', { rows: properties.feature_count ?? 0, cols: properties.column_count })
+                            : t('card.tableAriaLabelNoCols', { rows: properties.feature_count ?? 0 })
+                        }
+                      >
+                        <Table2
+                          className="h-10 w-10 opacity-80"
+                          aria-hidden="true"
+                          data-testid="table-thumbnail-icon"
+                        />
+                        <span className="text-xs font-medium font-mono tabular-nums tracking-wide">
+                          {properties.column_count
+                            ? t('card.tableRowsColsJoined', {
+                                rows: t('card.tableRows', { count: properties.feature_count ?? 0 }),
+                                cols: t('card.tableCols', { count: properties.column_count }),
+                              })
+                            : t('card.tableRows', { count: properties.feature_count ?? 0 })}
+                        </span>
+                      </div>
+                    ) : quicklookBlobUrl ? (
+                      <img
+                        src={quicklookBlobUrl}
+                        loading="lazy"
+                        alt={t('datasetCard.quicklookAlt', { name: properties.title })}
+                        className="size-[132px] object-cover dark:brightness-75 xl:size-[148px]"
+                      />
+                    ) : (
+                      <BBoxPreview bbox={bbox} className="size-[132px] rounded-md bg-muted xl:size-[148px]" />
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Collection footer */}
+            {isCollection && (
+              <div className="flex items-center justify-between text-xs text-muted-foreground">
+                {properties.created ? (
+                  <span
+                    data-testid="dataset-card-updated-attribution"
+                    title={createdTime.absolute}
+                  >
+                    {t('card.updatedFallback', { time: createdTime.relative, defaultValue: 'Updated {{time}}' })}
+                  </span>
+                ) : (
+                  <span />
+                )}
+              </div>
+            )}
+
+          </div>
+        </div>
+      </Card>
+    </Link>
+  );
+});

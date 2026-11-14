@@ -1,0 +1,525 @@
+"""The 4326 render column and the reader grant.
+
+What ``_finalize_ingest`` does last, to make a landed table readable by the
+tile, feature and analysis surfaces. ``add_4326_column`` writes the render
+column (2D, linear, with its GIST index); ``linearize_existing_4326``
+enforces that same invariant on a BYO column the pipeline never wrote;
+``rederive_geom_4326`` re-applies the whole invariant to a
+registered table its owner has written to since, over the state
+``probe_geom_4326`` reads; ``grant_reader_access`` hands the finished table
+to the reader role. ``probe_gid`` and ``add_gid_column`` give a registered
+table the ``gid`` readers identify its features by.
+"""
+
+from typing import NamedTuple
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.processing.ingest.metadata_sql import _qtable
+
+
+def _geom_4326_expr(source_srid: int) -> str:
+    """The expression that derives ``geom_4326`` from ``geom``.
+
+    One definition: :func:`add_4326_column` and the out-of-band repair
+    :func:`rederive_geom_4326` both write this column, and a drift between
+    them would make a refresh rewrite every row of every table forever
+    while "fixing" nothing.
+
+    Linearize in the source CRS, then reproject. An arc is defined by its
+    control points, and CRS transforms are nonlinear: transforming the
+    points first and densifying after traces the arc in the wrong space,
+    so ``ST_CurveToLine(ST_Transform(...))`` yields a materially different
+    shape from the correct
+    ``ST_Transform(ST_CurveToLine(...))``.
+    """
+    if source_srid == 4326:
+        return "ST_Force2D(ST_CurveToLine(ST_SetSRID(geom, 4326)))"
+    return "ST_Force2D(ST_Transform(ST_CurveToLine(geom), 4326))"
+
+
+async def add_4326_column(
+    session: AsyncSession,
+    table_name: str,
+    source_srid: int,
+    *,
+    schema: str = "data",
+) -> None:
+    """Add a geom_4326 column with WGS84 geometry and spatial index.
+
+    Copies geom directly if source_srid is 4326; otherwise reprojects via
+    ST_Transform.
+
+    Declared 2D (`geometry(Geometry, 4326)`) since it backs tile/map
+    rendering. `ST_Force2D` strips any source Z (e.g. SRID 4979) so the
+    UPDATE doesn't fail with "Geometry has Z dimension but column does
+    not"; Z stays in the original `geom` column.
+
+    Also always linear. WFS ingest admits curved geometries
+    (MultiSurface/CompoundCurve), and every reader of geom_4326 raises on
+    them (ST_AsMVTGeom, ST_AsGeoJSON, ``::geography``, ST_MakeValid).
+    `ST_CurveToLine` densifies arcs here, at the one boundary they all
+    read from. It is a no-op on already-linear input, and the curved source
+    stays in `geom`, like Z.
+    """
+    tref = _qtable(table_name, schema=schema)
+
+    await session.execute(
+        text(
+            # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
+            f"ALTER TABLE {tref} "
+            f"ADD COLUMN IF NOT EXISTS geom_4326 geometry(Geometry, 4326)"
+        )
+    )
+
+    # The expression, and why it linearizes before it reprojects, live on
+    # _geom_4326_expr: the repair path writes the same column and must write
+    # it the same way.
+    rewrite_expr = _geom_4326_expr(source_srid)
+    # codeql[py/sql-injection] table via _qtable (metadata_sql.py); rewrite_expr is one of _geom_4326_expr's two literals
+    await session.execute(text(f"UPDATE {tref} SET geom_4326 = {rewrite_expr}"))
+
+    await ensure_geom_4326_gist_index(session, table_name, schema=schema)
+
+    # No internal commit: the caller (_finalize_ingest in tasks_common.py)
+    # owns the phase-2 commit boundary, so a downstream failure rolls back
+    # the ALTER + UPDATE + CREATE INDEX above atomically.
+
+
+REPAIR_APPLIED = "applied"
+REPAIR_NO_GEOMETRY = "no_geometry"
+REPAIR_GENERATED = "generated"
+
+
+class Geom4326State(NamedTuple):
+    """What the two geometry columns look like right now.
+
+    Split out so the caller can decide what to do before resolving the
+    source SRID. ``get_table_srid`` wraps PostGIS ``Find_SRID``, which
+    raises for a table with no registered geometry column rather than
+    returning NULL. Registration admits non-spatial tables, so one would
+    otherwise reach the repair as an exception and skip the reader grant
+    that follows it.
+    """
+
+    source_is_geometry: bool
+    has_render: bool
+    render_generated: bool
+
+    @property
+    def rederivable(self) -> bool:
+        """Whether re-deriving the render column is possible at all."""
+        return self.source_is_geometry and not self.render_generated
+
+
+async def probe_geom_4326(
+    session: AsyncSession, table_name: str, *, schema: str = "data"
+) -> Geom4326State:
+    """Read the state of ``geom`` and ``geom_4326`` in one query.
+
+    The same pair of column names registration looks for. ``udt_name`` is
+    checked because a plain column that happens to be called ``geom`` is not a
+    geometry: ``Find_SRID`` would raise on it, and the UPDATE would too.
+    """
+    rows = (
+        await session.execute(
+            text(
+                "SELECT column_name, udt_name, is_generated "
+                "FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table "
+                "  AND column_name IN ('geom', 'geom_4326')"
+            ).bindparams(schema=schema, table=table_name)
+        )
+    ).all()
+    columns = {row.column_name: row for row in rows}
+    source = columns.get("geom")
+    render = columns.get("geom_4326")
+    return Geom4326State(
+        source_is_geometry=source is not None and source.udt_name == "geometry",
+        has_render=render is not None,
+        render_generated=render is not None and render.is_generated == "ALWAYS",
+    )
+
+
+class Geom4326Repair(NamedTuple):
+    """What one re-derive pass did to a table, for the run to report.
+
+    ``rows_rewritten`` is the drift signal: a table nobody wrote to since the
+    last pass reports 0, and a repeated non-zero count means the owner's
+    writes keep arriving between refreshes.
+    """
+
+    outcome: str
+    column_added: bool
+    index_added: bool
+    rows_rewritten: int
+
+
+async def rederive_geom_4326(
+    session: AsyncSession,
+    table_name: str,
+    source_srid: int,
+    *,
+    schema: str = "data",
+    state: Geom4326State | None = None,
+) -> Geom4326Repair:
+    """Re-apply the geom_4326 invariant to a table written to outside GeoLens.
+
+    ``geom_4326`` is a plain column, populated once at registration and
+    afterwards only by GeoLens's own feature-edit writes. A registered
+    table's owner keeps writing to it directly, and nothing re-derives the
+    column for those writes: an ``UPDATE geom``, a
+    ``DELETE``+re-``INSERT``, or ``ogr2ogr -overwrite`` (which drops and
+    recreates the table without the column, index, or reader grant) leaves
+    rows whose render geometry is stale or NULL. Every reader filters on
+    ``geom_4326 && <envelope>``, and ``NULL && anything`` is NULL, so
+    those rows go silently invisible rather than visibly wrong.
+
+    Re-applied from outside the table (the same idempotent ADD COLUMN,
+    expression, and index-if-absent registration uses), which is what lets
+    it survive ``-overwrite`` without deleting and re-registering the
+    dataset.
+
+    **The UPDATE is scoped to rows whose stored value would actually
+    change**, compared via ``ST_AsBinary``. That keeps a refresh of an
+    untouched table to one sequential scan with no writes, which is what
+    makes it safe to run on every refresh. Deliberately not
+    ``geom_4326 IS NULL OR ...``: a row with NULL ``geom`` already has a
+    correct NULL render, and that disjunct would rewrite it NULL-to-NULL
+    every pass, a write that changes nothing and a drift count that lies.
+
+    Skips a STORED GENERATED ``geom_4326`` (same reason as
+    :func:`linearize_existing_4326`: PostgreSQL rejects non-DEFAULT writes
+    to it at parse time, and it re-derives itself on every write anyway).
+    Skips a table with no ``geom`` column too: registration admits
+    non-spatial tables and refuses geometry under another name, so "no
+    geom" here means an attribute table, not a broken one.
+
+    Benign interaction, not drift: feature edits write ``geom_4326``
+    straight from the request GeoJSON and ``geom`` by transforming that
+    into the dataset SRID (``features/service.py``), so on a projected
+    dataset the stored render value isn't a round trip. The first pass
+    after such an edit normalizes it to ``ST_Transform(geom, 4326)`` (a
+    sub-millimetre change counted as one drifted row), then converges.
+
+    The caller owns the transaction, statement deadline, and reader GRANT;
+    this function only touches the column and its index.
+    """
+    tref = _qtable(table_name, schema=schema)
+
+    # ``state`` is accepted rather than always probed: the caller needs these
+    # answers first anyway to decide whether to resolve the source SRID at
+    # all. Probed here when absent so the function still stands on its own.
+    if state is None:
+        state = await probe_geom_4326(session, table_name, schema=schema)
+
+    if not state.source_is_geometry:
+        return Geom4326Repair(REPAIR_NO_GEOMETRY, False, False, 0)
+    if state.render_generated:
+        return Geom4326Repair(REPAIR_GENERATED, False, False, 0)
+
+    if not state.has_render:
+        # Gated on the probe, not left to ``IF NOT EXISTS``: ALTER TABLE
+        # takes ACCESS EXCLUSIVE regardless, and a merely queued lock request
+        # already blocks every reader behind it, so issuing it on the ordinary
+        # path (a table that still has its column) would stop the world on
+        # every refresh. ``IF NOT EXISTS`` stays as the race guard for a
+        # column added between the probe and here.
+        await session.execute(
+            text(
+                # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
+                f"ALTER TABLE {tref} "
+                f"ADD COLUMN IF NOT EXISTS geom_4326 geometry(Geometry, 4326)"
+            )
+        )
+
+    rewrite_expr = _geom_4326_expr(source_srid)
+    result = await session.execute(
+        text(
+            # codeql[py/sql-injection] table via _qtable (metadata_sql.py); rewrite_expr is one of _geom_4326_expr's two literals
+            f"UPDATE {tref} SET geom_4326 = {rewrite_expr} "
+            f"WHERE ST_AsBinary(geom_4326) IS DISTINCT FROM "
+            f"      ST_AsBinary({rewrite_expr})"
+        )
+    )
+    index_added = await ensure_geom_4326_gist_index(session, table_name, schema=schema)
+    return Geom4326Repair(
+        REPAIR_APPLIED,
+        not state.has_render,
+        index_added,
+        result.rowcount if result.rowcount and result.rowcount > 0 else 0,
+    )
+
+
+async def linearize_existing_4326(
+    session: AsyncSession, table_name: str, *, schema: str = "data"
+) -> None:
+    """Enforce the geom_4326-is-always-linear invariant on a column we did not write.
+
+    ``register_existing_table`` skips :func:`add_4326_column` when the
+    table already carries geom_4326, so a table created or copied into the
+    data schema after migration 0034's backfill could bring curved values,
+    and readers apply no per-read ST_CurveToLine. Enforced here at
+    registration with the same predicate as the migration: any arc,
+    top-level curve type, or GEOMETRYCOLLECTION (curve members can't hide
+    anywhere else; linear multi types can't contain them). Exact no-op on
+    already-linear rows.
+
+    A BYO column may also declare a curved typmod (e.g.
+    geometry(CurvePolygon, 4326)), which would reject the linear UPDATE
+    result outright; such a column is loosened to a generic typmod first,
+    preserving its Z/M flags (geometry_columns reports M as a type suffix
+    and Z only via coord_dimension; a plain Geometry typmod rejects Z).
+    Only the concrete curve typmods need it, since abstract CURVE/SURFACE
+    accept their linear subtypes; rtrim(type,'M') matches M-suffixed
+    variants, since no base curve name ends in M.
+    """
+    tref = _qtable(table_name, schema=schema)
+    # A STORED GENERATED geom_4326 rejects any UPDATE at parse time, its
+    # value set by its generation expression, so it can be neither repaired
+    # nor retyped here and is skipped; keeping its expression linear is the
+    # operator's side of the registered-table contract.
+    generated = (
+        await session.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table "
+                "  AND column_name = 'geom_4326' AND is_generated = 'ALWAYS'"
+            ).bindparams(schema=schema, table=table_name)
+        )
+    ).first()
+    if generated is not None:
+        # A generated column with currently curved rows would register a
+        # dataset broken on every surface with no later fix possible, so it
+        # is refused with the actionable cause. An empty or linear generated
+        # column registers fine; curves in future rows fall under the
+        # registered-table contract, like any external write. The test
+        # ("would linearization change the value", byte for byte) catches
+        # arcs, top-level curve types and curve containers nested in a
+        # GEOMETRYCOLLECTION in one comparison; a type list would miss the
+        # nested case or over-reject linear collections.
+        curved = (
+            await session.execute(
+                text(
+                    # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
+                    f"SELECT 1 FROM {tref} "  # noqa: S608
+                    f"WHERE ST_AsBinary(ST_CurveToLine(geom_4326)) "
+                    f"      <> ST_AsBinary(geom_4326) "
+                    f"LIMIT 1"
+                )
+            )
+        ).first()
+        if curved is not None:
+            raise ValueError(
+                "geom_4326 is a generated column whose expression yields "
+                "curved geometries; adjust it to apply ST_CurveToLine "
+                "(curved types break tiles, feature reads, and analysis)"
+            )
+        return
+    typmod = (
+        await session.execute(
+            text(
+                "SELECT type, srid, coord_dimension "
+                "FROM public.geometry_columns "
+                "WHERE f_table_schema = :schema "
+                "  AND f_table_name = :table "
+                "  AND f_geometry_column = 'geom_4326' "
+                "  AND rtrim(type, 'M') IN ('CIRCULARSTRING','COMPOUNDCURVE',"
+                "               'CURVEPOLYGON','MULTICURVE','MULTISURFACE')"
+            ).bindparams(schema=schema, table=table_name)
+        )
+    ).first()
+    if typmod is not None:
+        if typmod.coord_dimension == 4:
+            generic = "GeometryZM"
+        elif typmod.coord_dimension == 3:
+            generic = "GeometryM" if typmod.type.endswith("M") else "GeometryZ"
+        else:
+            generic = "Geometry"
+        await session.execute(
+            text(
+                # codeql[py/sql-injection] table via _qtable (metadata_sql.py); generic is a fixed literal, srid an int()
+                f"ALTER TABLE {tref} ALTER COLUMN geom_4326 "
+                f"TYPE geometry({generic}, {int(typmod.srid)})"
+            )
+        )
+    # rtrim on GeometryType too: an M curve reports CURVEPOLYGONM, so the
+    # bare list would skip an arc-free M container.
+    await session.execute(
+        text(
+            # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
+            f"UPDATE {tref} SET geom_4326 = ST_CurveToLine(geom_4326) "
+            f"WHERE ST_HasArc(geom_4326) "
+            f"   OR rtrim(GeometryType(geom_4326), 'M') IN "
+            f"      ('CIRCULARSTRING','COMPOUNDCURVE','CURVEPOLYGON',"
+            f"       'MULTICURVE','MULTISURFACE') "
+            f"   OR rtrim(GeometryType(geom_4326), 'M') = 'GEOMETRYCOLLECTION'"
+        )
+    )
+
+
+async def ensure_geom_4326_gist_index(
+    session: AsyncSession, table_name: str, *, schema: str = "data"
+) -> bool:
+    """Create the GIST index on geom_4326 if this table doesn't have one.
+
+    Returns whether an index was created. The repair paths report "the
+    spatial index was missing" from this value; every other caller
+    ignores it.
+
+    A ``CREATE INDEX IF NOT EXISTS idx_<table>_geom_4326`` would match by
+    name schema-wide, not per table. On a second re-ingest the previous
+    swap's index (created against ``<table>_staging``, carried along by the
+    RENAME) still holds that name, so the new staging table would silently
+    get no spatial index and the swap would drop the only indexed copy.
+    This checks ``pg_indexes`` for a gist index on this table instead, and
+    lets PostgreSQL pick a collision-free name. The reupload swap
+    (``install_candidate_table``) calls it too, so any re-ingest
+    self-heals a missing index.
+
+    The no-geom_4326 early return is defensive: add_4326_column has just
+    added the column, and the swap call is gated on a geometry_type
+    extract_metadata can't report without geom_4326.
+    """
+    has_col = await session.execute(
+        text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :tn "
+            "AND column_name = 'geom_4326'"
+        ).bindparams(schema=schema, tn=table_name)
+    )
+    if has_col.first() is None:
+        return False
+
+    has_gist = await session.execute(
+        text(
+            "SELECT 1 FROM pg_indexes "
+            "WHERE schemaname = :schema AND tablename = :tn "
+            "AND indexdef LIKE '%USING gist (geom_4326)%'"
+        ).bindparams(schema=schema, tn=table_name)
+    )
+    if has_gist.first() is None:
+        await session.execute(
+            text(
+                # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
+                f"CREATE INDEX ON {_qtable(table_name, schema)} USING GIST (geom_4326)"
+            )
+        )
+        return True
+    return False
+
+
+async def grant_reader_access(
+    session: AsyncSession,
+    table_name: str,
+    *,
+    schema: str = "data",
+    role: str = "geolens_reader",
+) -> None:
+    """Grant SELECT on the table to the appropriate reader role.
+
+    Defense-in-depth alongside ``ALTER DEFAULT PRIVILEGES`` in
+    ``scripts/init-db.sh``, redundant when the runtime ingest role matches
+    the init-db role but the only grant path when a deployment's roles
+    differ. ``schema``/``role`` default to single_tenant's 'data'/
+    'geolens_reader'; multi_tenant callers pass tenant_data_schema(tid)/
+    tenant_reader_role(tid).
+    """
+    await session.execute(
+        # codeql[py/sql-injection] table via _qtable (metadata_sql.py); role is server-derived (tenant_reader_role)
+        text(f"GRANT SELECT ON {_qtable(table_name, schema)} TO {role}")
+    )
+    # No internal commit: the caller (_finalize_ingest in tasks_common.py)
+    # owns the phase-2 commit boundary, so a downstream failure rolls back
+    # this GRANT atomically.
+
+
+# Readers page, fetch, edit and tile by gid, so it must name one row of all a
+# query on the table returns, inheriting tables' rows included. PostgreSQL adds
+# no gid to a partitioned, partition or typed table; views and foreign tables
+# have no index to check. ``c`` is pg_class, ``a`` the gid pg_attribute.
+GID_UNUSABLE_SQL = """(
+    (c.relkind = 'r' AND EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhparent = c.oid))
+    OR (
+        a.attnum IS NULL
+        AND (c.relkind = 'p' OR c.relispartition OR c.reloftype <> 0)
+    )
+    OR (
+        a.attnum IS NOT NULL
+        AND NOT (
+            COALESCE((
+                WITH RECURSIVE base(oid, typtype, typbasetype) AS (
+                    SELECT t.oid, t.typtype, t.typbasetype
+                    FROM pg_type t WHERE t.oid = a.atttypid
+                    UNION ALL
+                    SELECT t.oid, t.typtype, t.typbasetype
+                    FROM pg_type t JOIN base b ON t.oid = b.typbasetype
+                    WHERE b.typtype = 'd'
+                )
+                SELECT oid FROM base WHERE typtype <> 'd'
+            ) IN ('int2'::regtype, 'int4'::regtype, 'int8'::regtype), false)
+            AND (
+                c.relkind NOT IN ('r', 'p')
+                OR (
+                    a.attnotnull
+                    AND NOT EXISTS (
+                        SELECT 1 FROM pg_constraint nn
+                        WHERE nn.conrelid = c.oid AND nn.contype = 'n'
+                          AND NOT nn.convalidated AND nn.conkey = ARRAY[a.attnum]
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_index i
+                        WHERE i.indrelid = c.oid AND i.indisunique AND i.indisvalid
+                          AND i.indpred IS NULL AND i.indnkeyatts = 1
+                          AND i.indkey[0] = a.attnum
+                    )
+                )
+            )
+        )
+    )
+)"""
+
+
+async def probe_gid(
+    session: AsyncSession, table_name: str, *, schema: str = "data"
+) -> bool | None:
+    """Whether readers can identify this table's features by its ``gid``.
+
+    None when the table has no ``gid`` column and GeoLens can add one.
+    """
+    row = (
+        await session.execute(
+            text(
+                # codeql[py/sql-injection] GID_UNUSABLE_SQL is a constant; names are bound
+                f"SELECT a.attnum IS NOT NULL AS present, {GID_UNUSABLE_SQL} AS unusable "
+                "FROM pg_class c LEFT JOIN pg_attribute a "
+                "ON a.attrelid = c.oid AND a.attname = 'gid' AND NOT a.attisdropped "
+                "WHERE c.oid = to_regclass("
+                "format('%I.%I', CAST(:schema AS text), CAST(:table AS text)))"
+            ),
+            {"schema": schema, "table": table_name},
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    if row.unusable:
+        return False
+    return True if row.present else None
+
+
+async def add_gid_column(
+    session: AsyncSession, table_name: str, *, schema: str = "data"
+) -> None:
+    """Add a unique identity ``gid`` to a table that has none.
+
+    The identity numbers existing rows and every later insert that names no
+    ``gid``, the owner's own writes included.
+    """
+    await session.execute(
+        text(
+            # codeql[py/sql-injection] identifiers validated by _qtable (metadata_sql.py)
+            f"ALTER TABLE {_qtable(table_name, schema)} "
+            "ADD COLUMN gid bigint GENERATED BY DEFAULT AS IDENTITY UNIQUE"
+        )
+    )

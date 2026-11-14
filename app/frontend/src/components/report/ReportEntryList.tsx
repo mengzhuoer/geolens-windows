@@ -1,0 +1,83 @@
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { AlertCircle, AlertTriangle, ChevronRight, Info } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { formatRelativeTime } from '@/lib/relative-time';
+import type { ReportEntry, ReportSeverity } from '@/lib/report';
+
+function SeverityIcon({ severity }: { severity: ReportSeverity }) {
+  if (severity === 'error') return <AlertCircle className="size-3.5 shrink-0 text-destructive" aria-hidden />;
+  if (severity === 'warning') return <AlertTriangle className="size-3.5 shrink-0 text-warning" aria-hidden />;
+  return <Info className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />;
+}
+
+// Shared formatter; exact seconds + hour cap preserve this
+// session-scoped list's original rendering.
+function formatRelative(ts: number, language: string): string {
+  return formatRelativeTime(new Date(ts), new Date(), language, {
+    maxUnit: 'hour',
+    exactSeconds: true,
+  });
+}
+
+function EntryRow({ entry, language }: { entry: ReportEntry; language: string }) {
+  const { t } = useTranslation('report');
+  const [expanded, setExpanded] = useState(false);
+  const canExpand = Boolean(entry.detail);
+
+  return (
+    <li className="border-b border-border/60 last:border-0">
+      <button
+        type="button"
+        onClick={() => canExpand && setExpanded((v) => !v)}
+        className={cn(
+          'flex w-full items-start gap-2 px-2 py-1.5 text-start text-xs',
+          canExpand ? 'cursor-pointer hover:bg-muted/50' : 'cursor-default',
+        )}
+        aria-expanded={canExpand ? expanded : undefined}
+      >
+        <SeverityIcon severity={entry.severity} />
+        <span className="shrink-0 rounded-sm bg-muted px-1 py-0.5 font-mono text-2xs uppercase text-muted-foreground">
+          {entry.source}
+        </span>
+        <span className="min-w-0 flex-1 break-words font-mono text-foreground">
+          {entry.message}
+          {entry.count > 1 && <span className="ms-1 text-muted-foreground">×{entry.count}</span>}
+          {entry.suppressed && <span className="ms-1 italic text-muted-foreground">{t('technicalSuppressed')}</span>}
+        </span>
+        <span className="shrink-0 text-2xs text-muted-foreground">{formatRelative(entry.ts, language)}</span>
+        {canExpand && (
+          <ChevronRight
+            className={cn(
+              'size-3 shrink-0 text-muted-foreground transition-transform',
+              expanded ? 'rotate-90' : 'rtl-mirror',
+            )}
+            aria-hidden
+          />
+        )}
+      </button>
+      {expanded && entry.detail && (
+        <pre className="mb-1.5 ms-7 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-muted/70 p-2 text-2xs leading-relaxed text-muted-foreground">
+          {entry.detail}
+        </pre>
+      )}
+    </li>
+  );
+}
+
+/** Read-only list of captured signals, newest first. */
+export function ReportEntryList({ entries }: { entries: ReportEntry[] }) {
+  const { t, i18n } = useTranslation('report');
+
+  if (entries.length === 0) {
+    return <p className="px-2 py-3 text-xs text-muted-foreground">{t('technicalEmpty')}</p>;
+  }
+
+  return (
+    <ul className="max-h-56 overflow-auto rounded-md border bg-card/40">
+      {entries.map((entry) => (
+        <EntryRow key={entry.id} entry={entry} language={i18n.language} />
+      ))}
+    </ul>
+  );
+}

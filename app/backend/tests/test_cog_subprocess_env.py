@@ -1,0 +1,590 @@
+"""GDAL CLI subprocess env overlay coverage.
+
+``_VRT_SAFE_ENV`` (with
+``CPL_VSIL_CURL_ALLOWED_EXTENSIONS`` and ``VRT_VIRTUAL_OVERVIEWS``) is scoped to
+``gdalbuildvrt`` only via ``_build_vrt``. This module extends the same clamp
+to the sibling raster subprocesses in ``cog.py``: ``gdaladdo`` (overview
+generation), ``gdalwarp`` (CRS reprojection), and ``gdal_translate`` (COG
+translation).
+
+``GDAL_HTTP_FOLLOWLOCATION=NO`` is not a GDAL configuration option and never
+blocked a redirect; ``_assert_clamps`` asserts it stays ABSENT so it cannot be
+reintroduced as a claimed defense.
+
+These tests pin the captured ``env=`` kwarg for each subprocess invocation
+so a future refactor cannot silently regress the overlay shape.
+
+Mirrors ``backend/tests/test_vrt_hardening.py::TestGdalBuildVrtSafeEnv``.
+"""
+
+from contextlib import contextmanager
+from unittest import mock
+
+
+# The clamp keys/values must match _VRT_SAFE_ENV in
+# backend/app/processing/raster/vrt.py. Re-stated here so a careless
+# edit to that dict trips these tests.
+EXPECTED_CLAMPS = {
+    "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": "tif,tiff,vrt",
+    "VRT_VIRTUAL_OVERVIEWS": "NO",
+}
+
+
+# What the probe reports for a source with no internal overviews whose
+# samples take a predictor: every conversion step below then runs.
+_NO_OVERVIEWS = {"has_internal_overviews": False, "predictor_supported": True}
+
+
+def _assert_clamps(env: dict) -> None:
+    """The clamps must be set on the captured env."""
+    assert env is not None, "subprocess.run was invoked without env="
+    for key, expected in EXPECTED_CLAMPS.items():
+        assert env.get(key) == expected, (
+            f"clamp {key} missing/wrong: expected {expected!r}, got {env.get(key)!r}"
+        )
+    # Not a GDAL option, provides no redirect protection — must
+    # not reappear in any GDAL subprocess env as if it did.
+    assert "GDAL_HTTP_FOLLOWLOCATION" not in env
+
+
+@contextmanager
+def _capture_subprocess_runs(monkeypatch):
+    """Patch ``vrt.subprocess.run`` to capture each (cmd, env) tuple.
+
+    ``cog.py`` no longer calls subprocess directly — its GDAL
+    CLIs route through ``run_gdal`` in vrt.py (which adds the kill-on-hang
+    timeout), so the patch target moved there.
+
+    Returns a list that callers can inspect after the patched code path runs.
+    Each entry is ``(cmd, env_dict_or_None)``.
+    """
+    captured: list[tuple[list[str], dict | None]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        env = kwargs.get("env")
+        # Copy the dict so later mutations by the system under test don't
+        # affect our snapshot.
+        captured.append((list(cmd), dict(env) if env is not None else None))
+        return mock.Mock(returncode=0, stderr="", stdout="")
+
+    from app.processing.raster import vrt as vrt_module
+
+    monkeypatch.setattr(vrt_module.subprocess, "run", _fake_run)
+    yield captured
+
+
+# ---------------------------------------------------------------------------
+# prepare_with_overviews → gdaladdo
+# ---------------------------------------------------------------------------
+
+
+class TestPrepareWithOverviewsSafeEnv:
+    def test_gdaladdo_subprocess_inherits_clamps(self, tmp_path, monkeypatch):
+        """``prepare_with_overviews`` invokes ``gdaladdo`` with the safety clamps."""
+        from app.processing.raster import cog as cog_module
+
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+
+        with _capture_subprocess_runs(monkeypatch) as captured:
+            cog_module.prepare_with_overviews(
+                str(src), "uint8", has_internal_overviews=False
+            )
+
+        # Find the gdaladdo invocation
+        gdaladdo_calls = [
+            (cmd, env) for cmd, env in captured if cmd and cmd[0] == "gdaladdo"
+        ]
+        assert gdaladdo_calls, (
+            f"gdaladdo was not invoked; captured: {[c[0] for c in captured]}"
+        )
+        _, env = gdaladdo_calls[0]
+        _assert_clamps(env)
+        # Per-call extras (GDAL_CACHEMAX, COMPRESS_OVERVIEW) must merge in too.
+        assert env.get("GDAL_CACHEMAX") == "200"
+        assert env.get("COMPRESS_OVERVIEW") == "DEFLATE"
+
+    def test_gdaladdo_inherits_clamps_with_custom_compression(
+        self, tmp_path, monkeypatch
+    ):
+        """Custom compression flows into the extras layer without losing clamps."""
+        from app.processing.raster import cog as cog_module
+
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+
+        with _capture_subprocess_runs(monkeypatch) as captured:
+            cog_module.prepare_with_overviews(
+                str(src), "uint8", has_internal_overviews=False, compression="ZSTD"
+            )
+
+        gdaladdo_calls = [
+            (cmd, env) for cmd, env in captured if cmd and cmd[0] == "gdaladdo"
+        ]
+        assert gdaladdo_calls
+        _, env = gdaladdo_calls[0]
+        _assert_clamps(env)
+        assert env.get("COMPRESS_OVERVIEW") == "ZSTD"
+
+
+# ---------------------------------------------------------------------------
+# convert_to_cog (assign_crs branch)
+# ---------------------------------------------------------------------------
+
+
+class TestConvertToCogCrsAssignment:
+    """``assign_crs`` ASSIGNS the CRS and does not reproject.
+
+    The EPSG code rides on the existing ``gdal_translate`` as ``-a_srs``,
+    which relabels the raster and touches no sample, so there is no
+    ``gdalwarp`` step to clamp. The clamp assertion is on the process that
+    carries the flag.
+    """
+
+    def test_assign_crs_lands_on_the_translate_and_spawns_no_warp(
+        self, tmp_path, monkeypatch
+    ):
+        """The whole of the #1291 behavior change, in one argv assertion.
+
+        ``-a_srs`` writes a CRS tag while every band passes through, so the
+        output carries the uploaded samples. ``gdalwarp -t_srs`` resampled them
+        onto a new grid. The absence of the warp is asserted, not implied: it
+        is what licenses both raster tails calling ``cog_preserves_source``
+        without ``reprojected=``, i.e. what licenses deleting the upload.
+        """
+        from app.processing.raster import cog as cog_module
+
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+        dst = tmp_path / "out.tif"
+
+        with _capture_subprocess_runs(monkeypatch) as captured:
+            cog_module.convert_to_cog(
+                str(src), str(dst), "uint8", assign_crs=3857, **_NO_OVERVIEWS
+            )
+
+        tools = [cmd[0] for cmd, _ in captured if cmd]
+        assert "gdalwarp" not in tools, (
+            f"a CRS assignment must not reproject (#1291); ran {tools}"
+        )
+
+        translate_calls = [
+            (cmd, env) for cmd, env in captured if cmd and cmd[0] == "gdal_translate"
+        ]
+        assert translate_calls, f"gdal_translate was not invoked; ran {tools}"
+        cmd, env = translate_calls[0]
+        assert "-a_srs" in cmd, f"-a_srs missing from the translate argv: {cmd}"
+        assert cmd[cmd.index("-a_srs") + 1] == "EPSG:3857"
+        assert "-t_srs" not in cmd, (
+            "-t_srs on gdal_translate reprojects; the assignment flag is -a_srs"
+        )
+        # The flag must precede the positional input/output pair, or GDAL reads
+        # it as a file name.
+        assert cmd.index("-a_srs") < cmd.index(str(dst))
+        # The clamps ride on whichever process carries the work.
+        _assert_clamps(env)
+
+    def test_no_assign_crs_leaves_the_argv_alone(self, tmp_path, monkeypatch):
+        """The flag is conditional — an ordinary conversion must not stamp a CRS
+        the source never declared."""
+        from app.processing.raster import cog as cog_module
+
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+        dst = tmp_path / "out.tif"
+
+        with _capture_subprocess_runs(monkeypatch) as captured:
+            cog_module.convert_to_cog(str(src), str(dst), "uint8", **_NO_OVERVIEWS)
+
+        for cmd, _ in captured:
+            assert "-a_srs" not in cmd, f"unrequested CRS assignment in {cmd}"
+
+    def test_resampling_reaches_overviews_only(self, tmp_path, monkeypatch):
+        """``resampling`` fed ``gdalwarp -r`` as well as ``gdaladdo -r`` before
+        #1291. With the warp gone it can only shape overviews, which is what
+        makes it irrelevant to whether the base samples survived."""
+        from app.processing.raster import cog as cog_module
+
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+        dst = tmp_path / "out.tif"
+
+        with _capture_subprocess_runs(monkeypatch) as captured:
+            cog_module.convert_to_cog(
+                str(src),
+                str(dst),
+                "uint8",
+                assign_crs=3857,
+                resampling="cubic",
+                **_NO_OVERVIEWS,
+            )
+
+        carriers = sorted({cmd[0] for cmd, _ in captured if "cubic" in cmd})
+        assert carriers == ["gdaladdo"], (
+            f"'cubic' reached {carriers}; after #1291 only overview generation "
+            "may see a resampling method"
+        )
+
+
+# ---------------------------------------------------------------------------
+# convert_to_cog (gdal_translate branch)
+# ---------------------------------------------------------------------------
+
+
+class TestConvertToCogGdalTranslateSafeEnv:
+    def test_gdal_translate_subprocess_inherits_clamps(self, tmp_path, monkeypatch):
+        """``convert_to_cog`` invokes ``gdal_translate`` with the safety clamps."""
+        from app.processing.raster import cog as cog_module
+
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+        dst = tmp_path / "out.tif"
+
+        with _capture_subprocess_runs(monkeypatch) as captured:
+            cog_module.convert_to_cog(str(src), str(dst), "uint8", **_NO_OVERVIEWS)
+
+        translate_calls = [
+            (cmd, env) for cmd, env in captured if cmd and cmd[0] == "gdal_translate"
+        ]
+        assert translate_calls, (
+            f"gdal_translate was not invoked; captured: {[c[0] for c in captured]}"
+        )
+        _, env = translate_calls[0]
+        _assert_clamps(env)
+        # Per-call extras must merge in too.
+        assert env.get("GDAL_CACHEMAX") == "200"
+
+
+# ---------------------------------------------------------------------------
+# Direct helper-level pin
+# ---------------------------------------------------------------------------
+
+
+class TestGdalSafeEnvHelper:
+    """Pin the public contract of ``gdal_safe_env(extras=...)`` directly."""
+
+    def test_base_clamps_present(self):
+        from app.processing.raster.vrt import gdal_safe_env
+
+        env = gdal_safe_env()
+        _assert_clamps(env)
+
+    def test_extras_merge_in_and_win(self):
+        from app.processing.raster.vrt import gdal_safe_env
+
+        env = gdal_safe_env(extras={"FOO": "bar", "GDAL_CACHEMAX": "200"})
+        _assert_clamps(env)
+        assert env.get("FOO") == "bar"
+        assert env.get("GDAL_CACHEMAX") == "200"
+
+    def test_extras_override_vrt_safe_env_if_collision(self):
+        """Passing a security clamp key in extras raises ValueError.
+
+        The old contract was "extras win" (clobber silently allowed), which is
+        the wrong contract for a security-clamping helper. The new contract is
+        that extras MUST NOT collide with _VRT_SAFE_ENV keys; a ValueError is
+        raised on collision so no caller can accidentally disable the clamps.
+        """
+        import pytest
+        from app.processing.raster.vrt import gdal_safe_env
+
+        with pytest.raises(ValueError, match="security clamps"):
+            gdal_safe_env(extras={"CPL_VSIL_CURL_ALLOWED_EXTENSIONS": "exe"})
+
+
+# ---------------------------------------------------------------------------
+# temp-file cleanup when run_gdal RAISES (timeout)
+# ---------------------------------------------------------------------------
+
+
+class TestGdalFailureTempCleanup:
+    """run_gdal raises on timeout; the returncode-only cleanup paths
+    leaked the staged temp copies. Any raise must remove them."""
+
+    def test_prepare_with_overviews_cleans_tmp_on_run_gdal_raise(
+        self, tmp_path, monkeypatch
+    ):
+        import tempfile
+
+        import pytest
+        from app.processing.raster import cog as cog_module
+
+        src_dir = tmp_path / "src"
+        work_dir = tmp_path / "work"
+        src_dir.mkdir()
+        work_dir.mkdir()
+        src = src_dir / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+        monkeypatch.setattr(tempfile, "tempdir", str(work_dir))
+
+        def _raise(*_a, **_k):
+            raise RuntimeError("gdaladdo timed out after 900s")
+
+        monkeypatch.setattr(cog_module, "run_gdal", _raise)
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            cog_module.prepare_with_overviews(
+                str(src), "uint8", has_internal_overviews=False
+            )
+
+        assert list(work_dir.iterdir()) == [], (
+            "temp raster copy leaked after run_gdal raised"
+        )
+
+    def test_convert_to_cog_with_assign_crs_leaves_no_temp_behind(
+        self, tmp_path, monkeypatch
+    ):
+        """The assignment path stages no temp file of its own for a
+        ``gdalwarp`` output — ``-a_srs`` rides the translate — so the only
+        scratch file is the overview copy, and its owner still removes it on
+        any raise.
+        """
+        import tempfile
+
+        import pytest
+        from app.processing.raster import cog as cog_module
+
+        src_dir = tmp_path / "src"
+        work_dir = tmp_path / "work"
+        src_dir.mkdir()
+        work_dir.mkdir()
+        src = src_dir / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+        monkeypatch.setattr(tempfile, "tempdir", str(work_dir))
+
+        def _raise(*_a, **_k):
+            raise RuntimeError("gdaladdo timed out after 900s")
+
+        monkeypatch.setattr(cog_module, "run_gdal", _raise)
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            cog_module.convert_to_cog(
+                str(src),
+                str(tmp_path / "out.tif"),
+                "uint8",
+                assign_crs=4326,
+                **_NO_OVERVIEWS,
+            )
+
+        assert list(work_dir.iterdir()) == [], (
+            "a temp file leaked from the CRS-assignment path after run_gdal raised"
+        )
+
+
+class TestOverviewSidecarCleanup:
+    """On a COG-layout input without internal overviews, GDAL 3.10 exits 0 and
+    writes ``<copy>.ovr`` beside the temp copy instead of rewriting it. Newer
+    GDAL refuses outright, so the stand-in below models the 3.10 behavior
+    rather than depending on whichever GDAL runs the suite.
+    """
+
+    @staticmethod
+    def _gdal_writing_ovr_sidecar(
+        work_dir, *, addo_raises=False, translate_returncode=0
+    ):
+        from pathlib import Path
+
+        def _run(cmd, **_kwargs):
+            if cmd[0] == "gdaladdo":
+                copy = next(a for a in cmd if Path(a).parent == work_dir)
+                Path(f"{copy}.ovr").write_bytes(b"\x00")
+                if addo_raises:
+                    raise RuntimeError("gdaladdo timed out after 900s")
+                return mock.Mock(returncode=0, stderr="")
+            # COPY_SRC_OVERVIEWS reads the sidecar, so it must still be there.
+            assert Path(f"{cmd[-2]}.ovr").exists()
+            if translate_returncode == 0:
+                Path(cmd[-1]).write_bytes(b"\x00")
+            return mock.Mock(returncode=translate_returncode, stderr="translate failed")
+
+        return _run
+
+    def _stage(self, tmp_path, monkeypatch, **fake_options):
+        from app.processing.raster import cog as cog_module
+
+        src = tmp_path / "src.tif"
+        src.write_bytes(b"\x00" * 8)
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        monkeypatch.setattr(cog_module, "_scratch_dir", lambda: str(work_dir))
+        monkeypatch.setattr(
+            cog_module,
+            "run_gdal",
+            self._gdal_writing_ovr_sidecar(work_dir, **fake_options),
+        )
+        return src, tmp_path / "out.tif", work_dir
+
+    def test_success_removes_the_sidecar_with_the_copy(self, tmp_path, monkeypatch):
+        from app.processing.raster import cog as cog_module
+
+        src, out, work_dir = self._stage(tmp_path, monkeypatch)
+
+        cog_module.convert_to_cog(str(src), str(out), "uint8", **_NO_OVERVIEWS)
+
+        assert out.exists()
+        assert list(work_dir.iterdir()) == []
+
+    def test_translate_failure_removes_the_sidecar(self, tmp_path, monkeypatch):
+        import pytest
+        from app.processing.raster import cog as cog_module
+
+        src, out, work_dir = self._stage(tmp_path, monkeypatch, translate_returncode=1)
+
+        with pytest.raises(RuntimeError, match="translate failed"):
+            cog_module.convert_to_cog(str(src), str(out), "uint8", **_NO_OVERVIEWS)
+
+        assert list(work_dir.iterdir()) == []
+
+    def test_gdaladdo_timeout_removes_a_partial_sidecar(self, tmp_path, monkeypatch):
+        import pytest
+        from app.processing.raster import cog as cog_module
+
+        src, out, work_dir = self._stage(tmp_path, monkeypatch, addo_raises=True)
+
+        with pytest.raises(RuntimeError, match="timed out"):
+            cog_module.convert_to_cog(str(src), str(out), "uint8", **_NO_OVERVIEWS)
+
+        assert list(work_dir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Low-bit-depth predictor guard: production failure on
+# Peshawar_City_LULC_2050.tif (2026-08-21 demo ingest)
+# ---------------------------------------------------------------------------
+#
+# A rasterio dtype string like "uint8" does not say how many bits a sample
+# occupies. GDAL's IMAGE_STRUCTURE NBITS tag sub-byte-packs 1/2/4-bit samples
+# (common for LULC/palette rasters) into that same uint8 container, and
+# gdal_translate hard-refuses PREDICTOR=2/3 on anything outside 8/16/32/64
+# bits:
+#
+#   ERROR 1: source.cog.tif: PREDICTOR=2 is only supported with 8/16/32/64
+#   bit samples.
+#
+# which failed the whole COG conversion step (and the ingest job with it).
+# These tests write REAL on-disk GeoTIFFs via rasterio's `nbits` creation
+# option -- the GDAL CLI is not guaranteed on the test host, but rasterio's
+# own driver bindings always are -- and hand ``convert_to_cog`` the verdict
+# the probe child reads from them. Only the GDAL CLI subprocesses are mocked
+# (via ``_capture_subprocess_runs``, entered after the probe has run), so the
+# fixture and the per-band tag detection are both genuine.
+
+
+def _write_nbits_fixture(
+    path: str, *, nbits: int | None, width: int = 4, height: int = 4
+) -> None:
+    """A minimal on-disk uint8 GeoTIFF, optionally sub-byte-packed via NBITS.
+
+    ``nbits=None`` writes a plain uint8 band with no NBITS tag at all (the
+    common case: rasterio dtype and true sample width agree). ``nbits=1/2/4``
+    reproduces the LULC/palette shape that broke production: rasterio still
+    reports the band as ``uint8``, but GDAL's IMAGE_STRUCTURE tag (band-level,
+    not dataset-level -- ``src.tags(ns=...)`` with no band index returns only
+    INTERLEAVE) declares the true, narrower packing.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+
+    kwargs = {} if nbits is None else {"nbits": nbits}
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=width,
+        height=height,
+        count=1,
+        dtype="uint8",
+        crs="EPSG:4326",
+        transform=from_origin(0, height, 1, 1),
+        **kwargs,
+    ) as dst:
+        dst.write(np.zeros((height, width), dtype="uint8"), 1)
+
+
+def _convert_as_ingest_would(src: str, out: str, monkeypatch):
+    from app.processing.raster import cog as cog_module
+    from app.processing.raster.probe import inspect_raster
+
+    inspection = inspect_raster(src)
+    with _capture_subprocess_runs(monkeypatch) as captured:
+        cog_module.convert_to_cog(
+            src,
+            out,
+            "uint8",
+            has_internal_overviews=False,
+            predictor_supported=inspection["predictor_supported"],
+        )
+    return captured
+
+
+def _gdal_translate_argv(captured):
+    calls = [(cmd, env) for cmd, env in captured if cmd and cmd[0] == "gdal_translate"]
+    assert calls, f"gdal_translate was not invoked; ran {[c[0] for c in captured]}"
+    return calls[0][0]
+
+
+class TestPredictorLowBitDepth:
+    """convert_to_cog must not hand gdal_translate a PREDICTOR it will refuse."""
+
+    def test_nbits4_source_drops_the_predictor(self, tmp_path, monkeypatch):
+        """NBITS=4 (e.g. an LULC classification raster) is the exact shape that
+        broke Peshawar_City_LULC_2050.tif in production."""
+        src = tmp_path / "src.tif"
+        _write_nbits_fixture(str(src), nbits=4)
+
+        captured = _convert_as_ingest_would(
+            str(src), str(tmp_path / "out.tif"), monkeypatch
+        )
+
+        cmd = _gdal_translate_argv(captured)
+        assert not any(arg.startswith("PREDICTOR=") for arg in cmd), (
+            f"NBITS=4 source must not receive any PREDICTOR -- gdal_translate "
+            f"hard-refuses PREDICTOR=2 on sub-byte samples; argv: {cmd}"
+        )
+
+    def test_nbits1_source_drops_the_predictor(self, tmp_path, monkeypatch):
+        """NBITS=1 (a binary mask/palette raster) is the other end of the same
+        failure class."""
+        src = tmp_path / "src.tif"
+        _write_nbits_fixture(str(src), nbits=1)
+
+        captured = _convert_as_ingest_would(
+            str(src), str(tmp_path / "out.tif"), monkeypatch
+        )
+
+        cmd = _gdal_translate_argv(captured)
+        assert not any(arg.startswith("PREDICTOR=") for arg in cmd), (
+            f"NBITS=1 source must not receive any PREDICTOR; argv: {cmd}"
+        )
+
+    def test_ordinary_uint8_source_keeps_the_predictor(self, tmp_path, monkeypatch):
+        """Counterpoint: a genuine 8-bit source (no NBITS tag at all) must keep
+        PREDICTOR=2 -- the fix must not turn the predictor off across the
+        board, only for the sources that actually can't take it."""
+        src = tmp_path / "src.tif"
+        _write_nbits_fixture(str(src), nbits=None)
+
+        captured = _convert_as_ingest_would(
+            str(src), str(tmp_path / "out.tif"), monkeypatch
+        )
+
+        cmd = _gdal_translate_argv(captured)
+        assert "PREDICTOR=2" in cmd, (
+            f"an ordinary uint8 source should still get PREDICTOR=2; argv: {cmd}"
+        )
+
+    def test_predictor_supported_reads_band_level_tag_not_dataset_level(self, tmp_path):
+        """Direct pin on the probe itself: NBITS lives under
+        ``src.tags(band, ns="IMAGE_STRUCTURE")``, not
+        ``src.tags(ns="IMAGE_STRUCTURE")`` (which only ever reports
+        INTERLEAVE for a packed source and would silently miss the tag)."""
+        from app.processing.raster import cog as cog_module
+
+        packed = tmp_path / "packed.tif"
+        plain = tmp_path / "plain.tif"
+        _write_nbits_fixture(str(packed), nbits=4)
+        _write_nbits_fixture(str(plain), nbits=None)
+
+        assert cog_module._predictor_supported(str(packed)) is False
+        assert cog_module._predictor_supported(str(plain)) is True

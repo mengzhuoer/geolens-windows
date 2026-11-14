@@ -1,0 +1,977 @@
+"""Dataset core CRUD endpoints: list, create, get, update, delete, quicklook, history."""
+
+import asyncio
+import hashlib
+import re
+import subprocess
+import sys
+import uuid
+from datetime import timedelta
+from pathlib import Path
+
+import structlog
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import NoInspectionAvailable
+
+from app.core.identity import Identity
+from app.core.db.sqlstate import is_lock_conflict
+from app.platform.binary_response import binary_response
+from app.platform.catalog_locks import (
+    CATALOG_LOCK_CONFLICT_CODE,
+    CatalogLockConflict,
+    bump_tile_cache_version_on,
+)
+from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+from app.modules.audit.schemas import AuditLogListResponse, AuditLogResponse
+from app.modules.audit.service import (
+    AuditEvent,
+    audit_emit,
+    query_audit_logs,
+    recently_audited,
+)
+from app.modules.auth.dependencies import (
+    get_current_active_user,
+    get_optional_user,
+    require_permission,
+)
+from app.modules.catalog.authorization import (
+    can_view_dataset_provenance,
+    check_dataset_access_or_anonymous,
+    check_dataset_write_access,
+    check_public_visibility_allowed,
+    check_vrt_serves,
+    get_user_roles,
+    visible_lineage_summary,
+    visible_vrt_extents,
+)
+from app.modules.catalog.datasets.domain.helpers import (
+    DatasetNotFoundError,
+    WorkflowTransitionDenied,
+    dataset_to_response,
+    _load_actor_identities,
+)
+from app.modules.catalog.datasets.domain.schemas import (
+    BulkDeleteRequest,
+    BulkDeleteResponse,
+    BulkDeleteResultItem,
+    CreateEmptyDatasetRequest,
+    DatasetDeleteRequest,
+    DatasetListResponse,
+    DatasetMetaUpdate,
+    DatasetRefreshRunListResponse,
+    DatasetRefreshRunResponse,
+    DatasetResponse,
+    RefreshVerification,
+    SchemaDiff,
+)
+from app.platform.refresh.service import list_runs_for_dataset
+from app.platform.cache.provider import get_tile_cache, notify_table_invalidated
+from app.platform.cache.scope import is_publicly_cacheable, public_cache_control
+from app.platform.http.ranges import if_none_match_matches
+from app.platform.cache.tiles import invalidate_catalog_cache
+from app.modules.catalog.collections.service import get_dataset_collections
+from app.modules.catalog.features.service import lock_catalog_rows_for_write
+from app.modules.catalog.write_recheck import refuse_stale_write
+from app.modules.catalog.ownership import (
+    require_transfer_admin,
+    transfer_dataset_owner,
+)
+from app.modules.catalog.datasets.domain.service import (
+    DatasetTitleMismatchError,
+    DependentVrtError,
+    PreviousVersionRefused,
+    create_empty_dataset,
+    defer_metadata_embedding,
+    delete_dataset,
+    get_dataset,
+    get_dataset_detail,
+    get_datasets_list,
+    update_user_metadata,
+)
+from app.core.dependencies import get_db
+from app.core.public_urls import get_dataset_service_url
+from app.platform.request_credential import refuse_publish_key
+from app.platform.storage import get_storage
+from app.platform.extensions import get_catalog_port
+from app.standards.ogc.errors import ERROR_RESPONSES_WRITE, FORBIDDEN_RESPONSE
+
+logger = structlog.get_logger()
+
+_DATASET_VIEW_AUDIT_WINDOW = timedelta(minutes=15)
+
+router = APIRouter(
+    prefix="/datasets", tags=["Datasets"], responses=ERROR_RESPONSES_WRITE
+)
+
+
+# Dual-shape decorator: the no-slash variant is a hidden alias of the canonical
+# slash form (already in OpenAPI), closing the 404 from redirect_slashes=False
+# (api/main.py).
+@router.get(
+    "",
+    response_model=DatasetListResponse,
+    include_in_schema=False,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+@router.get(
+    "/",
+    response_model=DatasetListResponse,
+    # Read-gated (visibility filtering inside get_datasets_list), not
+    # write-gated -- see get_single_dataset below.
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_all_datasets(
+    request: Request,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    user: Identity = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetListResponse:
+    """List datasets with visibility filtering and pagination."""
+    user_roles = await get_user_roles(db, user)
+    base_url = await get_dataset_service_url(db, request=request)
+    datasets, total = await get_datasets_list(
+        db, user, user_roles, skip=skip, limit=limit, base_url=base_url
+    )
+    return DatasetListResponse(datasets=datasets, total=total)
+
+
+@router.post(
+    "/create/", response_model=DatasetResponse, status_code=status.HTTP_201_CREATED
+)
+async def create_empty_dataset_endpoint(
+    body: CreateEmptyDatasetRequest,
+    request: Request,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetResponse:
+    """Create an empty dataset with user-defined columns.
+
+    Creates a PostGIS table in the data schema and a catalog record.
+    """
+    try:
+        dataset = await create_empty_dataset(db, body, user)
+        await db.commit()
+        await db.refresh(dataset, ["record"])
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    actors_by_id = await _load_actor_identities(db, [dataset.record.created_by])
+    return dataset_to_response(
+        dataset,
+        actors_by_id=actors_by_id,
+        base_url=await get_dataset_service_url(db, request=request),
+        # Access-checked prose. A dataset created here has no
+        # provenance to redact, and the helper says so without a query.
+        lineage_summary=await visible_lineage_summary(
+            db, dataset.record, user, await get_user_roles(db, user)
+        ),
+        # The caller is the dataset's own creator — always owner.
+        can_view_provenance=True,
+    )
+
+
+@router.get(
+    "/{dataset_id}",
+    response_model=DatasetResponse,
+    # Read-gated (check_dataset_access_or_anonymous below), not write-gated
+    # -- same override on every other read-gated GET in this file (quicklook,
+    # history, refresh-runs).
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_single_dataset(
+    dataset_id: uuid.UUID,
+    request: Request,
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetResponse:
+    """Get a single dataset by ID with visibility check."""
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+
+    # Visibility check — returns resolved user_roles to avoid duplicate DB query
+    user_roles = await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+
+    # Authenticated views only; a repeat view inside the window writes nothing
+    # to any sink, which keeps a reloading page from flooding the audit log.
+    if user is not None and not await recently_audited(
+        db,
+        user_id=user.id,
+        action="dataset.view",
+        resource_id=dataset_id,
+        within=_DATASET_VIEW_AUDIT_WINDOW,
+    ):
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=user.id,
+                action="dataset.view",
+                resource_type="dataset",
+                resource_id=dataset_id,
+                ip_address=request.client.host if request.client else None,
+            ),
+        )
+        await db.commit()
+
+    colls = await get_dataset_collections(db, dataset_id)
+    collections_data = [{"id": str(c.id), "name": c.name} for c in colls]
+
+    base_url = await get_dataset_service_url(db, request=request)
+    result = await get_dataset_detail(
+        db,
+        dataset_id,
+        user,
+        base_url=base_url,
+        collections_data=collections_data,
+        dataset=dataset,
+        user_roles=user_roles,
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+    return result
+
+
+_QUICKLOOK_READ_ATTEMPTS = 3
+
+
+@router.post(
+    "/{dataset_id}/reveal",
+    status_code=status.HTTP_204_NO_CONTENT,
+    include_in_schema=False,
+)
+async def reveal_dataset_file(
+    dataset_id: uuid.UUID,
+    user: Identity = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Open the dataset's on-disk source in Explorer (local Windows only).
+
+    The bundled desktop build writes the source/library paths into the
+    dataset summary; the detail page's time-series panel calls this so
+    "locate the file" lands on the actual file instead of just showing text.
+    """
+    if sys.platform != "win32":
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Reveal-in-folder is only available on Windows",
+        )
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+
+    summary = dataset.record.summary or ""
+    match = re.search(r"影像库路径[：:]\s*(.+)", summary)
+    if match is None:
+        match = re.search(r"来源文件[：:]\s*(.+)", summary)
+    if match is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This dataset has no recorded source path",
+        )
+    path = Path(match.group(1).strip())
+    if not path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Source file is missing on disk",
+        )
+    subprocess.Popen(  # noqa: S603 - fixed executable, no shell, DB-sourced path
+        ["explorer", f"/select,{path}"],
+        close_fds=True,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{dataset_id}/quicklook",
+    response_class=Response,
+    responses={
+        200: binary_response("The quicklook image", "image/png"),
+        403: FORBIDDEN_RESPONSE,
+    },
+)
+async def get_quicklook(
+    dataset_id: uuid.UUID,
+    request: Request,
+    size: int = Query(
+        256, ge=1, le=512, description="Quicklook size in pixels (256 or 512)"
+    ),
+    v: str | None = Query(
+        None,
+        description="The record's `quicklook_version`; it only keys caches and does not change the response.",
+    ),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Serve a quicklook PNG image for a dataset."""
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+
+    await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+
+    # A VRT quicklook is drawn from its members' pixels, so it follows the tile rule.
+    await check_vrt_serves(db, dataset)
+
+    record_type = getattr(dataset.record, "record_type", None)
+
+    if record_type in RASTER_FAMILY_RECORD_TYPES:
+        raster_asset = await get_catalog_port().get_raster_asset(db, dataset.id)
+        if raster_asset is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Raster asset not found",
+            )
+        uri = (
+            raster_asset.quicklook_256_uri
+            if size <= 256
+            else raster_asset.quicklook_512_uri
+        )
+
+    elif record_type == "vector_dataset":
+        uri = dataset.quicklook_256_uri
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Quicklook not available for this dataset type",
+        )
+
+    if uri is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quicklook not available",
+        )
+
+    storage = get_storage()
+    try:
+        from app.core.db.tenant_session import current_tenant_var
+        from app.platform.storage.titiler_url import resolve_storage_key
+
+        tenant_id = current_tenant_var.get()
+        for attempt in range(_QUICKLOOK_READ_ATTEMPTS):
+            try:
+                data = await storage.get(resolve_storage_key(uri, tenant_id=tenant_id))
+                break
+            except FileNotFoundError:
+                # A redraw may have replaced and removed this image after the read above.
+                if (
+                    record_type != "vector_dataset"
+                    or attempt == _QUICKLOOK_READ_ATTEMPTS - 1
+                ):
+                    raise
+                await db.refresh(dataset, ["quicklook_256_uri"])
+                if dataset.quicklook_256_uri in (None, uri):
+                    raise
+                uri = dataset.quicklook_256_uri
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quicklook not found",
+        )
+    except Exception:  # broad: storage backend (S3/MinIO/local) can throw varied SDK/I/O errors; map to 503
+        logger.exception("quicklook_storage_error", dataset_id=str(dataset_id))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Quicklook temporarily unavailable",
+        )
+    # A shared cache keys on the URL alone, so only an image anyone may fetch is public.
+    record = dataset.record
+    if not is_publicly_cacheable(record.visibility, record.record_status):
+        headers = {"Cache-Control": "private, no-store"}
+    elif record_type in ("vector_dataset", "vrt_dataset"):
+        # A vector replacement redraws the image under the same URL, and a VRT
+        # stops serving when a member narrows, so a cache revalidates every use.
+        etag = '"' + hashlib.sha256(data).hexdigest() + '"'
+        headers = {"Cache-Control": "public, no-cache", "ETag": etag}
+        if if_none_match_matches(request.headers.get("if-none-match"), etag):
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    else:
+        headers = {"Cache-Control": public_cache_control(3600)}
+    return Response(content=data, media_type="image/png", headers=headers)
+
+
+async def _refuse_stale_write(
+    db: AsyncSession, dataset, meta: DatasetMetaUpdate
+) -> None:
+    await lock_catalog_rows_for_write(
+        db, dataset, with_raster_asset="is_dem" in meta.model_fields_set
+    )
+    await db.refresh(dataset.record, ["updated_at"])
+    refuse_stale_write(dataset.record.updated_at, meta.expected_updated_at)
+
+
+@router.patch("/{dataset_id}", response_model=DatasetResponse)
+async def update_dataset_metadata(
+    dataset_id: uuid.UUID,
+    meta: DatasetMetaUpdate,
+    request: Request,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetResponse:
+    """Update user-editable dataset metadata."""
+    # Owner-or-admin: the role gate + visibility check alone let any editor
+    # edit a peer's public dataset.
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+    user_roles = await check_dataset_write_access(db, dataset, dataset_id, user)
+    if "owner_id" in meta.model_fields_set:
+        refuse_publish_key(db, "A publish key can't transfer dataset ownership")
+    owner_id = (
+        require_transfer_admin(user_roles, meta.owner_id)
+        if "owner_id" in meta.model_fields_set
+        else None
+    )
+    # A non-admin may not move a dataset TO public when the
+    # restrict_public_visibility instance setting is on.
+    await check_public_visibility_allowed(
+        db, user, meta.visibility, user_roles=user_roles
+    )
+
+    # Capture the pre-update value so a PATCH that echoes the
+    # same tile_columns doesn't roll the tile version / purge the tile
+    # cache. None and [] are captured distinctly -- None means
+    # per-zoom defaults, [] means "never project attributes", so a
+    # None<->[] flip IS a tile-content change.
+    tile_columns_before = (
+        list(dataset.tile_columns) if dataset.tile_columns is not None else None
+    )
+
+    if meta.expected_updated_at is not None:
+        await _refuse_stale_write(db, dataset, meta)
+
+    if owner_id is not None:
+        # Before the metadata update, so its visibility and audience checks
+        # see the new owner. Locked in house order, as update_user_metadata
+        # would lock them.
+        await lock_catalog_rows_for_write(
+            db, dataset, with_raster_asset="is_dem" in meta.model_fields_set
+        )
+        await transfer_dataset_owner(
+            db,
+            dataset,
+            owner_id,
+            actor=user,
+            ip_address=request.client.host if request.client else None,
+            visibility=meta.visibility,
+            record_status=meta.record_status,
+        )
+
+    # Advisory warnings from the metadata chokepoint, e.g. a
+    # visibility/status change exposing inherited keywords beyond the
+    # analysis source's audience. Attached to the response below.
+    metadata_warnings: list[str] = []
+    try:
+        dataset = await update_user_metadata(
+            db,
+            dataset_id,
+            meta,
+            actor_id=user.id,
+            actor=user,
+            warnings_out=metadata_warnings,
+        )
+    except WorkflowTransitionDenied as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=e.detail,
+        )
+    except DatasetNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(e),
+        )
+    # A transfer has its own audit row, so a body naming only owner_id is
+    # not also a metadata edit.
+    if meta.model_fields_set - {"expected_updated_at"} != {"owner_id"}:
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=user.id,
+                action="metadata.edit",
+                resource_type="dataset",
+                resource_id=dataset_id,
+                # exclude_unset, not exclude_none: an explicit null clear must
+                # appear in the history. mode="json" because details is JSONB
+                # serialized with stdlib json.dumps, which cannot take the
+                # vintage dates and would roll back the UPDATE at flush.
+                details=meta.model_dump(
+                    mode="json",
+                    exclude_unset=True,
+                    exclude={"owner_id", "expected_updated_at"},
+                ),
+                ip_address=request.client.host if request.client else None,
+            ),
+        )
+    # Only when the value actually changed; a no-op echo must
+    # not purge every cached tile for the table.
+    tile_columns_changed = (
+        "tile_columns" in meta.model_fields_set
+        and dataset.tile_columns != tile_columns_before
+    )
+    if tile_columns_changed:
+        # Evaluated at write time, so a counter read before the
+        # lock wait is never written back over a peer's commit.
+        await bump_tile_cache_version_on(db, dataset)
+    await db.commit()
+    await defer_metadata_embedding(meta, dataset.record_id, dataset_id)
+    await db.refresh(dataset)
+    await db.refresh(dataset.record)
+    await invalidate_catalog_cache()
+    if tile_columns_changed:
+        tile_cache = get_tile_cache()
+        if tile_cache is not None:
+            await tile_cache.invalidate_table(dataset.table_name)
+
+    actors_by_id = await _load_actor_identities(
+        db,
+        [dataset.record.created_by, dataset.record.updated_by],
+    )
+    response = dataset_to_response(
+        dataset,
+        actors_by_id=actors_by_id,
+        vrt_extents=await visible_vrt_extents(db, [dataset_id], user, user_roles),
+        base_url=await get_dataset_service_url(db, request=request),
+        # "owner of the output" does not imply access to what
+        # it was derived from -- a grant on the source can be revoked
+        # after the analysis ran.
+        lineage_summary=await visible_lineage_summary(
+            db, dataset.record, user, user_roles
+        ),
+        # Reached only after check_dataset_write_access, the
+        # owner-or-admin gate itself.
+        can_view_provenance=True,
+    )
+    if metadata_warnings:
+        response.metadata_warnings = metadata_warnings
+    return response
+
+
+# Held until each reap finishes, so a reap whose request was cancelled is not
+# garbage-collected mid-walk.
+_reaps_in_flight: set[asyncio.Task] = set()
+
+
+async def _reap_after_commit(*deletions) -> None:
+    """Remove deleted datasets' objects, once their rows are gone for good.
+
+    Runs after the commit because it's irreversible and the delete's FK
+    cascades can still lose a lock race. A failure orphans objects and
+    can't resurrect a dataset, so it's logged rather than raised. The reap
+    runs in its own shielded task, so cancelling the request doesn't stop
+    it; a worker that dies mid-reap still leaves the rest behind.
+    """
+    task = asyncio.create_task(_reap(deletions))
+    _reaps_in_flight.add(task)
+    task.add_done_callback(_reaps_in_flight.discard)
+    await asyncio.shield(task)
+
+
+async def _reap(deletions) -> None:
+    from app.modules.catalog.datasets.domain.service import reap_managed_storage
+
+    for deletion in deletions:
+        try:
+            await reap_managed_storage(
+                list(deletion.storage_prefixes), deletion.tenant_id
+            )
+        except Exception:  # broad: the rows are already gone, so no failure here can be raised at a caller that could act on it
+            logger.exception(
+                "Dataset rows are deleted but their storage was not reaped",
+                table_name=deletion.table_name,
+                prefixes=list(deletion.storage_prefixes),
+            )
+
+
+async def _rollback_failed_item(db: AsyncSession, user) -> None:
+    """Roll back one failed bulk-delete item without breaking the next one.
+
+    `rollback()` expires every session instance, including the actor,
+    whose next attribute read would lazy-load outside the greenlet --
+    reloaded here instead, but only if PERSISTENT: an `IdentityExtension`
+    identity has no mapper and isn't in the session, so nothing expired it.
+    """
+    await db.rollback()
+    try:
+        state = sa_inspect(user)
+    except NoInspectionAvailable:
+        return
+    if state.persistent:
+        await db.refresh(user)
+
+
+# Dual-shape decorator: the no-slash variant is a hidden alias of the canonical
+# slash form (already in OpenAPI), closing the 404 from redirect_slashes=False
+# (api/main.py).
+@router.post("/bulk-delete", response_model=BulkDeleteResponse, include_in_schema=False)
+@router.post("/bulk-delete/", response_model=BulkDeleteResponse)
+async def bulk_delete_datasets_endpoint(
+    body: BulkDeleteRequest,
+    request: Request,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> BulkDeleteResponse:
+    """Delete multiple datasets in one request. Returns per-item results."""
+    results: list[BulkDeleteResultItem] = []
+    pending_reaps: list = []
+    deleted = 0
+
+    for item in body.datasets:
+        try:
+            # Per-item resource-level access check.
+            item_dataset = await get_dataset(db, item.dataset_id)
+            if item_dataset is None:
+                results.append(
+                    BulkDeleteResultItem(
+                        dataset_id=item.dataset_id,
+                        status="error",
+                        detail="Dataset not found",
+                    )
+                )
+                continue
+            try:
+                await check_dataset_write_access(
+                    db, item_dataset, item.dataset_id, user
+                )
+            except HTTPException as exc:
+                # write-access raises 404 (not visible) / 403 (not owner) — surface per-item
+                results.append(
+                    BulkDeleteResultItem(
+                        dataset_id=item.dataset_id,
+                        status="error",
+                        detail=str(exc.detail),
+                    )
+                )
+                continue
+
+            deletion = await delete_dataset(db, item.dataset_id, item.confirm_title)
+            table_name = deletion.table_name
+            await audit_emit(
+                db,
+                AuditEvent(
+                    user_id=user.id,
+                    action="dataset.delete",
+                    resource_type="dataset",
+                    resource_id=item.dataset_id,
+                    details={"title": item.confirm_title, "table_name": table_name},
+                    ip_address=request.client.host if request.client else None,
+                ),
+            )
+            # Commit per item so one item's failure cannot roll back the rows
+            # of the items before it.
+            await db.commit()
+            # The reap is deferred past both invalidations below;
+            # awaiting object storage here would delay them per item.
+            pending_reaps.append(deletion)
+            # Only now is the delete visible to a concurrent
+            # tile request, so only now can the table_name -> metadata map
+            # be evicted without a request re-caching the deleted row.
+            notify_table_invalidated(table_name)
+            results.append(
+                BulkDeleteResultItem(dataset_id=item.dataset_id, status="deleted")
+            )
+            deleted += 1
+        except CatalogLockConflict as exc:
+            # Per item, not raised -- the batch commits per
+            # item, so aborting would discard already-committed results.
+            await _rollback_failed_item(db, user)
+            results.append(
+                BulkDeleteResultItem(
+                    dataset_id=item.dataset_id,
+                    status="error",
+                    detail=str(exc),
+                    code=CATALOG_LOCK_CONFLICT_CODE,
+                )
+            )
+            continue
+        except HTTPException as exc:
+            # The write guard's re-check under the catalog lock refuses here.
+            await _rollback_failed_item(db, user)
+            results.append(
+                BulkDeleteResultItem(
+                    dataset_id=item.dataset_id,
+                    status="error",
+                    detail=str(exc.detail),
+                )
+            )
+            continue
+        except Exception as exc:  # broad: per-item bulk-delete is isolated — any failure is recorded per-item without aborting the batch
+            await _rollback_failed_item(db, user)
+            if is_lock_conflict(exc):
+                # A wait after the acquisition (the record cascade on
+                # a held child) is the same contended row, so the same code.
+                results.append(
+                    BulkDeleteResultItem(
+                        dataset_id=item.dataset_id,
+                        status="error",
+                        detail="Another operation is updating this dataset's catalog entry.",
+                        code=CATALOG_LOCK_CONFLICT_CODE,
+                    )
+                )
+                continue
+            if isinstance(exc, (DependentVrtError, DatasetTitleMismatchError)):
+                detail = str(exc)
+            else:
+                logger.exception(
+                    "Unexpected error during bulk delete",
+                    dataset_id=str(item.dataset_id),
+                )
+                detail = "Dataset deletion failed unexpectedly"
+            results.append(
+                BulkDeleteResultItem(
+                    dataset_id=item.dataset_id,
+                    status="error",
+                    detail=detail,
+                )
+            )
+
+    if deleted > 0:
+        await invalidate_catalog_cache()
+
+    # Last, so no storage round trip can delay or skip the
+    # invalidations above for any item in the batch.
+    await _reap_after_commit(*pending_reaps)
+
+    return BulkDeleteResponse(
+        deleted=deleted, errors=len(results) - deleted, results=results
+    )
+
+
+@router.delete("/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_dataset_endpoint(
+    dataset_id: uuid.UUID,
+    body: DatasetDeleteRequest,
+    request: Request,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Delete a dataset with cascade cleanup. Owner or admin only, requires confirm_title."""
+    # Owner-or-admin: destructive op restricted to the dataset's creator or admin.
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+    await check_dataset_write_access(db, dataset, dataset_id, user)
+
+    try:
+        deletion = await delete_dataset(db, dataset_id, body.confirm_title)
+        table_name = deletion.table_name
+    except DependentVrtError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": str(exc),
+                "dependent_vrts": exc.dependents,
+            },
+        )
+    except DatasetTitleMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except PreviousVersionRefused as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except ValueError as exc:
+        if str(exc) == "Dataset not found":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Dataset not found",
+            )
+        logger.exception(
+            "Unexpected error during dataset delete",
+            dataset_id=str(dataset_id),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Dataset deletion failed unexpectedly",
+        )
+
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=user.id,
+            action="dataset.delete",
+            resource_type="dataset",
+            resource_id=dataset_id,
+            details={"title": body.confirm_title, "table_name": table_name},
+            ip_address=request.client.host if request.client else None,
+        ),
+    )
+    await db.commit()
+
+    await invalidate_catalog_cache()
+    # Only now is the delete visible to a concurrent tile request, so only now
+    # can the table_name -> metadata map be evicted without re-caching the
+    # deleted row. That map decides visibility; a stale entry would authorize a
+    # successor under the deleted dataset's rules.
+    notify_table_invalidated(table_name)
+
+    # After both invalidations: the reap awaits object storage, so a slow
+    # backend or cancellation would delay or skip them and leave search and the
+    # tile map serving a deleted dataset until TTL.
+    await _reap_after_commit(deletion)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{dataset_id}/history",
+    response_model=AuditLogListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_dataset_history(
+    dataset_id: uuid.UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> AuditLogListResponse:
+    """Get audit log history for a specific dataset."""
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+
+    # Visibility check. Full actor/detail history is owner/admin-only; public
+    # readers keep the event timeline without PII or internal metadata.
+    user_roles = await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+    can_view_full_history = bool(
+        user and (dataset.record.created_by == user.id or "admin" in user_roles)
+    )
+
+    logs, total = await query_audit_logs(
+        db,
+        resource_type="dataset",
+        resource_id=dataset_id,
+        skip=skip,
+        limit=limit,
+    )
+
+    return AuditLogListResponse(
+        logs=[
+            AuditLogResponse(
+                id=log.id,
+                user_id=log.user_id if can_view_full_history else None,
+                username=log.user.username
+                if can_view_full_history and log.user
+                else None,
+                action=log.action,
+                resource_type=log.resource_type,
+                resource_id=log.resource_id,
+                details=log.details if can_view_full_history else None,
+                ip_address=log.ip_address if can_view_full_history else None,
+                created_at=log.created_at,
+            )
+            for log in logs
+        ],
+        total=total,
+    )
+
+
+@router.get(
+    "/{dataset_id}/refresh-runs",
+    response_model=DatasetRefreshRunListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_dataset_refresh_runs(
+    dataset_id: uuid.UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetRefreshRunListResponse:
+    """Return durable refresh history for a dataset.
+
+    Readers can see the timeline and outcomes. Only the dataset owner and
+    admins can see actors, failure details, schema changes, and verification
+    source data.
+    """
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+
+    user_roles = await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+    can_view_detail = can_view_dataset_provenance(dataset.record, user, user_roles)
+
+    runs, total = await list_runs_for_dataset(db, dataset_id, skip=skip, limit=limit)
+    actors = (
+        await _load_actor_identities(db, [run.triggered_by for run in runs])
+        if can_view_detail
+        else {}
+    )
+    usernames = {actor_id: actor.username for actor_id, actor in actors.items()}
+
+    return DatasetRefreshRunListResponse(
+        runs=[
+            DatasetRefreshRunResponse(
+                id=run.id,
+                dataset_id=run.dataset_id,
+                dataset_version_id=run.dataset_version_id,
+                ingest_job_id=run.ingest_job_id,
+                origin_kind=run.origin_kind,
+                trigger=run.trigger,
+                scheduled_for=run.scheduled_for,
+                claim_deadline=run.claim_deadline,
+                status=run.status,
+                triggered_by=run.triggered_by if can_view_detail else None,
+                triggered_by_username=usernames.get(run.triggered_by),
+                started_at=run.started_at,
+                claimed_at=run.claimed_at,
+                finished_at=run.finished_at,
+                feature_count_before=run.feature_count_before,
+                feature_count_after=run.feature_count_after,
+                schema_diff=(
+                    SchemaDiff(**run.schema_diff)
+                    if can_view_detail and run.schema_diff
+                    else None
+                ),
+                verification=(
+                    RefreshVerification(**run.verification)
+                    if can_view_detail and run.verification
+                    else None
+                ),
+                error_code=run.error_code if can_view_detail else None,
+                error_message=run.error_message if can_view_detail else None,
+            )
+            for run in runs
+        ],
+        total=total,
+    )

@@ -1,0 +1,434 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router';
+import { useTranslation } from 'react-i18next';
+import { AlertCircle, Loader2, Map, RotateCcw, SendHorizontal, Sparkles, Square, X } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { ApiError } from '@/api/client';
+import { streamDatasetChatMessage } from '@/api/maps';
+import { useCreateMap } from '@/hooks/use-maps';
+import { useAIAvailability } from '@/hooks/use-ai-availability';
+import { usePermissions } from '@/hooks/use-permissions';
+import type { BuilderEntryIntent } from '@/hooks/use-builder-entry-intent';
+import { QueryResultTable, type QueryResult } from '@/components/viewer/ViewerChatPanel';
+import { stashChatResult, toChatResultHandoff, type ChatResultHandoff } from '@/lib/chat-result-handoff';
+import { chatOverlayCompleteness, overlayFeatureCount } from '@/lib/chat-result-completeness';
+import { cn } from '@/lib/utils';
+import type { ChatAction, ChatHistoryMessage } from '@/types/api';
+import { randomId } from '@/lib/random-id';
+
+/** Set on the document root while the Ask AI launcher is showing. */
+const FLOATING_DOCK_INSET_VAR = '--floating-dock-inset';
+/** Width the launcher covers from the inline end edge, for rows it floats over. */
+const FLOATING_DOCK_REACH_VAR = '--floating-dock-reach';
+
+// Launcher offset (bottom-10, or bottom-44 when lifted above the pending-edits bar) plus its height and a margin.
+const DOCK_INSET = '5.5rem';
+const LIFTED_DOCK_INSET = '14rem';
+// The launcher's end-16 offset plus a margin, added to its measured width.
+const DOCK_END_GAP = '4.5rem';
+// Used when the launcher can't be measured.
+const DOCK_REACH = '12rem';
+
+const prefersReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
+
+// The launcher always clears the sticky pending-edits bar, which sits higher once the footer scrolls in.
+const LAUNCHER_ABOVE_PENDING_BAR = 'bottom-44 sm:bottom-32';
+// The open dialog gives way on short viewports (the 100dvh term) so it keeps a usable height.
+const DIALOG_ABOVE_PENDING_BAR =
+  'bottom-(--ask-ai-bottom) [--ask-ai-bottom:clamp(2.5rem,100dvh_-_18rem,11rem)] sm:[--ask-ai-bottom:clamp(2.5rem,100dvh_-_18rem,8rem)]';
+
+function dockPosition(abovePendingBar: boolean, open: boolean): string {
+  if (!abovePendingBar) return 'bottom-10';
+  return open ? DIALOG_ABOVE_PENDING_BAR : LAUNCHER_ABOVE_PENDING_BAR;
+}
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'error';
+  content: string;
+  queryResult?: QueryResult;
+  /** Spatial payload of the query result, carried into the builder on open. */
+  spatialResult?: ChatResultHandoff;
+  retryMessage?: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getChatActions(value: unknown): ChatAction[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is ChatAction => isRecord(item) && typeof item.type === 'string');
+}
+
+/** Extract the tabular payload from a show_query_result action (no map here). */
+function toQueryResult(action: ChatAction): QueryResult | undefined {
+  const rows = Array.isArray(action.rows) ? action.rows : null;
+  if (rows === null) return undefined;
+  return {
+    rows,
+    columns: Array.isArray(action.columns) ? action.columns.filter((c): c is string => typeof c === 'string') : [],
+    rowCount: typeof action.row_count === 'number' ? action.row_count : rows.length,
+    truncated: action.truncated === true,
+  };
+}
+
+interface DatasetChatPanelProps {
+  datasetId: string;
+  datasetTitle: string;
+  /** Non-spatial tables can chat but have no map-layer flow —
+   * the rest of the UI (AddToMapButton) hides builder handoffs for them. */
+  showOpenInBuilder: boolean;
+  /** Notifies the page when the panel opens/closes so it can pad
+   * its content clear of the fixed panel (which otherwise covers the sticky
+   * detail tabs and other controls). */
+  onOpenChange?: (open: boolean) => void;
+  /** The pending-edits bar is showing; the launcher and dialog rise above it. */
+  abovePendingBar?: boolean;
+}
+
+/**
+ * Dataset-scoped "Ask AI".
+ *
+ * Mirrors ViewerChatPanel's read-only chat UX for the dataset detail page:
+ * questions go to `/ai/chat/dataset/stream/` (query_data-only tool set, dataset
+ * context resolved server-side), the streamed answer renders inline, and
+ * `show_query_result` shows the compact table. With no map on this page, the
+ * panel offers "Open in builder" instead of a flyover: a new map is created
+ * and the builder opens with this dataset staged via the add-dataset entry
+ * intent AddToMapButton uses.
+ *
+ * Self-gates on `useAIAvailability` (token + `use_ai_chat` + AI configured),
+ * so anonymous or unpermitted visitors render nothing.
+ */
+export function DatasetChatPanel({
+  datasetId,
+  datasetTitle,
+  showOpenInBuilder,
+  onOpenChange,
+  abovePendingBar = false,
+}: DatasetChatPanelProps) {
+  const { t, i18n } = useTranslation('dataset');
+  const navigate = useNavigate();
+  const { isAIAvailable } = useAIAvailability();
+  const { can } = usePermissions();
+  const createMap = useCreateMap();
+  const canOpenInBuilder = showOpenInBuilder && can('edit_metadata');
+
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [streamingText, setStreamingText] = useState('');
+
+  const abortRef = useRef<AbortController | null>(null);
+  const inflightRef = useRef(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: prefersReducedMotion ? 'auto' : 'smooth' });
+  }, [messages, isLoading, streamingText]);
+
+  // Abort any in-flight stream on unmount.
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  useEffect(() => {
+    if (open) requestAnimationFrame(() => inputRef.current?.focus());
+  }, [open]);
+
+  // Keep the page informed so it can reflow clear of the fixed panel. An effect
+  // (not inline in the setOpen calls) so unmount while open also reports
+  // closed. ANDed with availability: if AI availability flips off while open,
+  // the render below bails to null but the component stays mounted, and the
+  // page must not keep padding for an invisible panel.
+  useEffect(() => {
+    onOpenChange?.(open && isAIAvailable);
+    return () => onOpenChange?.(false);
+  }, [open, isAIAvailable, onOpenChange]);
+
+  // The launcher floats over the page bottom; the page reads this to keep its last content clear of it.
+  const launcherVisible = isAIAvailable && !open;
+  const dockRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!launcherVisible) return undefined;
+    const root = document.documentElement;
+    root.style.setProperty(FLOATING_DOCK_INSET_VAR, abovePendingBar ? LIFTED_DOCK_INSET : DOCK_INSET);
+    // The label's width differs by language.
+    const width = dockRef.current?.getBoundingClientRect().width ?? 0;
+    root.style.setProperty(FLOATING_DOCK_REACH_VAR, width > 0 ? `calc(${width}px + ${DOCK_END_GAP})` : DOCK_REACH);
+    return () => {
+      root.style.removeProperty(FLOATING_DOCK_INSET_VAR);
+      root.style.removeProperty(FLOATING_DOCK_REACH_VAR);
+    };
+  }, [launcherVisible, abovePendingBar, i18n.resolvedLanguage]);
+
+  const handleSend = useCallback(async () => {
+    const userMsg = input.trim();
+    if (!userMsg || isLoading || inflightRef.current) return;
+    inflightRef.current = true;
+    setInput('');
+    const history: ChatHistoryMessage[] = messages
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .slice(-20)
+      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+    setMessages((prev) => [...prev, { id: randomId(), role: 'user', content: userMsg }]);
+    setIsLoading(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let streamed = '';
+    let queryResult: QueryResult | undefined;
+    let spatialResult: ChatResultHandoff | undefined;
+    let modelUnsupported = false;
+    try {
+      for await (const { event, data } of streamDatasetChatMessage(datasetId, userMsg, i18n.language, history, controller.signal)) {
+        if (event === 'token') {
+          streamed += typeof data.text === 'string' ? data.text : '';
+          setStreamingText(streamed);
+        } else if (event === 'actions') {
+          // Read-only surface: only show_query_result is acted on.
+          for (const action of getChatActions(data.actions)) {
+            if (action.type === 'show_query_result') {
+              const qr = toQueryResult(action);
+              if (qr) {
+                // Keep table and spatial payload PAIRED: both come from the same
+                // accepted action, so "Open in builder" never carries geometry
+                // from an earlier result than the table shown.
+                queryResult = qr;
+                // Carry the completeness pair and the question with the geometry:
+                // the builder can save a carried result as a dataset, so a handoff
+                // without them would look like a complete answer to every guard
+                // on the other side.
+                const carried = toChatResultHandoff(action.geojson, action.bbox);
+                spatialResult = carried
+                  ? {
+                      ...carried,
+                      ...chatOverlayCompleteness(action, overlayFeatureCount(carried.geojson)),
+                      prompt: userMsg,
+                    }
+                  : undefined;
+              }
+            }
+          }
+        } else if (event === 'done') {
+          const finalText = (typeof data.explanation === 'string' ? data.explanation : '') || streamed;
+          setMessages((prev) => [...prev, { id: randomId(), role: 'assistant', content: finalText, queryResult, spatialResult }]);
+        } else if (event === 'error') {
+          // A pre-flight HTTP status (403/503) rides the SSE error event; surface it
+          // as ApiError so it classifies honestly rather than as a generic failure.
+          if (typeof data.status === 'number') {
+            throw new ApiError(typeof data.message === 'string' ? data.message : '', data.status);
+          }
+          if (data.code === 'model_requires_responses_api') modelUnsupported = true;
+          throw new Error(typeof data.message === 'string' ? data.message : '');
+        }
+      }
+    } catch {
+      if (controller.signal.aborted) {
+        setMessages((prev) => [
+          ...prev,
+          { id: randomId(), role: 'assistant', content: streamed || t('common:viewer.ai.cancelled') },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: randomId(),
+            role: 'error',
+            content: t(modelUnsupported ? 'common:viewer.ai.errorModelUnsupported' : 'common:viewer.ai.error'),
+            retryMessage: userMsg,
+          },
+        ]);
+      }
+    } finally {
+      abortRef.current = null;
+      inflightRef.current = false;
+      setStreamingText('');
+      setIsLoading(false);
+    }
+  }, [input, isLoading, messages, datasetId, i18n.language, t]);
+
+  const handleRetry = useCallback((msg: ChatMessage) => {
+    if (msg.retryMessage) setInput(msg.retryMessage);
+    setMessages((prev) => prev.filter((m) => m.id !== msg.id));
+  }, []);
+
+  /** "Open in builder": new map + navigate with this dataset staged (AddToMapButton flow).
+   * A spatial query result rides sessionStorage into the builder's ephemeral-layer
+   * path; a stash failure (quota/private mode) degrades to opening without it. */
+  const handleOpenInBuilder = useCallback(async (spatial?: ChatResultHandoff) => {
+    try {
+      const name = t('addToMap.newMapName', { title: datasetTitle });
+      const newMap = await createMap.mutateAsync({ name });
+      const carried = spatial ? stashChatResult(spatial) : false;
+      const state: BuilderEntryIntent = { addDatasetId: datasetId, ...(carried ? { chatResult: true } : {}) };
+      navigate(`/maps/${newMap.id}`, { state });
+    } catch {
+      // useCreateMap reports the failure.
+    }
+  }, [createMap, datasetId, datasetTitle, navigate, t]);
+
+  if (!isAIAvailable) return null;
+
+  // bottom-10/end-16 clears the ReportProblemHost lifebuoy (fixed bottom-10
+  // right-4, size-10): same baseline, 8px gap to its left.
+  // Only the dialog and launcher take clicks; the empty corners must not block the bar.
+  return (
+    <div
+      ref={dockRef}
+      data-testid="dataset-chat-dock"
+      className={cn(
+        'pointer-events-none fixed end-16 z-40 flex flex-col items-end gap-2',
+        dockPosition(abovePendingBar, open),
+      )}
+    >
+      {open && (
+        <section
+          role="dialog"
+          aria-label={t('ai.chat.title')}
+          className={cn(
+            'pointer-events-auto flex h-[min(70vh,520px)] w-[min(360px,calc(100vw-4.75rem))] flex-col overflow-hidden rounded-2xl border bg-background/98 shadow-lg backdrop-blur',
+            abovePendingBar && 'max-h-[calc(100dvh-var(--ask-ai-bottom)-4.5rem)]',
+          )}
+        >
+          <div className="flex items-center justify-between border-b px-3 py-2">
+            <div className="flex items-center gap-2">
+              <Sparkles className="size-4 text-primary" aria-hidden="true" />
+              <h2 className="text-sm font-semibold text-foreground">{t('ai.chat.title')}</h2>
+            </div>
+            <Button size="icon-xs" variant="ghost" onClick={() => setOpen(false)} aria-label={t('common:close')}>
+              <X className="size-4" />
+            </Button>
+          </div>
+
+          <div className="flex-1 space-y-2 overflow-y-auto px-3 py-2" role="log" aria-live="polite">
+            {messages.length === 0 && (
+              <div className="space-y-1 py-6 text-center">
+                <p className="text-sm text-muted-foreground">{t('ai.chat.emptyHint')}</p>
+                <p className="text-xs text-muted-foreground">{t('ai.chat.readOnlyNote')}</p>
+              </div>
+            )}
+            {messages.map((msg) =>
+              msg.role === 'error' ? (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="max-w-[85%] rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" />
+                      <p className="text-sm text-foreground">{msg.content}</p>
+                    </div>
+                    <div className="mt-2 flex justify-end">
+                      <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={() => handleRetry(msg)}>
+                        <RotateCcw className="size-3" />
+                        {t('common:viewer.ai.retry')}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div key={msg.id} className={cn('flex', msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+                  <div
+                    className={cn(
+                      'max-w-[85%] rounded-lg px-3 py-1.5 text-sm',
+                      msg.role === 'user' ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground',
+                    )}
+                  >
+                    <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+                    {msg.queryResult && (
+                      <>
+                        <QueryResultTable result={msg.queryResult} />
+                        {canOpenInBuilder && (
+                          <div className="mt-2 flex justify-end">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-7 gap-1 text-xs"
+                              onClick={() => void handleOpenInBuilder(msg.spatialResult)}
+                              disabled={createMap.isPending}
+                            >
+                              {createMap.isPending ? (
+                                <Loader2 className="size-3 animate-spin" />
+                              ) : (
+                                <Map className="size-3" />
+                              )}
+                              {t('ai.chat.openInBuilder')}
+                            </Button>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              ),
+            )}
+            {isLoading && (
+              <div className="flex justify-start">
+                <div className="max-w-[85%] rounded-lg bg-muted px-3 py-1.5 text-sm text-foreground">
+                  {streamingText ? (
+                    <p className="whitespace-pre-wrap">{streamingText}</p>
+                  ) : (
+                    <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                      <Loader2 className="size-3 animate-spin" />
+                      {t('common:viewer.ai.thinking')}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+
+          <div className="flex items-end gap-2 border-t px-3 py-2">
+            {/* Raw textarea kept for the auto-growing chat composer. */}
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  void handleSend();
+                }
+              }}
+              rows={1}
+              placeholder={t('ai.chat.placeholder')}
+              disabled={isLoading}
+              aria-label={t('ai.chat.placeholder')}
+              className="max-h-28 min-h-9 flex-1 resize-none rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+            />
+            {isLoading ? (
+              <Button
+                size="icon-xs"
+                variant="destructive"
+                onClick={() => abortRef.current?.abort()}
+                aria-label={t('common:viewer.ai.cancel')}
+                title={t('common:viewer.ai.cancel')}
+              >
+                <Square className="size-3" />
+              </Button>
+            ) : (
+              <Button
+                size="icon-xs"
+                onClick={() => void handleSend()}
+                disabled={!input.trim()}
+                aria-label={t('common:viewer.ai.send')}
+                title={t('common:viewer.ai.send')}
+              >
+                <SendHorizontal className="size-3" />
+              </Button>
+            )}
+          </div>
+        </section>
+      )}
+      {!open && (
+        <Button
+          onClick={() => setOpen(true)}
+          aria-haspopup="dialog"
+          className="pointer-events-auto gap-2 rounded-full shadow-lg"
+        >
+          <Sparkles className="size-4" aria-hidden="true" />
+          {t('common:viewer.ai.launch')}
+        </Button>
+      )}
+    </div>
+  );
+}

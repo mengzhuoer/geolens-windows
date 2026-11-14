@@ -1,0 +1,159 @@
+"""Per-event notification helpers for GeoLens.
+
+Three call-site helpers: ``event_enabled()`` (cheap toggle gate),
+``build_event_notification()`` (consistent Notification shape), and
+``emit_event_safe()`` (defensive wrapper — never raises into the caller).
+
+``notify`` is imported at module level so tests can monkeypatch it here;
+``app_settings`` is imported lazily inside each function for
+the same reason. ``notify()`` takes no DB/session argument by design.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import structlog
+
+from app.platform.notifications import notify
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from app.platform.extensions.protocols import Notification
+
+logger = structlog.stdlib.get_logger(__name__)
+
+__all__ = [
+    "EventDelivery",
+    "build_event_notification",
+    "emit_event_safe",
+    "event_enabled",
+]
+
+# Mapping from event_key -> Settings attribute name.
+_EVENT_KEY_TO_TOGGLE: dict[str, str] = {
+    "signup": "notify_on_signup",
+    "ingest_complete": "notify_on_ingest_complete",
+    "ingest_failed": "notify_on_ingest_failed",
+    "health_alert": "notify_on_health_alert",
+}
+
+
+def event_enabled(event_key: str) -> bool:
+    """Return True if the per-event toggle for *event_key* is enabled in settings.
+
+    Reads the matching ``notify_on_*`` field (deferred import).
+    Unknown keys return False rather than erroring, so a new event type is
+    silently suppressed until wired up.
+    """
+    # Deferred import so tests can monkeypatch app.core.config.settings.
+    from app.core.config import settings as app_settings
+
+    toggle_attr = _EVENT_KEY_TO_TOGGLE.get(event_key)
+    if toggle_attr is None:
+        return False
+    return bool(getattr(app_settings, toggle_attr, False))
+
+
+def build_event_notification(
+    event_type: str,
+    *,
+    subject: str,
+    body: str,
+    reason: str | None = None,
+    extra: dict[str, object] | None = None,
+) -> "Notification":
+    """Build a ``Notification`` with a consistent shape for event call sites.
+
+    Recipient is ``notification_admin_email or smtp_from_address`` (either
+    may be None) in ``data["to"]``. *reason* (failure path) is
+    appended to *body* and placed in ``data["reason"]`` — it's the job's
+    error_message surfaced to the dataset owner, not a secret.
+    A reason the door stored as a code becomes the sentence it stands for.
+    *extra* is merged into ``data`` last for structured context (job_id,
+    dataset name, etc.).
+    """
+    from app.core.config import settings as app_settings
+    from app.core.failure_reason import describe_failure_reason
+    from app.platform.extensions.protocols import Notification
+
+    recipient: str | None = getattr(
+        app_settings, "notification_admin_email", None
+    ) or getattr(app_settings, "smtp_from_address", None)
+
+    # Mail is a reader like the web app, and a code is not a sentence. Mapped
+    # here rather than at each call site, so no event mails a raw identifier.
+    reason = describe_failure_reason(reason) if reason else reason
+
+    final_body = body
+    if reason:
+        final_body = f"{body}\n\nReason: {reason}"
+
+    data: dict[str, object] = {"to": recipient}
+    if reason:
+        data["reason"] = reason
+    if extra:
+        data.update(extra)
+
+    return Notification(
+        event_type=event_type,
+        subject=subject,
+        body=final_body,
+        data=data,
+    )
+
+
+@dataclass(frozen=True)
+class EventDelivery:
+    """What an event notification left undelivered; true when nothing was.
+
+    ``owed`` names the channels that failed, or is None when the failure
+    can't be pinned to channels, as when the notification never got built.
+    """
+
+    owed: frozenset[str] | None
+
+    def __bool__(self) -> bool:
+        return self.owed == frozenset()
+
+
+async def emit_event_safe(
+    *,
+    event_key: str,
+    build: "Callable[[], Notification]",
+    channels: frozenset[str] | None = None,
+) -> EventDelivery:
+    """Defensive async wrapper for firing a single event notification.
+
+    Returns immediately if ``event_enabled(event_key)`` is False — no
+    payload built, no I/O. Otherwise calls ``build()`` then
+    ``await notify(notification)`` inside one try/except that logs the
+    exception type only (never payload/secrets) and swallows it, so a
+    thrown *builder* — unlike ``notify()``'s own fail-safety — can never
+    escape to the caller. With ``channels`` it sends
+    to those channels alone. The result is true when nothing failed, a
+    disabled event included.
+    """
+    if not event_enabled(event_key):
+        return EventDelivery(frozenset())
+
+    try:
+        notification = build()
+        if channels is None:
+            result = await notify(notification)
+        else:
+            result = await notify(notification, channels=channels)
+    except Exception as exc:  # broad: notification must never break callers
+        # Log only the exception type — never the notification body or any secret.
+        logger.warning(
+            "emit_event_safe: notification failed; suppressed",
+            event_key=event_key,
+            error_type=type(exc).__name__,
+        )
+        return EventDelivery(None)
+    failed = frozenset(getattr(result, "failed_channels", ()) or ())
+    if failed or not getattr(result, "errors", None):
+        return EventDelivery(failed)
+    return EventDelivery(None)

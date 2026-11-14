@@ -1,0 +1,212 @@
+"""Tests for AIProviderExtension Protocol, registry seeding, and entry-points dispatch.
+
+Covers: the Protocol exists, defaults are registered via the accessor,
+overlay-registered providers dispatch correctly via importlib.metadata
+entry_points, an unknown provider name raises ValueError. The
+architecture-guard test in test_layering.py covers the import boundary.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("_clean_registry")
+
+
+def test_default_providers_registered():
+    """Smoke: get_ai_provider returns the right community-default class for each name.
+
+    Verifies SC#2 ("DefaultAIProviderExtension resolves the two community
+    providers -- Anthropic native, OpenAI-compatible -- via the same accessor
+    pattern as get_billing_extension() / get_audit_sink()").
+    """
+    from app.platform.extensions import get_ai_provider
+    from app.platform.extensions.defaults import (
+        DefaultAnthropicProvider,
+        DefaultOpenAICompatibleProvider,
+    )
+
+    anthropic = get_ai_provider("anthropic")
+    openai_compatible = get_ai_provider("openai_compatible")
+
+    assert isinstance(anthropic, DefaultAnthropicProvider)
+    assert isinstance(openai_compatible, DefaultOpenAICompatibleProvider)
+
+    # Verify Protocol satisfaction (runtime_checkable)
+    from app.platform.extensions.protocols import AIProviderExtension
+
+    assert isinstance(anthropic, AIProviderExtension)
+    assert isinstance(openai_compatible, AIProviderExtension)
+
+    # Singleton stability: two calls to get_ai_provider("anthropic") return the SAME instance
+    # (registry singleton, not re-seeded per call).
+    assert get_ai_provider("anthropic") is anthropic
+    assert get_ai_provider("openai_compatible") is openai_compatible
+
+
+def test_unknown_provider_raises_value_error():
+    """Unknown name raises ValueError with the
+    EXACT message the previous llm_loop.py behavior produced.
+
+    Preserves today's exception type and message format so
+    existing tests that catch ``ValueError`` from the dispatch path continue
+    to pass.
+    """
+    from app.platform.extensions import get_ai_provider
+
+    with pytest.raises(ValueError, match=r"^Unknown LLM provider: bedrock$"):
+        get_ai_provider("bedrock")
+
+    with pytest.raises(ValueError, match=r"^Unknown LLM provider: $"):
+        get_ai_provider("")
+
+
+@pytest.mark.asyncio
+async def test_overlay_provider_is_dispatched():
+    """Overlay registered via
+    importlib.metadata entry_points is dispatched correctly without
+    modifying any core file.
+
+    Exercises the FULL chain: ``entry_points()`` discovery ->
+    ``register_extensions(registry)`` callback -> ``get_ai_provider(name)``
+    accessor -> ``provider.complete(...)`` async dispatch -> returned
+    ToolLoopResult. The fake provider's ``complete()`` returns a known
+    sentinel value to prove dispatch reached the overlay's class (not the
+    community defaults).
+    """
+    from app.platform.extensions import get_ai_provider, load_extensions
+    from app.processing.ai.llm_loop import ToolLoopResult
+
+    # Track whether complete() was called with the expected kwargs.
+    captured_kwargs: dict = {}
+
+    class TestProvider:
+        async def complete(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return ToolLoopResult(
+                text="from-test-provider",
+                actions=[],
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        async def stream(self, **kwargs):
+            raise NotImplementedError
+
+        async def resolve_runtime_config(self, db):
+            return {"base_url": None, "default_model": "test-model-1"}
+
+    def register(registry: dict) -> None:
+        providers = registry.setdefault("ai_providers", {})
+        providers["test_provider"] = TestProvider()
+
+    mock_ep = MagicMock()
+    mock_ep.name = "geolens.ai-providers.test"
+    mock_ep.load.return_value = register
+
+    with patch("app.platform.extensions.entry_points", return_value=[mock_ep]):
+        load_extensions()
+        provider_ext = get_ai_provider("test_provider")
+
+        # Sentinel executor -- never invoked because tools=[] + max_rounds=1.
+        async def _noop_executor(name: str, args: dict) -> dict:
+            return {}
+
+        result = await provider_ext.complete(
+            model="test-model-1",
+            system_prompt="",
+            user_message="hello",
+            tools=[],
+            tool_executor=_noop_executor,
+            max_rounds=1,
+            max_tokens=128,
+        )
+
+        assert result.text == "from-test-provider"
+        assert captured_kwargs.get("model") == "test-model-1"
+        assert captured_kwargs.get("user_message") == "hello"
+        assert captured_kwargs.get("max_rounds") == 1
+
+    # Verify the community defaults still resolve correctly even though we
+    # added a third provider -- registry coexistence (setdefault discipline).
+    from app.platform.extensions.defaults import (
+        DefaultAnthropicProvider,
+        DefaultOpenAICompatibleProvider,
+    )
+
+    with patch("app.platform.extensions.entry_points", return_value=[mock_ep]):
+        load_extensions()
+        assert isinstance(get_ai_provider("anthropic"), DefaultAnthropicProvider)
+        assert isinstance(
+            get_ai_provider("openai_compatible"), DefaultOpenAICompatibleProvider
+        )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_complete_aborts_at_token_budget():
+    """The non-streaming tool loop must stop once cumulative
+    input+output tokens exceed MAX_REQUEST_TOKEN_BUDGET (parity with
+    the streaming path). A tool_use round that reports a huge usage makes the
+    next round-top guard raise instead of calling the provider again."""
+    from unittest.mock import AsyncMock
+
+    from app.core.config import settings
+    from app.platform.extensions.defaults import DefaultAnthropicProvider
+    from app.processing.ai.llm_loop import ToolLoopExhaustedError
+
+    response = MagicMock()
+    response.stop_reason = "tool_use"
+    response.usage.input_tokens = 300_000  # > MAX_REQUEST_TOKEN_BUDGET (200K)
+    response.usage.output_tokens = 0
+    response.content = []
+
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=response)
+
+    provider = DefaultAnthropicProvider()
+    original_client = DefaultAnthropicProvider._client
+    DefaultAnthropicProvider._client = fake_client
+    try:
+        with patch.object(settings, "anthropic_api_key", "test-key"):
+            with pytest.raises(ToolLoopExhaustedError, match="token budget"):
+                await provider.complete(
+                    model="test-model",
+                    system_prompt="s",
+                    user_message="u",
+                    tools=[],
+                    tool_executor=AsyncMock(return_value={}),
+                    max_rounds=5,
+                    max_tokens=128,
+                )
+    finally:
+        DefaultAnthropicProvider._client = original_client
+
+    # Round 1 ran (and reported the runaway usage); round 2 was refused.
+    assert fake_client.messages.create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_noop_tool_executor_returns_empty_dict():
+    """llm_loop.noop_tool_executor is the shared ToolExecutor for no-tools
+    calls (tools=[] + max_rounds=1). It is never actually invoked by the
+    tool loop in that shape, but it must still satisfy the ToolExecutor
+    contract (a real callable a conforming provider can call unconditionally)
+    since AIProviderExtension.complete()/stream() require a real executor."""
+    from app.processing.ai.llm_loop import noop_tool_executor
+
+    assert await noop_tool_executor("anything", {"x": 1}) == {}
+
+
+def test_noop_tool_executor_call_sites_share_one_definition():
+    """sql_generator, probe, and service's retry/repair rounds each used to
+    define an identical throwaway ``_noop_executor`` closure. They now import
+    the same llm_loop.noop_tool_executor rather than each constructing their
+    own — verifies the de-duplication, not just that each site still works."""
+    from app.processing.ai import sql_generator
+    from app.processing.ai.llm_loop import noop_tool_executor
+    from app.processing.ai.service import noop_tool_executor as service_noop
+
+    assert sql_generator.noop_tool_executor is noop_tool_executor
+    assert service_noop is noop_tool_executor

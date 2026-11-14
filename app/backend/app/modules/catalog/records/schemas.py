@@ -1,0 +1,277 @@
+"""Pydantic schemas for record sub-resources."""
+
+import re
+import uuid
+from typing import Any
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    HttpUrl,
+    field_validator,
+    model_validator,
+)
+
+from app.core.text import normalize_nfc as _nfc
+
+
+_LANGUAGE_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
+
+
+def normalize_language_tag(value: str) -> str:
+    """Validate and canonicalize a compact BCP 47 language tag."""
+    tag = value.strip().replace("_", "-")
+    if not _LANGUAGE_TAG_RE.fullmatch(tag):
+        raise ValueError("language must be a BCP 47 tag such as en, fr, or pt-BR")
+    parts = tag.split("-")
+    canonical = [parts[0].lower()]
+    for part in parts[1:]:
+        if len(part) == 4 and part.isalpha():
+            canonical.append(part.title())
+        elif (len(part) == 2 and part.isalpha()) or (len(part) == 3 and part.isdigit()):
+            canonical.append(part.upper())
+        else:
+            canonical.append(part.lower())
+    return "-".join(canonical)
+
+
+class TranslationUpsert(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    summary: str | None = Field(default=None, max_length=5000)
+
+    @field_validator("title", "summary", mode="before")
+    @classmethod
+    def normalize_nfc(cls, v: str | None) -> str | None:
+        if isinstance(v, str):
+            v = v.strip()
+        return _nfc(v)
+
+
+class TranslationResponse(BaseModel):
+    record_id: uuid.UUID
+    language: str
+    title: str
+    summary: str | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TranslationListResponse(BaseModel):
+    translations: list[TranslationResponse]
+    total: int
+
+
+class ContactCreate(BaseModel):
+    role: str = Field(
+        max_length=30, description="ISO CI_RoleCode, e.g. pointOfContact, author"
+    )
+    name: str | None = Field(default=None, max_length=500)
+    email: EmailStr | None = None
+    organization: str | None = Field(default=None, max_length=500)
+
+    @field_validator("name", "organization", mode="before")
+    @classmethod
+    def normalize_nfc(cls, v: str | None) -> str | None:
+        return _nfc(v)
+
+    phone: str | None = Field(default=None, max_length=50)
+    extra_json: dict[str, Any] | None = Field(
+        default=None, description="Arbitrary extra fields stored as JSON"
+    )
+    sort_order: int = Field(
+        default=0, ge=0, le=9999, description="Display ordering (lower first)"
+    )
+
+
+class ContactUpdate(BaseModel):
+    role: str | None = Field(default=None, max_length=30)
+    name: str | None = Field(default=None, max_length=500)
+    email: EmailStr | None = None
+    organization: str | None = Field(default=None, max_length=500)
+    phone: str | None = Field(default=None, max_length=50)
+    extra_json: dict[str, Any] | None = None
+    sort_order: int | None = Field(default=None, ge=0, le=9999)
+
+    @field_validator("name", "organization", mode="before")
+    @classmethod
+    def normalize_nfc(cls, v: str | None) -> str | None:
+        return _nfc(v)
+
+    @model_validator(mode="after")
+    def _reject_null_required(self) -> "ContactUpdate":
+        # PATCH follows the dataset update contract: an explicitly set null
+        # clears the field. `role` is NOT NULL in the model, so an explicit
+        # null there is a 422, not a silent drop.
+        for field in ("role", "sort_order"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be cleared to null")
+        return self
+
+
+class ContactResponse(BaseModel):
+    id: uuid.UUID
+    record_id: uuid.UUID
+    role: str
+    name: str | None
+    email: str | None
+    organization: str | None
+    phone: str | None
+    extra_json: dict[str, Any] | None
+    sort_order: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ContactListResponse(BaseModel):
+    contacts: list[ContactResponse]
+    total: int
+
+
+class KeywordCreate(BaseModel):
+    keyword: str = Field(max_length=500)
+    vocabulary_uri: str | None = Field(
+        default=None, max_length=2048, description="URI of the controlled vocabulary"
+    )
+    keyword_type: str = Field(
+        default="theme",
+        max_length=20,
+        description="ISO MD_KeywordTypeCode, e.g. theme, place, discipline",
+    )
+
+    @field_validator("keyword", mode="before")
+    @classmethod
+    def normalize_nfc(cls, v: str | None) -> str | None:
+        return _nfc(v)
+
+
+class KeywordResponse(BaseModel):
+    id: uuid.UUID
+    record_id: uuid.UUID
+    keyword: str
+    vocabulary_uri: str | None
+    keyword_type: str
+    inherited: bool = Field(
+        default=False,
+        description=(
+            "True when this keyword also exists on the dataset this record was "
+            "derived from. Derived at read time from derived_from; "
+            "only ever true for a requester who can access that source dataset, "
+            "so everyone else sees false — matching the derived_from redaction."
+        ),
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class KeywordListResponse(BaseModel):
+    keywords: list[KeywordResponse]
+    total: int
+    inherited_audience_gap: bool = Field(
+        default=False,
+        description=(
+            "True when at least one keyword is inherited AND this record's "
+            "audience — at its stored state, or at the counterfactual "
+            "audience_visibility/audience_record_status query parameters, "
+            "which are honored only for the record's owner and admins — "
+            "includes someone who cannot open the source dataset."
+        ),
+    )
+
+
+class DistributionCreate(BaseModel):
+    distribution_type: str = Field(
+        max_length=30, description="e.g. download, api, ogc_wms, ogc_wfs"
+    )
+    format: str = Field(
+        max_length=50,
+        description="File or service format, e.g. GeoJSON, SHP, WMS",
+    )
+    url: str = Field(max_length=2048, description="Access URL for this distribution")
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str) -> str:
+        """Validate HTTP/HTTPS URL format. Returns str so downstream code is unchanged."""
+        HttpUrl(v)
+        return v
+
+    title: str | None = Field(default=None, max_length=500)
+    description: str | None = Field(default=None, max_length=2000)
+    protocol: str | None = Field(
+        default=None,
+        max_length=100,
+        description="Transfer protocol, e.g. HTTPS, OGC:WFS",
+    )
+    media_type: str | None = Field(
+        default=None,
+        max_length=100,
+        description="IANA media type, e.g. application/geo+json",
+    )
+    is_primary: bool = Field(
+        default=False, description="Mark as the preferred distribution"
+    )
+
+    @field_validator("title", "description", mode="before")
+    @classmethod
+    def normalize_nfc(cls, v: str | None) -> str | None:
+        return _nfc(v)
+
+
+class DistributionUpdate(BaseModel):
+    distribution_type: str | None = Field(default=None, max_length=30)
+    format: str | None = Field(default=None, max_length=50)
+    url: str | None = Field(default=None, max_length=2048)
+    title: str | None = Field(default=None, max_length=500)
+    description: str | None = Field(default=None, max_length=2000)
+    protocol: str | None = Field(default=None, max_length=100)
+    media_type: str | None = Field(default=None, max_length=100)
+    is_primary: bool | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, v: str | None) -> str | None:
+        # Same HTTP(S) validation as the create path; otherwise javascript:
+        # or file:// strings could re-enter the DCAT/STAC feeds as
+        # accessURL/downloadURL.
+        if v is not None:
+            HttpUrl(v)
+        return v
+
+    @field_validator("title", "description", mode="before")
+    @classmethod
+    def normalize_nfc(cls, v: str | None) -> str | None:
+        return _nfc(v)
+
+    @model_validator(mode="after")
+    def _reject_null_required(self) -> "DistributionUpdate":
+        # Explicit null clears optional fields (dataset update contract);
+        # the NOT NULL trio must 422 instead of silently dropping the null.
+        for field in ("distribution_type", "format", "url", "is_primary"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be cleared to null")
+        return self
+
+
+class DistributionResponse(BaseModel):
+    id: uuid.UUID
+    record_id: uuid.UUID
+    distribution_type: str
+    format: str | None
+    url: str
+    title: str | None
+    description: str | None
+    protocol: str | None
+    media_type: str | None
+    is_primary: bool
+    auto_generated: bool = Field(
+        description="True if created automatically by the system"
+    )
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DistributionListResponse(BaseModel):
+    distributions: list[DistributionResponse]
+    total: int

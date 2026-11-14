@@ -1,0 +1,130 @@
+"""Structured ingest-warning producer contract for ``IngestJob.user_metadata['warnings']``.
+
+These TypedDicts pin the producer side so mypy catches a malformed ``kind``
+or ``details`` shape at the call site rather than at client deserialize
+time. Matching Pydantic models live in ``app.jobs.schemas``, validated by
+the router before ``JobStatusResponse`` goes out.
+"""
+
+from typing import Literal, NotRequired, TypedDict
+
+
+class ReservedRenameDetail(TypedDict):
+    original: str
+    renamed: str
+
+
+class ReservedRenameWarning(TypedDict):
+    kind: Literal["reserved_rename"]
+    details: list[ReservedRenameDetail]
+
+
+class DbfTruncationDetail(TypedDict):
+    truncated: str
+    originals: list[str]
+
+
+class DbfTruncationCollisionWarning(TypedDict):
+    kind: Literal["dbf_truncation_collision"]
+    details: list[DbfTruncationDetail]
+
+
+class MercatorClipDetail(TypedDict):
+    dropped_features: int
+    clipped_features: int
+    # True when the clip was skipped because the safe envelope
+    # degenerates under ST_Transform into the source CRS (e.g. EPSG:4807
+    # collapses to a line). Counts are 0/0 then; warn so it isn't silent.
+    clip_skipped: NotRequired[bool]
+    polar_only: NotRequired[bool]
+
+
+class MercatorClipWarning(TypedDict):
+    kind: Literal["mercator_clip"]
+    details: MercatorClipDetail
+
+
+class MercatorClipCounts(TypedDict):
+    """Return shape of ``clip_to_mercator_bounds``.
+
+    ``shifted_longitudes``: source was 0..360, translated to -180..180
+    before the clip ran. ``clip_skipped``: clip didn't run
+    because the safe envelope degenerated in the source CRS; the
+    longitude shift was still applied. ``polar_only``: the clip trimmed
+    geometry and none of it lay outside longitude ±180° or latitude ±90° in
+    EPSG:4326, so the source itself is not at fault; omitted otherwise.
+    """
+
+    shifted_longitudes: bool
+    dropped_features: int
+    clipped_features: int
+    clip_skipped: NotRequired[bool]
+    polar_only: NotRequired[bool]
+
+
+IngestJobWarning = (
+    ReservedRenameWarning | DbfTruncationCollisionWarning | MercatorClipWarning
+)
+
+
+def make_reserved_rename_warning(
+    renames: list[dict],
+) -> ReservedRenameWarning:
+    """Build a ``reserved_rename`` warning from ``rename_reserved_columns`` output."""
+    return ReservedRenameWarning(
+        kind="reserved_rename",
+        details=[
+            ReservedRenameDetail(
+                original=str(r.get("original", "")),
+                renamed=str(r.get("renamed", "")),
+            )
+            for r in renames
+        ],
+    )
+
+
+def make_dbf_truncation_warning(
+    collisions: list[dict],
+) -> DbfTruncationCollisionWarning:
+    """Build a ``dbf_truncation_collision`` warning from the detector output."""
+    return DbfTruncationCollisionWarning(
+        kind="dbf_truncation_collision",
+        details=[
+            DbfTruncationDetail(
+                truncated=str(c.get("truncated", "")),
+                originals=[str(o) for o in c.get("originals", [])],
+            )
+            for c in collisions
+        ],
+    )
+
+
+def make_mercator_clip_warning(
+    clip: MercatorClipCounts | None,
+) -> MercatorClipWarning | None:
+    """Build a ``mercator_clip`` warning, or None when no geometry was lost.
+
+    The Web Mercator clamp can silently empty geometry (a point at lat -89.95
+    becomes ``MULTIPOINT EMPTY``); this makes that visible. Any shape other
+    than the counts dict yields None rather than a malformed warning.
+    """
+    if not isinstance(clip, dict):
+        return None
+    dropped = clip.get("dropped_features")
+    clipped = clip.get("clipped_features")
+    if not isinstance(dropped, int) or not isinstance(clipped, int):
+        return None
+    # A skipped clip lost no data, but the dataset now carries geometry the
+    # Mercator clamp never inspected.
+    skipped = clip.get("clip_skipped") is True
+    if dropped <= 0 and clipped <= 0 and not skipped:
+        return None
+    details = MercatorClipDetail(
+        dropped_features=max(dropped, 0),
+        clipped_features=max(clipped, 0),
+    )
+    if skipped:
+        details["clip_skipped"] = True
+    if clip.get("polar_only"):
+        details["polar_only"] = True
+    return MercatorClipWarning(kind="mercator_clip", details=details)

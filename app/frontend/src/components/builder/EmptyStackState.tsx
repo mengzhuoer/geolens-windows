@@ -1,0 +1,289 @@
+import { useId, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useQuery } from '@tanstack/react-query';
+import { Check, Loader2, MapPin, Plus, Search } from 'lucide-react';
+import { getDataset } from '@/api/datasets';
+import { queryKeys } from '@/lib/query-keys';
+import { cn } from '@/lib/utils';
+import { SUGGESTED_DATASETS, type SuggestedDataset } from './suggested-datasets';
+
+interface EmptyStackStateProps {
+  onOpenAddData: (initialQuery?: string) => void;
+  onAddDataset: (datasetId: string) => void;
+}
+
+// Shared eyebrow class string — single source of truth for 10px uppercase label
+// imported by UnifiedStackPanel for the basemap-dock BASEMAP eyebrow label
+export const eyebrowClassName = 'block text-2xs font-semibold tracking-wide text-muted-foreground uppercase px-1';
+
+function formatCompactNumber(n: number, locale: string): string {
+  return new Intl.NumberFormat(locale, {
+    notation: 'compact',
+    maximumFractionDigits: n >= 1_000_000 ? 1 : 0,
+  }).format(n);
+}
+
+function isRasterType(recordType: SuggestedDataset['record_type']): boolean {
+  return recordType === 'raster_dataset' || recordType === 'vrt_dataset';
+}
+
+interface SuggestCardProps {
+  suggestion: SuggestedDataset;
+  onOpenAddData: (initialQuery?: string) => void;
+  addingId: string | null;
+  addedIds: Set<string>;
+  onDirectAdd: (id: string) => void;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function SuggestCard({ suggestion, onOpenAddData, addingId, addedIds, onDirectAdd }: SuggestCardProps) {
+  const { t, i18n } = useTranslation('builder');
+  const idIsRealUuid = UUID_RE.test(suggestion.id);
+  const { isError } = useQuery({
+    queryKey: queryKeys.datasets.detail(suggestion.id),
+    queryFn: () => getDataset(suggestion.id),
+    staleTime: 60_000,
+    retry: false,
+    enabled: idIsRealUuid,
+  });
+
+  // Hide cards whose ID is a placeholder or whose fetch errored.
+  if (!idIsRealUuid) return null;
+  if (isError) return null;
+  // While loading the first time (no data yet) hide only if explicitly errored;
+  // if data is undefined but not errored, show optimistically. Cards that
+  // actually 404 set isError=true, so this is the correct guard.
+
+  const isAdding = addingId === suggestion.id;
+  const isAdded = addedIds.has(suggestion.id);
+
+  const metaParts = [
+    isRasterType(suggestion.record_type)
+      ? t('search.raster', { defaultValue: 'Raster' })
+      : t('search.vector', { defaultValue: 'Vector' }),
+    suggestion.feature_count != null
+      ? formatCompactNumber(suggestion.feature_count, i18n.resolvedLanguage ?? i18n.language)
+      : null,
+    suggestion.crs,
+  ].filter(Boolean);
+  const metaString = metaParts.join(' · ');
+
+  const isRaster = isRasterType(suggestion.record_type);
+
+  return (
+    <li>
+      <div
+        className={cn(
+          'grid gap-2 items-center p-2 px-3 rounded-md border',
+          'bg-[var(--surface-0)] hover:bg-[var(--surface-2)] hover:border-primary/30 hover:shadow-sm',
+          'transition-colors',
+          isAdding && 'pointer-events-none opacity-70',
+        )}
+        style={{ gridTemplateColumns: '32px 1fr 22px' }}
+      >
+        {/* Type icon */}
+        <button
+          type="button"
+          aria-label={t('unifiedStack.openSuggestion', {
+            name: suggestion.name,
+            defaultValue: 'Open {{name}} in Add Data modal',
+          })}
+          onClick={() => onOpenAddData(suggestion.name)}
+          className="flex items-center justify-center h-[32px] w-[32px] rounded-sm text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          style={{
+            backgroundColor: isRaster ? 'var(--type-raster-bg)' : 'var(--type-vector-bg)',
+            color: isRaster ? 'var(--type-raster)' : 'var(--type-vector)',
+          }}
+          tabIndex={-1}
+          aria-hidden="true"
+        >
+          <span className="text-2xs font-medium select-none">
+            {isRaster ? '▦' : '⬡'}
+          </span>
+        </button>
+
+        {/* Name + meta — card body click area */}
+        <button
+          type="button"
+          aria-label={t('unifiedStack.openSuggestion', {
+            name: suggestion.name,
+            defaultValue: 'Open {{name}} in Add Data modal',
+          })}
+          onClick={() => onOpenAddData(suggestion.name)}
+          className="min-w-0 text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
+        >
+          <span className="block text-sm truncate">{suggestion.name}</span>
+          {metaString && (
+            <span className="block text-2xs text-muted-foreground truncate">{metaString}</span>
+          )}
+        </button>
+
+        {/* Add button */}
+        <button
+          type="button"
+          aria-label={t('unifiedStack.addSuggestion', {
+            name: suggestion.name,
+            defaultValue: 'Add {{name}} to map',
+          })}
+          aria-busy={isAdding}
+          onClick={(e) => {
+            e.stopPropagation();
+            onDirectAdd(suggestion.id);
+          }}
+          className="h-[22px] w-[22px] flex items-center justify-center rounded-sm text-primary hover:bg-primary-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {isAdding ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          ) : isAdded ? (
+            <Check className="h-3.5 w-3.5" aria-hidden="true" />
+          ) : (
+            <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+          )}
+        </button>
+      </div>
+    </li>
+  );
+}
+
+export function EmptyStackState({ onOpenAddData, onAddDataset }: EmptyStackStateProps) {
+  const { t } = useTranslation('builder');
+  const searchHintId = useId();
+  const [inlineQuery, setInlineQuery] = useState('');
+  const [addingId, setAddingId] = useState<string | null>(null);
+  const [addedIds, setAddedIds] = useState<Set<string>>(() => new Set());
+
+  function handleSearchKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter') {
+      // Read from the DOM target rather than the React state closure: under
+      // Playwright the keydown can fire before React reconciles the prior
+      // change event, so the closure-captured `inlineQuery` may still be ''.
+      const value = e.currentTarget.value.trim();
+      if (value) {
+        // preventDefault prevents the synthesized keyup → click on whatever
+        // element Radix Dialog autofocuses (the close X when the lazy panel
+        // is still suspending), which would close the modal we just opened.
+        e.preventDefault();
+        onOpenAddData(value);
+      }
+    }
+    if (e.key === 'Escape') {
+      setInlineQuery('');
+    }
+  }
+
+  async function handleDirectAdd(datasetId: string) {
+    setAddingId(datasetId);
+    try {
+      await Promise.resolve(onAddDataset(datasetId));
+      setAddedIds((prev) => new Set(prev).add(datasetId));
+    } finally {
+      setAddingId(null);
+    }
+  }
+
+  return (
+    <div
+      role="region"
+      aria-label={t('unifiedStack.emptyRegionLabel', { defaultValue: 'No layers — get started' })}
+      className="flex flex-col gap-4 p-4 pb-2"
+    >
+      {/* Prompt */}
+      <div className="text-center">
+        {/* The heading level follows the builder's <h1> outline (an <h4> would
+            skip h2/h3). */}
+        <h2 className="text-sm font-semibold">
+          {t('unifiedStack.emptyHeading', { defaultValue: 'Add your first layer' })}
+        </h2>
+        <p className="text-xs text-muted-foreground mt-1">
+          {/* Stock installs ship SUGGESTED_DATASETS=[] — the copy must
+              not point at a starter list (or an Upload button) that isn't there. */}
+          {t('unifiedStack.emptyBody', { defaultValue: 'Search the catalog to find datasets for your map.' })}
+        </p>
+      </div>
+
+      {/* Inline search */}
+      <div
+        className={cn(
+          'flex items-center gap-2 rounded-md border',
+          'bg-[var(--surface-2)] px-3',
+          'focus-within:border-primary',
+          'transition-colors duration-[--motion-fast]',
+        )}
+        style={{ height: '36px' }}
+      >
+        <button
+          type="button"
+          aria-label={t('unifiedStack.emptySearchButton', { defaultValue: 'Search and open Add Data modal' })}
+          onClick={() => {
+            if (inlineQuery.trim()) {
+              onOpenAddData(inlineQuery.trim());
+            }
+          }}
+          className="flex items-center justify-center text-muted-foreground hover:text-foreground focus-visible:outline-none transition-colors duration-[--motion-fast]"
+        >
+          <Search className="h-4 w-4" aria-hidden="true" />
+        </button>
+        <input
+          // type="search" gives the searchbox role natively plus the browser's
+          // built-in Escape-clear. The manual Escape handler stays for engines
+          // (and jsdom) without native clear.
+          type="search"
+          aria-label={t('unifiedStack.emptySearchInput', { defaultValue: 'Search datasets to add' })}
+          placeholder={t('unifiedStack.emptySearchPlaceholder', { defaultValue: 'Search datasets, URLs, or files…' })}
+          value={inlineQuery}
+          onChange={(e) => setInlineQuery(e.target.value)}
+          onKeyDown={handleSearchKeyDown}
+          aria-describedby={searchHintId}
+          className="flex-1 bg-transparent border-0 outline-none text-sm"
+        />
+      </div>
+      <p id={searchHintId} className="px-1 text-xs text-muted-foreground">
+        {t('unifiedStack.emptySearchHint', { defaultValue: 'Press Enter to search' })}
+      </p>
+
+      {/* Suggested section — or starter-help fallback when SUGGESTED_DATASETS is empty */}
+      {SUGGESTED_DATASETS.length > 0 ? (
+        <div className="flex flex-col gap-2">
+          <span
+            aria-hidden="true"
+            className={eyebrowClassName}
+          >
+            {t('unifiedStack.suggestedLabel', { defaultValue: 'SUGGESTED' })}
+          </span>
+          <ul aria-label={t('unifiedStack.suggestedListLabel', { defaultValue: 'Suggested datasets' })} className="flex flex-col gap-2">
+            {SUGGESTED_DATASETS.map((suggestion) => (
+              <SuggestCard
+                key={suggestion.id}
+                suggestion={suggestion}
+                onOpenAddData={onOpenAddData}
+                addingId={addingId}
+                addedIds={addedIds}
+                onDirectAdd={handleDirectAdd}
+              />
+            ))}
+          </ul>
+        </div>
+      ) : (
+        <div className="flex flex-col items-center gap-3 px-4 py-4 text-center">
+          <MapPin className="h-8 w-8 text-muted-foreground" aria-hidden="true" />
+          <p className="text-sm text-muted-foreground">
+            {/* Name the control that actually exists on this surface —
+                the header's "Add data" button — not the modal-internal Upload. */}
+            {t('unifiedStack.emptyHelpBody', { defaultValue: 'Search the catalog to find datasets, or use the Add data button to add your own.' })}
+          </p>
+        </div>
+      )}
+
+      {/* Browse all */}
+      <button
+        type="button"
+        aria-label={t('unifiedStack.browseAllLabel', { defaultValue: 'Browse all datasets in the Add Data modal' })}
+        onClick={() => onOpenAddData()}
+        className="text-xs text-primary self-start hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
+      >
+        {t('unifiedStack.browseAll', { defaultValue: 'Browse all datasets →' })}
+      </button>
+    </div>
+  );
+}

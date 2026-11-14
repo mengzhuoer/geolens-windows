@@ -1,0 +1,213 @@
+"""Migration round-trip + ORM drift-gate regression for email verification.
+
+Verifies the 0009_email_verification migration is reversible (downgrade is a NO-OP
+per the 0008 precedent) and leaves the schema in the exact state the ORM expects
+(no alembic check drift after upgrade).
+
+Tests
+-----
+A: upgrade head → downgrade -1 → upgrade head all exit 0 (reversibility)
+B: after upgrade head, catalog.users has email_verified column (NOT NULL boolean)
+C: after upgrade head, catalog.email_verification_tokens table exists
+D: alembic check reports no drift after upgrade (ORM-declared columns/table)
+
+Notes
+-----
+- These tests shell out to ``alembic`` via subprocess so they exercise the real
+  alembic.ini / env.py stack (the same path CI uses).
+- Run against the per-worker test DB (POSTGRES_DB set to postgres_db_test) so the
+  destructive downgrade/upgrade roundtrips never mutate the shared main DB.
+- DB-mutating alembic calls run sequentially (not in parallel) per project convention.
+- Run with: cd backend && set -a && source ../.env.test && set +a &&
+            uv run pytest tests/test_email_verification_migration.py -x -q
+"""
+
+import pytest
+from tests.alembic_helpers import (
+    enterprise_migrations_present,
+    fresh_query as _fresh_query,
+    run_alembic as _run_alembic,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_SKIP_UNDER_OVERLAY = pytest.mark.skipif(
+    enterprise_migrations_present(),
+    reason=(
+        "OSS migration drift gate; multi-head under enterprise overlay — "
+        "runs in the no-overlay Pytest Parallel Isolation job instead."
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Test A: alembic round-trip exits 0
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestMigrationRoundTripExitCodes:
+    """The migration chain round-trips with no subprocess errors.
+
+    NOTE: ``downgrade -1`` reverts the CURRENT head, not 0009 — the original
+    "downgrade is a NO-OP" premise went stale as new heads landed. The
+    downgrade test therefore restores head in a ``finally``: under xdist the
+    reupgrade test can be scheduled onto a DIFFERENT worker (own database), so
+    without the in-test restore this worker's DB stays one revision behind for
+    every later test — with a destructive head downgrade (e.g. 0025 drops
+    datasets.tile_cache_version) that poisons unrelated tests with
+    UndefinedColumnError.
+    """
+
+    def test_upgrade_head_exits_zero(self):
+        """alembic upgrade head exits 0 (idempotent — may already be at head)."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, (
+            f"alembic upgrade head failed (rc={r.returncode}):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+
+    def test_downgrade_minus_one_exits_zero(self):
+        """alembic downgrade -1 exits 0, then head is restored in-test."""
+        try:
+            r = _run_alembic("downgrade", "-1")
+            assert r.returncode == 0, (
+                f"alembic downgrade -1 failed (rc={r.returncode}):\n"
+                f"stdout: {r.stdout}\nstderr: {r.stderr}"
+            )
+        finally:
+            restore = _run_alembic("upgrade", "head")
+            assert restore.returncode == 0, (
+                f"alembic upgrade head (restore) failed (rc={restore.returncode}):\n"
+                f"stdout: {restore.stdout}\nstderr: {restore.stderr}"
+            )
+
+    def test_reupgrade_head_exits_zero(self):
+        """alembic upgrade head (re-apply) exits 0 after NO-OP downgrade."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, (
+            f"alembic upgrade head (re-apply) failed (rc={r.returncode}):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests B + C: DB state after upgrade head
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestMigrationSchemaState:
+    """Schema state reflects the 0009 migration correctly after upgrade head."""
+
+    async def test_email_verified_column_exists(self):
+        """catalog.users has email_verified (boolean, NOT NULL) after upgrade head."""
+        # Ensure we're at head.
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, f"upgrade head failed: {r.stderr}"
+
+        rows = await _fresh_query(
+            """
+            SELECT column_name, data_type, column_default, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'catalog'
+              AND table_name = 'users'
+              AND column_name = 'email_verified'
+            """
+        )
+        assert rows, "email_verified column missing from catalog.users after upgrade"
+        col = rows[0]
+        assert col[1] == "boolean", f"email_verified is {col[1]!r}, expected 'boolean'"
+        assert col[3] == "NO", "email_verified must be NOT NULL"
+
+    async def test_email_verified_server_default_false(self):
+        """email_verified server_default is 'false' (new users default to unverified)."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, f"upgrade head failed: {r.stderr}"
+
+        rows = await _fresh_query(
+            """
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'catalog'
+              AND table_name = 'users'
+              AND column_name = 'email_verified'
+            """
+        )
+        assert rows, "email_verified column missing"
+        default_val = rows[0][0]
+        assert default_val is not None, "email_verified has no server_default"
+        assert "false" in default_val.lower(), (
+            f"email_verified server_default is {default_val!r}, expected 'false'"
+        )
+
+    async def test_email_verification_tokens_table_exists(self):
+        """catalog.email_verification_tokens table exists after upgrade head."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, f"upgrade head failed: {r.stderr}"
+
+        rows = await _fresh_query(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'catalog'
+              AND table_name = 'email_verification_tokens'
+            """
+        )
+        assert rows, (
+            "catalog.email_verification_tokens table missing after upgrade head"
+        )
+
+    async def test_email_verification_tokens_columns(self):
+        """email_verification_tokens has all required columns."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, f"upgrade head failed: {r.stderr}"
+
+        rows = await _fresh_query(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'catalog'
+              AND table_name = 'email_verification_tokens'
+            ORDER BY column_name
+            """
+        )
+        cols = {row[0] for row in rows}
+        required = {
+            "id",
+            "user_id",
+            "token_hash",
+            "expires_at",
+            "consumed_at",
+            "created_at",
+        }
+        missing = required - cols
+        assert not missing, f"email_verification_tokens missing columns: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Test D: alembic check — ORM drift gate
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestAlembicCheckNoDrift:
+    """alembic check reports no drift after 0009 is applied."""
+
+    def test_alembic_check_no_drift(self):
+        """alembic check exits 0 and prints 'No new upgrade operations detected.'"""
+        # Ensure head first.
+        _run_alembic("upgrade", "head")
+
+        r = _run_alembic("check")
+        assert r.returncode == 0, (
+            f"alembic check exited {r.returncode} (drift detected):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        combined = r.stdout + r.stderr
+        assert "No new upgrade operations detected." in combined, (
+            f"Expected 'No new upgrade operations detected.' in check output.\n"
+            f"Got:\nstdout: {r.stdout}\nstderr: {r.stderr}"
+        )

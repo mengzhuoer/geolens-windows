@@ -1,0 +1,879 @@
+"""CRUD API endpoints for record sub-resources: contacts, keywords, distributions."""
+
+import uuid
+
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+
+from app.core.identity import Identity
+from app.core.tile_scope import republished_tile_url
+from app.modules.audit.service import AuditEvent, audit_emit
+from app.modules.auth.dependencies import get_optional_user, require_permission
+from app.modules.catalog.authorization import (
+    check_dataset_access_or_anonymous,
+    get_user_roles,
+    visible_derived_from,
+)
+from app.core.dependencies import get_db
+from app.modules.catalog.write_recheck import (
+    RECORD_WRITE_DENIED,
+    admit_writer,
+    recheck_record_write_access,
+)
+from app.platform.cache.tiles import invalidate_catalog_cache
+from app.platform.catalog_locks import lock_catalog_rows
+from app.platform.extensions import get_catalog_port
+from app.modules.catalog.datasets.domain.models import Dataset, Record
+from app.modules.catalog.records.schemas import (
+    ContactCreate,
+    ContactListResponse,
+    ContactResponse,
+    ContactUpdate,
+    DistributionCreate,
+    DistributionListResponse,
+    DistributionResponse,
+    DistributionUpdate,
+    KeywordCreate,
+    KeywordListResponse,
+    KeywordResponse,
+    TranslationListResponse,
+    TranslationResponse,
+    TranslationUpsert,
+    normalize_language_tag,
+)
+from app.modules.catalog.records.inherited import (
+    audience_exceeds_source,
+    inherited_keyword_keys,
+    resolve_inherited_source,
+)
+from app.modules.catalog.records.service import (
+    create_contact,
+    create_distribution,
+    count_contacts,
+    count_distributions,
+    count_keywords,
+    create_keyword,
+    delete_contact,
+    delete_distribution,
+    delete_keyword,
+    get_record,
+    list_contacts,
+    list_distributions,
+    list_keywords,
+    list_translations,
+    record_publication_version,
+    upsert_translation,
+    delete_translation,
+    update_contact,
+    update_distribution,
+)
+from app.standards.ogc.errors import ERROR_RESPONSES_WRITE, FORBIDDEN_RESPONSE
+
+logger = structlog.get_logger()
+
+router = APIRouter(prefix="/records", tags=["Records"], responses=ERROR_RESPONSES_WRITE)
+
+
+_LANGUAGE_PATH = Path(
+    ...,
+    min_length=2,
+    max_length=35,
+    pattern=r"^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$",
+    description="BCP 47 language tag, for example fr or pt-BR",
+)
+
+
+async def _touch_record(db: AsyncSession, record: Record, user: Identity) -> None:
+    """Take the record's catalog rows, re-check the writer, then stamp the parent
+    before child writes, in their transaction."""
+    # The parent before any child lock, as a cascading delete takes them.
+    await lock_catalog_rows(
+        db,
+        dataset_cls=Dataset,
+        record_cls=Record,
+        dataset_id=await db.scalar(
+            select(Dataset.id).where(Dataset.record_id == record.id)
+        ),
+        record_id=record.id,
+    )
+    await recheck_record_write_access(db, record.id)
+    # Force an UPDATE for the same actor; the trigger supplies monotonic wall time.
+    record.updated_at = func.now()
+    record.updated_by = user.id
+    await db.flush()
+
+
+async def _propagate_record_write(
+    record_id: uuid.UUID,
+    *,
+    reembed: bool,
+    db: AsyncSession | None = None,
+    user: Identity | None = None,
+    details: dict | None = None,
+) -> None:
+    """Keep downstream surfaces coherent after a record sub-resource write.
+
+    Busts the catalog cache and re-embeds on keyword change, like the
+    top-level metadata PATCH; best-effort, post-commit. When db/user/details
+    are passed, also emits a metadata.edit audit event against the backing
+    dataset, if there is one.
+    """
+    try:
+        await invalidate_catalog_cache()
+    except Exception:  # broad: cache bust is non-fatal; entries expire on TTL
+        logger.warning("record.write catalog-cache invalidation failed", exc_info=True)
+    if reembed:
+        try:
+            await get_catalog_port().defer_embed_record(record_id)
+        except Exception:  # broad: embedding catches up on next edit or backfill
+            logger.warning(
+                "record.write embed defer failed for %s", record_id, exc_info=True
+            )
+    if db is not None and user is not None and details is not None:
+        try:
+            dataset_id = (
+                await db.execute(
+                    select(Dataset.id).where(Dataset.record_id == record_id)
+                )
+            ).scalar_one_or_none()
+            if dataset_id is not None:
+                await audit_emit(
+                    db,
+                    AuditEvent(
+                        user_id=user.id,
+                        action="metadata.edit",
+                        resource_type="dataset",
+                        resource_id=dataset_id,
+                        details=details,
+                    ),
+                )
+                await db.commit()
+        except Exception:  # broad: audit is best-effort here; the write is committed
+            logger.warning(
+                "record.write audit emit failed for %s", record_id, exc_info=True
+            )
+
+
+async def _check_record_read_access(
+    db: AsyncSession,
+    record_id: uuid.UUID,
+    user: Identity | None,
+) -> None:
+    """Verify the record is visible to the caller. Raises 404 on denial.
+
+    Sub-resources carry the same visibility as the dataset they back, so this
+    delegates to the shared per-dataset RBAC. A bare `user is None` check
+    would let any authenticated user read a private record.
+    """
+    record = await get_record(db, record_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+        )
+
+    # Same guard as the dataset read endpoints.
+    dataset = (
+        (
+            await db.execute(
+                select(Dataset)
+                .options(joinedload(Dataset.record))
+                .where(Dataset.record_id == record_id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if dataset is not None:
+        try:
+            await check_dataset_access_or_anonymous(db, dataset, dataset.id, user)
+        except HTTPException:
+            # The record's own 404, so a backing dataset's existence doesn't leak.
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+            )
+        return
+
+    # Orphan record with no backing dataset (e.g. mid-ingest): only public +
+    # published is world-readable; otherwise owner or admin only.
+    if record.visibility == "public" and record.record_status == "published":
+        return
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+        )
+    if record.created_by == user.id:
+        return
+    if "admin" in await get_user_roles(db, user):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+    )
+
+
+async def _is_record_owner_or_admin(
+    db: AsyncSession, record: Record, user: Identity | None
+) -> bool:
+    """Return whether ``user`` owns ``record`` or is a global admin.
+
+    The non-raising twin of the predicate `_check_record_ownership` enforces
+    (and of `check_dataset_write_access` on the dataset side): creator match
+    on `created_by`, else the `admin` role. Read endpoints that branch on
+    ownership without rejecting the request use this.
+    """
+    if user is None:
+        return False
+    if record.created_by is not None and record.created_by == user.id:
+        return True
+    return "admin" in await get_user_roles(db, user)
+
+
+async def _check_record_ownership(
+    db: AsyncSession, record_id: uuid.UUID, user: Identity
+) -> Record:
+    """Verify the user owns the record or is an admin. Raises 404/403.
+
+    Returns the fetched Record so callers can reuse it without a second
+    query. Gates on read visibility first, so a record the caller can't see
+    404s (no existence leak) rather than 403.
+    """
+    await _check_record_read_access(db, record_id, user)
+    record = await get_record(db, record_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+        )
+    if record.created_by != user.id and "admin" not in await get_user_roles(db, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=RECORD_WRITE_DENIED
+        )
+    admit_writer(db, ("record", record_id), user)
+    return record
+
+
+@router.get(
+    "/{record_id}/translations/",
+    response_model=TranslationListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_translations_endpoint(
+    record_id: uuid.UUID,
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> TranslationListResponse:
+    """List localized title/summary variants visible with the parent record."""
+    await _check_record_read_access(db, record_id, user)
+    translations = await list_translations(db, record_id)
+    return TranslationListResponse(
+        translations=[TranslationResponse.model_validate(t) for t in translations],
+        total=len(translations),
+    )
+
+
+@router.put(
+    "/{record_id}/translations/{language}/",
+    response_model=TranslationResponse,
+)
+async def upsert_translation_endpoint(
+    record_id: uuid.UUID,
+    body: TranslationUpsert,
+    language: str = _LANGUAGE_PATH,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> TranslationResponse:
+    """Create or replace one localized title/summary variant."""
+    record = await _check_record_ownership(db, record_id, user)
+    normalized_language = normalize_language_tag(language)
+    await _touch_record(db, record, user)
+    try:
+        translation = await upsert_translation(
+            db,
+            record_id,
+            language=normalized_language,
+            title=body.title,
+            summary=body.summary,
+            record=record,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    await db.commit()
+    await db.refresh(translation)
+    await _propagate_record_write(
+        record_id,
+        reembed=True,
+        db=db,
+        user=user,
+        details={
+            "resource": "translation",
+            "op": "upsert",
+            "language": normalized_language,
+        },
+    )
+    return TranslationResponse.model_validate(translation)
+
+
+@router.delete(
+    "/{record_id}/translations/{language}/",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_translation_endpoint(
+    record_id: uuid.UUID,
+    language: str = _LANGUAGE_PATH,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Delete one localized title/summary variant."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        await delete_translation(db, record_id, normalize_language_tag(language))
+        await db.commit()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Record translation not found",
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=True,
+        db=db,
+        user=user,
+        details={
+            "resource": "translation",
+            "op": "delete",
+            "language": normalize_language_tag(language),
+        },
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{record_id}/contacts/",
+    response_model=ContactListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_contacts_endpoint(
+    record_id: uuid.UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> ContactListResponse:
+    """List all contacts for a record."""
+    await _check_record_read_access(db, record_id, user)
+    contacts, total = (
+        await list_contacts(db, record_id, skip=skip, limit=limit),
+        await count_contacts(db, record_id),
+    )
+    return ContactListResponse(
+        contacts=[ContactResponse.model_validate(c) for c in contacts],
+        total=total,
+    )
+
+
+@router.post(
+    "/{record_id}/contacts/",
+    response_model=ContactResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_contact_endpoint(
+    record_id: uuid.UUID,
+    body: ContactCreate,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> ContactResponse:
+    """Create a new contact for a record."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        contact = await create_contact(
+            db,
+            record_id,
+            role=body.role,
+            name=body.name,
+            email=body.email,
+            organization=body.organization,
+            phone=body.phone,
+            extra_json=body.extra_json,
+            sort_order=body.sort_order,
+            record=record,
+        )
+        await db.commit()
+        await db.refresh(contact)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+        )
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid contact data (check role value against ISO CI_RoleCode codelist)",
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=False,
+        db=db,
+        user=user,
+        details={"resource": "contact", "op": "create", "role": body.role},
+    )
+    return ContactResponse.model_validate(contact)
+
+
+@router.patch("/{record_id}/contacts/{contact_id}/", response_model=ContactResponse)
+async def update_contact_endpoint(
+    record_id: uuid.UUID,
+    contact_id: uuid.UUID,
+    body: ContactUpdate,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> ContactResponse:
+    """Update a contact."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        # exclude_unset, not exclude_none: an explicitly set null clears the
+        # field (the dataset contract); the schema already 422s nulls on
+        # non-clearable fields.
+        contact = await update_contact(
+            db, contact_id, record_id, **body.model_dump(exclude_unset=True)
+        )
+        await db.commit()
+        await db.refresh(contact)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found"
+        )
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid contact data (check role value against ISO CI_RoleCode codelist)",
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=False,
+        db=db,
+        user=user,
+        details={
+            "resource": "contact",
+            "op": "update",
+            "fields": sorted(body.model_fields_set),
+        },
+    )
+    return ContactResponse.model_validate(contact)
+
+
+@router.delete(
+    "/{record_id}/contacts/{contact_id}/", status_code=status.HTTP_204_NO_CONTENT
+)
+async def delete_contact_endpoint(
+    record_id: uuid.UUID,
+    contact_id: uuid.UUID,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Delete a contact."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        await delete_contact(db, contact_id, record_id)
+        await db.commit()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found"
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=False,
+        db=db,
+        user=user,
+        details={
+            "resource": "contact",
+            "op": "delete",
+            "contact_id": str(contact_id),
+        },
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{record_id}/keywords/",
+    response_model=KeywordListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_keywords_endpoint(
+    record_id: uuid.UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    audience_visibility: str | None = Query(
+        None,
+        pattern="^(private|restricted|internal|public)$",
+        description=(
+            "Compute inherited_audience_gap as if the record had this "
+            "visibility. Honored only for the record's owner and "
+            "admins; ignored for everyone else, who get the gap at the "
+            "record's stored state. Keywords themselves are unaffected."
+        ),
+    ),
+    audience_record_status: str | None = Query(
+        None,
+        max_length=30,
+        description=(
+            "Compute inherited_audience_gap as if the record had this status — "
+            "the counterfactual an owner asks before publishing. "
+            "Honored only for the record's owner and admins; ignored for "
+            "everyone else, who get the gap at the record's stored state. "
+            "Deliberately not pinned to an enum: the lifecycle statuses come "
+            "from the workflow extension's status_order(), so an overlay may "
+            "define its own. An unrecognized status is treated conservatively "
+            "(it reaches only the owner, which errs toward warning) rather "
+            "than rejected."
+        ),
+    ),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> KeywordListResponse:
+    """List all keywords for a record, marking analysis-inherited ones."""
+    await _check_record_read_access(db, record_id, user)
+    keywords, total = (
+        await list_keywords(db, record_id, skip=skip, limit=limit),
+        await count_keywords(db, record_id),
+    )
+
+    # Derive the inherited set from derived_from at read time. Gated like the
+    # derived_from reference itself: a requester who cannot access the source
+    # gets all-false flags, which cannot reveal "derived from something you
+    # cannot see".
+    inherited_keys: set[tuple[str, str | None, str]] = set()
+    audience_gap = False
+    record = await get_record(db, record_id)
+    if record is not None and record.derived_from:
+        user_roles = await get_user_roles(db, user) if user is not None else set()
+        visible = await visible_derived_from(db, record.derived_from, user, user_roles)
+        if visible is not None:
+            source = await resolve_inherited_source(db, record)
+            if source is not None:
+                inherited_keys = await inherited_keyword_keys(db, record, source)
+                if inherited_keys:
+                    dataset_id = (
+                        await db.execute(
+                            select(Dataset.id).where(Dataset.record_id == record_id)
+                        )
+                    ).scalar_one_or_none()
+                    # The counterfactual collapses the derived audience to "the
+                    # owner", which would make the gap an oracle for whether
+                    # that owner holds a grant on a restricted source. Honor
+                    # the overrides only for the owner (or an admin); otherwise
+                    # answer at stored state.
+                    counterfactual = await _is_record_owner_or_admin(db, record, user)
+                    audience_gap = await audience_exceeds_source(
+                        db,
+                        record=record,
+                        dataset_id=dataset_id,
+                        source=source,
+                        visibility=audience_visibility if counterfactual else None,
+                        record_status=(
+                            audience_record_status if counterfactual else None
+                        ),
+                    )
+
+    def _to_response(k) -> KeywordResponse:
+        resp = KeywordResponse.model_validate(k)
+        resp.inherited = (k.keyword, k.vocabulary_uri, k.keyword_type) in inherited_keys
+        return resp
+
+    return KeywordListResponse(
+        keywords=[_to_response(k) for k in keywords],
+        total=total,
+        inherited_audience_gap=audience_gap,
+    )
+
+
+@router.post(
+    "/{record_id}/keywords/",
+    response_model=KeywordResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_keyword_endpoint(
+    record_id: uuid.UUID,
+    body: KeywordCreate,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> KeywordResponse:
+    """Create a new keyword for a record."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        kw = await create_keyword(
+            db,
+            record_id,
+            keyword=body.keyword,
+            vocabulary_uri=body.vocabulary_uri,
+            keyword_type=body.keyword_type,
+            record=record,
+        )
+        await db.commit()
+        await db.refresh(kw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+        )
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Duplicate keyword for this record",
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=True,
+        db=db,
+        user=user,
+        details={"resource": "keyword", "op": "create", "keyword": body.keyword},
+    )
+    return KeywordResponse.model_validate(kw)
+
+
+@router.delete(
+    "/{record_id}/keywords/{keyword_id}/", status_code=status.HTTP_204_NO_CONTENT
+)
+async def delete_keyword_endpoint(
+    record_id: uuid.UUID,
+    keyword_id: uuid.UUID,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Delete a keyword."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        await delete_keyword(db, keyword_id, record_id)
+        await db.commit()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Keyword not found"
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=True,
+        db=db,
+        user=user,
+        details={
+            "resource": "keyword",
+            "op": "delete",
+            "keyword_id": str(keyword_id),
+        },
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{record_id}/distributions/",
+    response_model=DistributionListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_distributions_endpoint(
+    record_id: uuid.UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> DistributionListResponse:
+    """List all distributions for a record."""
+    await _check_record_read_access(db, record_id, user)
+    distributions, total = (
+        await list_distributions(db, record_id, skip=skip, limit=limit),
+        await count_distributions(db, record_id),
+    )
+    # The Connect panel copies the vector template from this endpoint, so
+    # republish it at the dataset's counter like every feed does.
+    counter = await record_publication_version(db, record_id)
+    return DistributionListResponse(
+        distributions=[
+            DistributionResponse.model_validate(d).model_copy(
+                update={"url": republished_tile_url(d.url, counter)}
+            )
+            for d in distributions
+        ],
+        total=total,
+    )
+
+
+# Reachable only from concurrent writes to one record's primary flag: the
+# service demotes the incumbent first, so a lone caller never gets here, and a
+# retry succeeds because the winner is settled by then.
+_PRIMARY_CONFLICT_DETAIL = "Another distribution was concurrently marked primary; retry"
+
+
+def _distribution_conflict_detail(exc: IntegrityError) -> str:
+    """Name the unique index the write actually hit.
+
+    ``uq_record_distribution_primary`` allows one primary row per record, and
+    "same record, type, and format" would send a caller who tripped it hunting
+    for a duplicate that does not exist.
+    """
+    if "uq_record_distribution_primary" in str(getattr(exc, "orig", exc)):
+        return _PRIMARY_CONFLICT_DETAIL
+    return "Duplicate distribution (same record, type, and format)"
+
+
+@router.post(
+    "/{record_id}/distributions/",
+    response_model=DistributionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_distribution_endpoint(
+    record_id: uuid.UUID,
+    body: DistributionCreate,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> DistributionResponse:
+    """Create a manual distribution for a record."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        dist = await create_distribution(
+            db,
+            record_id,
+            distribution_type=body.distribution_type,
+            format=body.format,
+            url=body.url,
+            title=body.title,
+            description=body.description,
+            protocol=body.protocol,
+            media_type=body.media_type,
+            is_primary=body.is_primary,
+            record=record,
+        )
+        await db.commit()
+        await db.refresh(dist)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Record not found"
+        )
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_distribution_conflict_detail(exc),
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=False,
+        db=db,
+        user=user,
+        details={
+            "resource": "distribution",
+            "op": "create",
+            "distribution_type": body.distribution_type,
+        },
+    )
+    return DistributionResponse.model_validate(dist)
+
+
+@router.patch(
+    "/{record_id}/distributions/{distribution_id}/",
+    response_model=DistributionResponse,
+)
+async def update_distribution_endpoint(
+    record_id: uuid.UUID,
+    distribution_id: uuid.UUID,
+    body: DistributionUpdate,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> DistributionResponse:
+    """Update a distribution (manual only; auto-generated distributions are immutable)."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        # exclude_unset, not exclude_none — see update_contact.
+        dist = await update_distribution(
+            db, distribution_id, record_id, **body.model_dump(exclude_unset=True)
+        )
+        await db.commit()
+        await db.refresh(dist)
+    except ValueError as e:
+        if "auto-generated" in str(e).lower():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot update auto-generated distributions",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Distribution not found"
+        )
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_distribution_conflict_detail(exc),
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=False,
+        db=db,
+        user=user,
+        details={
+            "resource": "distribution",
+            "op": "update",
+            "fields": sorted(body.model_fields_set),
+        },
+    )
+    return DistributionResponse.model_validate(dist)
+
+
+@router.delete(
+    "/{record_id}/distributions/{distribution_id}/",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_distribution_endpoint(
+    record_id: uuid.UUID,
+    distribution_id: uuid.UUID,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Delete a distribution (manual only; auto-generated distributions are immutable)."""
+    record = await _check_record_ownership(db, record_id, user)
+    try:
+        await _touch_record(db, record, user)
+        await delete_distribution(db, distribution_id, record_id)
+        await db.commit()
+    except ValueError as e:
+        if "auto-generated" in str(e).lower():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete auto-generated distributions",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Distribution not found"
+        )
+    except IntegrityError:
+        # Deleting the primary hands the flag back to the generated default,
+        # and a write that claimed it concurrently gets there first. No other
+        # constraint on this table is reachable from a delete, so the detail
+        # is stated rather than sniffed. A retry succeeds: the flag is spoken
+        # for by then and the restore is skipped. 409, not the 500 an uncaught
+        # IntegrityError would produce.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_PRIMARY_CONFLICT_DETAIL,
+        )
+    await _propagate_record_write(
+        record_id,
+        reembed=False,
+        db=db,
+        user=user,
+        details={
+            "resource": "distribution",
+            "op": "delete",
+            "distribution_id": str(distribution_id),
+        },
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

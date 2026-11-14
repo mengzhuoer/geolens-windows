@@ -1,0 +1,688 @@
+"""Admin schemas for user management endpoints."""
+
+import uuid
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+from app.core.text import normalize_nfc
+from app.modules.auth.schemas import VALID_ROLES, UserResponse, validate_future_expiry
+from app.processing.ai.schemas import AIProbeReport
+
+
+# Mirror the CHECK constraint on IngestJob.status — see jobs/models.py
+JobStatus = Literal[
+    "pending", "running", "complete", "failed", "cancelled", "fanned_out"
+]
+
+# Outer half of a two-layer allowlist (inner: USER_SORT_COLUMNS in service.py) —
+# FastAPI 422s anything outside it, so no caller string reaches ORDER BY.
+# Excludes roles (many-to-many) and storage (computed per page), neither orderable.
+UserSortField = Literal["username", "email", "status", "last_login_at", "created_at"]
+
+# Same two-layer allowlist shape as UserSortField (inner: _job_sort_columns() in
+# service.py). `duration` orders by completed_at - started_at, NULL for jobs whose
+# Duration cell renders "-"; retry affordance is computed per page, not orderable.
+JobSortField = Literal[
+    "created_at", "source_filename", "status", "username", "duration"
+]
+
+# Inner half: _share_token_ordering() in catalog/maps/service_public.py.
+# Link status is absent — derived in Python from is_active + expires_at vs
+# now(), so ordering it would need a CASE the listing does not have.
+ShareTokenSortField = Literal[
+    "map_name", "created_at", "creator", "expires_at", "embed_token_count"
+]
+
+SortDirection = Literal["asc", "desc"]
+
+
+# Password-policy wiring for every admin schema that accepts a password; the
+# rules live in auth/password_policy.py.
+def _enforce_password_policy(value: str) -> str:
+    """Enforce the application password policy."""
+    from app.modules.auth.password_policy import validate_password_from_settings  # noqa: PLC0415
+
+    validate_password_from_settings(value)
+    return value
+
+
+class AdminUserCreate(BaseModel):
+    username: str = Field(
+        min_length=3,
+        max_length=150,
+        description="Login username (3-150 chars). Must be unique across the system.",
+    )
+    password: str = Field(
+        min_length=8,
+        max_length=256,
+        # min_length=8 is a fast-fail floor; the real policy (PASSWORD_MIN_LENGTH /
+        # PASSWORD_REQUIRE_CLASSES) is enforced by validate_password below.
+        description=(
+            "Initial password (policy: min 12 chars, 3+ character classes, "
+            "at most 72 bytes UTF-8). "
+            "The user can change this after first login."
+        ),
+    )
+    email: EmailStr | None = Field(
+        default=None,
+        max_length=255,
+        description="Optional email address. Used for OAuth account linking and notifications.",
+    )
+    role: str = Field(
+        default="viewer",
+        description="User role: 'admin', 'editor', or 'viewer'. Defaults to 'viewer'.",
+    )
+
+    validate_password = field_validator("password", mode="after")(
+        _enforce_password_policy
+    )
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in VALID_ROLES:
+            raise ValueError(f"Role must be one of: {', '.join(sorted(VALID_ROLES))}")
+        return v
+
+
+class ApproveRequest(BaseModel):
+    role: str = Field(
+        max_length=50,
+        description="Role to assign to the approved user: 'admin', 'editor', or 'viewer'.",
+    )
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        if v not in VALID_ROLES:
+            raise ValueError(f"Role must be one of: {', '.join(sorted(VALID_ROLES))}")
+        return v
+
+
+class UserUpdate(BaseModel):
+    email: EmailStr | None = Field(
+        default=None,
+        description=(
+            "New email address. Set to update, send null or an empty string to "
+            "clear it, omit to leave unchanged."
+        ),
+    )
+    is_active: bool | None = Field(
+        default=None,
+        description=(
+            "Legacy account-state toggle. False maps to 'deactivated' and true "
+            "maps to 'active'. Prefer the explicit status field."
+        ),
+    )
+    status: Literal["active", "suspended", "deactivated"] | None = Field(
+        default=None,
+        description=(
+            "Explicit account lifecycle state. Pending registrations must use "
+            "the approve/reject endpoints."
+        ),
+    )
+    role: str | None = Field(
+        default=None,
+        max_length=50,
+        description="New role: 'admin', 'editor', or 'viewer'. Omit to leave unchanged.",
+    )
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def blank_email_clears(cls, v: Any) -> Any:
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_ROLES:
+            raise ValueError(f"Role must be one of: {', '.join(sorted(VALID_ROLES))}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_state_fields(self) -> "UserUpdate":
+        """Reject contradictory legacy and explicit lifecycle fields."""
+        if self.status is not None and self.is_active is not None:
+            expected_active = self.status == "active"
+            if self.is_active is not expected_active:
+                raise ValueError("status and is_active describe conflicting states")
+        return self
+
+
+class SamlToLocalConversion(BaseModel):
+    """Request body for POST /admin/users/{user_id}/convert-saml-to-local/.
+
+    A dedicated, single-purpose schema kept narrow on
+    purpose -- password is intentionally NOT on the generic UserUpdate schema
+    (which has no password field) so this conversion produces a single,
+    audit-distinct action ('user.convert_saml_to_local') instead of being
+    folded into 'user.update'.
+    """
+
+    password: str = Field(
+        min_length=8,
+        max_length=256,
+        # min_length=8 is a fast-fail floor; validate_password below enforces
+        # the real policy.
+        description=(
+            "Local-password for the converted account "
+            "(policy: min 12 chars, 3+ character classes, at most 72 bytes "
+            "UTF-8). The user can change this after first login."
+        ),
+    )
+
+    validate_password = field_validator("password", mode="after")(
+        _enforce_password_policy
+    )
+
+
+class AdminPasswordReset(BaseModel):
+    """Request body for POST /admin/users/{user_id}/reset-password/.
+
+    Single-purpose for the same reason as SamlToLocalConversion above: the
+    generic UserUpdate schema has no password field, so an admin-set password
+    lands as its own audited action ('user.password_reset') rather than
+    disappearing into 'user.update'.
+    """
+
+    password: str = Field(
+        min_length=8,
+        max_length=256,
+        # min_length=8 is a fast-fail floor; validate_password below enforces
+        # the real policy.
+        description=(
+            "Replacement password for the account "
+            "(policy: min 12 chars, 3+ character classes, at most 72 bytes "
+            "UTF-8). The user can change this after their next login."
+        ),
+    )
+
+    validate_password = field_validator("password", mode="after")(
+        _enforce_password_policy
+    )
+
+
+class UserNameItem(BaseModel):
+    id: uuid.UUID = Field(description="Unique user identifier.")
+    username: str = Field(description="User's login username.")
+
+
+class UserListResponse(BaseModel):
+    users: list[UserResponse] = Field(description="Page of users matching the query.")
+    total: int = Field(
+        description="Total number of users matching the query (across all pages)."
+    )
+
+
+class GroupWrite(BaseModel):
+    name: str = Field(
+        min_length=1,
+        max_length=255,
+        description=(
+            "Group name, unique across the instance. Leading and trailing "
+            "whitespace is removed."
+        ),
+        json_schema_extra={"example": "Planning"},
+    )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: object) -> object:
+        if isinstance(value, str):
+            return normalize_nfc(value.strip())
+        return value
+
+
+class GroupResponse(BaseModel):
+    id: uuid.UUID = Field(description="Unique group identifier.")
+    name: str = Field(description="Group name.")
+    member_count: int = Field(description="Number of users in the group.")
+    created_at: datetime = Field(description="When the group was created.")
+    updated_at: datetime = Field(description="When the group was last renamed.")
+
+
+class GroupListResponse(BaseModel):
+    groups: list[GroupResponse] = Field(description="Page of groups, by name.")
+    total: int = Field(description="Total number of groups (across all pages).")
+
+
+class GroupMembersAdd(BaseModel):
+    user_ids: list[uuid.UUID] = Field(
+        min_length=1,
+        max_length=500,
+        description=(
+            "Users to add. Users already in the group are left as they are; "
+            "if any id matches no user, none are added."
+        ),
+    )
+
+
+class GroupMemberListResponse(BaseModel):
+    members: list[UserNameItem] = Field(
+        description="Page of group members, by username."
+    )
+    total: int = Field(description="Total number of members (across all pages).")
+
+
+class AdminJobResponse(BaseModel):
+    id: uuid.UUID = Field(description="Unique ingestion job identifier.")
+    status: JobStatus = Field(
+        description="Current job status: 'pending', 'running', 'complete', 'failed', "
+        "'cancelled', or 'fanned_out' (a multi-layer upload split into per-layer child jobs)."
+    )
+    source_filename: str | None = Field(
+        description="Original filename of the uploaded file, if applicable."
+    )
+    dataset_id: uuid.UUID | None = Field(
+        description="ID of the dataset created by this job, if completed successfully."
+    )
+    error_message: str | None = Field(description="Error details if the job failed.")
+    error_code: str | None = Field(
+        default=None,
+        description="Stable code for a fixed failure reason, so a client can show "
+        "it in the reader's language; `error_message` keeps its English text. "
+        "Null when the reason is free text.",
+    )
+    review_state: Literal["awaiting", "resolved"] | None = Field(
+        default=None,
+        description="Set on a replacement the pipeline held for review rather than "
+        "failed: 'awaiting' while the held run still needs a decision, 'resolved' "
+        "once it was accepted. Null for every other job.",
+    )
+    can_retry: bool = Field(
+        description="Whether the failed job can be retried with its retained source."
+    )
+    retry_reason: str | None = Field(
+        description="Why the job cannot be retried, when retry is unavailable."
+    )
+    source_url: str | None = Field(
+        default=None,
+        description="URL a service or file URL import was started from, with userinfo and "
+        "credential query values redacted. Null for every other job.",
+    )
+    restart_source: Literal["url", "service"] | None = Field(
+        default=None,
+        description="Import tab a failed job whose retry is refused can be started "
+        "again from: 'url' for a file URL import, 'service' for a service import. "
+        "Null otherwise.",
+    )
+    user_metadata: dict[str, Any] | None = Field(
+        description="Metadata captured with the job: the fields supplied at upload and commit (title, summary, tags, visibility, file_type, vrt_type, etc.) and outcomes such as warnings. Heterogeneous shape across ingest paths. Worker bookkeeping, such as staging keys and unpublished artifacts, is left out; null when nothing else is recorded.",
+    )
+    created_by: uuid.UUID | None = Field(
+        description="ID of the user who initiated the job."
+    )
+    username: str | None = Field(
+        description="Username of the user who initiated the job."
+    )
+    started_at: datetime | None = Field(
+        description="Timestamp when the worker began processing the job."
+    )
+    completed_at: datetime | None = Field(
+        description="Timestamp when the job finished (success or failure)."
+    )
+    created_at: datetime = Field(description="Timestamp when the job was queued.")
+
+
+class AdminJobListResponse(BaseModel):
+    jobs: list[AdminJobResponse] = Field(description="Page of ingestion jobs.")
+    total: int = Field(description="Total number of jobs matching the query.")
+
+
+class CatalogStatsResponse(BaseModel):
+    total_datasets: int = Field(description="Total number of datasets in the catalog.")
+    recent_additions: int = Field(
+        description="Number of datasets added in the last 30 days."
+    )
+    total_storage_bytes: int | None = Field(
+        description="Total storage used by dataset tables, including the tables that keep previous versions, plus the recorded sizes of stored data files (rasters, point clouds, 3D Tiles), in bytes. Quicklook images carry no recorded size and are not counted. Null if calculation is unavailable."
+    )
+    previous_versions_bytes: int = Field(
+        default=0,
+        description="Recorded size of the tables that keep datasets' previous versions, in bytes; part of total_storage_bytes.",
+    )
+    datasets_by_geometry_type: dict[str, int] = Field(
+        description="Histogram of datasets keyed by geometry type (Point, MultiPolygon, etc.)."
+    )
+    datasets_by_visibility: dict[str, int] = Field(
+        description="Histogram of datasets keyed by visibility level (private, internal, restricted, public)."
+    )
+    users_by_status: dict[str, int] = Field(
+        default={},
+        description="Histogram of users keyed by status (active, deactivated, pending).",
+    )
+    total_users: int = Field(
+        default=0, description="Total number of users in the system."
+    )
+
+
+class AdminShareTokenResponse(BaseModel):
+    id: uuid.UUID | None = None
+    map_id: uuid.UUID
+    map_name: str
+    token: str | None = None
+    is_active: bool | None = None
+    expires_at: datetime | None = None
+    created_at: datetime
+    created_by: str | None
+    embed_token_count: int = 0
+
+
+class AdminShareTokenListResponse(BaseModel):
+    tokens: list[AdminShareTokenResponse]
+    total: int
+
+
+class AIStatusResponse(BaseModel):
+    provider: str | None = Field(
+        description="Active AI provider name (e.g. 'anthropic', 'openai')."
+    )
+    model: str | None = Field(
+        description="Active model name (e.g. 'claude-sonnet-5-5')."
+    )
+    enabled: bool = Field(
+        description="Whether AI features are enabled for this instance."
+    )
+    configured: bool = Field(
+        description="Whether an API key is configured. AI features require both 'enabled' and 'configured'."
+    )
+    semantic_search_enabled: bool = Field(
+        default=False, description="Whether pgvector-backed semantic search is enabled."
+    )
+    has_embeddings: bool = Field(
+        default=False, description="Whether at least one record has embeddings stored."
+    )
+    # Key presence != key validity. Present only when the caller passed
+    # ?probe=true (the ai-status routes serialize with exclude_unset, so
+    # default responses omit it).
+    probe: AIProbeReport | None = Field(
+        default=None,
+        description="Live provider probe results. Only present when the "
+        "request opted in via ?probe=true.",
+    )
+
+
+class AIStatusUpdate(BaseModel):
+    enabled: bool = Field(
+        description="Set to true to enable AI features (chat, generation, semantic search), false to disable."
+    )
+
+
+class BackfillRunProgress(BaseModel):
+    """The embedding backfill run currently holding the single run slot."""
+
+    job_id: uuid.UUID = Field(description="Identifier of the run in flight.")
+    status: str = Field(description="Job status: 'pending' or 'running'.")
+    records_processed: int = Field(description="Records the run has embedded so far.")
+    records_total: int | None = Field(
+        default=None,
+        description=(
+            "Records the run will embed in total. Null until the run has "
+            "selected its records."
+        ),
+    )
+    started_at: datetime | None = Field(
+        default=None, description="When a worker picked the run up."
+    )
+    heartbeat_at: datetime | None = Field(
+        default=None,
+        description="Last time the running worker renewed its lease.",
+    )
+
+
+class BackfillRunSummary(BaseModel):
+    """One finished embedding backfill run."""
+
+    job_id: uuid.UUID = Field(description="Identifier of the finished run.")
+    status: str = Field(
+        description="How the run ended: 'complete', 'failed' or 'cancelled'."
+    )
+    started_at: datetime | None = Field(
+        default=None, description="When a worker picked the run up."
+    )
+    finished_at: datetime | None = Field(
+        default=None, description="When the run reached its final status."
+    )
+    records_processed: int = Field(description="Records the run embedded.")
+    records_failed: int | None = Field(
+        default=None,
+        description=(
+            "Records the run could not embed, when the run recorded a count. A "
+            "finished run with a non-zero figure here left coverage gaps."
+        ),
+    )
+    error_code: str | None = Field(
+        default=None,
+        description="Short code identifying how a run failed, when it failed.",
+    )
+
+
+class BackfillEstimate(BaseModel):
+    """How long each backfill action should take, before starting one.
+
+    Both figures come from the throughput of the most recent completed run, so
+    they describe this deployment's own provider rather than a generic rate.
+    """
+
+    missing_seconds: float = Field(
+        description="Estimated seconds to embed the records that lack a usable vector."
+    )
+    all_seconds: float = Field(
+        description="Estimated seconds to regenerate every record in the catalog."
+    )
+
+
+class EmbeddingStatsResponse(BaseModel):
+    total_records: int = Field(description="Total number of records in the catalog.")
+    embedded_records: int = Field(
+        description=(
+            "Number of records with an embedding for the ACTIVE embedding model "
+            "— the only vectors semantic search can use."
+        )
+    )
+    missing_records: int = Field(
+        description=(
+            "Number of records without an active-model embedding "
+            "(total_records - embedded_records)."
+        )
+    )
+    stale_records: int = Field(
+        description=(
+            "Subset of missing_records whose only stored embeddings belong to "
+            "other models. Regenerating all embeddings clears these; generating "
+            "missing ones does not."
+        )
+    )
+    coverage_percent: float = Field(
+        description="Embedding coverage as a percentage (0-100)."
+    )
+    current_run: BackfillRunProgress | None = Field(
+        default=None,
+        description="The backfill run in flight, or null when none is running.",
+    )
+    recent_runs: list[BackfillRunSummary] = Field(
+        default_factory=list,
+        description="The most recent finished backfill runs, newest first.",
+    )
+    estimate: BackfillEstimate | None = Field(
+        default=None,
+        description=(
+            "Expected duration of each backfill action, or null until one run "
+            "has completed and measured this deployment's throughput."
+        ),
+    )
+
+
+class BackfillTenantRun(BaseModel):
+    """What an all-tenant backfill request did for one other tenant."""
+
+    tenant_id: uuid.UUID = Field(description="The tenant the run was queued for.")
+    job_id: uuid.UUID | None = Field(
+        description=(
+            "Identifier of the job queued in that tenant, or null when none was queued."
+        )
+    )
+    status: Literal["pending", "already_running", "not_queued"] = Field(
+        description=(
+            "'pending' when a run was queued, 'already_running' when that tenant "
+            "already had one in flight, 'not_queued' when queueing failed."
+        )
+    )
+
+
+class BackfillResponse(BaseModel):
+    """Acknowledgement that a backfill run was queued.
+
+    The response carries no counts because the work runs asynchronously. Poll
+    ``GET /jobs/{job_id}`` for status.
+    """
+
+    job_id: uuid.UUID | None = Field(
+        description=(
+            "Identifier of the queued backfill job; poll /jobs/{job_id}. Null only "
+            "with status 'already_running' when the caller may not read that run."
+        )
+    )
+    status: str = Field(
+        description=(
+            "'pending' when this request queued job_id. 'already_running' when an "
+            "all_tenants request found a run in flight in the calling tenant; "
+            "job_id is then that run, which this request did not queue. Run the "
+            "backfill again once it ends."
+        )
+    )
+    other_tenants: list[BackfillTenantRun] = Field(
+        default_factory=list,
+        description=(
+            "Runs queued for the other tenants by an all_tenants request in a "
+            "multi-tenant deployment. Empty otherwise."
+        ),
+    )
+
+
+class ProviderHealth(BaseModel):
+    status: str = Field(description="Provider health status: 'ok' or 'error'.")
+    latency_ms: float = Field(
+        description="Latency of the most recent health probe in milliseconds."
+    )
+    error: str | None = Field(
+        default=None, description="Error message when status is 'error'."
+    )
+
+
+class InfrastructureConfig(BaseModel):
+    storage_provider: str = Field(
+        description="Active storage backend ('local' or 's3')."
+    )
+    cache_provider: str = Field(
+        description="Active cache backend ('memory' or 'redis')."
+    )
+    database_type: str = Field(
+        description="Database flavor (e.g. 'postgres', 'managed-postgres')."
+    )
+    database_pooler: str = Field(
+        description="Active connection pooler mode ('sqlalchemy' or 'external')."
+    )
+    tile_cache: str = Field(description="Tile caching backend in use.")
+    tile_cache_ttl: int = Field(description="Tile cache TTL in seconds.")
+    cdn_configured: bool = Field(
+        description="Whether a CDN base URL is configured for tile delivery."
+    )
+
+
+class InfrastructureResponse(BaseModel):
+    config: InfrastructureConfig = Field(
+        description="Snapshot of active infrastructure configuration."
+    )
+    health: dict[str, ProviderHealth] = Field(
+        description="Health probe results keyed by provider name (db, storage, cache, llm, embedding)."
+    )
+    oidc_providers: dict[str, ProviderHealth] = Field(
+        default={},
+        description="Health probe results for configured OAuth/OIDC providers, keyed by slug.",
+    )
+
+
+class AdminApiKeyCreateRequest(BaseModel):
+    user_id: uuid.UUID = Field(
+        description="ID of the user the new API key will belong to."
+    )
+    name: str = Field(
+        min_length=1,
+        max_length=255,
+        description="Human-readable label for the API key (e.g. 'CI pipeline', 'QGIS desktop').",
+    )
+    expires_at: AwareDatetime | None = Field(
+        default=None,
+        description=(
+            "Optional expiry timestamp (RFC 3339, timezone-aware). Omit or null "
+            "for a non-expiring key; expired keys stop authenticating."
+        ),
+    )
+    scope: Literal["full", "read_only", "publish"] = Field(
+        default="full",
+        description=(
+            "Privilege scope. 'full' impersonates the owner completely. "
+            "'read_only' authenticates GET, HEAD and "
+            "OPTIONS requests only; any other method is refused with 403. A "
+            "service-account key minted for an application is the usual case "
+            "for 'read_only'. 'publish' also allows uploads, manifest apply, "
+            "dataset metadata edits and new maps, but no map update, delete, "
+            "feature write, public visibility, admin or key route."
+        ),
+    )
+
+    _expires_at_future = field_validator("expires_at")(validate_future_expiry)
+
+
+class AdminApiKeyListItem(BaseModel):
+    id: uuid.UUID = Field(description="Unique API key identifier.")
+    user_id: uuid.UUID = Field(description="Owning user's ID.")
+    name: str = Field(description="Human-readable label.")
+    fingerprint: str | None = Field(
+        description="Non-secret key identifier; null for legacy keys."
+    )
+    is_active: bool = Field(
+        description="Whether the key is active. Inactive keys cannot authenticate."
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description="Expiry timestamp; null means the key does not expire.",
+    )
+    scope: str = Field(
+        description=(
+            "Privilege scope: 'full', 'read_only', 'publish' (reads, uploads, "
+            "manifest apply, dataset metadata edits and new maps, but no map "
+            "updates, deletes, feature writes or public visibility), "
+            "'dataset_write' (reads and writes the features of "
+            "the dataset in dataset_id, and nothing else), or 'dataset_append' "
+            "(only creates features in that dataset)."
+        )
+    )
+    dataset_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "The dataset a 'dataset_write' or 'dataset_append' key is bound to; "
+            "null for other scopes."
+        ),
+    )
+    created_at: datetime = Field(description="Timestamp when the key was created.")
+    last_used_at: datetime | None = Field(
+        description="Timestamp of the most recent successful authentication using this key."
+    )
+
+
+class AdminApiKeyListResponse(BaseModel):
+    items: list[AdminApiKeyListItem] = Field(description="Page of API keys.")
+    total: int = Field(description="Total number of API keys matching the query.")

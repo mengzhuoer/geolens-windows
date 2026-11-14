@@ -1,0 +1,245 @@
+import { useMemo, useRef, type KeyboardEvent } from 'react';
+import type { MapTerrainConfig, SharedLayerResponse } from '@/types/api';
+import { useTranslation } from 'react-i18next';
+import { demChipGlyph, LayerTypeIcon, RasterGlyphChip } from '@/components/map/layer-icons';
+import { HeatmapLegend, LegendClassesList } from '@/components/map/LegendEntries';
+import { Eye, EyeOff, Layers, X } from 'lucide-react';
+import { createViewerLayerEntries, isTerrainBackingLiveVisible } from '@/components/viewer/layer-identity';
+import {
+  deriveTerrainLegendEntry,
+  terrainSourceIsShownAsLayer,
+} from '@/components/builder/terrain-legend';
+import { legendFacts, type DrawnLayer } from '@/components/map/legend-facts';
+
+interface LayerLegendProps {
+  layers: SharedLayerResponse[];
+  visibleLayers: Set<string>;
+  onToggleVisibility: (layerKey: string) => void;
+  isOpen: boolean;
+  onToggle: () => void;
+  /** Map-level terrain config; drives the synthetic "3D terrain" legend entry. */
+  terrainConfig?: MapTerrainConfig | null;
+  /**
+   * Custom map-level legend title. When non-empty it replaces the default
+   * "Legend" panel heading.
+   */
+  legendTitle?: string | null;
+  /** What the map drew each layer as, by layer key. A layer missing from it follows its saved style. */
+  drawn?: ReadonlyMap<string, DrawnLayer>;
+  /** The map edge the toggle and panel sit on; the end side clears the zoom controls. */
+  side?: 'start' | 'end';
+}
+
+export function LayerLegend({
+  layers,
+  visibleLayers,
+  onToggleVisibility,
+  isOpen,
+  onToggle,
+  terrainConfig = null,
+  legendTitle = null,
+  drawn,
+  side,
+}: LayerLegendProps) {
+  const edge = side === 'end' ? 'end-14' : 'start-3';
+  const { t } = useTranslation('common');
+  const panelRef = useRef<HTMLDivElement>(null);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const customTitle = legendTitle?.trim() ? legendTitle.trim() : null;
+
+  // The synthetic terrain entry below stays local to this legend: ViewerMap
+  // also reads createViewerLayerEntries and must not see a row that draws nothing.
+  const sorted = useMemo(
+    () =>
+      createViewerLayerEntries(layers)
+        .flatMap((entry) => {
+          if (entry.layer.show_in_legend === false) return [];
+          const facts = legendFacts(entry.layer, drawn?.get(entry.key));
+          return facts ? [{ ...entry, facts }] : [];
+        })
+        .sort((a, b) => a.layer.sort_order - b.layer.sort_order),
+    [layers, drawn],
+  );
+
+  // Single synthetic "3D terrain" entry driven by terrain_config — only
+  // when a backing terrain-capable DEM layer for the source dataset is present
+  // (no phantom entry for a dangling terrain_config).
+  const terrainEntry = useMemo(() => {
+    const entry = deriveTerrainLegendEntry(terrainConfig, layers, { labelKey: 'viewer.legend.terrain3d' });
+    if (!entry) return null;
+    // The viewer clears terrain when the bound DEM is LIVE-hidden via the legend
+    // eye (useViewerTerrain honors visibleLayers), so a hidden source must not
+    // keep a synthetic "3D terrain" row for a mesh that no longer renders. Same
+    // helper as ViewerMap's mesh gate, so legend and mesh cannot disagree.
+    if (!isTerrainBackingLiveVisible(layers, terrainConfig, visibleLayers)) return null;
+    // Dedup: drop the synthetic entry when the terrain source DEM is shown as a
+    // VISIBLE per-layer entry (e.g. a visible hillshade of the same dataset), so
+    // the legend doesn't list one DEM twice. Kept for the pure-terrain case
+    // where the suppressed DEM has no per-layer row.
+    const visibleSourceLayers = sorted.filter((s) => visibleLayers.has(s.key)).map((s) => s.layer);
+    return terrainSourceIsShownAsLayer(terrainConfig, visibleSourceLayers) ? null : entry;
+  }, [terrainConfig, layers, sorted, visibleLayers]);
+
+  // Escape closes the panel only while focus is in the legend, and marks the
+  // event handled so FeaturePopup and BasemapToggle's document listeners skip it.
+  function handleEscape(e: KeyboardEvent<HTMLElement>) {
+    if (e.key !== 'Escape' || e.defaultPrevented || !isOpen) return;
+    e.preventDefault();
+    onToggle();
+    toggleRef.current?.focus();
+  }
+
+  return (
+    <>
+      {/* Toggle button — always visible */}
+      <button
+        ref={toggleRef}
+        type="button"
+        onClick={onToggle}
+        onKeyDown={handleEscape}
+        aria-expanded={isOpen}
+        aria-controls="layer-legend-panel"
+        aria-label={isOpen ? t('viewer.legend.hide') : t('viewer.legend.show')}
+        className={`absolute ${edge} top-3 z-20 flex items-center justify-center w-8 h-8 rounded-md bg-background/80 backdrop-blur-sm border border-border/50 shadow-sm text-foreground hover:bg-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring`}
+      >
+        {isOpen ? <X className="w-4 h-4" aria-hidden="true" /> : <Layers className="w-4 h-4" aria-hidden="true" />}
+      </button>
+
+      {/* Legend panel — unmounted when closed (prevents a keyboard trap into
+          invisible per-layer toggles; opacity-0 + pointer-events-none alone
+          would not). */}
+      {isOpen && (
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- Escape dismisses the region from any control focused inside it
+      <div
+        ref={panelRef}
+        onKeyDown={handleEscape}
+        id="layer-legend-panel"
+        role="region"
+        aria-label={t('viewer.legend.title')}
+        // Cap the height against the CONTAINER, not the viewport: the panel is
+        // absolutely positioned inside the map, so a viewport cap would let a
+        // tall legend run behind the Map data button (bottom-20 + ~2rem) and the
+        // basemap toggle (bottom-8) in the same corner. 11rem = the 3.5rem top
+        // offset plus clearance above that bottom-left stack.
+        className={`absolute ${edge} top-14 z-10 w-64 max-h-[calc(100%-11rem)] overflow-y-auto bg-background/90 backdrop-blur-md rounded-lg shadow-lg border border-border/50`}
+      >
+        <div className="p-3 border-b border-border/50">
+          <h2 className="text-sm font-semibold text-foreground">
+            {customTitle ?? t('viewer.legend.title')}
+          </h2>
+          {customTitle && (
+            <span data-testid="viewer-legend-title" className="sr-only">{customTitle}</span>
+          )}
+        </div>
+        <ul className="divide-y divide-border/50">
+          {/* Pin the synthetic terrain entry at the top, mirroring the
+              stack's relief:terrain row at the top of the relief/terrain group. */}
+          {terrainEntry && (
+            <li
+              key={terrainEntry.id}
+              data-testid="legend-terrain-synthetic"
+              className="px-3 py-2 hover:bg-accent/50"
+            >
+              <div className="flex items-center gap-2">
+                {/* Same ◬ chip as the stack's terrain-mode DEM row —
+                    legend and layer-list icons must agree, so derive the glyph
+                    instead of hardcoding it. */}
+                <RasterGlyphChip glyph={demChipGlyph('terrain')} />
+                {/* Keep the bound DEM's identity — fall back to the
+                    generic "3D terrain" label only when the layer has no name. */}
+                <span className="text-sm text-foreground flex-1">
+                  {terrainEntry.sourceName ?? t(terrainEntry.labelKey)}
+                </span>
+              </div>
+            </li>
+          )}
+          {sorted.map(({ layer, key, facts }) => {
+            const isVisible = visibleLayers.has(key);
+            const sc = layer.style_config;
+            const layerName = facts.name;
+            const clusterKind = facts.cluster?.kind;
+            return (
+              <li key={key} className="px-3 py-2 hover:bg-accent/50">
+                <div className="flex items-center gap-2">
+                  {/* One shared icon component with the builder layer
+                      stack — raster/DEM rows get the same glyph chip (▦/⛰/◬),
+                      vector rows the same colorized geometry icon. */}
+                  <LayerTypeIcon
+                    layer={{
+                      dataset_geometry_type: layer.geometry_type,
+                      layer_type: layer.layer_type,
+                      dataset_record_type: layer.dataset_record_type,
+                      is_dem: layer.is_dem,
+                      paint: layer.paint,
+                      layout: layer.layout,
+                      opacity: layer.opacity,
+                      style_config: sc,
+                    }}
+                    iconId={`viewer-legend-${key}`}
+                  />
+                  <span className="text-sm text-foreground flex-1 line-clamp-2" title={layerName}>
+                    {layerName}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onToggleVisibility(key)}
+                    className="flex-shrink-0 p-1 rounded-sm hover:bg-accent text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    aria-label={isVisible
+                      ? t('viewer.legend.hideLayer', { name: layerName })
+                      : t('viewer.legend.showLayer', { name: layerName })}
+                  >
+                    {isVisible ? <Eye className="w-4 h-4" aria-hidden="true" /> : <EyeOff className="w-4 h-4" aria-hidden="true" />}
+                  </button>
+                </div>
+                {clusterKind && (
+                  <div className="mt-1 ms-6 text-mini font-medium text-muted-foreground">
+                    {clusterKind === 'server-tile'
+                      ? t('viewer.legend.cluster.server')
+                      : clusterKind === 'bounded-geojson'
+                        ? t('viewer.legend.cluster.bounded')
+                        : t('viewer.legend.cluster.fallback')}
+                  </div>
+                )}
+                {isVisible && drawn?.get(key)?.sampled && (
+                  <p className="mt-1 ms-6 text-mini text-muted-foreground">
+                    {t('viewer.legend.sampled')}
+                  </p>
+                )}
+
+                {/* Data-driven legend entries */}
+                {isVisible && (
+                  facts.ramp ? (
+                    <div className="mt-1.5 ms-6">
+                      <HeatmapLegend
+                        name=""
+                        ramp={facts.ramp}
+                        weightColumn={facts.weight?.column}
+                        opacity={layer.opacity ?? 1}
+                        lowLabel={t('viewer.heatmapLow')}
+                        highLabel={t('viewer.heatmapHigh')}
+                        weightedByLabel={facts.weight
+                          ? t(facts.weight.scaled ? 'viewer.legend.weightedByScaled' : 'viewer.legend.weightedBy', { column: facts.weight.column })
+                          : undefined}
+                      />
+                    </div>
+                  ) : facts.classes ? (
+                    <div className="mt-1.5 ms-6">
+                      <LegendClassesList classes={facts.classes} geometryType={layer.geometry_type} style={facts.swatch} />
+                    </div>
+                  ) : null
+                )}
+                {isVisible && facts.cluster?.steps && (
+                  <div className="mt-1.5 ms-6 space-y-1">
+                    <div className="text-mini font-medium text-muted-foreground">{t('viewer.legend.cluster.pointsPerCluster')}</div>
+                    <LegendClassesList classes={[facts.cluster.steps.classes]} geometryType="POINT" style={facts.cluster.steps.swatch} />
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+      )}
+    </>
+  );
+}

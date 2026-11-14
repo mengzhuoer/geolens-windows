@@ -1,0 +1,2206 @@
+import { act, render, screen, waitFor, within } from '@/test/test-utils';
+import userEvent from '@testing-library/user-event';
+import { denySessionStorage } from '@/test/deny-storage';
+import { sendChatMessage, streamChatMessage } from '@/api/maps';
+import { ApiError } from '@/api/client';
+import { ChatPanel, type LayerActions } from '../ChatPanel';
+import type { MapLayerResponse, StyleConfig } from '@/types/api';
+import { buildRenderAsPatch } from '../renderAs';
+import { DEFAULT_HEATMAP_PAINT } from '../layer-adapters/builder-defaults';
+
+// scrollIntoView is not available in jsdom
+Element.prototype.scrollIntoView = vi.fn();
+
+vi.mock('@/api/maps', () => ({
+  sendChatMessage: vi.fn(),
+  streamChatMessage: vi.fn(),
+}));
+
+const mockStreamChat = vi.mocked(streamChatMessage);
+const mockSendChat = vi.mocked(sendChatMessage);
+
+function makeLayer(overrides: Partial<MapLayerResponse> = {}): MapLayerResponse {
+  return {
+    id: 'layer-1',
+    dataset_id: 'ds-1',
+    dataset_name: 'Test Dataset',
+    dataset_geometry_type: 'Polygon',
+    dataset_table_name: 'test_table',
+    dataset_extent_bbox: null,
+    dataset_column_info: null,
+    dataset_feature_count: null,
+    dataset_sample_values: null,
+    display_name: null,
+    sort_order: 0,
+    visible: true,
+    show_in_legend: true,
+    opacity: 1,
+    paint: {},
+    layout: {},
+    filter: null,
+    ...overrides,
+  };
+}
+
+/** One overlay feature. Overlay completeness is judged
+ *  against row_count, so a fixture's feature COUNT is now load-bearing. */
+function feature() {
+  return { type: 'Feature', geometry: { type: 'Point', coordinates: [-73.9, 40.8] }, properties: {} };
+}
+
+function renderPanel(
+  propOverrides: Partial<React.ComponentProps<typeof ChatPanel>> & Partial<LayerActions> = {},
+) {
+  const {
+    onFilterChange = vi.fn(),
+    onPaintChange = vi.fn(),
+    onStyleConfigChange = vi.fn(),
+    onLabelChange = vi.fn(),
+    onToggleVisibility = vi.fn(),
+    onAddDataset = vi.fn(),
+    onRemove = vi.fn(),
+    onOpacityChange,
+    onRenderAsChange,
+    getLayer,
+    onRestoreLayers = vi.fn(),
+    ...rest
+  } = propOverrides;
+  const layerActions = {
+    onFilterChange,
+    onPaintChange,
+    onStyleConfigChange,
+    onLabelChange,
+    onToggleVisibility,
+    onAddDataset,
+    onRemove,
+    onRestoreLayers,
+    ...(onOpacityChange ? { onOpacityChange } : {}),
+    ...(onRenderAsChange ? { onRenderAsChange } : {}),
+    ...(getLayer ? { getLayer } : {}),
+  };
+  const props = {
+    mapId: 'map-1',
+    layers: [makeLayer()],
+    layerActions,
+    onQueryResult: vi.fn(),
+    onClearPreview: vi.fn(),
+    ...rest,
+  };
+  render(<ChatPanel {...props} />);
+  return { ...layerActions, ...props };
+}
+
+async function typeAndSend(
+  user: ReturnType<typeof userEvent.setup>,
+  text: string,
+) {
+  const input = screen.getByPlaceholderText(/describe a map change/i);
+  await user.type(input, text);
+  await user.click(screen.getByRole('button', { name: /send/i }));
+}
+
+describe('ChatPanel', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+  });
+
+  it('suggestion chip shows the plain layer name but inserts the raw mention payload', async () => {
+    const user = userEvent.setup();
+    renderPanel({
+      layers: [makeLayer({ display_name: 'Some Layer', dataset_geometry_type: 'Point' })],
+    });
+
+    // Visible label and accessible name use the plain layer name, no @[...] markup.
+    const chip = screen.getByRole('button', { name: 'Color "Some Layer" using a field' });
+    expect(chip.textContent).toContain('Some Layer');
+    expect(chip.textContent).not.toContain('@[');
+
+    // Clicking still inserts the raw mention payload into the chat input.
+    await user.click(chip);
+    const input = screen.getByPlaceholderText(/describe a map change/i) as HTMLTextAreaElement;
+    expect(input.value).toBe('Color "@[Some Layer]" using a field');
+  });
+
+  it('a layer name containing "]" survives intact in the chip label', async () => {
+    const user = userEvent.setup();
+    renderPanel({
+      layers: [makeLayer({ display_name: 'Zone A] B', dataset_geometry_type: 'Point' })],
+    });
+
+    const chip = screen.getByRole('button', { name: 'Color "Zone A] B" using a field' });
+    expect(chip.textContent).not.toContain('@[');
+
+    await user.click(chip);
+    const input = screen.getByPlaceholderText(/describe a map change/i) as HTMLTextAreaElement;
+    expect(input.value).toBe('Color "@[Zone A] B]" using a field');
+  });
+
+  it('passes explicit visible value to onToggleVisibility', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'toggle_visibility', layer_id: 'layer-1', visible: true },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Toggled' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'show the layer');
+
+    await waitFor(() => {
+      expect(props.onToggleVisibility).toHaveBeenCalledWith('layer-1', true);
+    });
+  });
+
+  it('calls onQueryResult for show_query_result actions', async () => {
+    const geojson = { type: 'FeatureCollection', features: [] };
+    const bbox = [-74, 40, -73, 41];
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [{ type: 'show_query_result', geojson, bbox }],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Results' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'find features');
+
+    await waitFor(() => {
+      // The meta now always carries the prompt behind the result,
+      // so a plain preview (no truncation, no analysis) can be saved as a
+      // dataset with its question suggested as the name.
+      expect(props.onQueryResult).toHaveBeenCalledWith(geojson, bbox, {
+        prompt: 'find features',
+      });
+    });
+  });
+
+  // "the preview surface" throughout, not "the badge" — the builder
+  // path this panel feeds now renders the ephemeral stack row.
+  it('forwards the truncation pair so the preview can disclose "N of TOTAL" (#674 audit)', async () => {
+    const geojson = { type: 'FeatureCollection', features: [] };
+    const bbox = [-74, 40, -73, 41];
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'show_query_result', geojson, bbox, truncated: true, row_count: 10651 },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Buffered' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'buffer the earthquakes by 10km');
+
+    await waitFor(() => {
+      expect(props.onQueryResult).toHaveBeenCalledWith(geojson, bbox, {
+        truncated: true,
+        totalCount: 10651,
+        prompt: 'buffer the earthquakes by 10km',
+      });
+    });
+  });
+
+  // A clip filters rows, so run_analysis reports no source total —
+  // the flag arrives alone. Requiring a total dropped it here and a capped
+  // clip preview reached the preview surface looking complete.
+  it('forwards a cap that arrives without a total', async () => {
+    const geojson = { type: 'FeatureCollection', features: [] };
+    const bbox = [-74, 40, -73, 41];
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'show_query_result', geojson, bbox, truncated: true },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Clipped' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'clip the buildings to the flood zone');
+
+    await waitFor(() => {
+      expect(props.onQueryResult).toHaveBeenCalledWith(geojson, bbox, {
+        truncated: true,
+        prompt: 'clip the buildings to the flood zone',
+      });
+    });
+  });
+
+  // The other direction: an uncapped result must forward nothing, or the
+  // preview discloses a truncation that did not happen.
+  //
+  // The fixture holds one feature per matched row. The
+  // overlay is complete only when it carries every row the answer matched, and
+  // the server never emits an empty FeatureCollection (_extract_geojson
+  // returns None when no row is mappable), so a features:[] fixture with
+  // row_count: 12 describes a state that cannot occur — and now reads, as it
+  // should, as a clipped result.
+  it('forwards no truncation for an uncapped result', async () => {
+    const geojson = { type: 'FeatureCollection', features: [feature()] };
+    const bbox = [-74, 40, -73, 41];
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [{ type: 'show_query_result', geojson, bbox, row_count: 1 }],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Clipped' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'clip the buildings to the flood zone');
+
+    await waitFor(() => {
+      // No `truncated` key at all — an uncapped result must not disclose one.
+      expect(props.onQueryResult).toHaveBeenCalledWith(geojson, bbox, {
+        prompt: 'clip the buildings to the flood zone',
+      });
+    });
+  });
+
+  // `truncated` is the SQL sandbox's row cap. When the
+  // model selects geometry itself the sandbox runs at its 1000-row default and
+  // the server then slices the OVERLAY to its own 50-row budget, so a 300-row
+  // answer arrives as a short FeatureCollection with the flag false. Believing
+  // the flag there labels a clipped preview complete — and would let the #1241
+  // save file it in the catalog as the whole answer.
+  it('discloses an overlay clipped below row_count even with truncated false', async () => {
+    const geojson = { type: 'FeatureCollection', features: [feature(), feature()] };
+    const bbox = [-74, 40, -73, 41];
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'show_query_result', geojson, bbox, truncated: false, row_count: 300 },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Found 300' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'show me every park');
+
+    await waitFor(() => {
+      expect(props.onQueryResult).toHaveBeenCalledWith(geojson, bbox, {
+        truncated: true,
+        totalCount: 300,
+        prompt: 'show me every park',
+      });
+    });
+  });
+
+  it('dispatches the flyover only for the winning (last) query result (#534)', async () => {
+    const geojson = { type: 'FeatureCollection', features: [] };
+    const bbox = [-74, 40, -73, 41];
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            // Superseded spatial result first — its flyover must NOT fire...
+            { type: 'show_query_result', geojson, bbox, rows: [], columns: ['name'] },
+            // ...because the retried (non-spatial) result is what the card shows.
+            { type: 'show_query_result', rows: [[496]], columns: ['count'] },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Counted on retry' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'count features');
+
+    await screen.findByText('Counted on retry');
+    expect(props.onQueryResult).not.toHaveBeenCalled();
+  });
+
+  it('threads the analysis handoff params through onQueryResult meta (#675)', async () => {
+    const geojson = { type: 'FeatureCollection', features: [] };
+    const bbox = [-74, 40, -73, 41];
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'show_query_result',
+              geojson,
+              bbox,
+              operation: 'buffer',
+              layer_id: 'layer-1',
+              distance_meters: 500,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Buffered' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'buffer the schools by 500m');
+
+    await waitFor(() => {
+      expect(props.onQueryResult).toHaveBeenCalledWith(geojson, bbox, {
+        analysis: { operation: 'buffer', layerId: 'layer-1', distanceMeters: 500 },
+        prompt: 'buffer the schools by 500m',
+      });
+    });
+  });
+
+  it('clears the stale overlay when the winning result has no geometry (#676)', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        // The geometry-less marker an empty run_analysis / attribute-only
+        // query_data emits.
+        data: { actions: [{ type: 'show_query_result', row_count: 0 }] },
+      };
+      yield { event: 'done', data: { explanation: 'Nothing found' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'buffer the empty layer');
+
+    await waitFor(() => {
+      expect(props.onClearPreview).toHaveBeenCalled();
+    });
+    expect(props.onQueryResult).not.toHaveBeenCalled();
+  });
+
+  it('does not clear the overlay when the winning result is spatial (#676)', async () => {
+    const geojson = { type: 'FeatureCollection', features: [] };
+    const bbox = [-74, 40, -73, 41];
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'show_query_result', geojson, bbox }] },
+      };
+      yield { event: 'done', data: { explanation: 'Results' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'find features');
+
+    await waitFor(() => {
+      expect(props.onQueryResult).toHaveBeenCalled();
+    });
+    expect(props.onClearPreview).not.toHaveBeenCalled();
+  });
+
+  // NaN and inverted bboxes pass the range comparisons
+  // and throw in fitBounds downstream — both must be rejected.
+  it.each([
+    ['NaN bbox', [NaN, 40, -73, 41]],
+    ['inverted bbox', [-73, 40, -74, 41]],
+  ])('does not call onQueryResult for a %s', async (_name, bbox) => {
+    const geojson = { type: 'FeatureCollection', features: [] };
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [{ type: 'show_query_result', geojson, bbox }],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Results' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'find features');
+
+    await waitFor(() => {
+      expect(screen.getByText('Results')).toBeInTheDocument();
+    });
+    expect(props.onQueryResult).not.toHaveBeenCalled();
+  });
+
+  it('shows cancel button while loading and hides send button', async () => {
+    let resolve!: () => void;
+    const hang = new Promise<void>((r) => {
+      resolve = r;
+    });
+
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementation(async function* () {
+      await hang;
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'slow request');
+
+    expect(
+      screen.getByRole('button', { name: /cancel/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /send/i }),
+    ).not.toBeInTheDocument();
+
+    resolve();
+  });
+
+  it('streaming happy path applies actions and shows explanation', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_filter', layer_id: 'layer-1', expression: ['==', 'type', 'park'] },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Filtered to parks' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'filter to parks');
+
+    await waitFor(() => {
+      // AI filters are validated + normalized through the shared
+      // filter contract before apply, so the legacy bare-field form is canonicalized.
+      expect(props.onFilterChange).toHaveBeenCalledWith('layer-1', ['==', ['get', 'type'], 'park']);
+    });
+    expect(await screen.findByText('Filtered to parks')).toBeInTheDocument();
+  });
+
+  it('passes raw user message to streamChatMessage without enrichment', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield { event: 'done', data: { explanation: 'ok' } };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'color @Parks red');
+
+    await waitFor(() => {
+      expect(mockStreamChat).toHaveBeenCalledTimes(1);
+    });
+    // First arg is mapId, second is message — should be raw text, no [Context:] or [Intent:]
+    const message = mockStreamChat.mock.calls[0][1];
+    expect(message).toBe('color @Parks red');
+    expect(message).not.toContain('[Context:');
+    expect(message).not.toContain('[Intent:');
+  });
+
+  it('dispatches set_opacity to onOpacityChange', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [{ type: 'set_opacity', layer_id: 'layer-1', opacity: 0.5 }],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Set opacity' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({ onOpacityChange: vi.fn() });
+    await typeAndSend(user, 'make it transparent');
+
+    await waitFor(() => {
+      expect(props.onOpacityChange).toHaveBeenCalledWith('layer-1', 0.5);
+    });
+  });
+
+  it('set_opacity on a 3D extrusion also sets the extrusion opacity the layer draws with', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'set_opacity', layer_id: 'layer-1', opacity: 0.5 }] },
+      };
+      yield { event: 'done', data: { explanation: 'Set opacity' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      onOpacityChange: vi.fn(),
+      layers: [makeLayer({
+        style_config: { builder: { heightColumn: 'height', extrusionOpacity: 0.92 } } as MapLayerResponse['style_config'],
+      })],
+    });
+    await typeAndSend(user, 'make the buildings 50% transparent');
+
+    await waitFor(() => {
+      expect(props.onStyleConfigChange).toHaveBeenCalledWith(
+        'layer-1',
+        { builder: { heightColumn: 'height', extrusionOpacity: 0.5 } },
+        expect.anything(),
+      );
+    });
+  });
+
+  it('clamps AI opacity actions before dispatching them to layer controls', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [{ type: 'set_opacity', layer_id: 'layer-1', opacity: 1.8 }],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Set opacity' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({ onOpacityChange: vi.fn() });
+    await typeAndSend(user, 'make it too opaque');
+
+    await waitFor(() => {
+      expect(props.onOpacityChange).toHaveBeenCalledWith('layer-1', 1);
+    });
+  });
+
+  it('ignores malformed streamed actions payloads without falling back or mutating layers', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: null },
+      };
+      yield { event: 'done', data: { explanation: 'No valid actions' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'send malformed actions');
+
+    expect(await screen.findByText('No valid actions')).toBeInTheDocument();
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+    expect(props.onFilterChange).not.toHaveBeenCalled();
+    expect(mockSendChat).not.toHaveBeenCalled();
+  });
+
+  it('CH-08: drops a streamed action with an unknown type while a sibling valid action still applies', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'toggle_visibility', layer_id: 'layer-1', visible: true },
+            { type: 'not_a_real_action_type', layer_id: 'layer-1' },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Mixed actions' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'send a mixed actions payload');
+
+    await waitFor(() => {
+      expect(props.onToggleVisibility).toHaveBeenCalledWith('layer-1', true);
+    });
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+    expect(props.onFilterChange).not.toHaveBeenCalled();
+  });
+
+  it('B-014: a streamed error event shows an inline error and does NOT retry via non-streaming', async () => {
+    // Model emitted an SSE error event mid-stream (e.g. tool-loop exhausted).
+    // The non-streaming sendChatMessage fallback must NOT fire — that would
+    // double the (already-failed) LLM call.
+    mockStreamChat.mockImplementation(async function* () {
+      yield { event: 'error', data: { message: 'tool loop exhausted' } };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'trigger a model error');
+
+    expect(await screen.findByText('Something went wrong. Please try again.')).toBeInTheDocument();
+    expect(mockSendChat).not.toHaveBeenCalled();
+  });
+
+  it('a streamed model_requires_responses_api error explains that the model is unsupported', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'error',
+        data: { message: 'English server text', code: 'model_requires_responses_api' },
+      };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'filter the parks');
+
+    expect(
+      await screen.findByText(
+        "This site's AI model needs the OpenAI Responses API. Ask an administrator to turn it on or choose a different model.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('English server text')).not.toBeInTheDocument();
+    expect(mockSendChat).not.toHaveBeenCalled();
+  });
+
+  it('a streamed error event WITH an HTTP status classifies by status (403 → forbidden banner), not a generic retry', async () => {
+    // A pre-flight HTTPException from the SSE endpoint carries a numeric `status`
+    // (the SSE body is always a 200 stream). It must classify like the
+    // non-streaming path — 403 → sticky forbidden banner — instead of collapsing
+    // to the generic retryable "Something went wrong" inline bubble. It must also
+    // NOT fall through to the non-streaming retry (no double LLM call).
+    mockStreamChat.mockImplementation(async function* () {
+      yield { event: 'error', data: { message: 'You do not own this map', status: 403 } };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'edit a map I cannot edit');
+
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent(/permission/i);
+    expect(mockSendChat).not.toHaveBeenCalled();
+  });
+
+  it('a streamed 500 error stays inline and does not issue a second LLM request', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield { event: 'error', data: { message: 'stream failed', status: 500 } };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'trigger an unexpected stream error');
+
+    expect(await screen.findByText('Something went wrong. Please try again.')).toBeInTheDocument();
+    expect(mockSendChat).not.toHaveBeenCalled();
+  });
+
+  it('ignores malformed style paint payloads instead of applying indexed string keys', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: 'red' },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Ignored malformed paint' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'style malformed');
+
+    expect(await screen.findByText('Ignored malformed paint')).toBeInTheDocument();
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+  });
+
+  it('CH-07: a no-op set_style (empty paint) records zero applied actions and renders no Applied N changes / Undo', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: {} },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'No changes to apply' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'style nothing');
+
+    expect(await screen.findByText('No changes to apply')).toBeInTheDocument();
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+    expect(screen.queryByText(/applied/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
+  });
+
+  it('patches set_style paint into the current layer paint', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': '#ff0000' } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({ paint: { 'fill-opacity': 0.45, 'fill-outline-color': '#111827' } })],
+    });
+    await typeAndSend(user, 'make it red');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
+        'fill-opacity': 0.45,
+        'fill-outline-color': '#111827',
+        'fill-color': '#ff0000',
+      });
+    });
+  });
+
+  it('drops fill-extrusion paint the 3D layer never reads and keeps the fill colour', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_style',
+              layer_id: 'layer-1',
+              paint: { 'fill-extrusion-opacity': 0.5, 'fill-color': '#ff0000' },
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({ paint: { 'fill-opacity': 0.45 } })],
+    });
+    await typeAndSend(user, 'make the buildings red and see-through');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
+        'fill-opacity': 0.45,
+        'fill-color': '#ff0000',
+      });
+    });
+  });
+
+  it('clears explicit set_style paint properties after patching', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_style',
+              layer_id: 'layer-1',
+              paint: { 'line-color': '#f97316' },
+              clear_paint: ['line-gradient'],
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Solid' } };
+    });
+
+    const gradient = ['interpolate', ['linear'], ['line-progress'], 0, '#00f', 1, '#0f0'];
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({
+        dataset_geometry_type: 'LineString',
+        paint: { 'line-color': '#111827', 'line-width': 4, 'line-gradient': gradient },
+      })],
+    });
+    await typeAndSend(user, 'make the trail solid orange');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
+        'line-color': '#f97316',
+        'line-width': 4,
+      });
+    });
+  });
+
+  it('honors replace_paint for set_style full replacement', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_style',
+              layer_id: 'layer-1',
+              paint: { 'fill-color': '#22c55e' },
+              replace_paint: true,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Replaced' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({ paint: { 'fill-opacity': 0.45, 'fill-outline-color': '#111827' } })],
+    });
+    await typeAndSend(user, 'replace style');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
+        'fill-color': '#22c55e',
+      });
+    });
+  });
+
+  it('B-002/CH-01: drops a geometry-invalid AI paint prop and applies only the valid clamped props', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_style',
+              layer_id: 'layer-1',
+              // fill-color is valid for a Polygon/fill layer; circle-radius is not
+              // (geometry-invalid) and must be dropped before it reaches onPaintChange.
+              paint: { 'fill-color': '#ff0000', 'circle-radius': 40 },
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({ dataset_geometry_type: 'Polygon', paint: {} })],
+    });
+    await typeAndSend(user, 'make it red');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
+        'fill-color': '#ff0000',
+      });
+    });
+  });
+
+  it('B-002/CH-01: clamps an out-of-bounds AI paint numeric to its Style-Spec bound', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'line-width': 99999 } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Widened' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({ dataset_geometry_type: 'LineString', paint: {} })],
+    });
+    await typeAndSend(user, 'make the line very wide');
+
+    await waitFor(() => {
+      // line-width bound is [0, 50] — 99999 clamps to 50.
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', { 'line-width': 50 });
+    });
+  });
+
+  it('B-002/CH-01: set_data_driven_style heatmap render_mode preserves heatmap-* paint', async () => {
+    const weightExpr = ['interpolate', ['linear'], ['get', 'magnitude'], 0, 0, 10, 1];
+    const styleConfig = { mode: 'graduated', column: 'magnitude', render_mode: 'heatmap' };
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_data_driven_style',
+              layer_id: 'layer-1',
+              paint: { 'heatmap-weight': weightExpr, 'heatmap-radius': 30 },
+              style_config: styleConfig,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled as heatmap' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      // Point geometry -> getLayerType 'circle'; without render-mode awareness
+      // filterPaintForLayerType would drop every heatmap-* key as invalid-for-circle.
+      layers: [makeLayer({ dataset_geometry_type: 'Point', paint: {} })],
+    });
+    await typeAndSend(user, 'show a heatmap by magnitude');
+
+    await waitFor(() => {
+      expect(props.onStyleConfigChange).toHaveBeenCalledWith(
+        'layer-1',
+        styleConfig,
+        { 'heatmap-weight': weightExpr, 'heatmap-radius': 30 },
+      );
+    });
+  });
+
+  it('WR-01 (1278 review): set_style heatmap-radius tweak survives render-mode-aware validation', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'heatmap-radius': 40 } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Widened the heatmap' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      // Point geometry -> getLayerType 'circle'; without render-mode awareness
+      // set_style (the only AI tool that can tune heatmap-radius) would have
+      // its paint stripped as invalid-for-circle, same as the
+      // set_data_driven_style bug above.
+      layers: [makeLayer({
+        dataset_geometry_type: 'Point',
+        paint: {},
+        // Partial StyleConfig fixture — real runtime shape, cast only.
+        style_config: { render_mode: 'heatmap' } as unknown as StyleConfig,
+      })],
+    });
+    await typeAndSend(user, 'widen the heatmap radius');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', { 'heatmap-radius': 40 });
+    });
+  });
+
+  it('set_render_as then set_style in one turn tunes the new heatmap', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_render_as', layer_id: 'layer-1', render_as: 'heatmap' },
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'heatmap-radius': 40 } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Now a heatmap' } };
+    });
+    const layer = makeLayer({ dataset_geometry_type: 'Point', paint: { 'circle-color': '#2255aa' } });
+    let live = layer;
+    const onRenderAsChange = vi.fn((_id: string, renderAs: string) => {
+      const mutation = buildRenderAsPatch(live, renderAs as 'heatmap');
+      if (mutation) live = { ...live, ...mutation.patch } as MapLayerResponse;
+      return Boolean(mutation);
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({ layers: [layer], onRenderAsChange, getLayer: () => live });
+    await typeAndSend(user, 'show it as a heatmap with a bigger radius');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', { ...DEFAULT_HEATMAP_PAINT, 'heatmap-radius': 40 });
+    });
+    expect(onRenderAsChange).toHaveBeenCalledWith('layer-1', 'heatmap', { heightColumn: undefined });
+  });
+
+  it('set_style on a symbol layer changes nothing', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'set_style', layer_id: 'layer-1', paint: { 'circle-color': '#dc2626' } }] },
+      };
+      yield { event: 'done', data: { explanation: 'Tried' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({
+        dataset_geometry_type: 'Point',
+        // Partial StyleConfig fixture — real runtime shape, cast only.
+        style_config: { render_mode: 'symbol' } as unknown as StyleConfig,
+      })],
+    });
+    await typeAndSend(user, 'make the icons red');
+
+    await screen.findByText('Tried');
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+  });
+
+  it('a second set_style in one turn builds on the first', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'circle-color': '#dc2626' } },
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'circle-radius': 8 } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Restyled' } };
+    });
+    let live = makeLayer({ dataset_geometry_type: 'Point', paint: {} });
+    const onPaintChange = vi.fn((_id: string, paint: Record<string, unknown>) => { live = { ...live, paint }; });
+
+    const user = userEvent.setup();
+    renderPanel({ layers: [live], onPaintChange, getLayer: () => live });
+    await typeAndSend(user, 'make it red and bigger');
+
+    await waitFor(() => {
+      expect(onPaintChange).toHaveBeenLastCalledWith('layer-1', { 'circle-color': '#dc2626', 'circle-radius': 8 });
+    });
+  });
+
+  it.each([
+    ['set_render_as', 'Changing render type...'],
+    ['future_tool', 'Server label'],
+  ])('shows the localized progress label for %s', async (tool, expected) => {
+    let release!: () => void;
+    const paused = new Promise<void>((resolve) => { release = resolve; });
+    mockStreamChat.mockImplementation(async function* () {
+      yield { event: 'tool_start', data: { type: 'tool_start', tool, label: 'Server label' } };
+      await paused;
+      yield { event: 'done', data: { explanation: 'Done' } };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'switch it');
+
+    expect(await screen.findByText(expected)).toBeInTheDocument();
+    release();
+    await screen.findByText('Done');
+  });
+
+  it('a refused set_render_as is not counted as applied', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'set_render_as', layer_id: 'layer-1', render_as: 'heatmap' }] },
+      };
+      yield { event: 'done', data: { explanation: 'Tried' } };
+    });
+    const onRenderAsChange = vi.fn(() => false);
+
+    const user = userEvent.setup();
+    renderPanel({ onRenderAsChange });
+    await typeAndSend(user, 'make the polygons a heatmap');
+
+    await screen.findByText('Tried');
+    expect(onRenderAsChange).toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
+  });
+
+  it('set_data_driven_style falls back to the layer render_mode when the action omits it, keeping heatmap-* paint', async () => {
+    const weightExpr = ['interpolate', ['linear'], ['get', 'magnitude'], 0, 0, 10, 1];
+    // Action OMITS render_mode; the layer is already in heatmap mode. Without the
+    // layer-render_mode fallback the heatmap-* keys are stripped as invalid-for-circle
+    // and the data-driven update becomes an empty no-op paint change.
+    const styleConfig = { mode: 'graduated', column: 'magnitude' };
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_data_driven_style',
+              layer_id: 'layer-1',
+              paint: { 'heatmap-weight': weightExpr, 'heatmap-radius': 30 },
+              style_config: styleConfig,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Restyled the heatmap' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({
+        dataset_geometry_type: 'Point',
+        paint: {},
+        // Partial StyleConfig fixture — real runtime shape, cast only.
+        style_config: { render_mode: 'heatmap' } as unknown as StyleConfig,
+      })],
+    });
+    await typeAndSend(user, 'restyle the heatmap by magnitude');
+
+    await waitFor(() => {
+      // heatmap-* paint survives validation AND the fallback render_mode is
+      // carried into the persisted style_config (onStyleConfigChange replaces it), so the
+      // layer stays a heatmap on save/reload instead of reverting to a circle.
+      expect(props.onStyleConfigChange).toHaveBeenCalledWith(
+        'layer-1',
+        { ...styleConfig, render_mode: 'heatmap' },
+        { 'heatmap-weight': weightExpr, 'heatmap-radius': 30 },
+      );
+    });
+  });
+
+  it('non-streaming fallback records only applied actions — a rejected action shows no "Applied"/Undo', async () => {
+    // Stream throws generically (no actions applied) -> non-streaming fallback fires.
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementation(async function* () {
+      throw new Error('stream failed');
+    });
+    // Fallback returns a no-op empty set_style: handleChatAction returns false, so it must
+    // NOT land in pendingActions and the message must not claim "Applied 1 changes".
+    mockSendChat.mockResolvedValue({
+      explanation: 'Nothing to change',
+      actions: [{ type: 'set_style', layer_id: 'layer-1', paint: {} }],
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'style it');
+
+    expect(await screen.findByText('Nothing to change')).toBeInTheDocument();
+    expect(mockSendChat).toHaveBeenCalled();
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+    expect(screen.queryByText(/applied/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
+  });
+
+  it('cancel during the non-streaming fallback applies nothing and shows no answer', async () => {
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementation(async function* () {
+      throw new Error('stream failed');
+    });
+    let settle!: (r: { explanation: string; actions: unknown[] }) => void;
+    mockSendChat.mockImplementation(
+      () => new Promise((r) => { settle = r as typeof settle; }),
+    );
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'style it red');
+    await waitFor(() => expect(mockSendChat).toHaveBeenCalled());
+    const signal = mockSendChat.mock.calls[0][5] as AbortSignal;
+
+    await user.click(screen.getByRole('button', { name: /cancel/i }));
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      settle({
+        explanation: 'Made it red',
+        actions: [{ type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': 'red' } }],
+      });
+    });
+
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+    expect(screen.queryByText('Made it red')).not.toBeInTheDocument();
+  });
+
+  it('set_style preserves builder _outline-* keys on a polygon (backend allowlist accepts them)', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { '_outline-color': '#ff0000', '_outline-width': 2 } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Outlined' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      // Polygon -> getLayerType 'fill'; _outline-color/_outline-width are builder
+      // CUSTOM_PAINT_PROPS that filterPaintForLayerType drops, but the backend allowlist
+      // (schemas.py _VALID_PAINT_PROPS['fill']) accepts them — so an outline-only style
+      // change must not be validated down to an empty no-op.
+      layers: [makeLayer({ dataset_geometry_type: 'Polygon', paint: {} })],
+    });
+    await typeAndSend(user, 'add a red outline');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
+        '_outline-color': '#ff0000',
+        '_outline-width': 2,
+      });
+    });
+  });
+
+  it('B-005/CH-09: set_style replace_paint:true with empty paint leaves existing layer paint unchanged', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: {}, replace_paint: true },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Nothing to replace' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({ paint: { 'fill-color': '#111827', 'fill-opacity': 0.4 } })],
+    });
+    await typeAndSend(user, 'replace with nothing');
+
+    expect(await screen.findByText('Nothing to replace')).toBeInTheDocument();
+    // Empty replace_paint is a no-op — the layer's existing paint must not be wiped.
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+    expect(screen.queryByText(/applied/i)).not.toBeInTheDocument();
+  });
+
+  it('B-002/CH-01: set_label clamps an absurd AI fontSize to the label bounds', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_label',
+              layer_id: 'layer-1',
+              label_config: { column: 'name', fontSize: 500, haloWidth: 1.5 },
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Labeled' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'label by name huge');
+
+    await waitFor(() => {
+      expect(props.onLabelChange).toHaveBeenCalledWith('layer-1', {
+        column: 'name',
+        fontSize: 24,
+        haloWidth: 1.5,
+      });
+    });
+  });
+
+  it('undo restores the last AI mutation snapshot for existing layers', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': '#ff0000' } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled' } };
+    });
+
+    const user = userEvent.setup();
+    const originalLayer = makeLayer({
+      paint: { 'fill-color': '#111827', 'fill-opacity': 0.4 },
+      filter: ['==', ['get', 'type'], 'park'],
+      label_config: { column: 'name' },
+      style_config: { mode: 'categorical', column: 'type', ramp: 'Viridis' },
+      visible: false,
+      opacity: 0.35,
+    });
+    const props = renderPanel({
+      layers: [originalLayer],
+      onOpacityChange: vi.fn(),
+    });
+
+    await typeAndSend(user, 'make it red');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledWith('layer-1', {
+        'fill-color': '#ff0000',
+        'fill-opacity': 0.4,
+      });
+    });
+
+    await user.click(await screen.findByRole('button', { name: /undo/i }));
+
+    // Undo restores the full pre-mutation snapshot in a SINGLE atomic call.
+    // (Restoring field-by-field clobbered earlier reverts — a later partial
+    // update re-stamped stale label_config/paint and the change visibly stuck.)
+    const restoreFn = vi.mocked(props.onRestoreLayers);
+    expect(restoreFn).toHaveBeenCalledTimes(1);
+    const restored = restoreFn.mock.calls[0][0];
+    expect(restored).toHaveLength(1);
+    expect(restored[0]).toMatchObject({
+      id: 'layer-1',
+      paint: originalLayer.paint,
+      filter: originalLayer.filter,
+      label_config: originalLayer.label_config,
+      visible: false,
+      style_config: originalLayer.style_config,
+      opacity: 0.35,
+    });
+    // The clobbering per-field restore handlers are no longer used by undo.
+    expect(props.onStyleConfigChange).not.toHaveBeenCalled();
+    expect(props.onLabelChange).not.toHaveBeenCalled();
+  });
+
+  it('STALE-01: a query-only turn after a style edit does not leave a stale undo button', async () => {
+    mockStreamChat
+      .mockImplementationOnce(async function* () {
+        yield {
+          event: 'actions',
+          data: { actions: [{ type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': '#ff0000' } }] },
+        };
+        yield { event: 'done', data: { explanation: 'Styled' } };
+      })
+      .mockImplementationOnce(async function* () {
+        yield {
+          event: 'actions',
+          data: { actions: [{ type: 'show_query_result', rows: [['x']], columns: ['name'], row_count: 1 }] },
+        };
+        yield { event: 'done', data: { explanation: 'Here are your results' } };
+      });
+
+    const user = userEvent.setup();
+    renderPanel();
+
+    await typeAndSend(user, 'make it red');
+    expect(await screen.findByText('Styled')).toBeInTheDocument();
+    // Undo is offered after a replay-safe style turn.
+    expect(await screen.findByRole('button', { name: /undo/i })).toBeInTheDocument();
+
+    await typeAndSend(user, 'how many parks');
+    expect(await screen.findByText('Here are your results')).toBeInTheDocument();
+
+    // The snapshot is reset at the start of every turn, so the query-only
+    // turn (which captures no snapshot) cannot leave a stale Undo button that would
+    // revert the earlier, unrelated style edit.
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
+    });
+  });
+
+  it('Applied-N nit: a pure query-result turn does not render "Applied N changes"', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'show_query_result', rows: [['x']], columns: ['name'], row_count: 1 }] },
+      };
+      yield { event: 'done', data: { explanation: 'Results' } };
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'how many parks');
+    expect(await screen.findByText('Results')).toBeInTheDocument();
+    // show_query_result mutates nothing — the "Applied N changes" line must not appear.
+    expect(screen.queryByText(/applied/i)).not.toBeInTheDocument();
+  });
+
+  it('P1-13: an invalid AI set_filter expression is rejected and never applied', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        // Legacy bare-field "in" form — rejected by the shared filter validator.
+        data: { actions: [{ type: 'set_filter', layer_id: 'layer-1', expression: ['in', 'type', 'a', 'b'] }] },
+      };
+      yield { event: 'done', data: { explanation: 'Tried to filter' } };
+    });
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'filter');
+    expect(await screen.findByText('Tried to filter')).toBeInTheDocument();
+    expect(props.onFilterChange).not.toHaveBeenCalled();
+    // A rejected filter is intent, not effect — it must not inflate the applied count.
+    expect(screen.queryByText(/applied/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
+  });
+
+  it('P1-13: a valid compound AI set_filter expression is applied', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [{
+            type: 'set_filter',
+            layer_id: 'layer-1',
+            expression: ['all', ['==', ['get', 'type'], 'park'], ['>', ['get', 'area'], 10]],
+          }],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Filtered' } };
+    });
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'filter');
+    await waitFor(() => {
+      expect(props.onFilterChange).toHaveBeenCalledWith('layer-1', [
+        'all', ['==', ['get', 'type'], 'park'], ['>', ['get', 'area'], 10],
+      ]);
+    });
+  });
+
+  it('does not offer undo for remove_layer actions (requires staging accept)', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'remove_layer', layer_id: 'layer-1' },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Removed' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'remove the layer');
+
+    // remove_layer is a destructive action — it goes into the staging
+    // buffer and only dispatches after the user accepts. Accept it first.
+    const acceptAll = await screen.findByRole('button', { name: /accept all/i });
+    await user.click(acceptAll);
+
+    await waitFor(() => {
+      expect(props.onRemove).toHaveBeenCalledWith('layer-1');
+    });
+    expect(await screen.findByText('Removed')).toBeInTheDocument();
+    // Undo is not offered for remove_layer (supportsUndo was false before staging;
+    // staging accept goes through handleChatAction which sets supportsUndo=false).
+    expect(screen.queryByRole('button', { name: /undo/i })).not.toBeInTheDocument();
+  });
+
+  it('does not re-apply actions when streaming partially succeeds then fails', async () => {
+    // Stream applies one action then throws
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': 'red' } },
+          ],
+        },
+      };
+      throw new Error('stream interrupted mid-response');
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'style it red');
+
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledTimes(1);
+    });
+
+    // Non-streaming fallback should NOT have been called
+    expect(mockSendChat).not.toHaveBeenCalled();
+
+    // Stream interrupted message should appear
+    expect(await screen.findByText(/interrupted/i)).toBeInTheDocument();
+  });
+
+  it.each([
+    { name: 'a 503 error event', event: { message: 'AI unavailable', status: 503 } },
+    { name: 'a model error event', event: { message: 'Tool loop exhausted' } },
+    { name: 'a network failure', event: null },
+  ])('makes no second request after a stream applied actions and then ended with $name', async ({ event }) => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': 'red' } }] },
+      };
+      if (!event) throw new TypeError('network error');
+      yield { event: 'error', data: event };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'style it red');
+
+    expect(await screen.findByText(/interrupted/i)).toBeInTheDocument();
+    expect(props.onPaintChange).toHaveBeenCalledTimes(1);
+    expect(mockSendChat).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('shows specific error when stream returns ApiError without fallback', async () => {
+    // Stream fails with a 403 ApiError — should show permission error directly
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementation(async function* () {
+      throw new ApiError('Forbidden', 403);
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'do something');
+
+    expect(await screen.findByText(/permission/i)).toBeInTheDocument();
+    // Should NOT have fallen back to non-streaming
+    expect(mockSendChat).not.toHaveBeenCalled();
+  });
+
+  it('dispatches set_data_driven_style to onStyleConfigChange with paint and config', async () => {
+    const stepExpr = ['step', ['get', 'acres'], '#ffffcc', 100, '#41b6c4', 500, '#253494'];
+    const styleConfig = { mode: 'graduated', column: 'acres', ramp: 'YlGnBu', method: 'quantile', breaks: [] };
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_data_driven_style',
+              layer_id: 'layer-1',
+              paint: { 'fill-color': stepExpr },
+              style_config: styleConfig,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled by acres' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'color by acres');
+
+    await waitFor(() => {
+      expect(props.onStyleConfigChange).toHaveBeenCalledWith(
+        'layer-1',
+        styleConfig,
+        { 'fill-color': stepExpr },
+      );
+    });
+    expect(props.onPaintChange).not.toHaveBeenCalled();
+  });
+
+  it('merges set_data_driven_style paint into current layer paint', async () => {
+    const stepExpr = ['step', ['get', 'acres'], '#ffffcc', 100, '#41b6c4', 500, '#253494'];
+    const styleConfig = { mode: 'graduated', column: 'acres', ramp: 'YlGnBu', method: 'quantile', breaks: [] };
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'set_data_driven_style',
+              layer_id: 'layer-1',
+              paint: { 'fill-color': stepExpr },
+              style_config: styleConfig,
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled by acres' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel({
+      layers: [makeLayer({ paint: { 'fill-opacity': 0.45, 'fill-outline-color': '#111827' } })],
+    });
+    await typeAndSend(user, 'color by acres');
+
+    await waitFor(() => {
+      expect(props.onStyleConfigChange).toHaveBeenCalledWith(
+        'layer-1',
+        styleConfig,
+        {
+          'fill-opacity': 0.45,
+          'fill-outline-color': '#111827',
+          'fill-color': stepExpr,
+        },
+      );
+    });
+  });
+
+  it.each([
+    { status: 401, expected: /session expired/i },
+    { status: 502, expected: /unavailable/i },
+  ])(
+    'shows specific error for ApiError status $status via fallback',
+    async ({ status, expected }) => {
+      // Stream fails with generic error, then fallback also fails with ApiError
+      // eslint-disable-next-line require-yield
+      mockStreamChat.mockImplementation(async function* () {
+        throw new Error('stream failed');
+      });
+      mockSendChat.mockRejectedValue(new ApiError('error', status));
+
+      const user = userEvent.setup();
+      renderPanel();
+      await typeAndSend(user, 'trigger error');
+
+      expect(await screen.findByText(expected)).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    { status: 403, expectedBanner: /permission/i },
+    { status: 503, expectedBanner: /unavailable/i },
+  ])(
+    'WR-03: ApiError status $status via fallback routes to sticky banner, not inline bubble',
+    async ({ status, expectedBanner }) => {
+      // Stream fails with generic error, then fallback also fails with ApiError
+      // eslint-disable-next-line require-yield
+      mockStreamChat.mockImplementation(async function* () {
+        throw new Error('stream failed');
+      });
+      mockSendChat.mockRejectedValue(new ApiError('error', status));
+
+      const user = userEvent.setup();
+      renderPanel();
+      await typeAndSend(user, 'trigger error');
+
+      // Should show sticky banner (role="alert"), not inline error bubble
+      const banner = await screen.findByRole('alert');
+      expect(banner).toBeInTheDocument();
+      expect(banner).toHaveTextContent(expectedBanner);
+    },
+  );
+});
+
+describe('ChatPanel — confirm-before-apply staging (Phase 1135 AI-01 / AI-09)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+  });
+
+  it('AI-01: rejecting the staging tray leaves layers byte-equal to pre-prompt — onAddDataset and onRemove NOT called', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'add_layer', dataset_id: 'ds-new', dataset_name: 'NYC Subway' },
+            { type: 'remove_layer', layer_id: 'layer-1' },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Two staged changes' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'add subway and remove polygons');
+
+    // Wait for the staging tray to render
+    const rejectAllBtn = await screen.findByRole('button', { name: /reject all/i });
+    expect(rejectAllBtn).toBeInTheDocument();
+
+    // No mutations should have fired yet — buffer is pre-flush
+    expect(props.onAddDataset).not.toHaveBeenCalled();
+    expect(props.onRemove).not.toHaveBeenCalled();
+
+    await user.click(rejectAllBtn);
+
+    // After reject: tray gone, NO mutations fired
+    expect(screen.queryByRole('button', { name: /reject all/i })).not.toBeInTheDocument();
+    expect(props.onAddDataset).not.toHaveBeenCalled();
+    expect(props.onRemove).not.toHaveBeenCalled();
+  });
+
+  it('AI-01: acceptOne dispatches exactly one action and leaves remaining pending', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'add_layer', dataset_id: 'ds-A', dataset_name: 'A' },
+            { type: 'add_layer', dataset_id: 'ds-B', dataset_name: 'B' },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Two adds' } };
+    });
+
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'add A and B');
+
+    // Per-chip Accept buttons render text "Accept" (capital A, exact);
+    // "Accept all" is the accept-all button — filter it out by exact text match.
+    await screen.findByRole('button', { name: /accept all/i }); // wait for tray to render
+    const allButtons = screen.getAllByRole('button');
+    const acceptButtons = allButtons.filter(
+      (btn) => btn.textContent?.trim() === 'Accept',
+    );
+    expect(acceptButtons.length).toBe(2);
+
+    await user.click(acceptButtons[0]);
+    await waitFor(() => {
+      expect(props.onAddDataset).toHaveBeenCalledTimes(1);
+      expect(props.onAddDataset).toHaveBeenCalledWith('ds-A');
+    });
+    // One chip remains — one per-chip Accept button still visible
+    const remaining = screen.getAllByRole('button').filter(
+      (btn) => btn.textContent?.trim() === 'Accept',
+    );
+    expect(remaining.length).toBe(1);
+  });
+
+  it('AI-01: acceptAll dispatches all pending actions in order', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'add_layer', dataset_id: 'ds-A', dataset_name: 'A' },
+            { type: 'remove_layer', layer_id: 'layer-1' },
+            { type: 'add_layer', dataset_id: 'ds-C', dataset_name: 'C' },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Three staged' } };
+    });
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'do three things');
+    const acceptAll = await screen.findByRole('button', { name: /accept all/i });
+    await user.click(acceptAll);
+    await waitFor(() => {
+      expect(props.onAddDataset).toHaveBeenCalledTimes(2);
+      expect(props.onRemove).toHaveBeenCalledTimes(1);
+    });
+    // Order — first call to onAddDataset is 'ds-A', second is 'ds-C'
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const addCalls = (props.onAddDataset as any).mock.calls as [string][];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const removeCalls = (props.onRemove as any).mock.calls as [string][];
+    expect(addCalls[0][0]).toBe('ds-A');
+    expect(addCalls[1][0]).toBe('ds-C');
+    expect(removeCalls[0][0]).toBe('layer-1');
+  });
+
+  it('AI-09: staging tray renders for add_layer + remove_layer; chip text format matches UI-SPEC', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'add_layer', dataset_id: 'ds-2', dataset_name: 'NYC Subway' },
+            { type: 'remove_layer', layer_id: 'layer-1' },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Two staged' } };
+    });
+    const user = userEvent.setup();
+    renderPanel({
+      layers: [makeLayer({ id: 'layer-1', display_name: 'Counties', dataset_feature_count: 5 })],
+    });
+    await typeAndSend(user, 'change some layers');
+    // add_layer chip — name appears
+    expect(await screen.findByText(/Add "NYC Subway"/)).toBeInTheDocument();
+    // remove_layer chip — feature count appears
+    expect(await screen.findByText(/Remove "Counties" \(5 features\)/)).toBeInTheDocument();
+  });
+
+  it('AI-09 negative control: set_style action does NOT trigger the staging tray — dispatches immediately', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'set_style', layer_id: 'layer-1', paint: { 'fill-color': '#ff0000' } },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Styled' } };
+    });
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'make it red');
+    await waitFor(() => {
+      expect(props.onPaintChange).toHaveBeenCalledTimes(1);
+    });
+    // Negative control: no staging tray for non-destructive actions
+    expect(screen.queryByRole('button', { name: /accept all/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /reject all/i })).not.toBeInTheDocument();
+  });
+
+  it('WR-02 (1278 review): staged add_layer/remove_layer do not render "Applied N changes" before acceptance', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'add_layer', dataset_id: 'ds-2', dataset_name: 'NYC Subway' },
+            { type: 'remove_layer', layer_id: 'layer-1' },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Two staged' } };
+    });
+    const user = userEvent.setup();
+    renderPanel({
+      layers: [makeLayer({ id: 'layer-1', display_name: 'Counties', dataset_feature_count: 5 })],
+    });
+    await typeAndSend(user, 'change some layers');
+    // Staging tray is visible — the changes are staged, not yet applied.
+    expect(await screen.findByRole('button', { name: /accept all/i })).toBeInTheDocument();
+    // "Applied N changes" must not render while add_layer/remove_layer sit unconfirmed
+    // in the tray — they were only staged (intent), not yet dispatched (effect).
+    expect(screen.queryByText(/applied/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('ChatPanel — inline data-analysis card (Phase 1135 AI-08)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+  });
+
+  it('renders inline table card when show_query_result returns rows', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'show_query_result',
+              // Real backend contract: rows are arrays of cell values paired
+              // with a separate `columns` array (chat_geojson.py: list[list]).
+              columns: ['county', 'area_sqkm', 'population'],
+              rows: [
+                ['Essex', 4853, 38000],
+                ['Hamilton', 4757, 4400],
+              ],
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Top 2 counties' } };
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'biggest counties');
+    expect(await screen.findByText(/Essex/)).toBeInTheDocument();
+    expect(await screen.findByText(/Hamilton/)).toBeInTheDocument();
+    // Scroll region with aria-label should exist
+    expect(await screen.findByRole('region', { name: /query result table/i })).toBeInTheDocument();
+  });
+
+  it('drops floating-point noise from aggregate cells', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            { type: 'show_query_result', columns: ['borough', 'total_acres'], rows: [['Brooklyn', 491.9000000000001]] },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Acreage by borough' } };
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'acreage by borough');
+    expect(await screen.findByRole('cell', { name: '491.9' })).toBeInTheDocument();
+    expect(screen.queryByText(/491\.90000/)).not.toBeInTheDocument();
+  });
+
+  it('renders the LAST query result when a retry supersedes an empty one (#534)', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            // Sanity-check retry path: first query came back empty...
+            { type: 'show_query_result', rows: [], columns: ['county'] },
+            // ...the retried query is the one the user should see.
+            { type: 'show_query_result', columns: ['county'], rows: [['Essex']] },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Found it on retry' } };
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'find essex');
+    expect(await screen.findByText(/Essex/)).toBeInTheDocument();
+    expect(screen.queryByText(/no rows/i)).toBeNull();
+  });
+
+  it('renders empty-state when show_query_result returns rows: []', async () => {
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'show_query_result', rows: [] }] },
+      };
+      yield { event: 'done', data: { explanation: 'No results' } };
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'find non-existent thing');
+    expect(await screen.findByText(/no rows/i)).toBeInTheDocument();
+    expect(await screen.findByText(/broader area or different filter/i)).toBeInTheDocument();
+  });
+
+  it('caps visible columns at 5 and shows ellipsis indicator when more exist', async () => {
+    const wideColumns = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
+    const wideRow = [1, 2, 3, 4, 5, 6, 7];
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'show_query_result', columns: wideColumns, rows: [wideRow] }] },
+      };
+      yield { event: 'done', data: { explanation: 'Wide row' } };
+    });
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'wide query');
+    // First 5 columns visible as headers
+    await screen.findByRole('region', { name: /query result table/i });
+    const headers = screen.getAllByRole('columnheader');
+    // 5 visible column headers + 1 "more columns" indicator = 6 total
+    expect(headers.length).toBe(6);
+    // The … indicator has aria-label "more columns"
+    expect(screen.getByLabelText(/more columns/i)).toBeInTheDocument();
+  });
+
+  it('show_query_result with only geojson + bbox (no rows) calls onQueryResult and does NOT render inline card', async () => {
+    const geojson = { type: 'FeatureCollection', features: [] };
+    const bbox = [-74, 40, -73, 41];
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: { actions: [{ type: 'show_query_result', geojson, bbox }] },
+      };
+      yield { event: 'done', data: { explanation: 'Spatial result' } };
+    });
+    const user = userEvent.setup();
+    const props = renderPanel();
+    await typeAndSend(user, 'find spatial features');
+    await waitFor(() => {
+      expect(props.onQueryResult).toHaveBeenCalledWith(geojson, bbox, {
+        prompt: 'find spatial features',
+      });
+    });
+    // Negative control — no inline card when rows is absent
+    expect(screen.queryByRole('region', { name: /query result table/i })).not.toBeInTheDocument();
+  });
+});
+
+describe('ChatPanel — recoverable error banner (Phase 1135 AI-03)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+  });
+
+  it('503 surfaces sticky banner with Retry button; Retry re-fires the last user message', async () => {
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementationOnce(async function* () {
+      throw new ApiError('AI unavailable', 503);
+    });
+    mockSendChat.mockRejectedValue(new ApiError('AI unavailable', 503));
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'broken request');
+
+    // Banner appears
+    const banner = await screen.findByRole('alert');
+    expect(banner).toBeInTheDocument();
+    expect(banner).toHaveTextContent(/AI is unavailable/i);
+    const retryBtn = within(banner).getByRole('button', { name: /retry/i });
+    expect(retryBtn).toBeInTheDocument();
+    // Inline error bubble suppressed — no Retry button OUTSIDE the alert region
+    const allRetryButtons = screen.getAllByRole('button', { name: /retry/i });
+    expect(allRetryButtons.length).toBe(1); // exactly the banner Retry
+
+    // Retry re-fills the input
+    await user.click(retryBtn);
+    const input = screen.getByPlaceholderText(/describe a map change/i) as HTMLTextAreaElement;
+    expect(input.value).toBe('broken request');
+    // Banner cleared
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('403 surfaces sticky banner with Dismiss button; NO Retry button', async () => {
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementationOnce(async function* () {
+      throw new ApiError('forbidden', 403);
+    });
+    mockSendChat.mockRejectedValue(new ApiError('forbidden', 403));
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'forbidden request');
+
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent(/AI access lost/i);
+    // No Retry button anywhere
+    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
+    // Dismiss button present
+    const dismiss = within(banner).getByRole('button', { name: /dismiss/i });
+    await user.click(dismiss);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('401 falls through to existing inline error bubble — banner NOT rendered', async () => {
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementationOnce(async function* () {
+      throw new ApiError('session expired', 401);
+    });
+    mockSendChat.mockRejectedValue(new ApiError('session expired', 401));
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'test-auth-401');
+
+    // No banner
+    await waitFor(() => {
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+    // Existing inline error bubble path renders the session-expired text (t('chat.errorSessionExpired'))
+    expect(await screen.findByText(/please log in again|session expired\. please/i)).toBeInTheDocument();
+  });
+
+  it('network error falls through to existing inline error bubble — banner NOT rendered', async () => {
+    // eslint-disable-next-line require-yield
+    mockStreamChat.mockImplementationOnce(async function* () {
+      throw new Error('Network unreachable');
+    });
+    mockSendChat.mockRejectedValue(new Error('Network unreachable'));
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'network drops');
+
+    await waitFor(() => {
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+    // Existing inline error bubble renders the generic friendly error
+    const errorMessage = await screen.findByText(/something went wrong|trouble|try again|error/i);
+    expect(errorMessage).toBeInTheDocument();
+  });
+});
+
+describe('ChatPanel — sessionStorage persistence (#723)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+  });
+
+  it('does not persist result geojson, so a big result cannot blow the quota', async () => {
+    // A 500-feature FeatureCollection, the size the preview cap allows.
+    const features = Array.from({ length: 500 }, (_, i) => ({
+      type: 'Feature' as const,
+      geometry: {
+        type: 'Polygon' as const,
+        coordinates: [
+          Array.from({ length: 40 }, (_, k) => [
+            -74 + k * 0.0001 + i * 0.001,
+            40 + k * 0.0001,
+          ]),
+        ],
+      },
+      properties: { gid: i, name: `parcel ${i}` },
+    }));
+
+    mockStreamChat.mockImplementation(async function* () {
+      yield {
+        event: 'actions',
+        data: {
+          actions: [
+            {
+              type: 'show_query_result',
+              geojson: { type: 'FeatureCollection', features },
+              bbox: [-74, 40, -73, 41],
+              row_count: 500,
+              truncated: true,
+              operation: 'buffer',
+              layer_id: 'layer-1',
+            },
+          ],
+        },
+      };
+      yield { event: 'done', data: { explanation: 'Buffered the parcels' } };
+    });
+
+    const user = userEvent.setup();
+    renderPanel();
+    await typeAndSend(user, 'buffer the parcels by 500m');
+
+    await waitFor(() => {
+      expect(sessionStorage.getItem('geolens-chat-map-1')).toBeTruthy();
+    });
+
+    const raw = sessionStorage.getItem('geolens-chat-map-1') as string;
+    expect(raw).not.toContain('FeatureCollection');
+    expect(raw).not.toContain('coordinates');
+    // Well under the ~5 MB budget; the unstripped payload is megabytes.
+    expect(raw.length).toBeLessThan(50_000);
+    // The metadata the inline card renders survives.
+    expect(raw).toContain('show_query_result');
+    expect(raw).toContain('row_count');
+    expect(raw).toContain('Buffered the parcels');
+  });
+});
+
+describe('ChatPanel — storage-denied contexts (#1536)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+  });
+
+  // cleanStaleLayerRefs read sessionStorage one line ABOVE the try
+  // that wrapped the rest of it, and the property access is what raises
+  // SecurityError in a sandboxed frame with an opaque origin. acceptAll
+  // dispatches the staged batch in a bare for loop with no per-action catch
+  // (chat-action-staging.ts), so the throw aborted the batch and every action
+  // ordered after the remove was silently dropped.
+  //
+  // The add is deliberately ordered AFTER the remove: that makes this a test of
+  // the feature (the batch completes) rather than of the line that changed.
+  // Asserting onRemove alone would pass either way, because onRemove(layerId)
+  // runs one line BEFORE cleanStaleLayerRefs.
+  it('applies the whole staged batch when sessionStorage access throws', async () => {
+    const restore = denySessionStorage();
+    try {
+      mockStreamChat.mockImplementation(async function* () {
+        yield {
+          event: 'actions',
+          data: {
+            actions: [
+              { type: 'remove_layer', layer_id: 'layer-1' },
+              { type: 'add_layer', dataset_id: 'ds-C', dataset_name: 'C' },
+            ],
+          },
+        };
+        yield { event: 'done', data: { explanation: 'Swapped the layer' } };
+      });
+
+      const user = userEvent.setup();
+      const props = renderPanel();
+      await typeAndSend(user, 'swap the parcels layer for C');
+      await user.click(await screen.findByRole('button', { name: /accept all/i }));
+
+      await waitFor(() => {
+        expect(props.onRemove).toHaveBeenCalledWith('layer-1');
+        expect(props.onAddDataset).toHaveBeenCalledWith('ds-C');
+      });
+    } finally {
+      restore();
+    }
+  });
+});

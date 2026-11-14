@@ -1,0 +1,15 @@
+"""Shared dataset utility functions."""
+
+from app.core.geo import extent_to_bbox
+from app.modules.catalog.datasets.domain.models import Dataset
+
+
+def extract_bbox(dataset: Dataset) -> list[float] | None:
+    """Extract a bbox array from the dataset's record spatial_extent geometry.
+
+    Delegates to ``extent_to_bbox`` so a seam-crossing extent yields
+    the RFC 7946 §5.2 west > east pair rather than a globe-spanning -180..180.
+    """
+    if dataset.record and dataset.record.spatial_extent is not None:
+        return extent_to_bbox(dataset.record.spatial_extent)
+    return None

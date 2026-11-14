@@ -1,0 +1,1627 @@
+"""Async subprocess wrappers for GDAL CLI tools (ogr2ogr, ogrinfo)."""
+
+import asyncio
+import json
+import os
+import re
+import time
+import zipfile
+from collections.abc import Callable
+from pathlib import PurePosixPath
+from typing import NoReturn, TypedDict
+
+import structlog
+
+from app.core.config import settings
+from app.core.crs_uri import parse_crs_uri
+from app.core.runtime.staging import (
+    GDAL_HEADER_FILE_REDIRECT_ENV,
+    ensure_staging_ready,
+    gdal_header_dir,
+)
+from app.processing.ingest.shapefile_source import (
+    declares_dbf_encoding,
+    zip_dataset_root,
+)
+from app.platform.service_items import materialise_oapif_items
+from app.platform.service_endpoints import (
+    assert_endpoints_stay_on_origin,
+    fire_once,
+    gdal_transport_env,
+    require_wfs_layer,
+)
+from app.core.service_tokens import (
+    BEARER_SCHEME,
+    HEADER_LINE_SEPARATOR,
+    HEADER_LINE_VALUE_CHARSET,
+    HEADER_NAME_CHARSET,
+    HEADER_TOKEN_CHARSET,
+    HEADER_TOKEN_MIN_LENGTH,
+    CredentialMethod,
+    ServiceCredential,
+    build_credential_header,
+    credential_header_line,
+    register_credential_secret,
+    requires_header_token_policy,
+)
+from app.core.upload_errors import IngestCeilingError
+from app.core.url_redaction import redact_url_credentials, scrub_secret_value
+from app.platform.egress_proxy import (
+    gdal_source_url,
+    pinned_origin,
+    service_egress_proxy,
+)
+from app.platform.service_auth import refuse_credential_over_http
+from app.platform.gdal_argv import is_option_like_layer_name
+from app.processing.ingest.arcgis_errors import (
+    ARCGIS_ERROR_RESPONSE_RE,
+    fetch_arcgis_error_detail,
+)
+from app.processing.ingest.gdal_drivers import local_input_driver_args
+from app.core.async_io import run_in_thread_draining
+from app.processing.ingest.validation import validate_content_directives
+from app.processing.raster.vrt import gdal_service_safe_env, gdal_vector_safe_env
+
+
+# Matches GDAL driver-list lines like "  -> 'FITS' (read-only)". The mode
+# group is optional since some GDAL builds emit bare driver names.
+_OGR_DRIVER_LIST_LINE_RE = re.compile(r"^\s*->\s*'[^']+'\s*(\([^)]*\))?\s*$")
+
+# When no driver can open the source, ogr2ogr prints this line ahead of GDAL's
+# full driver enumeration (100+ lines), and ogrinfo says it in one line of its
+# own naming the staging path. Both are anchored tightly so no other failure
+# class (bad SRS, permission denied) matches.
+_OGR_UNABLE_TO_OPEN_RE = re.compile(
+    r"Unable to open datasource `[^']*' with the following drivers\."
+    r"|ogrinfo failed - unable to open '[^']*'"
+)
+
+# A second shape: a driver DOES claim the source (e.g. GPKG is SQLite) but
+# the content is corrupt, surfacing as SQLite's own "file is not a
+# database" error instead of GDAL's enumeration. Fires when the SQLite
+# header itself doesn't parse (magic present, page-size/header garbage).
+_SQLITE_NOT_A_DATABASE_RE = re.compile(r"file is not a database")
+
+# A third shape: the SQLite header parses but an interior b-tree page is
+# corrupt, reported as "database disk image is malformed". Neither pattern
+# above matches it, and the raw stderr would carry the staging path.
+_SQLITE_DISK_IMAGE_MALFORMED_RE = re.compile(r"database disk image is malformed")
+
+
+def _is_unopenable_source_stderr(stderr_text: str) -> bool:
+    """True when ``stderr_text`` matches a known "can't open this source" shape.
+
+    The patterns all mean the same thing to the uploader (GDAL couldn't
+    read it as a spatial dataset), so they map to one friendly message;
+    see ``_friendly_open_failure_message``.
+    """
+    return bool(
+        _OGR_UNABLE_TO_OPEN_RE.search(stderr_text)
+        or _SQLITE_NOT_A_DATABASE_RE.search(stderr_text)
+        or _SQLITE_DISK_IMAGE_MALFORMED_RE.search(stderr_text)
+    )
+
+
+# The failure classes a stored reason may name, and the only field any of
+# them takes out of GDAL's text. A driver names the source inside its own
+# prose ("unable to open 'GPKG:/app/staging/x.gpkg'"), which no cut over that
+# text can be relied on to reach.
+_GDAL_FAILURE_CLASSES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"HTTP (?:error )?(?:code|response)\s*:?\s*(\d{3})"),
+        "the source service answered HTTP {}",
+    ),
+    (
+        re.compile(r"(?i)couldn't fetch requested layer"),
+        "the requested layer is not in the source",
+    ),
+    (
+        re.compile(r"Failed to process SRS definition"),
+        "the coordinate reference system could not be resolved",
+    ),
+)
+
+
+# Human-readable label per uploaded extension, used only to phrase the
+# friendly "could not open" message below. Unknown/missing extensions fall
+# back to a generic "spatial data" phrasing.
+_VECTOR_FORMAT_LABELS: dict[str, str] = {
+    ".gpkg": "GeoPackage (.gpkg)",
+    ".shp": "Shapefile (.shp)",
+    ".zip": "zipped Shapefile or File Geodatabase (.zip)",
+    ".geojson": "GeoJSON (.geojson)",
+    ".json": "GeoJSON (.json)",
+    ".csv": "CSV (.csv)",
+    ".kml": "KML (.kml)",
+    ".kmz": "KMZ (.kmz)",
+    ".fgb": "FlatGeobuf (.fgb)",
+    ".gml": "GML (.gml)",
+    ".gdb": "File Geodatabase (.gdb)",
+}
+
+
+def _friendly_open_failure_message(original_filename: "str | None") -> str:
+    """User-facing text for an ogr2ogr "unable to open datasource" failure.
+
+    Built from ``original_filename`` alone, never from the staging path or
+    the raw stderr, so the message can never leak the
+    `/app/staging/<uuid>_...` path GDAL echoes back on this failure class.
+    """
+    name = os.path.basename(original_filename) if original_filename else None
+    suffix = os.path.splitext(name)[1].lower() if name else ""
+    format_label = _VECTOR_FORMAT_LABELS.get(suffix, "spatial data")
+    if name:
+        return (
+            f"Could not open '{name}' as a spatial dataset — the file may be "
+            f"corrupt, incomplete, or not a valid {format_label} file."
+        )
+    return (
+        "Could not open the uploaded file as a spatial dataset — it may be "
+        "corrupt, incomplete, or not a valid spatial data file."
+    )
+
+
+def _raise_gdal_failure(
+    tool: str,
+    returncode: int,
+    stderr_text: str,
+    original_filename: "str | None",
+) -> NoReturn:
+    """Raise the reason ``stderr_text``'s failure class allows, having logged it.
+
+    The message carries the tool, the exit status and the fields the matched
+    class permits, never the driver's own prose. Full stderr is diagnostic
+    gold for us and noise for the job UI, so it stays in the log.
+    """
+    structlog.get_logger().error(
+        f"{tool} failed",
+        exit_code=returncode,
+        stderr=stderr_text,
+        original_filename=original_filename,
+    )
+    if _is_unopenable_source_stderr(stderr_text):
+        raise IngestionError(_friendly_open_failure_message(original_filename))
+    raise IngestionError(_gdal_failure_reason(tool, returncode, stderr_text))
+
+
+def _gdal_failure_reason(
+    tool: str,
+    returncode: int,
+    stderr_text: str,
+    classes: tuple[tuple[re.Pattern[str], str], ...] = _GDAL_FAILURE_CLASSES,
+) -> str:
+    """The tool and exit status, plus the one sentence a matched class allows."""
+    for pattern, sentence in classes:
+        match = pattern.search(stderr_text)
+        if match:
+            return (
+                f"{tool} failed (exit {returncode}): {sentence.format(*match.groups())}"
+            )
+    return f"{tool} failed (exit {returncode})"
+
+
+SERVICE_ADDRESS_REFUSED = (
+    "the source service pointed to an address this server does not connect to"
+)
+SERVICE_LEFT_ORIGIN = (
+    "the source service redirected to another address, and GeoLens does not "
+    "send a credential anywhere but the service's own address"
+)
+
+# A service can refuse a credential inside an HTTP 200 exception report. The
+# sentence names authentication so the caller can still suggest a credential.
+_SERVICE_FAILURE_CLASSES = (
+    *_GDAL_FAILURE_CLASSES,
+    (
+        re.compile(
+            r"(?i)\b(?:unauthori[sz]ed|forbidden|access denied|"
+            r"authentication (?:failed|required)|invalid (?:token|credentials?)|"
+            r"token required)\b"
+        ),
+        "the source service reported an authentication failure",
+    ),
+    (
+        re.compile(r"Missing 'features' member|Failed to read ESRIJSON data"),
+        "the source service returned an error instead of features",
+    ),
+)
+
+
+# GDAL echoes a destination it can't open, masking only the first word of a
+# quoted password.
+_PG_DESTINATION_ECHO_RE = re.compile(r"PG:.*")
+
+
+def _raise_service_gdal_failure(
+    tool: str,
+    returncode: int,
+    stderr_text: str,
+    *,
+    refused: bool,
+    left_origin: bool = False,
+    service_error: str | None = None,
+) -> NoReturn:
+    """Raise a service import's reason, having logged the redacted GDAL text.
+
+    ``refused`` is whether the egress proxy turned a destination away, which
+    GDAL itself reports only as an HTTP 403, and ``left_origin`` whether that
+    was a hop off a credentialed run's origin. ``service_error`` is the
+    service's own redacted error, added to the reason.
+    """
+    structlog.get_logger().error(
+        f"{tool} failed for a remote service",
+        exit_code=returncode,
+        stderr=stderr_text,
+        service_error=service_error,
+    )
+    if refused:
+        why = SERVICE_LEFT_ORIGIN if left_origin else SERVICE_ADDRESS_REFUSED
+        raise IngestionError(f"{tool} failed (exit {returncode}): {why}")
+    reason = _gdal_failure_reason(
+        tool, returncode, stderr_text, _SERVICE_FAILURE_CLASSES
+    )
+    raise IngestionError(f"{reason}. {service_error}" if service_error else reason)
+
+
+# The worker's own refusals, as constants rather than composed strings, so
+# none may name any part of the credential being judged. No brace in any, so
+# none can grow an interpolation later.
+HEADER_LINE_SHAPE_POLICY = (
+    "The service credential did not arrive as one header line "
+    "(a header name, a colon and a space, then a value). Nothing was sent."
+)
+
+HEADER_LINE_NAME_POLICY = (
+    "The service credential named a header this build will not "
+    "write. A header name may use only letters, digits and the characters "
+    "! # $ % & ' * + - . ^ _ ` | ~ ."
+)
+
+HEADER_LINE_VALUE_POLICY = (
+    "The service credential's value contains a character that "
+    "cannot be written into an HTTP header. Only printable ASCII is "
+    "permitted, so that no line break can smuggle a second header through "
+    "libcurl."
+)
+
+
+def _legacy_bearer_line(token: str, service_format: str) -> str:
+    """The line an older queued job's bare bearer token would have become.
+
+    Composed by ``build_credential_header``, not here: the single-producer
+    rule (``tests/test_credential_producer_structural.py``) keeps any second
+    place in the tree from growing a prefix of its own. The builder applies
+    the base64url charset and length floor, so a refused token gets the
+    shape policy, not a bearer-specific message; the value is not named.
+    """
+    # The format gate sits at `_sanitize_authorization_token`'s entry; see the
+    # comment there.
+    try:
+        pair = build_credential_header(
+            ServiceCredential(
+                method=CredentialMethod.BEARER,
+                service_format=service_format,
+                token=token,
+            )
+        )
+    except ValueError:
+        raise ValueError(HEADER_LINE_SHAPE_POLICY) from None
+    if pair is None:
+        # A service format that carries no header at all: a silent empty
+        # line would be worse than a refusal.
+        raise ValueError(HEADER_LINE_SHAPE_POLICY)
+    return credential_header_line(pair)
+
+
+def _sanitize_authorization_token(
+    header_line: "str | None", *, service_format: str
+) -> "str | None":
+    """Pin the credential header line to the shared policy.
+
+    What crosses from the door to this worker is one finished header line,
+    not a bare token, so this judges a line: printable ASCII, no CR or LF,
+    exactly one ``": "`` separator, and a name that passes
+    ``header_name_rejection_reason``. A character outside that shape could
+    let an attacker inject additional HTTP headers through the
+    GDAL_HTTP_HEADER_FILE-to-libcurl pipeline. These rules mirror
+    ``app.core.service_tokens``, which every door also applies, but this
+    check stays regardless: the guarantee is about what reaches libcurl and
+    can't rest on a validator running in another process.
+
+    The bearer branch keeps the base64url charset/length floor and names the
+    offending character, which is safe because every character of a bearer
+    token is already constrained to a set with no secret structure. Every
+    other branch is policy-only: the exception becomes
+    ``IngestJob.error_message``, a log record, a notification reason and the
+    queue's re-raise (``scrub_secret_from_exception`` keeps all four in
+    sync), and under basic auth the judged value is an encoded
+    username:password, so no character of it is named.
+
+    A value with no separator is the older wire format, a bare bearer token,
+    and must keep working: a worker started while old jobs are queued reads
+    one out of ``procrastinate_jobs.args`` or the credential store, and
+    refusing it would fail those jobs at the next deploy. So a bare value
+    satisfying the old charset is composed into the line it would have
+    produced, through the same builder every other caller uses. Anything
+    neither a valid line nor a valid bare token raises the shape policy.
+
+    ``service_format`` selects the builder's allowlist branch; passing the
+    caller's real value (not a constant) keeps the builder the sole
+    authority on which formats may carry a header.
+
+    Returns the line the file should hold, raises ValueError otherwise.
+    None passes through.
+    """
+    if header_line is None:
+        return None
+    # The format gate sits here, at this module's only sanitization entry, so
+    # it refuses a finished line for a gated service_format (e.g. ArcGIS) as
+    # well as a bare token. This is the trust-boundary copy of the door's gate.
+    if not requires_header_token_policy(service_format):
+        raise ValueError(HEADER_LINE_SHAPE_POLICY)
+    name, separator, value = header_line.partition(HEADER_LINE_SEPARATOR)
+    if not separator:
+        return _legacy_bearer_line(header_line, service_format)
+    if not value or HEADER_LINE_SEPARATOR in value:
+        raise ValueError(HEADER_LINE_SHAPE_POLICY)
+    if not name or any(character not in HEADER_NAME_CHARSET for character in name):
+        # Field-name grammar, deliberately not the door's reserved-name
+        # denylist: the builder's own bearer/basic output is `Authorization`,
+        # which that denylist exists to keep a caller from claiming.
+        # Applying it here would refuse every line this codebase composes.
+        raise ValueError(HEADER_LINE_NAME_POLICY)
+    if any(character not in HEADER_LINE_VALUE_CHARSET for character in value):
+        raise ValueError(HEADER_LINE_VALUE_POLICY)
+    # A finished line never touches `build_credential_header`, so it is
+    # registered for scrubbing here, or no log line on the worker's
+    # service-import path would be scrubbed.
+    #
+    # The line is registered, not the value. `_secret_variants`
+    # (`core/url_redaction.py`) derives the bare token, basic blob and
+    # decoded user:pass only from a secret containing `": "`, so registering
+    # `Bearer <tok>` alone would expand to nothing and leave a bare token an
+    # origin echoed back unscrubbed. The line expands to every shape and
+    # never yields the bare word `Authorization` (the tail always starts
+    # after `": "`).
+    #
+    # Registration waits until the bearer grammar below is checked: a refused
+    # line is not a secret in play, and registering one such as
+    # `Authorization: Bearer e` would seed the one-character variant `e`,
+    # redacting every "e" in every log line for the rest of the job.
+    if value.startswith(BEARER_SCHEME):
+        token = value[len(BEARER_SCHEME) :]
+        if len(token) < HEADER_TOKEN_MIN_LENGTH:
+            raise ValueError(
+                "Authorization token is empty or implausibly short "
+                f"(minimum {HEADER_TOKEN_MIN_LENGTH} characters required to "
+                "prevent single-char attack payloads)."
+            )
+        bad = [c for c in token if c not in HEADER_TOKEN_CHARSET]
+        if bad:
+            sample = bad[0]
+            raise ValueError(
+                f"Authorization token contains non-base64url "
+                f"character (first offender: {sample!r}); only "
+                "[A-Za-z0-9._\\-=] are permitted to prevent CRLF header "
+                "smuggling via GDAL_HTTP_HEADERS env var."
+            )
+
+    register_credential_secret(header_line)
+    return header_line
+
+
+def _strip_ogr_driver_list(stderr_text: str) -> str:
+    """Remove GDAL driver-list lines from ogr2ogr stderr output.
+
+    ogr2ogr emits a 150+ line driver enumeration before the actual error
+    when it can't open a source; this strips those "  -> 'NAME' (modes)"
+    lines so IngestionError messages carry only the actionable line(s).
+    Runs of blank lines left behind collapse to one; result is stripped.
+
+    Safety: the regex only matches that exact shape, so a future GDAL format
+    change means nothing gets stripped, never that real content is removed.
+    """
+    if not stderr_text:
+        return stderr_text
+
+    lines = stderr_text.splitlines()
+    kept: list[str] = []
+    for line in lines:
+        if _OGR_DRIVER_LIST_LINE_RE.match(line):
+            continue
+        kept.append(line)
+
+    collapsed: list[str] = []
+    prev_blank = False
+    for line in kept:
+        is_blank = line.strip() == ""
+        if is_blank and prev_blank:
+            continue
+        collapsed.append(line)
+        prev_blank = is_blank
+
+    return "\n".join(collapsed).strip()
+
+
+class OgrinfoResult(TypedDict, total=False):
+    srid: int | None
+    geometry_type: str | None
+    layer_name: str
+    feature_count: int | None
+    columns: list[dict[str, str]]
+    sample_rows: list[dict]
+    all_layers: list[dict] | None
+    attachments_omitted: bool
+
+
+class IngestionError(Exception):
+    """Raised when an ingestion subprocess fails."""
+
+
+class MissingCrsError(IngestionError):
+    """A spatial source declares no CRS and no override was given.
+
+    A subclass so a re-upload's failure classifier can give it a stable code
+    without matching on the generic handler's message text.
+    """
+
+
+class IngestBudgetExceededError(IngestionError, IngestCeilingError):
+    """Raised when a source exceeds an ingest resource ceiling.
+
+    A subclass so the preview route can surface this message verbatim
+    without widening the generic ``IngestionError`` handler, which also
+    carries GDAL subprocess output. The text is server-authored and names
+    the limit, the observed value, and what to do about it; telling a user
+    only that their file "may be malformed or unsupported" when it is merely
+    too large leaves them with nothing to act on. Raised from the parquet
+    path.
+
+    Also an ``IngestCeilingError``, the core marker the re-upload preview
+    catches, since that door may not import this module at all.
+    """
+
+
+def validate_layer_name_argv(layer_name: str) -> None:
+    """Reject option-like layer names before they reach a GDAL argv.
+
+    Layer names are appended to ogrinfo/ogr2ogr argv as positional
+    tokens. A value starting with '-' could be parsed by GDAL as a command-line
+    flag instead of a layer name (argument-injection hygiene; the argv is
+    exec'd directly, never a shell). Called by every spawner in this module
+    that forwards a layer name.
+    """
+    if is_option_like_layer_name(layer_name):
+        raise IngestionError(
+            f"Invalid layer name {layer_name!r}: must not start with '-'"
+        )
+
+
+# Subprocess wall-clock limits keep the Procrastinate worker from hanging on a
+# bad file or a slow or hung upstream service.
+
+# What's left for ogr2ogr when in-process materialisation used the whole
+# clock. A second, not zero, so it fails through the ordinary timeout path
+# and message rather than an arithmetic edge;
+# `export_subprocess_timeout_seconds` keeps the same floor for the same reason.
+_SUBPROCESS_FLOOR_SECONDS = 1.0
+
+OGRINFO_TIMEOUT_SECONDS = 300  # 5 min — metadata probe, should be fast
+OGR2OGR_FILE_TIMEOUT_SECONDS = 3600  # 1 hour — large files legitimately take a while
+
+
+async def _kill_and_reap_subprocess(proc: asyncio.subprocess.Process) -> None:
+    """Best-effort kill + reap for a subprocess whose ``communicate()`` ended abnormally."""
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    except (
+        Exception
+    ):  # broad: kill() can fail with permission/state errors; fall back to terminate()
+        try:
+            proc.terminate()
+        except Exception:  # broad: terminate() best-effort cleanup; give up if subprocess is already gone
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except (asyncio.TimeoutError, ProcessLookupError):
+        pass
+
+
+async def _communicate_with_timeout(
+    proc: asyncio.subprocess.Process,
+    timeout: float,
+    *,
+    tool_name: str,
+) -> tuple[bytes, bytes]:
+    """Run ``proc.communicate()`` with a timeout + graceful kill fallback.
+
+    On timeout, attempts ``proc.kill()``, then ``proc.terminate()``, then
+    gives up; in all cases it raises IngestionError so the caller surfaces a
+    meaningful error instead of hanging the worker.
+
+    On cancellation (client disconnect, or Procrastinate shutdown),
+    ``asyncio.wait_for`` re-raises ``CancelledError`` without touching the
+    child process. Without the branch below, a caller that then deletes
+    its output directory (export cleanup) would race a process that may
+    still hold the file open. Runs the same kill/terminate/wait sequence,
+    then re-raises so cancellation still propagates.
+    """
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await _kill_and_reap_subprocess(proc)
+        raise IngestionError(
+            f"{tool_name} timed out after {int(timeout)}s — the file or upstream service is too slow"
+        )
+    except asyncio.CancelledError:
+        await _kill_and_reap_subprocess(proc)
+        raise
+
+
+LAT_PATTERNS = {"lat", "latitude", "y", "lat_dd", "ycoord"}
+LNG_PATTERNS = {"lon", "lng", "long", "longitude", "x", "lon_dd", "xcoord"}
+WKT_PATTERNS = {"wkt", "geom", "geometry", "the_geom", "shape"}
+
+
+def detect_geometry_columns(columns: list[dict]) -> dict:
+    """Detect potential geometry columns from column metadata.
+
+    Pattern-matches column names (case-insensitive) against known
+    lat/lng and WKT naming conventions.
+
+    Returns dict with keys: x_column, y_column, wkt_column (original case).
+    """
+    col_names = {c["name"].lower(): c["name"] for c in columns}
+
+    x_col = next((col_names[n] for n in LNG_PATTERNS if n in col_names), None)
+    y_col = next((col_names[n] for n in LAT_PATTERNS if n in col_names), None)
+    wkt_col = next((col_names[n] for n in WKT_PATTERNS if n in col_names), None)
+
+    return {"x_column": x_col, "y_column": y_col, "wkt_column": wkt_col}
+
+
+def build_pg_conn_str() -> str:
+    """Build a PG connection string for ogr2ogr from settings."""
+    return settings.ogr_connection_string
+
+
+def _tenant_subprocess_env(
+    schema: str,
+    *,
+    writer: bool,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Bind a libpq/GDAL connection to the active tenant's SET-only role.
+
+    ogr2ogr opens its own PostgreSQL connection, outside SQLAlchemy's
+    statement hooks, so ``PGOPTIONS`` is the connection-time equivalent.
+    Single-tenant mode returns ``base_env`` unchanged.
+    """
+    from app.core.db.tenant_schema import (
+        tenant_data_schema,
+        tenant_reader_role,
+        tenant_writer_role,
+    )
+    from app.core.db.tenant_session import current_tenant_var
+    from app.core.tenancy import is_multi_tenant
+
+    if not is_multi_tenant():
+        return base_env
+
+    tenant_id = current_tenant_var.get()
+    if tenant_id is None:
+        raise RuntimeError("ogr2ogr tenant access requires an active tenant context")
+
+    expected_schema = tenant_data_schema(tenant_id)
+    if schema != expected_schema:
+        raise RuntimeError(
+            "ogr2ogr target schema does not match the active tenant: "
+            f"expected {expected_schema!r}, got {schema!r}"
+        )
+
+    role = tenant_writer_role(tenant_id) if writer else tenant_reader_role(tenant_id)
+    env = dict(os.environ if base_env is None else base_env)
+    existing_options = env.get("PGOPTIONS", "").strip()
+    role_option = f"-c role={role}"
+    env["PGOPTIONS"] = (
+        f"{existing_options} {role_option}" if existing_options else role_option
+    )
+    return env
+
+
+def _tenant_writer_subprocess_env(
+    schema: str,
+    *,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Bind an independent ogr2ogr connection to a tenant writer role."""
+    return _tenant_subprocess_env(schema, writer=True, base_env=base_env)
+
+
+def _tenant_reader_subprocess_env(
+    schema: str,
+    *,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Bind an independent ogr2ogr connection to a tenant reader role."""
+    return _tenant_subprocess_env(schema, writer=False, base_env=base_env)
+
+
+def _resolve_source_path(file_path: str) -> str:
+    """Wrap file path with /vsizip/ if it is a zip file."""
+    if file_path.endswith(".zip"):
+        folder = zip_dataset_root(file_path)
+        return f"/vsizip/{file_path}" + (f"/{folder}" if folder else "")
+    return file_path
+
+
+_ARCHIVE_SIDECAR_SUFFIXES = {".csvt", ".prj", ".txt", ".md", ".xml"}
+
+
+def _is_csv_source(file_path: str, layer_name: str | None = None) -> bool:
+    """Whether GDAL reads this source through its CSV driver.
+
+    A zip is a CSV source when its selected layer is a ``.csv`` member, or,
+    with no layer chosen, when the only data file in it is a ``.csv``.
+    """
+    lower = file_path.lower()
+    if lower.endswith(".csv"):
+        return True
+    if not lower.endswith(".zip"):
+        return False
+    # GDAL opens the geodatabase in such a zip, never a CSV beside it.
+    if (zip_dataset_root(file_path) or "").lower().endswith(".gdb"):
+        return False
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            names = [n for n in archive.namelist() if not n.endswith("/")]
+    except (OSError, zipfile.BadZipFile):
+        return False
+    if layer_name:
+        return any(
+            PurePosixPath(n).stem == layer_name and n.lower().endswith(".csv")
+            for n in names
+        )
+    suffixes = {PurePosixPath(n.lower()).suffix for n in names}
+    data = suffixes - _ARCHIVE_SIDECAR_SUFFIXES
+    return data == {".csv"} and sum(n.lower().endswith(".csv") for n in names) == 1
+
+
+def _is_parquet(file_path: str) -> bool:
+    """The Debian GDAL build has no Arrow/Parquet driver — .parquet files
+    are handled by the pure-pyarrow path in ingest/parquet.py instead of
+    the GDAL subprocesses in this module."""
+    return file_path.lower().endswith(".parquet")
+
+
+def extract_srid_from_json(coord_system: dict) -> int | None:
+    """Extract EPSG SRID from ogrinfo JSON coordinateSystem field."""
+    if not coord_system:
+        return None
+
+    # Try projjson.id.code first
+    projjson = coord_system.get("projjson")
+    if projjson:
+        id_obj = projjson.get("id")
+        if id_obj and id_obj.get("authority") == "EPSG":
+            code = id_obj.get("code")
+            if code is not None:
+                return int(code)
+
+    # Fall back to parsing WKT for AUTHORITY["EPSG","XXXX"]
+    wkt = coord_system.get("wkt")
+    if wkt:
+        match = re.search(r'AUTHORITY\["EPSG","(\d+)"\]', wkt)
+        if match:
+            return int(match.group(1))
+
+    # Third fallback: a URI/URN-form CRS in `name`, which ogrinfo fills with
+    # the source CRS reference when projjson and WKT lack an EPSG authority.
+    # That covers OGC API Features sources declaring storageCrs as a URI/URN
+    # (e.g. pygeoapi) and WFS 2.0 sources with DefaultCRS as a URN (e.g.
+    # urn:ogc:def:crs:EPSG::4326). Unrecognised URIs return None.
+    name = coord_system.get("name")
+    if name:
+        srid = parse_crs_uri(name)
+        if srid is not None:
+            return srid
+
+    return None
+
+
+# A file geodatabase keeps a feature class's attachments in `<name>__ATTACH`
+# and the link back to it in `<name>__ATTACHREL`; neither is a dataset.
+_GDB_ATTACHMENT_SUFFIXES = ("__ATTACH", "__ATTACHREL")
+
+
+def _is_gdb_attachment_table(layer: dict) -> bool:
+    return layer.get("name", "").upper().endswith(_GDB_ATTACHMENT_SUFFIXES)
+
+
+def _extract_common_layer_metadata(
+    data: dict, layer_name: str | None
+) -> tuple[dict, dict]:
+    """Extract the target layer and common metadata from parsed ogrinfo JSON.
+
+    Returns ``(target_layer, metadata_dict)`` where metadata_dict carries
+    the fields common to both ``run_ogrinfo`` and ``run_ogrinfo_preview``:
+    srid, geometry_type, layer_name, feature_count, columns, all_layers,
+    attachments_omitted.
+
+    ``columns`` is a list of ``{"name": str, "type": str}`` mirroring the
+    field definitions from the target layer, plus ``"subtype"`` when GDAL
+    reports one (e.g. Integer/Boolean, Integer/Int16, Real/Float32,
+    String/JSON). The PostgreSQL driver stores these subtypes as a
+    narrower column type than the bare OGR type, so schema-diff
+    comparisons need the subtype to avoid reporting a false type change.
+
+    Populating ``columns`` here rather than only in ``run_ogrinfo_preview``
+    lets shapefile ingest reuse the DBF-collision detector without spawning
+    a second ogrinfo subprocess.
+
+    Raises KeyError if the JSON has no ``layers`` entry so callers can
+    fall through to their fallback path.
+    """
+    all_found = data.get("layers", [])
+    if not all_found:
+        raise KeyError("no layers in ogrinfo JSON output")
+    # The suffixes mean attachment only in a geodatabase. They are never
+    # offered there; a source that holds nothing else keeps them so it still
+    # previews.
+    layers = all_found
+    if data.get("driverShortName") == "OpenFileGDB":
+        layers = [
+            lyr for lyr in all_found if not _is_gdb_attachment_table(lyr)
+        ] or all_found
+
+    target_layer = layers[0]
+    if layer_name:
+        for lyr in all_found:
+            if lyr.get("name") == layer_name:
+                target_layer = lyr
+                break
+
+    geom_fields = target_layer.get("geometryFields", [])
+    geometry_type: str | None = None
+    coord_system = target_layer.get("coordinateSystem", {})
+    if geom_fields:
+        geometry_type = geom_fields[0].get("type")
+        # coordinateSystem may be nested inside geometryFields
+        if not coord_system:
+            coord_system = geom_fields[0].get("coordinateSystem", {})
+    srid = extract_srid_from_json(coord_system or {})
+
+    columns = [
+        {
+            "name": f.get("name", ""),
+            "type": f.get("type", ""),
+            **({"subtype": f["subType"]} if f.get("subType") else {}),
+        }
+        for f in target_layer.get("fields", [])
+    ]
+
+    # all_layers lists every layer in the report when it holds more than one;
+    # run_ogrinfo_preview asks for them all even when a layer is named.
+    all_layers = None
+    if len(layers) > 1:
+        all_layers = [
+            {
+                "name": lyr.get("name", ""),
+                "feature_count": lyr.get("featureCount", 0),
+                "field_count": len(lyr.get("fields", [])),
+            }
+            for lyr in layers
+        ]
+
+    return target_layer, {
+        "srid": srid,
+        "geometry_type": geometry_type,
+        "layer_name": target_layer.get("name", ""),
+        "feature_count": target_layer.get("featureCount"),
+        "columns": columns,
+        "all_layers": all_layers,
+        "attachments_omitted": len(layers) < len(all_found),
+    }
+
+
+def _parse_text_ogrinfo(output: str) -> dict:
+    """Parse text output from ogrinfo -so (fallback for GDAL < 3.7)."""
+    srid = None
+    geometry_type = None
+    layer_name = ""
+    feature_count = None
+
+    for line in output.splitlines():
+        line = line.strip()
+
+        if line.startswith("Layer name:"):
+            layer_name = line.split(":", 1)[1].strip()
+        elif line.startswith("Geometry:"):
+            value = line.split(":", 1)[1].strip()
+            # `ogrinfo` prints `Geometry: None` for a non-spatial layer, and
+            # the literal string would read as a geometry type to every caller
+            # (the refusal below and `is_non_spatial`).
+            geometry_type = None if value in ("", "None") else value
+        elif line.startswith("Feature Count:"):
+            try:
+                feature_count = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+
+        # Look for EPSG code in the output
+        epsg_match = re.search(r"EPSG:(\d+)", line)
+        if epsg_match and srid is None:
+            srid = int(epsg_match.group(1))
+
+    return {
+        "srid": srid,
+        "geometry_type": geometry_type,
+        "layer_name": layer_name,
+        "feature_count": feature_count,
+    }
+
+
+async def run_ogrinfo(
+    file_path: str,
+    layer_name: str | None = None,
+    *,
+    original_filename: str | None = None,
+) -> OgrinfoResult:
+    """Run ogrinfo to detect CRS and layer metadata.
+
+    Returns dict with keys: srid, geometry_type, layer_name, feature_count, all_layers,
+    attachments_omitted.
+    When multiple layers exist and no layer_name is specified, all_layers lists them.
+    Tries JSON output first (GDAL 3.7+), falls back to text parsing.
+
+    Args:
+        original_filename: The user-visible upload filename (not the staging
+            path in ``file_path``), used only to phrase the friendly message
+            on an "unable to open" failure. Optional — callers without it
+            (e.g. the preview endpoint) still get a generic-but-safe message.
+    """
+    if layer_name:
+        validate_layer_name_argv(layer_name)
+    if _is_parquet(file_path):
+        from app.processing.ingest.parquet import parquet_info
+
+        return await parquet_info(file_path)
+
+    # All three defenses (content directives, driver allowlist, safe env) on
+    # every staged-file argv: this is the last point before GDAL sees the
+    # file, and preview runs before the door that validates a presigned
+    # upload's whole body.
+    await run_in_thread_draining(
+        validate_content_directives, file_path, original_filename
+    )
+    source = await run_in_thread_draining(_resolve_source_path, file_path)
+    driver_args = local_input_driver_args(file_path)
+    driver_env = gdal_vector_safe_env()
+
+    cmd = ["ogrinfo", "-so", "-json", *driver_args]
+    # CSV driver types all fields as String by default; auto-detect so
+    # numeric columns appear as Real/Integer in the preview schema.
+    if _is_csv_source(file_path, layer_name):
+        cmd += ["-oo", "AUTODETECT_TYPE=YES", "-oo", "AUTODETECT_SIZE_LIMIT=0"]
+    cmd.append(source)
+    if layer_name:
+        cmd.append(layer_name)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=driver_env,
+    )
+    stdout, stderr = await _communicate_with_timeout(
+        proc, OGRINFO_TIMEOUT_SECONDS, tool_name="ogrinfo"
+    )
+
+    if proc.returncode == 0:
+        try:
+            data = json.loads(stdout.decode(errors="replace"))
+            _, metadata = _extract_common_layer_metadata(data, layer_name)
+            return metadata
+        except KeyError:
+            # No layers in JSON output but command succeeded — return empty shell.
+            return {
+                "srid": None,
+                "geometry_type": None,
+                "layer_name": "",
+                "feature_count": None,
+                "columns": [],
+                "all_layers": None,
+            }
+        except json.JSONDecodeError:
+            pass  # Fall through to text fallback
+
+    # Fallback: text output (GDAL < 3.7 or -json flag failed)
+    cmd_text = ["ogrinfo", "-so", *driver_args, source]
+    if layer_name:
+        cmd_text.append(layer_name)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd_text,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=driver_env,
+    )
+    stdout, stderr = await _communicate_with_timeout(
+        proc, OGRINFO_TIMEOUT_SECONDS, tool_name="ogrinfo"
+    )
+
+    if proc.returncode != 0:
+        _raise_gdal_failure(
+            "ogrinfo",
+            proc.returncode,
+            stderr.decode(errors="replace").strip(),
+            original_filename,
+        )
+
+    result = _parse_text_ogrinfo(stdout.decode(errors="replace"))
+    # Text-fallback parse doesn't extract field definitions, so the DBF
+    # collision detector will still have to fall back to ogrinfo_preview
+    # on GDAL < 3.7. Keep the key present so callers can rely on it.
+    result["columns"] = []
+    result["all_layers"] = None
+    return result
+
+
+async def run_ogrinfo_preview(
+    file_path: str, sample_limit: int = 5, layer_name: str | None = None
+) -> OgrinfoResult:
+    """Run ogrinfo to get metadata AND sample rows for preview.
+
+    Uses -json -features -limit N to get structured output with sample features.
+    Falls back to summary-only run_ogrinfo() if feature extraction fails; that
+    fallback lists no other layers when one is named.
+
+    Returns dict with keys: srid, geometry_type, layer_name, feature_count,
+    columns, sample_rows, all_layers. With ``layer_name`` the keys describe that
+    layer, and all_layers still lists every layer of a multi-layer source.
+    """
+    if layer_name:
+        validate_layer_name_argv(layer_name)
+    if _is_parquet(file_path):
+        from app.processing.ingest.parquet import parquet_info
+
+        return await parquet_info(file_path, sample_limit=sample_limit)
+
+    # Preview returns rows to the caller, so it must not ask an unrestricted
+    # driver set what the file is, and a database whose schema reads from
+    # outside the file must not reach it.
+    await run_in_thread_draining(validate_content_directives, file_path)
+    source = await run_in_thread_draining(_resolve_source_path, file_path)
+    driver_args = local_input_driver_args(file_path)
+
+    cmd = ["ogrinfo", "-json", "-features", "-limit", str(sample_limit), *driver_args]
+    # CSV driver types all fields as String by default; auto-detect so
+    # numeric columns appear as Real/Integer in the preview schema.
+    if _is_csv_source(file_path, layer_name):
+        cmd += ["-oo", "AUTODETECT_TYPE=YES", "-oo", "AUTODETECT_SIZE_LIMIT=0"]
+    # No layer argument: ogrinfo would then report only that layer, and
+    # all_layers needs the rest.
+    cmd.append(source)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=gdal_vector_safe_env(),
+    )
+    stdout, stderr = await _communicate_with_timeout(
+        proc, OGRINFO_TIMEOUT_SECONDS, tool_name="ogrinfo"
+    )
+
+    if proc.returncode == 0:
+        try:
+            data = json.loads(stdout.decode(errors="replace"))
+            target_layer, metadata = _extract_common_layer_metadata(data, layer_name)
+            # A named layer the report lacks goes to the targeted fallback,
+            # which fails as ogrinfo does for a missing layer.
+            if not layer_name or target_layer.get("name") == layer_name:
+                metadata["sample_rows"] = [
+                    feat.get("properties", {})
+                    for feat in target_layer.get("features", [])
+                ]
+                return metadata
+        except KeyError:
+            if not layer_name:
+                # No layers in JSON output but command succeeded — return empty shell.
+                return {
+                    "srid": None,
+                    "geometry_type": None,
+                    "layer_name": "",
+                    "feature_count": None,
+                    "columns": [],
+                    "sample_rows": [],
+                    "all_layers": None,
+                }
+        except json.JSONDecodeError:
+            pass  # Fall through to fallback
+
+    # Fallback: summary only (no sample rows)
+    info = await run_ogrinfo(file_path, layer_name=layer_name)
+    info.setdefault("columns", [])
+    info["sample_rows"] = []
+    return info
+
+
+# One GeoJSON feature per line; a feature wider than this fails the probe.
+_CSV_PROBE_LINE_LIMIT = 32 * 1024 * 1024
+
+
+def _geometry_z(geometry: dict) -> bool | None:
+    """Whether a GeoJSON geometry carries Z, or None when it is empty."""
+    if geometry.get("type") == "GeometryCollection":
+        parts = [_geometry_z(g) for g in geometry.get("geometries") or []]
+        parts = [p for p in parts if p is not None]
+        return all(parts) if parts else None
+    return _coordinates_z(geometry.get("coordinates"))
+
+
+def _coordinates_z(coordinates: object) -> bool | None:
+    if not isinstance(coordinates, list) or not coordinates:
+        return None
+    if isinstance(coordinates[0], (int, float)):
+        return len(coordinates) >= 3
+    parts = [z for z in map(_coordinates_z, coordinates) if z is not None]
+    return all(parts) if parts else None
+
+
+async def _csv_geometry_is_3d(
+    file_path: str, source: str, layer_name: str | None
+) -> bool:
+    """Whether every geometry in a CSV's geometry column has Z.
+
+    The CSV driver reports a WKT column as an untyped 2D layer, so the loaded
+    column would drop Z that the text carries. A mix of 2D and 3D rows counts
+    as 2D, since forcing three dimensions would invent an elevation of 0. The
+    read stops at the first 2D geometry.
+    """
+    await run_in_thread_draining(validate_content_directives, file_path)
+    # ogr2ogr rather than ogrinfo: the GeoJSON writer exists on every GDAL
+    # this runs on, and it writes one feature per line, so the file is read
+    # as a stream.
+    cmd = [
+        "ogr2ogr",
+        *local_input_driver_args(file_path),
+        "-f",
+        "GeoJSON",
+        "/vsistdout/",
+        source,
+        "-oo",
+        "GEOM_POSSIBLE_NAMES=WKT,wkt,geometry,geom,the_geom,shape",
+    ]
+    if layer_name:
+        cmd.append(layer_name)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=gdal_vector_safe_env(),
+        limit=_CSV_PROBE_LINE_LIMIT,
+    )
+    assert proc.stdout is not None
+    seen = False
+    try:
+        async with asyncio.timeout(OGR2OGR_FILE_TIMEOUT_SECONDS):
+            async for line in proc.stdout:
+                # The writer's spacing differs between GDAL versions, so
+                # anything that is not one whole feature is skipped.
+                try:
+                    feature = json.loads(line.strip().removesuffix(b","))
+                except ValueError:
+                    continue
+                if not isinstance(feature, dict) or feature.get("type") != "Feature":
+                    continue
+                geometry = feature.get("geometry")
+                z = _geometry_z(geometry) if geometry else None
+                if z is False:
+                    return False
+                seen = seen or z is True
+    except ValueError:
+        raise IngestionError(
+            "A geometry in this CSV is too large to check for elevation values"
+        )
+    except TimeoutError:
+        raise IngestionError(
+            f"ogr2ogr timed out after {OGR2OGR_FILE_TIMEOUT_SECONDS}s reading the "
+            "file's geometry"
+        )
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+    return seen
+
+
+def declares_linear_geometry(geometry_type: str) -> bool:
+    """Whether an ogrinfo geometry type names no curved type, in either spelling."""
+    lowered = geometry_type.lower()
+    return not any(word in lowered for word in ("circular", "curve", "surface"))
+
+
+async def run_ogr2ogr(
+    file_path: str,
+    table_name: str,
+    db_conn_str: str,
+    source_srid: int | None = None,
+    geometry_type: str | None = None,
+    layer_name: str | None = None,
+    *,
+    schema: str,
+    effective_srid: int | None = None,
+    original_filename: str | None = None,
+) -> None:
+    """Run ogr2ogr to load a file into PostGIS.
+
+    Args:
+        file_path: Path to the source file.
+        table_name: Target table name (without schema prefix).
+        db_conn_str: PG connection string for ogr2ogr.
+        source_srid: Optional SRID from ogrinfo. Used for CSV defaults.
+        geometry_type: Geometry type from ogrinfo. None for non-spatial files.
+        schema: Target PostgreSQL schema. Required so callers cannot silently
+            fall back to the shared ``data`` schema in multi-tenant mode.
+        effective_srid: The SRID ``add_4326_column`` will be called with
+            (user srid_override > detected > 4326). Every format's geometries
+            are stamped with it when it differs from ``source_srid``, since
+            clipping and the 4326 transform read the stored SRID.
+        original_filename: The user-visible upload filename (not the staging
+            path in ``file_path``), used only to phrase the friendly message
+            on an "unable to open" failure.
+
+    Raises:
+        IngestionError: If ogr2ogr exits with non-zero code.
+    """
+    from app.processing.ingest.metadata import _validate_table_name
+
+    _validate_table_name(table_name)
+    _validate_table_name(schema)
+    if layer_name:
+        validate_layer_name_argv(layer_name)
+
+    if _is_parquet(file_path):
+        from app.processing.ingest.parquet import load_parquet_to_postgis
+
+        # Stamp with effective_srid, not detected-or-4326. A file with unknown
+        # CRS proceeds via srid_override; tagging it 4326 would make the
+        # downstream ST_Transform a no-op.
+        srid = effective_srid if effective_srid is not None else source_srid
+        await load_parquet_to_postgis(
+            file_path,
+            table_name,
+            schema=schema,
+            srid=srid if srid is not None else 4326,
+            include_geometry=geometry_type is not None,
+        )
+        return
+
+    # Re-checked at commit, not trusted from preview: the two calls read the
+    # staged file at different moments.
+    await run_in_thread_draining(
+        validate_content_directives, file_path, original_filename
+    )
+    source = await run_in_thread_draining(_resolve_source_path, file_path)
+    is_csv = _is_csv_source(file_path, layer_name)
+    is_non_spatial = geometry_type is None
+
+    cmd = [
+        "ogr2ogr",
+        # The preview's driver allowlist: the commit must not select a
+        # driver the preview refused.
+        *local_input_driver_args(file_path),
+        "-f",
+        "PostgreSQL",
+        db_conn_str,
+        source,
+        "-overwrite",
+        "-nln",
+        f"{schema}.{table_name}",
+        "-lco",
+        "FID=gid",
+        # -lco PRECISION=NO forces numeric-family fields to FLOAT8/INTEGER/
+        # VARCHAR instead of GDAL's default PG NUMERIC. It trades declared
+        # precision/scale (values above 2^53 may lose integer precision) for
+        # predictable query performance and simpler type inference
+        # (metadata_attributes.py _infer_domain_type).
+        "-lco",
+        "PRECISION=NO",
+        "--config",
+        "PG_USE_COPY",
+        "YES",
+        # Otherwise GDAL creates an ogr_system_tables metadata schema on first
+        # write, concurrent first writes race on it, and nothing reads it.
+        "--config",
+        "OGR_PG_ENABLE_METADATA",
+        "NO",
+    ]
+    if not await run_in_thread_draining(declares_dbf_encoding, file_path, layer_name):
+        # Undeclared Shapefile text is taken as UTF-8; forcing it over a
+        # declared encoding would store the original bytes unconverted.
+        cmd.extend(["--config", "SHAPE_ENCODING", "UTF-8"])
+
+    if not is_non_spatial:
+        if declares_linear_geometry(geometry_type):
+            # A geodatabase polygon or polyline layer reports a linear type yet
+            # returns curved rows wherever a segment is an arc, and PostGIS
+            # refuses those in the linear column the declared type creates.
+            cmd.extend(["-nlt", "CONVERT_TO_LINEAR"])
+        cmd.extend(
+            [
+                "-nlt",
+                "PROMOTE_TO_MULTI",
+                # Use a non-colliding target name so that source attributes
+                # named `geom` or `geometry` (valid GeoJSON/Shapefile/GeoPackage
+                # property names) do not clash with the pipeline geometry
+                # column at CREATE TABLE time. `rename_reserved_columns` will
+                # rename the source attribute to `src_<name>` afterwards, and
+                # `ensure_geom_column` renames this placeholder to `geom`.
+                "-lco",
+                "GEOMETRY_NAME=_geolens_geom",
+                "-lco",
+                "SPATIAL_INDEX=NONE",
+            ]
+        )
+
+    if is_csv:
+        # The CSV driver otherwise stores every column as text. The default
+        # scan stops after 1 MB and empties later values that don't fit the
+        # inferred type, so scan the whole file.
+        cmd.extend(["-oo", "AUTODETECT_TYPE=YES", "-oo", "AUTODETECT_SIZE_LIMIT=0"])
+
+    if is_csv and not is_non_spatial:
+        cmd.extend(
+            [
+                "-oo",
+                "X_POSSIBLE_NAMES=lon*,lng*,long*,x",
+                "-oo",
+                "Y_POSSIBLE_NAMES=lat*,y",
+                "-oo",
+                "GEOM_POSSIBLE_NAMES=WKT,wkt,geometry,geom,the_geom,shape",
+            ]
+        )
+
+    if (
+        is_csv
+        and not is_non_spatial
+        and await _csv_geometry_is_3d(file_path, source, layer_name)
+    ):
+        cmd.extend(["-dim", "XYZ"])
+
+    if not is_non_spatial:
+        assigned_srid = effective_srid
+        if assigned_srid is None and is_csv:
+            assigned_srid = 4326
+        # -a_srs replaces a missing or wrong declared CRS without moving any
+        # coordinate. An EPSG code, never source WKT, reaches PROJ.
+        if assigned_srid is not None and assigned_srid != source_srid:
+            cmd.extend(["-a_srs", f"EPSG:{int(assigned_srid)}"])
+
+    if layer_name:
+        cmd.append(layer_name)
+
+    # `run_ogr2ogr` processes LOCAL FILE PATHS only, so it issues no HTTP
+    # fetches — `run_ogr2ogr_service` below is the one with an HTTP surface
+    # (see its egress-proxy note). In multi-tenant mode PGOPTIONS also selects
+    # the active tenant's writer role for this independent libpq connection.
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        # The clamp is the base the tenant role is layered onto, so both
+        # single- and multi-tenant carry it.
+        env=_tenant_writer_subprocess_env(schema, base_env=gdal_vector_safe_env()),
+    )
+    stdout, stderr = await _communicate_with_timeout(
+        proc, OGR2OGR_FILE_TIMEOUT_SECONDS, tool_name="ogr2ogr"
+    )
+
+    if proc.returncode != 0:
+        _raise_gdal_failure(
+            "ogr2ogr",
+            proc.returncode,
+            stderr.decode(errors="replace").strip(),
+            original_filename,
+        )
+
+
+async def run_ogr2ogr_service(
+    gdal_source: str,
+    layer_name: str,
+    table_name: str,
+    db_conn_str: str,
+    service_type: str,
+    timeout: float = 1800.0,
+    token: str | None = None,
+    is_non_spatial: bool = False,
+    append: bool = False,
+    *,
+    schema: str,
+    on_spawn: "Callable[[], None] | None" = None,
+    keep_z: bool = False,
+) -> None:
+    """Run ogr2ogr to load a remote service layer into PostGIS.
+
+    Args:
+        gdal_source: GDAL-prefixed source string (e.g. "WFS:https://...")
+        layer_name: Layer name (empty for ESRIJSON)
+        table_name: Target table name (without schema prefix)
+        db_conn_str: PG connection string for ogr2ogr
+        service_type: "wfs", "ogcapi_features" or "arcgis_featureserver"
+        timeout: Seconds before killing subprocess (default 30 min)
+        is_non_spatial: When True, omit geometry-specific flags (-nlt, -t_srs,
+            GEOMETRY_NAME) to avoid dropping attribute columns for tables with
+            no geometry (ArcGIS Table layers, non-spatial WFS, etc.)
+        append: When True, append to an existing target layer instead of
+            overwriting it. Used by chunked ArcGIS imports after the first page.
+        schema: Target PostgreSQL schema. Required so service imports cannot
+            silently write into the shared ``data`` schema.
+        on_spawn: Invoked once, at the first outbound attempt: the page
+            walk's or preflight's first request, else the moment the
+            subprocess exists. Callers date origin contacts off it rather
+            than guessing from exception types, since every local check
+            happens before it fires.
+        keep_z: When True, stage a 3D geometry column. ``-nlt GEOMETRY``
+            drops Z; ``GEOMETRYZ`` keeps it and gives a feature without Z a
+            zero.
+    """
+    from app.processing.ingest.metadata import _validate_table_name
+
+    _validate_table_name(table_name)
+    _validate_table_name(schema)
+    refuse_credential_over_http(gdal_source_url(gdal_source), token)
+
+    # A protected OGC API collection is read here, not by GDAL, so the
+    # credential never becomes a header file: GDAL applies a header file to
+    # every request the process makes, and a collection whose page 2 names a
+    # different origin would otherwise hand it the credential too. GDAL
+    # 3.10.3 has no way to scope a header to one origin (measured; see
+    # `platform/service_items`). WFS is untouched: its driver pages by
+    # startIndex against the capabilities endpoint and ignores `next`.
+    items_path: str | None = None
+    # One clock over the materialisation and the subprocess, or a service
+    # trickling pages inside the per-read timeout could hold a worker for
+    # hours and still get the full timeout to convert.
+    deadline = time.monotonic() + timeout
+    # One callback, wrapped to fire at most once, handed to every site that
+    # might reach the origin first (page walk, preflight, spawn), so a callee
+    # that returns early or is stubbed cannot lose the contact date.
+    arm_origin_contact = fire_once(on_spawn)
+    if token and service_type == "ogcapi_features":
+        items_path = (
+            await materialise_oapif_items(
+                gdal_source.split(":", 1)[1],
+                layer_name,
+                credential_line=_sanitize_authorization_token(
+                    token, service_format=service_type
+                )
+                or "",
+                staging_dir=ensure_staging_ready(settings.upload_staging_dir),
+                deadline=deadline,
+                # Here the walk, not the subprocess, contacts the origin, so
+                # a materialisation failing on its first page still reached
+                # the service. Spawn below skips it if the walk already fired.
+                on_first_request=arm_origin_contact,
+            )
+        ).path
+        gdal_source, layer_name, token = items_path, "", None
+
+    if layer_name:
+        validate_layer_name_argv(layer_name)
+    cmd = [
+        "ogr2ogr",
+        "-f",
+        "PostgreSQL",
+        db_conn_str,
+        gdal_source,
+        "-append" if append else "-overwrite",
+        "-nln",
+        f"{schema}.{table_name}",
+        "-lco",
+        "FID=gid",
+        # -lco PRECISION=NO: same tradeoff as run_ogr2ogr — see its comment.
+        "-lco",
+        "PRECISION=NO",
+        "--config",
+        "PG_USE_COPY",
+        "YES",
+        "--config",
+        "OGR_PG_ENABLE_METADATA",
+        "NO",
+        "--config",
+        "GDAL_HTTP_TIMEOUT",
+        str(settings.ingest_http_timeout_seconds),  # configurable, default 300
+    ]
+
+    if not is_non_spatial:
+        # -nlt GEOMETRY, not PROMOTE_TO_MULTI: some OGC/WFS services (e.g.
+        # GeoServer) declare abstract geometry types (MultiSurface,
+        # MultiCurve) in their schema, ogr2ogr honours that, and when
+        # concrete features (MultiPolygon) arrive the bounds-clip UPDATE in
+        # clip_to_mercator_bounds (metadata_mercator.py) fails with "Geometry
+        # type (MultiPolygon) does not match column type (MultiSurface)".
+        # -nlt GEOMETRY emits a constraint-free `geometry(Geometry, 4326)`
+        # column that accepts any concrete subtype; the concrete
+        # Dataset.geometry_type is derived post-ingest via get_geometry_type()
+        # (metadata_extent.py). run_ogr2ogr() keeps PROMOTE_TO_MULTI since
+        # local files always report concrete types.
+        #
+        # GEOMETRY_NAME=_geolens_geom avoids a CREATE TABLE collision when
+        # the service publishes a `geom`/`geometry` attribute;
+        # `ensure_geom_column` renames the placeholder after
+        # `rename_reserved_columns` moves any source attribute to `src_<name>`.
+        cmd += [
+            "-nlt",
+            "GEOMETRYZ" if keep_z else "GEOMETRY",
+            "-lco",
+            "GEOMETRY_NAME=_geolens_geom",
+            "-lco",
+            "SPATIAL_INDEX=NONE",
+            "-t_srs",
+            "EPSG:4326",
+        ]
+
+    if layer_name:
+        cmd.append(layer_name)
+
+    if service_type == "wfs":
+        cmd.extend(["--config", "OGR_WFS_PAGE_SIZE", "1000"])
+
+    # libcurl inside GDAL resolves hosts and follows every redirect itself, and
+    # no GDAL option stops it (GDAL_HTTP_FOLLOWLOCATION is not one; never add
+    # it). gdal_service_safe_env sends all of the subprocess's HTTP through
+    # service_egress_proxy, which resolves, checks and pins each connection,
+    # redirect hops included, so the process lives inside that block.
+    #
+    # Authorization headers must not pass through the subprocess env (visible
+    # via /proc/<pid>/environ for the process lifetime), so
+    # GDAL_HTTP_HEADER_FILE points at a 0600 tempfile holding the header line;
+    # the env var is the file path, not the token. Unlinked in the finally
+    # block below.
+    header_file_path: str | None = None
+    header_line: str | None = None
+    try:
+        async with service_egress_proxy(
+            idle_seconds=settings.ingest_http_timeout_seconds,
+            origin=pinned_origin(gdal_source, credential=bool(token)),
+        ) as egress:
+            env = _tenant_writer_subprocess_env(
+                schema,
+                # Keeps WFS/OAPIF, the point of this call, and refuses the
+                # rest: a service response has no business selecting the VRT
+                # driver or shelling out to a helper.
+                base_env=gdal_service_safe_env(egress),
+            )
+            assert env is not None  # base_env is always returned in single-tenant mode
+            if token and service_type in ("wfs", "ogcapi_features"):
+                # For these two formats `token` is the finished header line
+                # the door composed, so this validates and writes it verbatim.
+                # Composing `Authorization: Bearer ` here too would produce
+                # `Authorization: Bearer Authorization: Basic <blob>`, a
+                # working-looking string that just 401s.
+                header_line = _sanitize_authorization_token(
+                    token, service_format=service_type
+                )  # raises ValueError before subprocess
+
+                # A credentialed WFS never reaches GDAL without a layer, since
+                # GDAL opened layerless reads every layer's schema.
+                require_wfs_layer(
+                    layer_name, service_format=service_type, credential_line=header_line
+                )
+                # GDAL applies the header file to the operation endpoints the
+                # service's own description advertises, fresh requests no
+                # redirect rule can see. Checked here as well as at the door
+                # because the document can change between a preview and the
+                # import, and this is the side that spends the credential.
+                await assert_endpoints_stay_on_origin(
+                    gdal_source.split(":", 1)[1],
+                    service_format=service_type,
+                    # Sent with the credential, so a protected service
+                    # answers with the document this import will act on
+                    # rather than a 401. Scoped to the layer being imported,
+                    # the collection whose document names the endpoint that
+                    # gets the header.
+                    credential_line=header_line,
+                    collection=layer_name or None,
+                    # The subprocess's clock, and the origin-contact
+                    # callback: firing only at spawn would leave
+                    # `origin_contact_attempted`/`last_checked_at` stale for
+                    # exactly the failures this preflight produces.
+                    deadline=deadline,
+                    on_first_request=arm_origin_contact,
+                )
+                import tempfile
+
+                # `mkstemp` without dir= lands wherever `tempfile.tempdir`
+                # points, and a SIGKILL/OOM before the finally block below
+                # would leak the bearer-header tempfile there.
+                #
+                # The directory is the container tmpfs, not the staging
+                # volume: staging is persistent and gets tarred into backups
+                # (`scripts/backup-entrypoint.sh`), so an orphaned header
+                # could be archived. `gdal_header_dir()` is 0700 under /tmp,
+                # the worker's own 512m tmpfs: private to this container, gone
+                # on restart, swept at boot.
+                fd, header_file_path = tempfile.mkstemp(
+                    prefix="gdal_auth_", suffix=".hdr", dir=gdal_header_dir()
+                )
+                try:
+                    os.write(fd, f"{header_line}\n".encode("ascii"))
+                finally:
+                    os.close(fd)
+                os.chmod(header_file_path, 0o600)
+                env["GDAL_HTTP_HEADER_FILE"] = header_file_path
+                env.update(gdal_transport_env(service_type))
+                # Other header names would follow a redirect to any host; the
+                # proxy's origin pin refuses those. IF_SAME_HOST, not NO: a
+                # same-host redirect (a trailing slash) must keep the credential.
+                env.update(GDAL_HEADER_FILE_REDIRECT_ENV)
+
+            # Computed here, not at each spender, so it accounts for all of
+            # them (page walk, preflight). Floored so a preflight that used the
+            # whole budget still fails through the ordinary subprocess timeout
+            # rather than an arithmetic edge.
+            timeout = max(deadline - time.monotonic(), _SUBPROCESS_FLOOR_SECONDS)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            if arm_origin_contact is not None:
+                # No-op when the walk or preflight already reached the origin.
+                arm_origin_contact()
+
+            stdout, stderr = await _communicate_with_timeout(
+                proc, timeout, tool_name="ogr2ogr (service)"
+            )
+    finally:
+        if items_path is not None:
+            try:
+                os.unlink(items_path)
+            except OSError:
+                # Already gone is the outcome this wanted; the staging sweep
+                # reclaims one a SIGKILL leaves behind.
+                pass
+        if header_file_path is not None:
+            try:
+                os.unlink(header_file_path)
+            except OSError:
+                # File may have been removed by another process; not a security
+                # concern since contents are only the bearer token + we wrote
+                # the file as 0600.
+                pass
+
+    # GDAL can exit 0 after a request fails, so a refusal fails the import too.
+    if proc.returncode != 0 or egress.refused:
+        # The GDAL text can quote whatever the service answered, so it goes to
+        # the log, redacted by value too: a service can echo the ArcGIS token,
+        # which rides in the source URL, as plain text.
+        stderr_text = scrub_secret_value(
+            scrub_secret_value(
+                _PG_DESTINATION_ECHO_RE.sub(
+                    "PG:***",
+                    redact_url_credentials(
+                        _strip_ogr_driver_list(stderr.decode(errors="replace")).strip()
+                    ),
+                ),
+                header_line,
+            ),
+            token,
+        )
+        service_error = None
+        if (
+            service_type == "arcgis_featureserver"
+            and not egress.refused
+            and ARCGIS_ERROR_RESPONSE_RE.search(stderr_text)
+        ):
+            service_error = await fetch_arcgis_error_detail(gdal_source, token)
+        _raise_service_gdal_failure(
+            "ogr2ogr",
+            proc.returncode,
+            stderr_text,
+            refused=egress.refused,
+            left_origin=egress.left_origin,
+            service_error=service_error,
+        )

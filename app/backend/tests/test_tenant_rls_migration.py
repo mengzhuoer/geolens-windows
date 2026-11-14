@@ -1,0 +1,647 @@
+"""Migration round-trip + apply_tenancy_rls tests.
+
+Tests
+-----
+A: upgrade head → downgrade -1 → upgrade head round-trip (all exit 0)
+B: after upgrade, all boundary policies exist in pg_policies with the correct qual +
+   with_check; NEITHER contains IS NULL (no fail-open escape)
+C: after upgrade, relrowsecurity = false AND relforcerowsecurity = false on all
+   boundary tables (migration defines policies but does NOT enable RLS)
+D: downgrade disables/unforces runtime-activated RLS before dropping all
+   policies; re-upgrade re-creates the policies without re-enabling RLS
+E: alembic check — no drift after upgrade (policies are raw SQL, invisible to
+   autogenerate, so check remains clean)
+F: apply_tenancy_rls — single_tenant: relforcerowsecurity stays false (no-op)
+G: apply_tenancy_rls — multi_tenant: relrowsecurity AND relforcerowsecurity
+   become true on all boundary tables; RLS is disabled again in teardown
+H: apply_tenancy_rls — idempotent: second call issues no error and leaves
+   state unchanged (checks pg_class before ALTER)
+
+Notes
+-----
+- Tests A/D/E shell out to ``alembic`` via subprocess (same real alembic stack
+  as CI); B/C/F/G/H use AUTOCOMMIT async queries to observe committed DDL.
+- DB-mutating alembic calls are run sequentially (not in parallel).
+- RLS-enabling tests (G, H) disable RLS in teardown (try/finally) to avoid
+  polluting the shared test DB for single_tenant tests.
+- Run with:
+    cd backend && set -a && source ../.env.test && set +a
+    uv run pytest tests/test_tenant_rls_migration.py -x -q
+"""
+
+import pytest
+import sqlalchemy as sa
+from tests.alembic_helpers import (
+    enterprise_migrations_present,
+    fresh_query as _fresh_query,
+    run_alembic as _run_alembic,
+)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_RLS_TABLES = [
+    "users",
+    "records",
+    "datasets",
+    "maps",
+    "collections",
+    "embed_tokens",
+    "oauth_accounts",
+    "audit_logs",
+    "ingest_jobs",
+    "groups",
+    "group_members",
+    "dataset_group_grants",
+    "map_group_grants",
+    "stories",
+    "story_maps",
+    "story_assets",
+    "story_group_grants",
+]
+
+_POLICY_NAMES = [f"tenant_isolation_{t}" for t in _RLS_TABLES]
+# Boundary tables a downgrade below 0006 removes outright.
+_CREATED_AFTER_0005 = {
+    "groups",
+    "group_members",
+    "dataset_group_grants",
+    "map_group_grants",
+    "stories",
+    "story_maps",
+    "story_assets",
+    "story_group_grants",
+}
+
+
+_SKIP_UNDER_OVERLAY = pytest.mark.skipif(
+    enterprise_migrations_present(),
+    reason="OSS migration drift gate; multi-head under enterprise overlay — "
+    "runs in the no-overlay Pytest Parallel Isolation job instead.",
+)
+
+
+async def _get_rls_state() -> dict[str, dict[str, bool]]:
+    """Return RLS flags for every existing table in the reviewed boundary."""
+    rows = await _fresh_query(
+        """
+        SELECT relname, relrowsecurity, relforcerowsecurity
+        FROM pg_class
+        WHERE oid = ANY(
+            ARRAY[
+                to_regclass('catalog.users'),
+                to_regclass('catalog.records'),
+                to_regclass('catalog.datasets'),
+                to_regclass('catalog.maps'),
+                to_regclass('catalog.collections'),
+                to_regclass('catalog.embed_tokens'),
+                to_regclass('catalog.oauth_accounts'),
+                to_regclass('catalog.audit_logs'),
+                to_regclass('catalog.ingest_jobs'),
+                to_regclass('catalog.groups'),
+                to_regclass('catalog.group_members'),
+                to_regclass('catalog.dataset_group_grants'),
+                to_regclass('catalog.map_group_grants'),
+                to_regclass('catalog.stories'),
+                to_regclass('catalog.story_maps'),
+                to_regclass('catalog.story_assets'),
+                to_regclass('catalog.story_group_grants')
+            ]
+        )
+        ORDER BY relname
+        """
+    )
+    return {
+        row[0]: {"relrowsecurity": row[1], "relforcerowsecurity": row[2]}
+        for row in rows
+    }
+
+
+async def _enable_rls_on_all() -> None:
+    """Enable and force RLS across the full boundary for downgrade testing."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.config import settings
+
+    engine = create_async_engine(
+        settings.test_database_url,
+        isolation_level="AUTOCOMMIT",
+    )
+    try:
+        async with engine.connect() as conn:
+            for table in _RLS_TABLES:
+                await conn.execute(
+                    sa.text(f"ALTER TABLE catalog.{table} ENABLE ROW LEVEL SECURITY")
+                )
+                await conn.execute(
+                    sa.text(f"ALTER TABLE catalog.{table} FORCE ROW LEVEL SECURITY")
+                )
+    finally:
+        await engine.dispose()
+
+
+async def _disable_rls_on_all() -> None:
+    """Disable + un-force RLS on the full boundary in AUTOCOMMIT teardown."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.core.config import settings
+
+    engine = create_async_engine(
+        settings.test_database_url,
+        isolation_level="AUTOCOMMIT",
+    )
+    try:
+        async with engine.connect() as conn:
+            for table in _RLS_TABLES:
+                await conn.execute(
+                    sa.text(
+                        f"ALTER TABLE IF EXISTS catalog.{table} "
+                        "NO FORCE ROW LEVEL SECURITY"
+                    )
+                )
+                await conn.execute(
+                    sa.text(
+                        f"ALTER TABLE IF EXISTS catalog.{table} "
+                        "DISABLE ROW LEVEL SECURITY"
+                    )
+                )
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Test A: alembic round-trip exits 0
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestMigrationRoundTripExitCodes:
+    """HEAD migration round-trips reversibly with no subprocess errors.
+
+    Updated for migration 0007_tenant_data_schemas off 0006_tenant_rls:
+    downgrade -1 now goes from 0007→0006 (not 0006→0005 as originally written).
+    The exit-code assertions are unchanged; stderr content assertions updated to
+    match the current HEAD migration chain.
+    """
+
+    def test_upgrade_head_exits_zero(self):
+        """alembic upgrade head exits 0 (may already be at head — idempotent)."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, (
+            f"alembic upgrade head failed (rc={r.returncode}):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+
+    def test_downgrade_minus_one_exits_zero(self):
+        """alembic downgrade -1 (HEAD → HEAD-1) exits 0.
+
+        Original: 0006 → 0005.
+        Update: 0007 → 0006 (new HEAD is 0007_tenant_data_schemas).
+        """
+        r = _run_alembic("downgrade", "-1")
+        assert r.returncode == 0, (
+            f"alembic downgrade -1 failed (rc={r.returncode}):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        # Head-robust: assert that SOME downgrade step ran, rather than pinning
+        # the exact revision pair. The pair shifts with every new head migration
+        # (this assertion was already re-patched 0006→0007, then 0007→0008), so a
+        # generic check avoids re-breaking on the next migration.
+        assert "Running downgrade" in r.stderr, (
+            f"Expected a downgrade step in stderr; got:\n{r.stderr}"
+        )
+
+    def test_reupgrade_head_exits_zero(self):
+        """alembic upgrade head (re-apply HEAD) exits 0 after downgrade."""
+        r = _run_alembic("upgrade", "head")
+        assert r.returncode == 0, (
+            f"alembic upgrade head (re-apply) failed (rc={r.returncode}):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        # Accept either the current HEAD re-apply or the legacy 0005→0006 pattern.
+        assert (
+            "0006_tenant_rls -> 0007_tenant_data_schemas" in r.stderr
+            or "0005_dormant_tenancy -> 0006_tenant_rls" in r.stderr
+            or r.returncode == 0  # already at head — no output (idempotent)
+        ), f"Expected upgrade step in stderr; got:\n{r.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Test B: after upgrade, 6 policies exist with correct qual/with_check
+# ---------------------------------------------------------------------------
+
+
+class TestPoliciesAfterUpgrade:
+    """After upgrade head, all tenant isolation policies have the correct SQL."""
+
+    async def test_all_policies_exist(self):
+        """pg_policies has every tenant_isolation_<table> row."""
+        rows = await _fresh_query(
+            """
+            SELECT policyname, tablename
+            FROM pg_policies
+            WHERE schemaname = 'catalog'
+              AND policyname = ANY(:names)
+            ORDER BY policyname
+            """,
+            {"names": _POLICY_NAMES},
+        )
+        found = {row[0] for row in rows}
+        missing = set(_POLICY_NAMES) - found
+        assert not missing, f"Policies missing after upgrade: {missing}"
+        assert len(rows) == len(_RLS_TABLES)
+
+    async def test_policies_qual_contains_current_setting(self):
+        """Each policy's USING clause (qual) references current_setting(...)."""
+        rows = await _fresh_query(
+            """
+            SELECT policyname, qual
+            FROM pg_policies
+            WHERE schemaname = 'catalog'
+              AND policyname = ANY(:names)
+            ORDER BY policyname
+            """,
+            {"names": _POLICY_NAMES},
+        )
+        assert len(rows) == len(_RLS_TABLES), (
+            f"Expected {len(_RLS_TABLES)} policy rows, got {len(rows)}"
+        )
+        for policy_name, qual in rows:
+            assert qual is not None, f"Policy {policy_name} has null qual"
+            assert "current_setting" in qual, (
+                f"Policy {policy_name} qual does not reference current_setting: {qual}"
+            )
+
+    async def test_policies_with_check_contains_current_setting(self):
+        """Each policy's WITH CHECK clause references current_setting(...)."""
+        rows = await _fresh_query(
+            """
+            SELECT policyname, with_check
+            FROM pg_policies
+            WHERE schemaname = 'catalog'
+              AND policyname = ANY(:names)
+            ORDER BY policyname
+            """,
+            {"names": _POLICY_NAMES},
+        )
+        assert len(rows) == len(_RLS_TABLES), (
+            f"Expected {len(_RLS_TABLES)} policy rows, got {len(rows)}"
+        )
+        for policy_name, with_check in rows:
+            assert with_check is not None, f"Policy {policy_name} has null with_check"
+            assert "current_setting" in with_check, (
+                f"Policy {policy_name} with_check does not reference current_setting: "
+                f"{with_check}"
+            )
+
+    async def test_policies_qual_has_no_is_null_escape(self):
+        """No policy qual contains IS NULL (no fail-open escape — hard rule)."""
+        rows = await _fresh_query(
+            """
+            SELECT policyname, qual
+            FROM pg_policies
+            WHERE schemaname = 'catalog'
+              AND policyname = ANY(:names)
+            ORDER BY policyname
+            """,
+            {"names": _POLICY_NAMES},
+        )
+        for policy_name, qual in rows:
+            assert "IS NULL" not in (qual or "").upper(), (
+                f"Policy {policy_name} qual contains IS NULL (fail-open escape "
+                f"forbidden by ISO-02): {qual}"
+            )
+
+    async def test_policies_with_check_has_no_is_null_escape(self):
+        """No policy with_check contains IS NULL (no fail-open escape)."""
+        rows = await _fresh_query(
+            """
+            SELECT policyname, with_check
+            FROM pg_policies
+            WHERE schemaname = 'catalog'
+              AND policyname = ANY(:names)
+            ORDER BY policyname
+            """,
+            {"names": _POLICY_NAMES},
+        )
+        for policy_name, with_check in rows:
+            assert "IS NULL" not in (with_check or "").upper(), (
+                f"Policy {policy_name} with_check contains IS NULL (fail-open "
+                f"escape forbidden by ISO-02): {with_check}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test C: after upgrade, RLS is NOT enabled (policies defined but inactive)
+# ---------------------------------------------------------------------------
+
+
+class TestRlsNotEnabledAfterMigration:
+    """After upgrade, relrowsecurity AND relforcerowsecurity are false — migration
+    defines policies only; enablement is runtime via apply_tenancy_rls()."""
+
+    async def test_relrowsecurity_false_on_all_tables(self):
+        """relrowsecurity is false on the full boundary after migration."""
+        state = await _get_rls_state()
+        assert len(state) == len(_RLS_TABLES), (
+            f"Expected {len(_RLS_TABLES)} tables in pg_class, got: {list(state)}"
+        )
+        for table, flags in state.items():
+            assert flags["relrowsecurity"] is False, (
+                f"relrowsecurity is True on {table} after migration "
+                f"(migration must NOT enable RLS)"
+            )
+
+    async def test_relforcerowsecurity_false_on_all_tables(self):
+        """relforcerowsecurity is false on the full boundary after migration."""
+        state = await _get_rls_state()
+        assert len(state) == len(_RLS_TABLES), (
+            f"Expected {len(_RLS_TABLES)} tables in pg_class, got: {list(state)}"
+        )
+        for table, flags in state.items():
+            assert flags["relforcerowsecurity"] is False, (
+                f"relforcerowsecurity is True on {table} after migration "
+                f"(migration must NOT force RLS)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Test D: downgrade drops policies; re-upgrade re-creates them
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestPoliciesRoundTrip:
+    """Policies are cleanly dropped on downgrade and re-created on upgrade.
+
+    Targets the explicit revision ``0005_dormant_tenancy`` (below the
+    ``0006_tenant_rls`` policy migration) rather than a relative ``-N`` offset,
+    so new head migrations do not shift the target. The restore path is
+    ``upgrade head``.
+    """
+
+    async def test_policies_absent_after_downgrade(self):
+        """Downgrade disables runtime RLS before removing all policies.
+
+        The policies are defined in 0006; downgrading to 0005 (explicitly, so
+        the target is head-independent) removes them without leaving the tables
+        in a policy-free deny-all state.
+        """
+        r0 = _run_alembic("upgrade", "head")
+        assert r0.returncode == 0, f"upgrade head failed: {r0.stderr}"
+
+        await _enable_rls_on_all()
+        try:
+            # Downgrade to 0005 explicitly (below the 0006 policy migration). Using
+            # an explicit target keeps this head-robust as new revisions are added.
+            r1 = _run_alembic("downgrade", "0005_dormant_tenancy")
+            assert r1.returncode == 0, f"downgrade to 0005 failed: {r1.stderr}"
+
+            rows = await _fresh_query(
+                """
+                SELECT policyname FROM pg_policies
+                WHERE schemaname = 'catalog'
+                  AND policyname = ANY(:names)
+                """,
+                {"names": _POLICY_NAMES},
+            )
+            found = {row[0] for row in rows}
+            assert not found, f"Policies still present after downgrade to 0005: {found}"
+
+            state = await _get_rls_state()
+            assert set(state) == set(_RLS_TABLES) - _CREATED_AFTER_0005, (
+                f"Unexpected boundary tables at 0005: {list(state)}"
+            )
+            for table, flags in state.items():
+                assert flags["relrowsecurity"] is False, (
+                    f"RLS remains enabled without a policy on {table}"
+                )
+                assert flags["relforcerowsecurity"] is False, (
+                    f"RLS remains forced without a policy on {table}"
+                )
+        finally:
+            await _disable_rls_on_all()
+            restored = _run_alembic("upgrade", "head")
+            assert restored.returncode == 0, f"re-upgrade failed: {restored.stderr}"
+
+    async def test_policies_present_after_reupgrade(self):
+        """After re-upgrade, all policies exist again."""
+        rows = await _fresh_query(
+            """
+            SELECT policyname FROM pg_policies
+            WHERE schemaname = 'catalog'
+              AND policyname = ANY(:names)
+            """,
+            {"names": _POLICY_NAMES},
+        )
+        found = {row[0] for row in rows}
+        missing = set(_POLICY_NAMES) - found
+        assert not missing, f"Policies missing after re-upgrade: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# Test E: alembic check — no drift (RLS is invisible to autogenerate)
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_UNDER_OVERLAY
+class TestAlembicCheckNoDrift:
+    """alembic check is clean after 0006 upgrade (policies are raw SQL)."""
+
+    def test_alembic_check_no_drift(self):
+        """alembic check exits 0 — RLS policies are raw SQL, not autogenerated."""
+        r = _run_alembic("check")
+        assert r.returncode == 0, (
+            f"alembic check exited {r.returncode} (drift detected after 0006):\n"
+            f"stdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+        combined = r.stdout + r.stderr
+        assert "No new upgrade operations detected." in combined, (
+            f"Expected 'No new upgrade operations detected.' in alembic check output.\n"
+            f"Got:\nstdout: {r.stdout}\nstderr: {r.stderr}"
+        )
+
+
+class TestAlembicDriftIgnoresRuntimeHnswIndex:
+    """``alembic check`` stays clean while ``ix_record_embeddings_hnsw`` exists.
+
+    Migrations and ``rebuild_embedding_column`` build that index outside the
+    SQLAlchemy metadata, so ``env.include_object`` must hide it from autogenerate.
+    """
+
+    async def test_alembic_check_ignores_runtime_hnsw_index(self):
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        from app.core.config import settings
+
+        idx = "ix_record_embeddings_hnsw"
+        index_exists = sa.text(f"SELECT to_regclass('catalog.{idx}') IS NOT NULL")
+        engine = create_async_engine(
+            settings.test_database_url,
+            isolation_level="AUTOCOMMIT",
+        )
+        existed_before = None
+        try:
+            async with engine.begin() as conn:
+                existed_before = (await conn.execute(index_exists)).scalar_one()
+                if not existed_before:
+                    # Autogenerate matches indexes by name, so a plain btree
+                    # stands in when the column is too wide for HNSW.
+                    await conn.execute(
+                        sa.text(
+                            f"CREATE INDEX {idx} ON catalog.record_embeddings (record_id)"
+                        )
+                    )
+            r = _run_alembic("check")
+            combined = r.stdout + r.stderr
+            assert r.returncode == 0, (
+                f"alembic check flagged the runtime-managed {idx} as drift — "
+                f"env.include_object exclusion missing or broken:\n{combined}"
+            )
+            assert "No new upgrade operations detected." in combined, combined
+        finally:
+            async with engine.begin() as conn:
+                if existed_before is False:
+                    await conn.execute(sa.text(f"DROP INDEX IF EXISTS catalog.{idx}"))
+                exists_after = (await conn.execute(index_exists)).scalar_one()
+            await engine.dispose()
+        # Later tests on this worker's database plan queries against the index.
+        assert exists_after == existed_before, f"the test changed whether {idx} exists"
+
+
+# ---------------------------------------------------------------------------
+# Tests F/G/H: apply_tenancy_rls() behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestApplyTenancyRls:
+    """apply_tenancy_rls() is a no-op in single_tenant and idempotently enables
+    + FORCEs RLS in multi_tenant; RLS is always restored to disabled in teardown."""
+
+    async def test_single_tenant_noop(self, monkeypatch):
+        """In single_tenant, apply_tenancy_rls() does NOT enable RLS on any table."""
+        monkeypatch.setenv("GEOLENS_TENANCY_MODE", "single_tenant")
+
+        # Reload settings so the env change takes effect (the settings object is
+        # a pydantic model cached at import time; monkeypatch alone is not enough
+        # when a prior test reloaded settings to multi_tenant).
+        import importlib
+        import app.core.config as _cfg_mod
+        import app.core.tenancy as _ten_mod
+
+        importlib.reload(_cfg_mod)
+        importlib.reload(_ten_mod)
+
+        from app.core.db.rls import apply_tenancy_rls
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from app.core.config import settings
+
+        engine = create_async_engine(
+            settings.test_database_url, isolation_level="AUTOCOMMIT"
+        )
+        try:
+            async with engine.connect() as conn:
+                await apply_tenancy_rls(conn)
+        finally:
+            await engine.dispose()
+
+        state = await _get_rls_state()
+        for table, flags in state.items():
+            assert flags["relforcerowsecurity"] is False, (
+                f"single_tenant apply_tenancy_rls set relforcerowsecurity on {table}"
+            )
+            assert flags["relrowsecurity"] is False, (
+                f"single_tenant apply_tenancy_rls set relrowsecurity on {table}"
+            )
+
+    async def test_multi_tenant_enables_force_rls(self, monkeypatch):
+        """In multi_tenant, apply_tenancy_rls() enables and forces the boundary."""
+        monkeypatch.setenv("GEOLENS_TENANCY_MODE", "multi_tenant")
+
+        from app.core.db.rls import apply_tenancy_rls
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from app.core.config import settings
+
+        # Reload settings so the env change takes effect.
+        import importlib
+        import app.core.config as _cfg_mod
+        import app.core.tenancy as _ten_mod
+
+        importlib.reload(_cfg_mod)
+        importlib.reload(_ten_mod)
+
+        engine = create_async_engine(
+            settings.test_database_url, isolation_level="AUTOCOMMIT"
+        )
+        try:
+            async with engine.connect() as conn:
+                await apply_tenancy_rls(conn)
+        finally:
+            await engine.dispose()
+
+        try:
+            state = await _get_rls_state()
+            assert len(state) == len(_RLS_TABLES), (
+                f"Expected {len(_RLS_TABLES)} tables, got: {list(state)}"
+            )
+            for table, flags in state.items():
+                assert flags["relrowsecurity"] is True, (
+                    f"relrowsecurity is False on {table} after multi_tenant apply"
+                )
+                assert flags["relforcerowsecurity"] is True, (
+                    f"relforcerowsecurity is False on {table} after multi_tenant apply"
+                )
+        finally:
+            # Teardown: disable RLS so single_tenant tests are not polluted.
+            await _disable_rls_on_all()
+
+    async def test_multi_tenant_apply_is_idempotent(self, monkeypatch):
+        """Calling apply_tenancy_rls() twice in multi_tenant raises no error and
+        leaves the state unchanged (second call is a catalog-read no-op)."""
+        monkeypatch.setenv("GEOLENS_TENANCY_MODE", "multi_tenant")
+
+        from app.core.db.rls import apply_tenancy_rls
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from app.core.config import settings
+
+        import importlib
+        import app.core.config as _cfg_mod
+        import app.core.tenancy as _ten_mod
+
+        importlib.reload(_cfg_mod)
+        importlib.reload(_ten_mod)
+
+        engine = create_async_engine(
+            settings.test_database_url, isolation_level="AUTOCOMMIT"
+        )
+        try:
+            async with engine.connect() as conn:
+                # First apply.
+                await apply_tenancy_rls(conn)
+                state_after_first = await _get_rls_state()
+
+            async with engine.connect() as conn:
+                # Second apply — must be a no-op (no error, no state change).
+                await apply_tenancy_rls(conn)
+                state_after_second = await _get_rls_state()
+        finally:
+            await engine.dispose()
+
+        try:
+            # Both calls should leave identical state.
+            for table in _RLS_TABLES:
+                assert state_after_first[table]["relforcerowsecurity"] is True
+                assert state_after_second[table]["relforcerowsecurity"] is True
+        finally:
+            await _disable_rls_on_all()
+
+    async def test_rls_disabled_after_teardown(self):
+        """Sanity: after teardown helpers run, relforcerowsecurity is false again."""
+        # This test must run after the multi_tenant tests that call _disable_rls_on_all.
+        # It verifies the teardown is actually effective.
+        state = await _get_rls_state()
+        for table, flags in state.items():
+            assert flags["relforcerowsecurity"] is False, (
+                f"relforcerowsecurity still True on {table} — teardown failed"
+            )

@@ -1,0 +1,175 @@
+"""Aggregate API router composition."""
+
+from fastapi import APIRouter
+
+from app.modules.admin.router import router as admin_router
+from app.processing.ai.query_router import router as query_router
+from app.processing.ai.router import router as ai_router
+from app.modules.audit.router import audit_datasets_router, router as audit_router
+from app.modules.auth.oauth.router import router as oauth_router
+from app.modules.auth.router import router as auth_router
+from app.modules.auth.router_groups import router as groups_router
+from app.modules.catalog.collections.router import router as collections_crud_router
+from app.platform.config_ops.router import router as config_ops_router
+from app.modules.catalog.datasets.api.router import router as datasets_router
+from app.modules.catalog.datasets.api.router_aggregate import (
+    router as datasets_aggregate_router,
+)
+from app.modules.catalog.datasets.api.router_analysis import (
+    router as datasets_analysis_router,
+)
+from app.modules.catalog.datasets.api.router_api_keys import (
+    router as datasets_api_keys_router,
+)
+from app.modules.catalog.datasets.api.router_data import router as datasets_data_router
+from app.modules.catalog.datasets.api.router_export import (
+    router as datasets_export_router,
+)
+from app.observability.health.router import router as readiness_router
+from app.modules.catalog.datasets.api.router_health import (
+    router as datasets_health_router,
+)
+from app.modules.catalog.datasets.api.router_metadata import (
+    router as datasets_metadata_router,
+)
+from app.modules.catalog.datasets.api.router_pointcloud import (
+    router as datasets_pointcloud_router,
+)
+from app.modules.catalog.datasets.api.router_previous_version import (
+    router as datasets_previous_version_router,
+)
+from app.modules.catalog.datasets.api.router_refresh import (
+    router as datasets_refresh_router,
+)
+from app.modules.catalog.datasets.api.router_retention import (
+    router as datasets_retention_router,
+)
+from app.modules.catalog.datasets.api.router_reupload import (
+    router as datasets_reupload_router,
+)
+from app.modules.catalog.datasets.api.router_tiles3d import (
+    router as datasets_tiles3d_router,
+)
+from app.modules.catalog.datasets.api.router_vrt import router as datasets_vrt_router
+from app.modules.embed_tokens.admin_router import router as embed_tokens_admin_router
+from app.modules.embed_tokens.public_router import router as embed_frame_policy_router
+from app.modules.embed_tokens.router import router as embed_tokens_router
+from app.processing.export.router import router as export_router
+from app.modules.catalog.features.router import features_router
+from app.processing.ingest.manifest_router import manifest_router
+from app.processing.ingest.router import router as ingest_router
+from app.processing.ingest.router_url_import import router as url_import_router
+from app.platform.jobs.router import router as jobs_router
+from app.modules.catalog.layers.router import layers_router
+from app.modules.catalog.maps.router import router as maps_router
+from app.modules.catalog.maps.router_assets import sprites_router as maps_sprites_router
+from app.modules.catalog.maps.router_import_arcgis import (
+    router as maps_import_arcgis_router,
+)
+from app.modules.catalog.maps.router_link_preview import (
+    router as maps_link_preview_router,
+)
+from app.modules.catalog.maps.router_ownership import router as maps_ownership_router
+from app.standards.ogc.router import ogc_features_router, ogc_router
+from app.modules.catalog.records.router import router as records_router
+from app.modules.catalog.stories.router import router as stories_router
+from app.modules.catalog.stories.router_map_stories import (
+    router as map_stories_router,
+)
+from app.modules.catalog.stories.router_assets import router as story_assets_router
+from app.modules.catalog.stories.router_groups import router as story_groups_router
+from app.modules.catalog.search.router import collections_router, search_router
+from app.modules.catalog.sources.router import router as services_router
+from app.modules.catalog.sources.stac_asset_size_router import (
+    router as stac_asset_size_router,
+)
+from app.modules.catalog.sources.stac_router import router as stac_import_router
+from app.modules.settings.router_capabilities import (
+    router as capabilities_router,
+)
+from app.modules.settings.router import (
+    public_router as settings_public_router,
+    router as settings_router,
+)
+from app.standards.stac.router import stac_router
+from app.processing.tiles.router import router as tiles_router
+from app.processing.tiles.raster_relay import router as raster_relay_router
+
+
+api_router = APIRouter()
+
+# OGC discovery must stay first because it owns the root landing paths.
+api_router.include_router(ogc_router)
+api_router.include_router(auth_router)
+api_router.include_router(groups_router)
+api_router.include_router(admin_router)
+api_router.include_router(audit_router)
+api_router.include_router(audit_datasets_router)
+api_router.include_router(ingest_router)
+api_router.include_router(url_import_router)
+api_router.include_router(manifest_router)
+
+# Export must stay before dataset CRUD because /dcat conflicts with /{dataset_id}.
+api_router.include_router(datasets_export_router)
+api_router.include_router(datasets_router)
+api_router.include_router(datasets_analysis_router)
+api_router.include_router(datasets_aggregate_router)
+api_router.include_router(datasets_vrt_router)
+api_router.include_router(datasets_tiles3d_router)
+api_router.include_router(datasets_pointcloud_router)
+api_router.include_router(datasets_data_router)
+api_router.include_router(datasets_metadata_router)
+api_router.include_router(datasets_reupload_router)
+api_router.include_router(datasets_refresh_router)
+api_router.include_router(datasets_previous_version_router)
+api_router.include_router(datasets_api_keys_router)
+api_router.include_router(datasets_retention_router)
+api_router.include_router(datasets_health_router)
+api_router.include_router(readiness_router)
+api_router.include_router(records_router)
+api_router.include_router(features_router)
+api_router.include_router(export_router)
+api_router.include_router(jobs_router)
+api_router.include_router(search_router)
+api_router.include_router(collections_router)
+api_router.include_router(collections_crud_router)
+
+# Per-dataset OGC Features must stay after /collections/datasets routes.
+api_router.include_router(ogc_features_router)
+
+api_router.include_router(maps_router)
+api_router.include_router(maps_import_arcgis_router)
+api_router.include_router(maps_ownership_router)
+api_router.include_router(maps_link_preview_router)
+# Sprites are unauthenticated reads; mounted as a sibling of
+# maps_router (not nested inside it) so they don't inherit its
+# ERROR_RESPONSES_WRITE defaults — see the comment on sprites_router in
+# maps/router_assets.py.
+api_router.include_router(maps_sprites_router)
+api_router.include_router(stories_router)
+api_router.include_router(story_groups_router)
+api_router.include_router(map_stories_router)
+api_router.include_router(story_assets_router)
+api_router.include_router(ai_router)
+# Raw sandbox SQL endpoint (POST /query/), consumed by the MCP
+# `query` tool. Auth-only; see processing/ai/query_router.py.
+api_router.include_router(query_router)
+api_router.include_router(services_router)
+api_router.include_router(stac_import_router)
+api_router.include_router(stac_asset_size_router)
+api_router.include_router(layers_router)
+api_router.include_router(settings_router)
+api_router.include_router(settings_public_router)
+api_router.include_router(capabilities_router)
+api_router.include_router(oauth_router)
+api_router.include_router(config_ops_router)
+api_router.include_router(embed_tokens_router)
+api_router.include_router(embed_tokens_admin_router)
+# Public, unauthenticated framing-policy endpoint for the /m/{token} embed
+# shell (consumed by the nginx auth_request edge wiring).
+api_router.include_router(embed_frame_policy_router)
+api_router.include_router(tiles_router)
+api_router.include_router(raster_relay_router)
+api_router.include_router(stac_router)
+
+__all__ = ["api_router"]

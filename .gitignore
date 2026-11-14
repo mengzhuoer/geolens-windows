@@ -1,0 +1,32 @@
+# Build outputs and local state
+desktop/runtime/
+desktop/cache/
+desktop/dist/
+desktop/data/
+tmp/
+dist/
+release/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node
+app/frontend/node_modules/
+app/frontend/dist/
+app/frontend/coverage/
+app/frontend/test-results/
+app/frontend/playwright-report/
+app/frontend/.vite/
+
+# Local config and logs
+.env
+.env.local
+*.log
+data/
+pgdata/

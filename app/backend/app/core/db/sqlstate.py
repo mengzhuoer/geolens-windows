@@ -1,0 +1,148 @@
+"""PostgreSQL SQLSTATE helpers for classifying database errors.
+
+SQLSTATE reference: https://www.postgresql.org/docs/current/errcodes-appendix.html
+"""
+
+from __future__ import annotations
+
+from sqlalchemy.exc import DBAPIError
+
+# The relation the query names does not exist. Not always damage: raster and
+# VRT datasets carry a synthetic `table_name` with no PostGIS table behind it.
+#
+# `3F000` (invalid_schema_name) is deliberately NOT in this set —
+# a `SELECT` against a missing schema reports `42P01`, not `3F000`; Postgres
+# raises `3F000` from DDL paths, where it means the schema itself is gone.
+# Treating it as "empty dataset" would have hidden real provisioning drift.
+#
+# `42P01` alone cannot separate "raster dataset, no backing table" from "the
+# tenant's data schema was never provisioned" — both report it. Callers must
+# probe the schema; see `schema_exists()` and `get_dataset_rows()`.
+TABLE_ABSENT = frozenset({"42P01"})  # undefined_table
+
+# The caller sent something the table cannot answer — a bad filter column or an
+# unparseable literal. These are 4xx, not 5xx.
+BAD_QUERY_INPUT = frozenset(
+    {
+        "42703",  # undefined_column
+        "22P02",  # invalid_text_representation
+        "42883",  # undefined_function (e.g. no operator for the cast)
+        "42804",  # datatype_mismatch
+    }
+)
+
+
+# SQLSTATE *classes* (first two chars) meaning "the database could not serve
+# this request", as opposed to "the request was wrong". Only these become 503.
+#
+# Selecting by class, not exception type, matters: SQLAlchemy's asyncpg
+# dialect wraps a statement timeout (57014) as a plain `DBAPIError`, not
+# `OperationalError`, so `except OperationalError` silently misses it.
+_OPERATIONAL_CLASSES = frozenset(
+    {
+        "08",  # connection_exception
+        "40",  # transaction_rollback — serialization_failure, deadlock_detected
+        "53",  # insufficient_resources — out of memory, too many connections
+        "57",  # operator_intervention — query_canceled, admin_shutdown
+        "58",  # system_error — I/O failure below the server
+    }
+)
+
+
+# States that mean "the caller's value does not fit the column it was
+# compared against", as opposed to an outage or a bug in our own SQL.
+#
+# Shared by the OGC items handler and native features list so both classify
+# input failures consistently.
+#
+# Class 22 is data_exception as a whole. asyncpg reports a client-side encode
+# failure (an int outside int8, say) as plain 22000 on a bare
+# ``sqlalchemy.exc.DBAPIError``, NOT a ``DataError``, so catching ``DataError``
+# alone misses it.
+TYPE_FAULT_SQLSTATES = frozenset(
+    {
+        "42883",  # undefined_function — no operator for the pair
+        "42804",  # datatype_mismatch
+        "42846",  # cannot_coerce
+        "42P18",  # indeterminate_datatype
+    }
+)
+
+
+def is_caller_type_fault(exc: DBAPIError) -> bool:
+    """True when the database refused a caller-supplied value's type or range.
+
+    A DataError carrying no SQLSTATE counts: the driver raised before the
+    server answered, and for this class of error that means it could not encode
+    what the caller sent.
+    """
+    from sqlalchemy.exc import DataError
+
+    code = sqlstate(exc) or ""
+    return (
+        code.startswith("22")
+        or code in TYPE_FAULT_SQLSTATES
+        or (isinstance(exc, DataError) and not code)
+    )
+
+
+def sqlstate(exc: DBAPIError) -> str | None:
+    """Return the five-character SQLSTATE for a SQLAlchemy DBAPI error, if any.
+
+    asyncpg exposes `sqlstate`; psycopg exposes `pgcode`. Returns None when the
+    driver surfaced no code (e.g. the connection died before the server answered),
+    which callers should treat as operational.
+    """
+    orig = getattr(exc, "orig", None)
+    if orig is None:
+        return None
+    code = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    return str(code) if code else None
+
+
+def is_operational(exc: DBAPIError) -> bool:
+    """True when *exc* means the database failed us, not that the request was bad.
+
+    A missing SQLSTATE counts as operational: the driver raised before the
+    server answered, a connection failure by another name.
+
+    Integrity violations (class 23), syntax/access errors (class 42), and
+    data errors (class 22) are deliberately excluded — a unique-constraint
+    collision is a bug or conflict, and reporting it as "database
+    unavailable" would send callers into a pointless retry loop.
+    """
+    code = sqlstate(exc)
+    if code is None:
+        return True
+    return code[:2] in _OPERATIONAL_CLASSES
+
+
+# Another transaction owns rows this one needs. Both states mean
+# the same to a caller: nothing was written, and a retry lands after the owner
+# commits. 40001 is excluded as unreachable at READ COMMITTED.
+LOCK_CONFLICT = frozenset(
+    {
+        "55P03",  # lock_not_available — SET LOCAL lock_timeout expired
+        "40P01",  # deadlock_detected — this transaction was the victim
+    }
+)
+
+
+def is_lock_conflict(exc: BaseException) -> bool:
+    """True when another transaction holds what this one wants.
+
+    Accepts a bare asyncpg exception or a SQLAlchemy `DBAPIError` wrapping one.
+
+    Narrower than "retry this statement": the re-upload swap keeps its own
+    55P03-only predicate, because retrying DDL after a deadlock is a different
+    decision from retrying it after a lock timeout.
+    """
+    for candidate in (exc, getattr(exc, "orig", None)):
+        if candidate is None:
+            continue
+        code = getattr(candidate, "sqlstate", None) or getattr(
+            candidate, "pgcode", None
+        )
+        if code and str(code) in LOCK_CONFLICT:
+            return True
+    return False

@@ -1,0 +1,322 @@
+import { queryKeys } from '@/lib/query-keys';
+import { renderHook } from '@/test/test-utils';
+import { vi } from 'vitest';
+import { QueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+
+vi.mock('sonner', () => ({ toast: { error: vi.fn() } }));
+
+vi.mock('@/api/features', () => ({
+  createFeature: vi.fn(),
+  updateFeature: vi.fn(),
+  deleteFeature: vi.fn(),
+  deleteFeatures: vi.fn(),
+}));
+
+vi.mock('@/api/datasets', () => ({
+  addColumn: vi.fn(),
+  dropColumn: vi.fn(),
+}));
+
+import { createFeature, updateFeature, deleteFeature, deleteFeatures } from '@/api/features';
+import { addColumn, dropColumn } from '@/api/datasets';
+import {
+  useCreateFeature,
+  useUpdateFeature,
+  useDeleteFeature,
+  useDeleteFeatures,
+  useAddColumn,
+  useDropColumn,
+} from '@/hooks/use-features';
+
+const mockCreateFeature = vi.mocked(createFeature);
+const mockUpdateFeature = vi.mocked(updateFeature);
+const mockDeleteFeature = vi.mocked(deleteFeature);
+const mockDeleteFeatures = vi.mocked(deleteFeatures);
+const mockAddColumn = vi.mocked(addColumn);
+const mockDropColumn = vi.mocked(dropColumn);
+
+// Feature/schema mutations must invalidate the column-values and
+// column-stats caches (used by data-driven style editors + filter pickers,
+// staleTime 5min). Pre-fix only datasets.detail + datasets.rowsPrefix were
+// invalidated, so the distinct-values/min-max caches stayed stale (dropColumn
+// even served values for a deleted column). Spy on the prototype since the
+// test harness owns the QueryClient instance.
+function spyInvalidate() {
+  return vi.spyOn(QueryClient.prototype, 'invalidateQueries').mockResolvedValue(undefined);
+}
+
+function invalidatedColumnCaches(spy: ReturnType<typeof spyInvalidate>, datasetId: string) {
+  const keys = spy.mock.calls.map((c) => (c[0] as { queryKey: unknown[] })?.queryKey);
+  const hasValues = keys.some(
+    (k) => Array.isArray(k) && k[0] === 'column-values' && k[1] === datasetId && k.length === 2,
+  );
+  const hasStats = keys.some(
+    (k) => Array.isArray(k) && k[0] === 'column-stats' && k[1] === datasetId && k.length === 2,
+  );
+  return { hasValues, hasStats };
+}
+
+describe('dashboard aggregates after a feature edit', () => {
+  beforeEach(() => vi.clearAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  function aggregatesInvalidated(spy: ReturnType<typeof spyInvalidate>) {
+    const keys = spy.mock.calls.map((c) => (c[0] as { queryKey: unknown[] })?.queryKey);
+    return keys.some((key) => JSON.stringify(key) === JSON.stringify(queryKeys.dashboard.aggregatePrefix('ds-9')));
+  }
+
+  it('refetches the dataset\'s dashboard aggregates after an update', async () => {
+    const spy = spyInvalidate();
+    mockUpdateFeature.mockResolvedValueOnce({} as never);
+    const { result } = renderHook(() => useUpdateFeature());
+    await result.current.mutateAsync({ datasetId: 'ds-9', gid: 1, properties: { a: 2 } });
+    expect(aggregatesInvalidated(spy)).toBe(true);
+  });
+
+  it('refetches the dataset\'s dashboard aggregates after a delete', async () => {
+    const spy = spyInvalidate();
+    mockDeleteFeature.mockResolvedValueOnce(undefined as never);
+    const { result } = renderHook(() => useDeleteFeature());
+    await result.current.mutateAsync({ datasetId: 'ds-9', gid: 1 });
+    expect(aggregatesInvalidated(spy)).toBe(true);
+  });
+});
+
+describe('BUG-038: column-value/stats cache invalidation', () => {
+  beforeEach(() => vi.clearAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  it('useUpdateFeature invalidates the column-values + column-stats prefixes', async () => {
+    const spy = spyInvalidate();
+    mockUpdateFeature.mockResolvedValueOnce({} as never);
+
+    const { result } = renderHook(() => useUpdateFeature());
+    await result.current.mutateAsync({ datasetId: 'ds-9', gid: 1, properties: { a: 2 } });
+
+    const { hasValues, hasStats } = invalidatedColumnCaches(spy, 'ds-9');
+    expect(hasValues).toBe(true);
+    expect(hasStats).toBe(true);
+  });
+
+  it('useCreateFeature invalidates the column caches', async () => {
+    const spy = spyInvalidate();
+    mockCreateFeature.mockResolvedValueOnce({} as never);
+
+    const { result } = renderHook(() => useCreateFeature());
+    await result.current.mutateAsync({ datasetId: 'ds-9', geometry: { type: 'Point', coordinates: [0, 0] } });
+
+    const { hasValues, hasStats } = invalidatedColumnCaches(spy, 'ds-9');
+    expect(hasValues).toBe(true);
+    expect(hasStats).toBe(true);
+  });
+
+  it('useDeleteFeature invalidates the column caches', async () => {
+    const spy = spyInvalidate();
+    mockDeleteFeature.mockResolvedValueOnce(undefined as never);
+
+    const { result } = renderHook(() => useDeleteFeature());
+    await result.current.mutateAsync({ datasetId: 'ds-9', gid: 1 });
+
+    const { hasValues, hasStats } = invalidatedColumnCaches(spy, 'ds-9');
+    expect(hasValues).toBe(true);
+    expect(hasStats).toBe(true);
+  });
+
+  it('useDropColumn invalidates the column caches (deleted-column staleness)', async () => {
+    const spy = spyInvalidate();
+    mockDropColumn.mockResolvedValueOnce({} as never);
+
+    const { result } = renderHook(() => useDropColumn());
+    await result.current.mutateAsync({ datasetId: 'ds-9', columnName: 'gone' });
+
+    const { hasValues, hasStats } = invalidatedColumnCaches(spy, 'ds-9');
+    expect(hasValues).toBe(true);
+    expect(hasStats).toBe(true);
+  });
+
+  it('useAddColumn invalidates the column caches', async () => {
+    const spy = spyInvalidate();
+    mockAddColumn.mockResolvedValueOnce({} as never);
+
+    const { result } = renderHook(() => useAddColumn());
+    await result.current.mutateAsync({ datasetId: 'ds-9', column: { name: 'c', type: 'text' } });
+
+    const { hasValues, hasStats } = invalidatedColumnCaches(spy, 'ds-9');
+    expect(hasValues).toBe(true);
+    expect(hasStats).toBe(true);
+  });
+
+  it('useDropColumn invalidates relationship lists, whose broken flags depend on the schema', async () => {
+    const spy = spyInvalidate();
+    mockDropColumn.mockResolvedValueOnce({} as never);
+
+    const { result } = renderHook(() => useDropColumn());
+    await result.current.mutateAsync({ datasetId: 'ds-9', columnName: 'gone' });
+
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.relationships.listPrefix });
+  });
+
+  it('useAddColumn invalidates relationship lists, whose broken flags depend on the schema', async () => {
+    const spy = spyInvalidate();
+    mockAddColumn.mockResolvedValueOnce({} as never);
+
+    const { result } = renderHook(() => useAddColumn());
+    await result.current.mutateAsync({ datasetId: 'ds-9', column: { name: 'c', type: 'text' } });
+
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.relationships.listPrefix });
+  });
+});
+
+describe('useCreateFeature', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('calls createFeature on mutate', async () => {
+    const created = { type: 'Feature', id: 1, geometry: { type: 'Point', coordinates: [0, 0] }, properties: {} };
+    mockCreateFeature.mockResolvedValueOnce(created as never);
+
+    const { result } = renderHook(() => useCreateFeature());
+
+    await result.current.mutateAsync({
+      datasetId: 'ds-1',
+      geometry: { type: 'Point', coordinates: [0, 0] },
+      properties: {},
+      idempotencyKey: 'sketch-1',
+      attempt: 2,
+    });
+
+    expect(mockCreateFeature).toHaveBeenCalledWith(
+      'ds-1',
+      { type: 'Point', coordinates: [0, 0] },
+      {},
+      'sketch-1',
+      2,
+    );
+  });
+
+  it('sends no key when the caller has none', async () => {
+    mockCreateFeature.mockResolvedValueOnce({} as never);
+
+    const { result } = renderHook(() => useCreateFeature());
+    await result.current.mutateAsync({
+      datasetId: 'ds-1',
+      geometry: { type: 'Point', coordinates: [0, 0] },
+    });
+
+    expect(mockCreateFeature).toHaveBeenCalledWith(
+      'ds-1',
+      { type: 'Point', coordinates: [0, 0] },
+      undefined,
+      undefined,
+      undefined,
+    );
+  });
+
+  it('returns error state on failure', async () => {
+    mockCreateFeature.mockRejectedValueOnce(new Error('Forbidden'));
+
+    const { result } = renderHook(() => useCreateFeature());
+
+    await expect(
+      result.current.mutateAsync({
+        datasetId: 'ds-1',
+        geometry: { type: 'Point', coordinates: [0, 0] },
+      }),
+    ).rejects.toThrow('Forbidden');
+  });
+});
+
+describe('useUpdateFeature', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('calls updateFeature on mutate', async () => {
+    const updated = { type: 'Feature', id: 1, geometry: { type: 'Point', coordinates: [1, 1] }, properties: {} };
+    mockUpdateFeature.mockResolvedValueOnce(updated as never);
+
+    const { result } = renderHook(() => useUpdateFeature());
+
+    await result.current.mutateAsync({
+      datasetId: 'ds-1',
+      gid: 1,
+      geometry: { type: 'Point', coordinates: [1, 1] },
+      tableId: '111',
+    });
+
+    expect(mockUpdateFeature).toHaveBeenCalledWith('ds-1', 1, { type: 'Point', coordinates: [1, 1] }, undefined, '111');
+  });
+});
+
+describe('useDeleteFeature', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('calls deleteFeature on mutate', async () => {
+    mockDeleteFeature.mockResolvedValueOnce(undefined as never);
+
+    const { result } = renderHook(() => useDeleteFeature());
+
+    await result.current.mutateAsync({ datasetId: 'ds-1', gid: 1, tableId: '111' });
+
+    expect(mockDeleteFeature).toHaveBeenCalledWith('ds-1', 1, '111');
+  });
+
+  it('returns error state on failure', async () => {
+    mockDeleteFeature.mockRejectedValueOnce(new Error('Not found'));
+
+    const { result } = renderHook(() => useDeleteFeature());
+
+    await expect(result.current.mutateAsync({ datasetId: 'ds-1', gid: 99 })).rejects.toThrow('Not found');
+  });
+});
+
+
+describe('schema error feedback belongs to the current editor', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('returns add failures without emitting an unscoped toast', async () => {
+    mockAddColumn.mockRejectedValueOnce(new Error('Add failed'));
+    const { result } = renderHook(() => useAddColumn());
+    await expect(result.current.mutateAsync({ datasetId: 'old-dataset', column: { name: 'new_column', type: 'text' } })).rejects.toThrow('Add failed');
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('returns drop failures without emitting an unscoped toast', async () => {
+    mockDropColumn.mockRejectedValueOnce(new Error('Drop failed'));
+    const { result } = renderHook(() => useDropColumn());
+    await expect(result.current.mutateAsync({ datasetId: 'old-dataset', columnName: 'old_column' })).rejects.toThrow('Drop failed');
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('useDeleteFeatures', () => {
+  beforeEach(() => vi.clearAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  function invalidatedKeys(spy: ReturnType<typeof spyInvalidate>) {
+    return spy.mock.calls.map((c) => (c[0] as { queryKey: unknown[] })?.queryKey);
+  }
+
+  it('refreshes the dataset and its rows after a delete', async () => {
+    const spy = spyInvalidate();
+    mockDeleteFeatures.mockResolvedValueOnce({ deleted: 2, tile_cache_version: 3 });
+
+    const { result } = renderHook(() => useDeleteFeatures());
+    await result.current.mutateAsync({ datasetId: 'ds-9', gids: [1, 2], tableId: '77' });
+
+    expect(mockDeleteFeatures).toHaveBeenCalledWith('ds-9', [1, 2], '77');
+    const keys = invalidatedKeys(spy);
+    expect(keys).toContainEqual(queryKeys.datasets.detail('ds-9'));
+    expect(keys).toContainEqual(queryKeys.datasets.rowsPrefix('ds-9'));
+  });
+
+  it('refreshes the rows when the batch is refused, since the page is out of date', async () => {
+    const spy = spyInvalidate();
+    mockDeleteFeatures.mockRejectedValueOnce(new Error('refused'));
+
+    const { result } = renderHook(() => useDeleteFeatures());
+    await expect(
+      result.current.mutateAsync({ datasetId: 'ds-9', gids: [1] }),
+    ).rejects.toThrow('refused');
+
+    expect(invalidatedKeys(spy)).toContainEqual(queryKeys.datasets.rowsPrefix('ds-9'));
+  });
+});

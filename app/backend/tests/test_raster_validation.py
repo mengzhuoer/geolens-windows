@@ -1,0 +1,621 @@
+"""Unit tests for backend/app/raster/validation.py.
+
+All tests are pure unit tests — no DB, no files, no network.
+A FakeRasterAsset dataclass substitutes for SQLAlchemy RasterAsset objects.
+CRS agreement is passed in, as compare_crs would report it.
+"""
+
+import uuid
+from dataclasses import dataclass, field
+from typing import Optional
+
+import pytest
+
+
+from app.processing.raster.validation import SourceValidationError, validate_sources
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeRasterAsset:
+    """Minimal stand-in for RasterAsset with fields used by validate_sources."""
+
+    id: uuid.UUID = field(default_factory=uuid.uuid4)
+    crs_wkt: Optional[str] = "EPSG:4326-WKT"
+    band_count: Optional[int] = 1
+    dtype: Optional[str] = "uint8"
+    nodata: Optional[str] = None
+    res_x: Optional[float] = 1.0
+    res_y: Optional[float] = 1.0
+    width: Optional[int] = 256
+    height: Optional[int] = 256
+    is_rotated: bool = False
+
+
+# compare_crs's answer for sources that all carry FakeRasterAsset's default text.
+_SAME_CRS = {FakeRasterAsset.crs_wkt: True}
+
+
+def _ids(errors: list[SourceValidationError]) -> set[str]:
+    return {e.code for e in errors}
+
+
+# ---------------------------------------------------------------------------
+# TestCrsCheck
+# ---------------------------------------------------------------------------
+
+
+class TestCrsCheck:
+    """CRS consistency check (mosaic + band_stack)."""
+
+    def test_matching_crs_no_errors(self):
+        sources = [FakeRasterAsset(crs_wkt="A"), FakeRasterAsset(crs_wkt="B")]
+
+        errors = validate_sources("mosaic", sources, {"A": True, "B": True})
+
+        assert [e for e in errors if e.field == "crs_wkt"] == []
+
+    def test_mismatched_crs_returns_error(self):
+        sources = [FakeRasterAsset(crs_wkt="A"), FakeRasterAsset(crs_wkt="B")]
+
+        errors = validate_sources("mosaic", sources, {"A": True, "B": False})
+
+        crs_errors = [e for e in errors if e.code == "crs_mismatch"]
+        assert len(crs_errors) == 1
+        assert crs_errors[0].source_id == sources[1].id
+        assert crs_errors[0].field == "crs_wkt"
+
+    def test_an_uncompared_crs_is_refused_as_unverified(self):
+        sources = [FakeRasterAsset(crs_wkt="A"), FakeRasterAsset(crs_wkt="B")]
+
+        errors = validate_sources("mosaic", sources, {"A": True, "B": None})
+
+        assert [(e.code, e.source_id) for e in errors if e.field == "crs_wkt"] == [
+            ("crs_unverified", sources[1].id)
+        ]
+
+    def test_an_unreadable_reference_is_the_source_reported(self):
+        sources = [FakeRasterAsset(crs_wkt="A"), FakeRasterAsset(crs_wkt="B")]
+
+        errors = validate_sources("mosaic", sources, {"A": None, "B": True})
+
+        assert [(e.code, e.source_id) for e in errors if e.field == "crs_wkt"] == [
+            ("crs_unverified", sources[0].id)
+        ]
+
+    def test_the_crs_agreement_is_passed_in_never_computed_here(self):
+        with pytest.raises(TypeError):
+            validate_sources("mosaic", [FakeRasterAsset(), FakeRasterAsset()])
+
+    def test_none_crs_skipped(self):
+        """Sources with crs_wkt=None are skipped; no error raised."""
+        sources = [
+            FakeRasterAsset(crs_wkt=None),
+            FakeRasterAsset(crs_wkt=None),
+        ]
+
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+
+        assert [e for e in errors if e.field == "crs_wkt"] == []
+
+    def test_crs_checked_for_band_stack(self):
+        sources = [FakeRasterAsset(crs_wkt="A"), FakeRasterAsset(crs_wkt="B")]
+
+        errors = validate_sources("band_stack", sources, {"A": True, "B": False})
+
+        crs_errors = [e for e in errors if e.code == "crs_mismatch"]
+        assert len(crs_errors) == 1
+
+
+# ---------------------------------------------------------------------------
+# TestBandCountCheck
+# ---------------------------------------------------------------------------
+
+
+class TestBandCountCheck:
+    """Band count check (mosaic only)."""
+
+    def test_matching_band_count_no_errors(self):
+        sources = [FakeRasterAsset(band_count=3), FakeRasterAsset(band_count=3)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        bc_errors = [e for e in errors if e.code == "band_count_mismatch"]
+        assert bc_errors == []
+
+    def test_mismatched_band_count_mosaic_error(self):
+        sources = [FakeRasterAsset(band_count=3), FakeRasterAsset(band_count=1)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        bc_errors = [e for e in errors if e.code == "band_count_mismatch"]
+        assert len(bc_errors) == 1
+        assert bc_errors[0].source_id == sources[1].id
+        assert bc_errors[0].field == "band_count"
+
+    def test_band_count_not_checked_for_band_stack(self):
+        """band_count_mismatch should never appear for band_stack."""
+        sources = [FakeRasterAsset(band_count=3), FakeRasterAsset(band_count=1)]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        bc_errors = [e for e in errors if e.code == "band_count_mismatch"]
+        assert bc_errors == []
+
+
+# ---------------------------------------------------------------------------
+# TestSingleBandCheck
+# ---------------------------------------------------------------------------
+
+
+class TestSingleBandCheck:
+    """Single-band requirement (band_stack only)."""
+
+    def test_single_band_sources_pass(self):
+        sources = [FakeRasterAsset(band_count=1), FakeRasterAsset(band_count=1)]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        sb_errors = [e for e in errors if e.code == "single_band_required"]
+        assert sb_errors == []
+
+    def test_multi_band_source_fails(self):
+        sources = [FakeRasterAsset(band_count=1), FakeRasterAsset(band_count=3)]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        sb_errors = [e for e in errors if e.code == "single_band_required"]
+        assert len(sb_errors) == 1
+        assert sb_errors[0].source_id == sources[1].id
+        assert sb_errors[0].field == "band_count"
+
+    def test_single_band_not_checked_for_mosaic(self):
+        sources = [FakeRasterAsset(band_count=3), FakeRasterAsset(band_count=3)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        sb_errors = [e for e in errors if e.code == "single_band_required"]
+        assert sb_errors == []
+
+
+# ---------------------------------------------------------------------------
+# TestDtypeCheck
+# ---------------------------------------------------------------------------
+
+
+class TestDtypeCheck:
+    """dtype consistency check (mosaic + band_stack)."""
+
+    def test_matching_dtype_no_errors(self):
+        sources = [FakeRasterAsset(dtype="float32"), FakeRasterAsset(dtype="float32")]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        dt_errors = [e for e in errors if e.code == "dtype_mismatch"]
+        assert dt_errors == []
+
+    def test_mismatched_dtype_error(self):
+        sources = [FakeRasterAsset(dtype="uint8"), FakeRasterAsset(dtype="float32")]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        dt_errors = [e for e in errors if e.code == "dtype_mismatch"]
+        assert len(dt_errors) == 1
+        assert dt_errors[0].source_id == sources[1].id
+        assert dt_errors[0].field == "dtype"
+
+    def test_dtype_checked_for_band_stack(self):
+        sources = [FakeRasterAsset(dtype="uint8"), FakeRasterAsset(dtype="float32")]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        dt_errors = [e for e in errors if e.code == "dtype_mismatch"]
+        assert len(dt_errors) == 1
+
+
+# ---------------------------------------------------------------------------
+# TestNodataCheck
+# ---------------------------------------------------------------------------
+
+
+class TestNodataCheck:
+    """Nodata consistency check (mosaic + band_stack)."""
+
+    def test_all_none_nodata_passes(self):
+        sources = [FakeRasterAsset(nodata=None), FakeRasterAsset(nodata=None)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        nd_errors = [e for e in errors if e.code == "nodata_inconsistent"]
+        assert nd_errors == []
+
+    def test_all_defined_nodata_passes(self):
+        sources = [FakeRasterAsset(nodata="-9999"), FakeRasterAsset(nodata="0")]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        nd_errors = [e for e in errors if e.code == "nodata_inconsistent"]
+        assert nd_errors == []
+
+    def test_mixed_nodata_fails(self):
+        """First source has nodata, second does not."""
+        sources = [FakeRasterAsset(nodata="-9999"), FakeRasterAsset(nodata=None)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        nd_errors = [e for e in errors if e.code == "nodata_inconsistent"]
+        assert len(nd_errors) == 1
+        assert nd_errors[0].source_id == sources[1].id
+        assert nd_errors[0].field == "nodata"
+
+    def test_mixed_nodata_reverse_fails(self):
+        """First source has no nodata, second does."""
+        sources = [FakeRasterAsset(nodata=None), FakeRasterAsset(nodata="-9999")]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        nd_errors = [e for e in errors if e.code == "nodata_inconsistent"]
+        assert len(nd_errors) == 1
+
+    def test_nodata_checked_for_band_stack(self):
+        sources = [FakeRasterAsset(nodata="-9999"), FakeRasterAsset(nodata=None)]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        nd_errors = [e for e in errors if e.code == "nodata_inconsistent"]
+        assert len(nd_errors) == 1
+
+
+# ---------------------------------------------------------------------------
+# TestRotationCheck
+# ---------------------------------------------------------------------------
+
+
+class TestRotationCheck:
+    """Rotation rejection (mosaic + band_stack)."""
+
+    def test_non_rotated_no_errors(self):
+        sources = [FakeRasterAsset(is_rotated=False), FakeRasterAsset(is_rotated=False)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        rot_errors = [e for e in errors if e.code == "rotated_raster"]
+        assert rot_errors == []
+
+    def test_rotated_source_fails(self):
+        src_rotated = FakeRasterAsset(is_rotated=True)
+        sources = [FakeRasterAsset(is_rotated=False), src_rotated]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        rot_errors = [e for e in errors if e.code == "rotated_raster"]
+        assert len(rot_errors) == 1
+        assert rot_errors[0].source_id == src_rotated.id
+        assert rot_errors[0].field == "is_rotated"
+
+    def test_rotation_checked_for_band_stack(self):
+        src_rotated = FakeRasterAsset(is_rotated=True)
+        sources = [FakeRasterAsset(is_rotated=False), src_rotated]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        rot_errors = [e for e in errors if e.code == "rotated_raster"]
+        assert len(rot_errors) == 1
+
+    def test_first_source_rotated_also_flagged(self):
+        """Rotation check applies to ALL sources including the first."""
+        src1 = FakeRasterAsset(is_rotated=True)
+        src2 = FakeRasterAsset(is_rotated=False)
+        errors = validate_sources("mosaic", [src1, src2], _SAME_CRS)
+        rot_errors = [e for e in errors if e.code == "rotated_raster"]
+        assert len(rot_errors) == 1
+        assert rot_errors[0].source_id == src1.id
+
+
+# ---------------------------------------------------------------------------
+# TestGridAlignmentCheck
+# ---------------------------------------------------------------------------
+
+
+class TestGridAlignmentCheck:
+    """Grid alignment check (band_stack only)."""
+
+    def test_matching_grid_passes(self):
+        sources = [
+            FakeRasterAsset(width=256, height=256, res_x=1.0, res_y=1.0),
+            FakeRasterAsset(width=256, height=256, res_x=1.0, res_y=1.0),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        grid_errors = [e for e in errors if e.code == "grid_misaligned"]
+        assert grid_errors == []
+
+    def test_mismatched_width_fails(self):
+        sources = [
+            FakeRasterAsset(width=256, height=256),
+            FakeRasterAsset(width=512, height=256),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        grid_errors = [e for e in errors if e.code == "grid_misaligned"]
+        assert len(grid_errors) == 1
+        assert grid_errors[0].field == "width"
+
+    def test_mismatched_height_fails(self):
+        sources = [
+            FakeRasterAsset(width=256, height=256),
+            FakeRasterAsset(width=256, height=512),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        grid_errors = [e for e in errors if e.code == "grid_misaligned"]
+        assert len(grid_errors) == 1
+        assert grid_errors[0].field == "height"
+
+    def test_mismatched_res_x_fails(self):
+        sources = [
+            FakeRasterAsset(res_x=1.0, res_y=1.0),
+            FakeRasterAsset(res_x=2.0, res_y=1.0),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        grid_errors = [e for e in errors if e.code == "grid_misaligned"]
+        assert len(grid_errors) == 1
+        assert grid_errors[0].field == "res_x"
+
+    def test_mismatched_res_y_fails(self):
+        sources = [
+            FakeRasterAsset(res_x=1.0, res_y=1.0),
+            FakeRasterAsset(res_x=1.0, res_y=2.0),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        grid_errors = [e for e in errors if e.code == "grid_misaligned"]
+        assert len(grid_errors) == 1
+        assert grid_errors[0].field == "res_y"
+
+    def test_float_tolerance_within_bounds(self):
+        """Tiny floating point differences within tolerance should not trigger grid_misaligned."""
+        sources = [
+            FakeRasterAsset(res_x=1.0, res_y=1.0),
+            FakeRasterAsset(res_x=1.0 + 1e-11, res_y=1.0),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        grid_errors = [e for e in errors if e.code == "grid_misaligned"]
+        assert grid_errors == []
+
+    def test_grid_not_checked_for_mosaic(self):
+        """Grid alignment is only for band_stack; mosaic ignores it."""
+        sources = [
+            FakeRasterAsset(width=256, height=256),
+            FakeRasterAsset(width=512, height=512),
+        ]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        grid_errors = [e for e in errors if e.code == "grid_misaligned"]
+        assert grid_errors == []
+
+
+# ---------------------------------------------------------------------------
+# TestPixelGeometryCheck
+# ---------------------------------------------------------------------------
+
+
+class TestPixelGeometryCheck:
+    """Unmeasured pixel geometry (NULL res_x/res_y) fails distinctly.
+
+    Neither the grid-alignment nor the rotation check can distinguish
+    "measured and fine" from "never measured" on their own, so a source
+    with NULL res_x/res_y must raise `unknown_pixel_geometry` instead of
+    silently passing both.
+    """
+
+    def test_null_res_x_fails(self):
+        sources = [FakeRasterAsset(), FakeRasterAsset(res_x=None)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        pg_errors = [e for e in errors if e.code == "unknown_pixel_geometry"]
+        assert len(pg_errors) == 1
+        assert pg_errors[0].source_id == sources[1].id
+        assert pg_errors[0].field == "res_x"
+
+    def test_null_res_y_fails(self):
+        sources = [FakeRasterAsset(), FakeRasterAsset(res_y=None)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        pg_errors = [e for e in errors if e.code == "unknown_pixel_geometry"]
+        assert len(pg_errors) == 1
+        assert pg_errors[0].source_id == sources[1].id
+        assert pg_errors[0].field == "res_y"
+
+    def test_both_null_reports_single_error(self):
+        """Both res_x and res_y NULL still yields one error, not two."""
+        sources = [FakeRasterAsset(), FakeRasterAsset(res_x=None, res_y=None)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        pg_errors = [e for e in errors if e.code == "unknown_pixel_geometry"]
+        assert len(pg_errors) == 1
+        assert pg_errors[0].field == "res_x"
+
+    def test_first_source_null_also_flagged(self):
+        """Applies to all sources, including the first — mirrors rotation."""
+        src1 = FakeRasterAsset(res_x=None)
+        src2 = FakeRasterAsset()
+        errors = validate_sources("mosaic", [src1, src2], _SAME_CRS)
+        pg_errors = [e for e in errors if e.code == "unknown_pixel_geometry"]
+        assert len(pg_errors) == 1
+        assert pg_errors[0].source_id == src1.id
+
+    def test_checked_for_band_stack(self):
+        sources = [FakeRasterAsset(), FakeRasterAsset(res_x=None)]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        pg_errors = [e for e in errors if e.code == "unknown_pixel_geometry"]
+        assert len(pg_errors) == 1
+
+    def test_checked_for_mosaic_even_though_grid_alignment_is_not(self):
+        """The grid-alignment check only runs for band_stack, but the unmeasured-
+        resolution check must still run for mosaic — it also guards the always-on rotation check.
+        """
+        sources = [FakeRasterAsset(), FakeRasterAsset(res_x=None, res_y=None)]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        pg_errors = [e for e in errors if e.code == "unknown_pixel_geometry"]
+        assert len(pg_errors) == 1
+
+    def test_measured_unrotated_aligned_source_passes(self):
+        """A fully measured, unrotated, grid-aligned pair passes cleanly."""
+        sources = [
+            FakeRasterAsset(
+                res_x=1.0, res_y=1.0, is_rotated=False, width=256, height=256
+            ),
+            FakeRasterAsset(
+                res_x=1.0, res_y=1.0, is_rotated=False, width=256, height=256
+            ),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        assert errors == []
+
+    def test_existing_grid_misalignment_still_fires_when_geometry_known(self):
+        """The grid-alignment check still fires unchanged when res_x/res_y are measured but differ."""
+        sources = [
+            FakeRasterAsset(res_x=1.0, res_y=1.0),
+            FakeRasterAsset(res_x=2.0, res_y=1.0),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+        codes = {e.code for e in errors}
+        assert "grid_misaligned" in codes
+        assert "unknown_pixel_geometry" not in codes
+
+    def test_existing_rotation_failure_still_fires_when_geometry_known(self):
+        """The rotation check still fires unchanged for a rotated source with measured geometry."""
+        src_rotated = FakeRasterAsset(is_rotated=True, res_x=1.0, res_y=1.0)
+        sources = [FakeRasterAsset(is_rotated=False), src_rotated]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        codes = {e.code for e in errors if e.source_id == src_rotated.id}
+        assert "rotated_raster" in codes
+        assert "unknown_pixel_geometry" not in codes
+
+    def test_null_resolution_does_not_mask_rotation(self):
+        """A source that is both unmeasured AND rotated reports both codes —
+        The unmeasured-resolution check does not suppress the rotation check.
+        """
+        src_bad = FakeRasterAsset(is_rotated=True, res_x=None)
+        sources = [FakeRasterAsset(), src_bad]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+        codes = {e.code for e in errors if e.source_id == src_bad.id}
+        assert "rotated_raster" in codes
+        assert "unknown_pixel_geometry" in codes
+
+
+# ---------------------------------------------------------------------------
+# TestAllChecksRun
+# ---------------------------------------------------------------------------
+
+
+class TestAllChecksRun:
+    """Verify no fail-fast: multiple errors returned for one problematic source."""
+
+    def test_multiple_problems_return_multiple_errors(self):
+        """A source with CRS mismatch, dtype mismatch, and rotation returns 3 errors."""
+        src_ref = FakeRasterAsset(crs_wkt="A", dtype="uint8", is_rotated=False)
+        src_bad = FakeRasterAsset(crs_wkt="B", dtype="float32", is_rotated=True)
+
+        errors = validate_sources("mosaic", [src_ref, src_bad], {"A": True, "B": False})
+
+        bad_src_errors = [e for e in errors if e.source_id == src_bad.id]
+        codes = {e.code for e in bad_src_errors}
+        assert "crs_mismatch" in codes
+        assert "dtype_mismatch" in codes
+        assert "rotated_raster" in codes
+        assert len(bad_src_errors) >= 3
+
+    def test_band_stack_multiple_problems(self):
+        """Band-stack: CRS mismatch + dtype mismatch + rotation + grid misalign."""
+        src_ref = FakeRasterAsset(
+            crs_wkt="A",
+            dtype="uint8",
+            is_rotated=False,
+            band_count=1,
+            width=256,
+            height=256,
+            res_x=1.0,
+            res_y=1.0,
+        )
+        src_bad = FakeRasterAsset(
+            crs_wkt="B",
+            dtype="float32",
+            is_rotated=True,
+            band_count=3,
+            width=512,
+            height=256,
+            res_x=2.0,
+            res_y=1.0,
+        )
+
+        errors = validate_sources(
+            "band_stack", [src_ref, src_bad], {"A": True, "B": False}
+        )
+
+        codes = {e.code for e in errors if e.source_id == src_bad.id}
+        assert "crs_mismatch" in codes
+        assert "dtype_mismatch" in codes
+        assert "rotated_raster" in codes
+        assert "single_band_required" in codes
+
+
+# ---------------------------------------------------------------------------
+# TestValidSources
+# ---------------------------------------------------------------------------
+
+
+class TestValidSources:
+    """Fully compatible sources return empty list for both vrt_types."""
+
+    def test_valid_mosaic_sources(self):
+        sources = [
+            FakeRasterAsset(band_count=3, dtype="uint8", nodata=None, is_rotated=False),
+            FakeRasterAsset(band_count=3, dtype="uint8", nodata=None, is_rotated=False),
+        ]
+        errors = validate_sources("mosaic", sources, _SAME_CRS)
+
+        assert errors == []
+
+    def test_valid_band_stack_sources(self):
+        sources = [
+            FakeRasterAsset(
+                band_count=1,
+                dtype="float32",
+                nodata="-9999",
+                is_rotated=False,
+                width=256,
+                height=256,
+                res_x=1.0,
+                res_y=1.0,
+            ),
+            FakeRasterAsset(
+                band_count=1,
+                dtype="float32",
+                nodata="-9999",
+                is_rotated=False,
+                width=256,
+                height=256,
+                res_x=1.0,
+                res_y=1.0,
+            ),
+        ]
+        errors = validate_sources("band_stack", sources, _SAME_CRS)
+
+        assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# TestEdgeCases
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    """Edge cases: 0 or 1 sources return empty list."""
+
+    def test_zero_sources(self):
+        errors = validate_sources("mosaic", [], _SAME_CRS)
+        assert errors == []
+
+    def test_one_source(self):
+        errors = validate_sources("mosaic", [FakeRasterAsset()], _SAME_CRS)
+        assert errors == []
+
+    def test_one_source_band_stack(self):
+        errors = validate_sources("band_stack", [FakeRasterAsset()], _SAME_CRS)
+        assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# TestSourceValidationError
+# ---------------------------------------------------------------------------
+
+
+class TestSourceValidationError:
+    """Verify SourceValidationError has all required fields."""
+
+    def test_all_fields_present(self):
+        err = SourceValidationError(
+            source_id=uuid.uuid4(),
+            code="crs_mismatch",
+            message="CRS does not match reference source",
+            field="crs_wkt",
+        )
+        assert err.source_id is not None
+        assert err.code == "crs_mismatch"
+        assert err.message == "CRS does not match reference source"
+        assert err.field == "crs_wkt"
+        assert err.severity == "error"  # default
+
+    def test_severity_override(self):
+        err = SourceValidationError(
+            source_id=uuid.uuid4(),
+            code="rotated_raster",
+            message="Raster is rotated",
+            field="is_rotated",
+            severity="warning",
+        )
+        assert err.severity == "warning"

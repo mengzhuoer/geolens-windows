@@ -1,0 +1,705 @@
+import { renderHook, act } from '@testing-library/react';
+import { useSettingsForm } from '../useSettingsForm';
+import type { SettingItem } from '@/api/settings';
+
+function makeSetting(
+  key: string,
+  value: unknown,
+  source: SettingItem['source'] = 'overridden',
+): SettingItem {
+  return { key, value, source, label: key };
+}
+
+describe('useSettingsForm', () => {
+  describe('basic behavior', () => {
+    it('initializes values from settings', () => {
+      const settings = [makeSetting('name', 'Alice')];
+      const fields = [{ key: 'name', defaultValue: '' }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+      expect(result.current.values.name).toBe('Alice');
+    });
+
+    it('uses defaultValue when setting is missing', () => {
+      const settings: SettingItem[] = [];
+      const fields = [{ key: 'name', defaultValue: 'default' }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+      expect(result.current.values.name).toBe('default');
+    });
+
+    it('tracks dirty state', () => {
+      const settings = [makeSetting('name', 'Alice')];
+      const fields = [{ key: 'name', defaultValue: '' }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+
+      expect(result.current.hasDirty).toBe(false);
+
+      act(() => {
+        result.current.setters.name('Bob');
+      });
+
+      expect(result.current.hasDirty).toBe(true);
+      expect(result.current.dirty).toEqual({ name: 'Bob' });
+    });
+
+    it('discard resets to server values', () => {
+      const settings = [makeSetting('name', 'Alice')];
+      const fields = [{ key: 'name', defaultValue: '' }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+
+      act(() => result.current.setters.name('Bob'));
+      expect(result.current.hasDirty).toBe(true);
+
+      act(() => result.current.discard());
+      expect(result.current.values.name).toBe('Alice');
+      expect(result.current.hasDirty).toBe(false);
+    });
+  });
+
+  describe('coerce option', () => {
+    it('coerces server value for initialization', () => {
+      const settings = [makeSetting('dims', 768)];
+      const fields = [{ key: 'dims', defaultValue: '0', coerce: String }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+      expect(result.current.values.dims).toBe('768');
+    });
+
+    it('coerces both sides for dirty comparison', () => {
+      const settings = [makeSetting('dims', 768)];
+      const fields = [{ key: 'dims', defaultValue: '0', coerce: String }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+
+      // '768' === String(768) so not dirty
+      expect(result.current.hasDirty).toBe(false);
+
+      act(() => result.current.setters.dims('1024'));
+      expect(result.current.hasDirty).toBe(true);
+      expect(result.current.dirty).toEqual({ dims: '1024' });
+    });
+
+    it('coerce prevents false positive with number-to-string', () => {
+      const settings = [makeSetting('count', 42)];
+      const fields = [{ key: 'count', defaultValue: '0', coerce: String }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+
+      // Without coerce, '42' !== 42 would be dirty. With coerce, both are '42'.
+      expect(result.current.hasDirty).toBe(false);
+    });
+  });
+
+  describe('compare option', () => {
+    it('json compare detects deep equality', () => {
+      const basemaps = [{ id: '1', enabled: true }];
+      const settings = [makeSetting('basemaps', basemaps)];
+      const fields = [{ key: 'basemaps', defaultValue: [], compare: 'json' as const }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+
+      // Same content, different reference — not dirty because JSON compare
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('json compare detects changes', () => {
+      const basemaps = [{ id: '1', enabled: true }];
+      const settings = [makeSetting('basemaps', basemaps)];
+      const fields = [{ key: 'basemaps', defaultValue: [], compare: 'json' as const }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+
+      act(() => {
+        result.current.setters.basemaps([{ id: '1', enabled: false }]);
+      });
+
+      expect(result.current.hasDirty).toBe(true);
+    });
+
+    it('strict compare (default) treats objects as always different', () => {
+      const obj = { a: 1 };
+      const settings = [makeSetting('data', obj)];
+      const fields = [{ key: 'data', defaultValue: {} }] as const;
+      const { result } = renderHook(() => useSettingsForm(settings, fields));
+
+      // Without json compare, the initial value from settings is the same reference
+      // so it's not dirty
+      expect(result.current.hasDirty).toBe(false);
+
+      // But after setting a new object with same content, strict !== says dirty
+      act(() => result.current.setters.data({ a: 1 }));
+      expect(result.current.hasDirty).toBe(true);
+    });
+  });
+
+  // A mid-edit settings refetch (new array identity) must not
+  // wipe drafts or disarm the unsaved-changes guard.
+  describe('refetch mid-edit', () => {
+    const fields = [
+      { key: 'name', defaultValue: '' },
+      { key: 'flag', defaultValue: false },
+    ] as const;
+
+    type Props = { s: SettingItem[]; saving?: boolean; u?: number; failed?: boolean };
+    let submitReset: (key: string) => Promise<boolean> = async () => true;
+    beforeEach(() => {
+      submitReset = async () => true;
+    });
+
+    function renderWithSettings(settings: SettingItem[]) {
+      return renderHook(
+        ({ s, saving, u, failed }: Props) =>
+          useSettingsForm(s, fields, saving, u, failed, (key) => submitReset(key)),
+        { initialProps: { s: settings } as Props },
+      );
+    }
+
+    it('keeps dirty fields and the guard armed when an unrelated field refetches', () => {
+      const { result, rerender } = renderWithSettings([
+        makeSetting('name', 'Alice'),
+        makeSetting('flag', false),
+      ]);
+
+      act(() => result.current.setters.name('Bob'));
+      expect(result.current.hasDirty).toBe(true);
+
+      // Simulate a query invalidation: new array identity, 'flag' changed
+      // on the server (e.g. a background refetch), 'name' unchanged.
+      rerender({ s: [makeSetting('name', 'Alice'), makeSetting('flag', true)] });
+
+      expect(result.current.values.name).toBe('Bob'); // draft survives
+      expect(result.current.values.flag).toBe(true); // untouched field syncs
+      expect(result.current.hasDirty).toBe(true); // guard stays armed
+      expect(result.current.dirty).toEqual({ name: 'Bob' });
+    });
+
+    it('keeps drafts across a refetch with identical content but new identity', () => {
+      const { result, rerender } = renderWithSettings([
+        makeSetting('name', 'Alice'),
+        makeSetting('flag', false),
+      ]);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: [makeSetting('name', 'Alice'), makeSetting('flag', false)] });
+
+      expect(result.current.values.name).toBe('Bob');
+      expect(result.current.hasDirty).toBe(true);
+    });
+
+    it('reads pristine after a save lands (server now equals the draft)', () => {
+      const { result, rerender } = renderWithSettings([
+        makeSetting('name', 'Alice'),
+        makeSetting('flag', false),
+      ]);
+
+      act(() => result.current.setters.name('Bob'));
+      expect(result.current.hasDirty).toBe(true);
+
+      // Save persisted the draft; the refetched settings now match it.
+      rerender({ s: [makeSetting('name', 'Bob'), makeSetting('flag', false)] });
+
+      expect(result.current.values.name).toBe('Bob');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('reads pristine when a save canonicalized the submitted value', () => {
+      const { result, rerender } = renderWithSettings([
+        makeSetting('name', 'Alice'),
+        makeSetting('flag', false),
+      ]);
+
+      act(() => result.current.setters.name('  Bob  '));
+      expect(result.current.hasDirty).toBe(true);
+
+      // The backend trims/normalizes on save; the refetch returns the
+      // canonical value, which differs from both the old baseline and
+      // the draft. The server value must win or the form stays dirty
+      // forever and a re-save repeats the request.
+      rerender({ s: [makeSetting('name', 'Bob'), makeSetting('flag', false)] });
+
+      expect(result.current.values.name).toBe('Bob');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('keeps an edit typed while the save was in flight', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+
+      // Save clicked: mutation goes pending with the draft 'Bob'. The
+      // query data itself is unchanged (same identity) at this point.
+      rerender({ s: initial, saving: true });
+
+      // Inputs stay enabled while saving; the user keeps typing.
+      act(() => result.current.setters.name('Carol'));
+
+      // The save's refetch acknowledges 'Bob' — it must not clobber the
+      // newer draft 'Carol' or silently mark the form pristine.
+      rerender({ s: [makeSetting('name', 'Bob'), makeSetting('flag', false)], saving: false });
+
+      expect(result.current.values.name).toBe('Carol');
+      expect(result.current.hasDirty).toBe(true);
+      expect(result.current.dirty).toEqual({ name: 'Carol' });
+    });
+
+    it('keeps an edit that returns to the previous value while the save is in flight', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.flag(true));
+      rerender({ s: initial, saving: true });
+
+      // The user flips the switch back to the value the server still holds.
+      act(() => result.current.setters.flag(false));
+
+      rerender({ s: [makeSetting('name', 'Alice'), makeSetting('flag', true)], saving: false });
+
+      expect(result.current.values.flag).toBe(false);
+      expect(result.current.dirty).toEqual({ flag: false });
+    });
+
+    it('reports an edit reverted during a pending save as unsaved before the refetch', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.flag(true));
+      rerender({ s: initial, saving: true });
+      act(() => result.current.setters.flag(false));
+
+      // The draft equals the server value the page still holds, but the
+      // pending request will persist the opposite, so leaving must warn.
+      expect(result.current.hasDirty).toBe(true);
+    });
+
+    it('takes the persisted value when a background refetch changed the field mid-save', () => {
+      const initial = [makeSetting('name', 'A'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('B'));
+      rerender({ s: initial, saving: true });
+
+      // Another admin's change lands while the save is pending.
+      rerender({ s: [makeSetting('name', 'C'), makeSetting('flag', false)], saving: true });
+
+      // The save's own refetch returns what it persisted.
+      rerender({ s: [makeSetting('name', 'B'), makeSetting('flag', false)], saving: false });
+
+      expect(result.current.values.name).toBe('B');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('adopts the persisted value after a discard between save settling and its refetch', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true });
+      act(() => result.current.setters.name('Carol'));
+
+      // The mutation settles; its refetch has not landed yet.
+      rerender({ s: initial, saving: false });
+      act(() => result.current.discard());
+      expect(result.current.values.name).toBe('Alice');
+
+      rerender({ s: [makeSetting('name', 'Bob'), makeSetting('flag', false)], saving: false });
+
+      expect(result.current.values.name).toBe('Bob');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('keeps a new edit made after a discard while the save refetch is outstanding', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true });
+      rerender({ s: initial, saving: false });
+      act(() => result.current.discard());
+      act(() => result.current.setters.name('Dave'));
+
+      rerender({ s: [makeSetting('name', 'Bob'), makeSetting('flag', false)], saving: false });
+
+      expect(result.current.values.name).toBe('Dave');
+      expect(result.current.dirty).toEqual({ name: 'Dave' });
+    });
+
+    it('keeps an edit reverted during a failing save dirty until the refetch lands', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.flag(true));
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.flag(false));
+
+      // The save failed, but part of the batch may have committed, so the
+      // cached server value is not yet known to be current.
+      rerender({ s: initial, saving: false, u: 1 });
+      expect(result.current.hasDirty).toBe(true);
+
+      // The error refetch returns unchanged data: nothing persisted.
+      rerender({ s: initial, saving: false, u: 2 });
+      expect(result.current.hasDirty).toBe(false);
+      expect(result.current.dirty).toEqual({});
+    });
+
+    it('keeps an edit made during a save that fails after a partial commit', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.flag(true));
+      rerender({ s: initial, saving: true });
+      act(() => result.current.setters.flag(false));
+
+      // The backend committed flag=true, then failed on another field of
+      // the batch. The error path refetches and returns the committed value.
+      rerender({ s: initial, saving: false });
+      rerender({
+        s: [makeSetting('name', 'Alice'), makeSetting('flag', true)],
+        saving: false,
+      });
+
+      expect(result.current.values.flag).toBe(false);
+      expect(result.current.dirty).toEqual({ flag: false });
+    });
+
+    it('keeps an edit through the first refetch when a second save starts before it lands', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.name('Carol'));
+      rerender({ s: initial, saving: false, u: 1 });
+
+      // A second save starts before the first save's refetch has landed.
+      act(() => result.current.setters.flag(true));
+      rerender({ s: initial, saving: true, u: 1 });
+
+      // The first refetch lands while the second save is pending.
+      rerender({ s: [makeSetting('name', 'Bob'), makeSetting('flag', false)], saving: true, u: 2 });
+
+      expect(result.current.values.name).toBe('Carol');
+      expect(result.current.dirty).toEqual({ name: 'Carol', flag: true });
+    });
+
+    it('reads saved once the refetch for the last of two saves lands, with the server value', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.name('  Carol  '));
+      rerender({ s: initial, saving: false, u: 1 });
+
+      // The second save submits the draft before the first refetch lands.
+      rerender({ s: initial, saving: true, u: 1 });
+      const afterFirst = [makeSetting('name', 'Bob'), makeSetting('flag', false)];
+      rerender({ s: afterFirst, saving: true, u: 2 });
+      expect(result.current.values.name).toBe('  Carol  ');
+      rerender({ s: afterFirst, saving: false, u: 2 });
+
+      // The server trimmed the value; the refetch reflecting the last save
+      // retires the marker, so the stored value shows and nothing is dirty.
+      rerender({ s: [makeSetting('name', 'Carol'), makeSetting('flag', false)], saving: false, u: 3 });
+
+      expect(result.current.values.name).toBe('Carol');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('keeps a draft edited after the second save started through that save refetch', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.name('Carol'));
+      rerender({ s: initial, saving: false, u: 1 });
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.name('Dave'));
+      rerender({ s: initial, saving: false, u: 1 });
+
+      rerender({ s: [makeSetting('name', 'Carol'), makeSetting('flag', false)], saving: false, u: 2 });
+
+      expect(result.current.values.name).toBe('Dave');
+      expect(result.current.dirty).toEqual({ name: 'Dave' });
+    });
+
+    it('lets a successful reset win after a failed save and its completed error refetch', async () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.name('Carol'));
+      rerender({ s: initial, saving: false, u: 1, failed: true });
+      rerender({ s: initial, saving: false, u: 2, failed: true });
+
+      act(() => result.current.setters.name('Dave'));
+      await act(async () => result.current.onReset('name'));
+      rerender({
+        s: [makeSetting('name', 'Default'), makeSetting('flag', false)],
+        saving: false,
+        u: 3,
+        failed: true,
+      });
+
+      expect(result.current.values.name).toBe('Default');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('keeps an edit made after a reset was submitted', async () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.name('Carol'));
+      rerender({ s: initial, saving: false, u: 1, failed: true });
+      rerender({ s: initial, saving: false, u: 2, failed: true });
+
+      let finishReset: (ok: boolean) => void = () => {};
+      submitReset = () => new Promise<boolean>((resolve) => (finishReset = resolve));
+      act(() => {
+        void result.current.onReset('name');
+      });
+      act(() => result.current.setters.name('Erin'));
+      await act(async () => finishReset(true));
+      rerender({
+        s: [makeSetting('name', 'Default'), makeSetting('flag', false)],
+        saving: false,
+        u: 3,
+        failed: true,
+      });
+
+      expect(result.current.values.name).toBe('Erin');
+      expect(result.current.dirty).toEqual({ name: 'Erin' });
+    });
+
+    it('keeps a draft whose save failed after an earlier save succeeded', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderHook(
+        ({ s, saving, u, failed }: Props & { failed?: boolean }) =>
+          useSettingsForm(s, fields, saving, u, failed),
+        { initialProps: { s: initial } as Props & { failed?: boolean } },
+      );
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.name('Carol'));
+      rerender({ s: initial, saving: false, u: 1 });
+
+      // The second save submits Carol before the first refetch lands, then fails.
+      rerender({ s: initial, saving: true, u: 1 });
+      rerender({ s: initial, saving: false, u: 1, failed: true });
+
+      // The error refetch returns what the first save persisted.
+      rerender({
+        s: [makeSetting('name', 'Bob'), makeSetting('flag', false)],
+        saving: false,
+        u: 2,
+        failed: true,
+      });
+
+      expect(result.current.values.name).toBe('Carol');
+      expect(result.current.dirty).toEqual({ name: 'Carol' });
+    });
+
+    it('keeps a post-submit edit even when an unrelated refetch races the save', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true });
+      act(() => result.current.setters.name('Carol'));
+
+      // An unrelated invalidation lands while the save is still pending —
+      // it must not consume the submitted snapshot.
+      rerender({ s: [makeSetting('name', 'Alice'), makeSetting('flag', true)], saving: true });
+      expect(result.current.values.name).toBe('Carol');
+
+      // Then the save's own refetch acknowledges 'Bob'.
+      rerender({ s: [makeSetting('name', 'Bob'), makeSetting('flag', true)], saving: false });
+
+      expect(result.current.values.name).toBe('Carol');
+      expect(result.current.hasDirty).toBe(true);
+    });
+
+    it('honors a reset that only changes the source, not the value', () => {
+      // An overridden setting whose effective value equals the default:
+      // resetting it removes the override, so the refetch reports the same
+      // value with source flipped to 'default'. That is authoritative
+      // server movement and must drop the draft.
+      const { result, rerender } = renderWithSettings([
+        makeSetting('name', 'Alice', 'overridden'),
+        makeSetting('flag', false),
+      ]);
+
+      act(() => result.current.setters.name('Bob'));
+      expect(result.current.hasDirty).toBe(true);
+
+      rerender({
+        s: [makeSetting('name', 'Alice', 'default'), makeSetting('flag', false)],
+      });
+
+      expect(result.current.values.name).toBe('Alice');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('drops the snapshot when a save fails, so a later reset wins', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true, u: 1 });
+
+      // The save fails and its error refetch returns unchanged data, which
+      // reconciles the draft and ends the tracking.
+      rerender({ s: initial, saving: false, u: 1 });
+      rerender({ s: initial, saving: false, u: 2 });
+
+      // The user edits the field again, then resets it.
+      act(() => result.current.setters.name('Dave'));
+      rerender({
+        s: [makeSetting('name', 'Default'), makeSetting('flag', false)],
+        saving: false,
+        u: 3,
+      });
+
+      // The failed submission must not be misread as a post-submit edit:
+      // the reset's server value wins and the form reads pristine.
+      expect(result.current.values.name).toBe('Default');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('ends a successful save tracking on an unchanged refetch so a later reset wins', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: initial, saving: true, u: 1 });
+      act(() => result.current.setters.name('Carol'));
+
+      // The refetch returns identical data, so the settings object keeps its
+      // identity and only the fetch time moves.
+      rerender({ s: initial, saving: false, u: 1 });
+      rerender({ s: initial, saving: false, u: 2 });
+
+      rerender({
+        s: [makeSetting('name', 'Default'), makeSetting('flag', false)],
+        saving: false,
+        u: 3,
+      });
+
+      expect(result.current.values.name).toBe('Default');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('keeps an edit made after a failure but before its refetch lands', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.flag(true));
+      rerender({ s: initial, saving: true, u: 1 });
+      rerender({ s: initial, saving: false, u: 1 });
+
+      // The user flips the switch back before the error refetch responds.
+      act(() => result.current.setters.flag(false));
+
+      rerender({
+        s: [makeSetting('name', 'Alice'), makeSetting('flag', true)],
+        saving: false,
+        u: 2,
+      });
+
+      expect(result.current.values.flag).toBe(false);
+      expect(result.current.dirty).toEqual({ flag: false });
+    });
+
+    it('reads pristine after a pending save when the draft was not edited again', () => {
+      const initial = [makeSetting('name', 'Alice'), makeSetting('flag', false)];
+      const { result, rerender } = renderWithSettings(initial);
+
+      act(() => result.current.setters.name('  Bob  '));
+      rerender({ s: initial, saving: true });
+
+      // Refetch returns the canonicalized value for the acknowledged draft.
+      rerender({ s: [makeSetting('name', 'Bob'), makeSetting('flag', false)], saving: false });
+
+      expect(result.current.values.name).toBe('Bob');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('restores the server value when an edited field is reset', () => {
+      const { result, rerender } = renderWithSettings([
+        makeSetting('name', 'Alice'),
+        makeSetting('flag', false),
+      ]);
+
+      act(() => result.current.setters.name('Bob'));
+
+      // Reset on 'name' persisted the default; its refetched value changed,
+      // so the stale draft is replaced by the authoritative server value.
+      rerender({ s: [makeSetting('name', 'Default'), makeSetting('flag', false)] });
+
+      expect(result.current.values.name).toBe('Default');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('resolves a concurrent change to the edited field as server-wins', () => {
+      const { result, rerender } = renderWithSettings([
+        makeSetting('name', 'Alice'),
+        makeSetting('flag', false),
+      ]);
+
+      act(() => result.current.setters.name('Bob'));
+
+      // Another admin changed 'name' underneath the edit: the field's
+      // server value moved, so the server value replaces the draft.
+      rerender({ s: [makeSetting('name', 'Carol'), makeSetting('flag', false)] });
+
+      expect(result.current.values.name).toBe('Carol');
+      expect(result.current.hasDirty).toBe(false);
+    });
+
+    it('keeps a json-compare draft through a refetch', () => {
+      const jsonFields = [
+        { key: 'basemaps', defaultValue: [], compare: 'json' as const },
+        { key: 'flag', defaultValue: false },
+      ] as const;
+      const { result, rerender } = renderHook(
+        ({ s }) => useSettingsForm(s, jsonFields),
+        {
+          initialProps: {
+            s: [
+              makeSetting('basemaps', [{ id: '1', enabled: true }]),
+              makeSetting('flag', false),
+            ],
+          },
+        },
+      );
+
+      act(() => result.current.setters.basemaps([{ id: '1', enabled: false }]));
+
+      rerender({
+        s: [
+          makeSetting('basemaps', [{ id: '1', enabled: true }]),
+          makeSetting('flag', true),
+        ],
+      });
+
+      expect(result.current.values.basemaps).toEqual([{ id: '1', enabled: false }]);
+      expect(result.current.values.flag).toBe(true);
+      expect(result.current.hasDirty).toBe(true);
+    });
+
+    it('discard still resets all fields, including drafts, after a refetch', () => {
+      const { result, rerender } = renderWithSettings([
+        makeSetting('name', 'Alice'),
+        makeSetting('flag', false),
+      ]);
+
+      act(() => result.current.setters.name('Bob'));
+      rerender({ s: [makeSetting('name', 'Alice'), makeSetting('flag', true)] });
+
+      act(() => result.current.discard());
+      expect(result.current.values.name).toBe('Alice');
+      expect(result.current.values.flag).toBe(true);
+      expect(result.current.hasDirty).toBe(false);
+    });
+  });
+});

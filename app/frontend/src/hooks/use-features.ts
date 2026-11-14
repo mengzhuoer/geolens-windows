@@ -1,0 +1,185 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { queryKeys } from '@/lib/query-keys';
+import { createFeature, updateFeature, deleteFeature, deleteFeatures } from '@/api/features';
+import { addColumn, dropColumn, getColumnReferences } from '@/api/datasets';
+import type { Geometry } from 'geojson';
+import { logger } from '@/lib/logger';
+import type { QueryClient } from '@tanstack/react-query';
+
+/**
+ * Feature/schema mutations change the column distribution, so the cached
+ * distinct-values and min/max stats (data-driven style editors, filter
+ * pickers) and dashboard aggregates are invalidated by prefix. After
+ * dropColumn the column-keyed cache would otherwise serve values for a column
+ * that no longer exists.
+ */
+function invalidateColumnCaches(qc: QueryClient, datasetId: string): void {
+  qc.invalidateQueries({ queryKey: queryKeys.maps.columnValuesPrefix(datasetId) });
+  qc.invalidateQueries({ queryKey: queryKeys.maps.columnStatsPrefix(datasetId) });
+  qc.invalidateQueries({ queryKey: queryKeys.dashboard.aggregatePrefix(datasetId) });
+}
+
+/**
+ * Feature edits change the feature count the catalog cards display and can
+ * move the quality badge, so search results and the dataset's validation are
+ * refreshed too.
+ */
+function invalidateFeatureDerived(qc: QueryClient, datasetId: string): void {
+  qc.invalidateQueries({ queryKey: queryKeys.search.all });
+  qc.invalidateQueries({ queryKey: queryKeys.datasets.validation(datasetId) });
+}
+
+function invalidateFeatureCaches(qc: QueryClient, datasetId: string): void {
+  qc.invalidateQueries({ queryKey: queryKeys.datasets.detail(datasetId) });
+  qc.invalidateQueries({ queryKey: queryKeys.datasets.rowsPrefix(datasetId) });
+  invalidateColumnCaches(qc, datasetId);
+  invalidateFeatureDerived(qc, datasetId);
+}
+
+export function useCreateFeature() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      datasetId,
+      geometry,
+      properties,
+      idempotencyKey,
+      attempt,
+    }: {
+      datasetId: string;
+      geometry: Geometry;
+      properties?: Record<string, unknown>;
+      idempotencyKey?: string;
+      attempt?: number;
+    }) => createFeature(datasetId, geometry, properties, idempotencyKey, attempt),
+    onSuccess: (_data, variables) => {
+      invalidateFeatureCaches(qc, variables.datasetId);
+    },
+    onError: (err) => {
+      logger.error('[useCreateFeature]', err);
+    },
+  });
+}
+
+export function useUpdateFeature() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      datasetId,
+      gid,
+      geometry,
+      properties,
+      tableId,
+    }: {
+      datasetId: string;
+      gid: number;
+      geometry?: Geometry;
+      properties?: Record<string, unknown>;
+      tableId?: string | null;
+    }) => updateFeature(datasetId, gid, geometry, properties, tableId),
+    onSuccess: (_data, variables) => {
+      invalidateFeatureCaches(qc, variables.datasetId);
+    },
+    onError: (err) => {
+      logger.error('[useUpdateFeature]', err);
+    },
+  });
+}
+
+export function useDeleteFeature() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      datasetId,
+      gid,
+      tableId,
+    }: {
+      datasetId: string;
+      gid: number;
+      tableId?: string | null;
+    }) => deleteFeature(datasetId, gid, tableId),
+    onSuccess: (_data, variables) => {
+      invalidateFeatureCaches(qc, variables.datasetId);
+    },
+    onError: (err) => {
+      logger.error('[useDeleteFeature]', err);
+    },
+  });
+}
+
+export function useDeleteFeatures() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      datasetId,
+      gids,
+      tableId,
+    }: {
+      datasetId: string;
+      gids: number[];
+      tableId?: string | null;
+    }) => deleteFeatures(datasetId, gids, tableId),
+    // A refused batch (missing rows, replaced table) also means the page the
+    // selection came from is out of date.
+    onSettled: (_data, _err, variables) => {
+      invalidateFeatureCaches(qc, variables.datasetId);
+    },
+    onError: (err) => {
+      logger.error('[useDeleteFeatures]', err);
+    },
+  });
+}
+
+export function useAddColumn() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      datasetId,
+      column,
+    }: {
+      datasetId: string;
+      column: { name: string; type: string };
+    }) => addColumn(datasetId, column),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.detail(variables.datasetId) });
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.rowsPrefix(variables.datasetId) });
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.attributes(variables.datasetId) });
+      invalidateColumnCaches(qc, variables.datasetId);
+      qc.invalidateQueries({ queryKey: queryKeys.relationships.listPrefix });
+    },
+  });
+}
+
+export function useDropColumn() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      datasetId,
+      columnName,
+    }: {
+      datasetId: string;
+      columnName: string;
+    }) => dropColumn(datasetId, columnName),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.detail(variables.datasetId) });
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.rowsPrefix(variables.datasetId) });
+      qc.invalidateQueries({ queryKey: queryKeys.datasets.attributes(variables.datasetId) });
+      invalidateColumnCaches(qc, variables.datasetId);
+      qc.invalidateQueries({ queryKey: queryKeys.relationships.listPrefix });
+    },
+  });
+}
+
+/**
+ * Count saved maps whose styles, filters, or labels reference a column, so
+ * SchemaEditor can warn before a destructive drop. Enabled only while a drop
+ * confirmation is open.
+ */
+export function useColumnReferences(datasetId: string, columnName: string | null) {
+  return useQuery({
+    queryKey: ['layers', 'column-references', datasetId, columnName],
+    queryFn: () => getColumnReferences(datasetId, columnName as string),
+    enabled: columnName != null,
+    staleTime: 30_000,
+  });
+}

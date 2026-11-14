@@ -1,0 +1,23 @@
+import { Card } from '@/components/ui/card';
+import { Skeleton } from '@/components/ui/skeleton';
+
+export function CollectionCardSkeleton() {
+  return (
+    <Card density="flush" className="flex flex-col sm:flex-row overflow-hidden">
+      <div className="flex-1 p-4 space-y-3">
+        <Skeleton className="h-5 w-3/4" />
+        <div className="space-y-1.5">
+          <Skeleton className="h-3 w-full" />
+          <Skeleton className="h-3 w-2/3" />
+        </div>
+        <div className="flex gap-2">
+          <Skeleton className="h-4 w-20 rounded-md" />
+          <Skeleton className="h-4 w-24 rounded-md" />
+        </div>
+      </div>
+      <div className="sm:w-48 sm:flex-shrink-0 p-3 sm:p-4 sm:border-s border-t sm:border-t-0 border-border/50">
+        <Skeleton className="w-full aspect-square rounded-sm" />
+      </div>
+    </Card>
+  );
+}

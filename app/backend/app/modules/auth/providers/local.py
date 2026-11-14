@@ -1,0 +1,122 @@
+"""Local (username + password) authentication provider."""
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from pwdlib import PasswordHash
+from pwdlib.exceptions import UnknownHashError
+from pwdlib.hashers.bcrypt import BcryptHasher
+
+from app.core.async_io import run_in_thread_draining
+from app.modules.auth.models import User
+from app.modules.auth.password_policy import BCRYPT_MAX_PASSWORD_BYTES
+from app.modules.auth.providers import AuthenticatedIdentity, AuthenticationError
+
+password_hash = PasswordHash((BcryptHasher(),))
+
+# Pre-computed dummy hash used in timing-attack prevention: when a username
+# is not found we still run the bcrypt verify so that the response time is
+# indistinguishable from a real password check.
+DUMMY_HASH = password_hash.hash("timing-attack-prevention-dummy")
+
+
+def hash_password(password: str) -> str:
+    return password_hash.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    """Verify a plaintext password against a stored hash.
+
+    An input over bcrypt's 72-byte limit is a non-match, not an exception:
+    pwdlib's BcryptHasher raises ValueError rather than truncating, and an
+    unvalidated caller (POST /auth/login's form has no length cap) would get
+    an uncaught 500 that skips the user.login.failure audit row.
+
+    Refusing is correct: signup, password reset and change-password all run
+    validate_password_complexity, capping the stored credential at
+    BCRYPT_MAX_PASSWORD_BYTES, so no correct password is rejected here, and
+    truncating would accept the first 72 bytes of a longer string as the
+    whole password.
+    """
+    if len(plain.encode("utf-8")) > BCRYPT_MAX_PASSWORD_BYTES:
+        return False
+    return password_hash.verify(plain, hashed)
+
+
+async def hash_password_async(password: str) -> str:
+    """``hash_password`` in a worker thread; bcrypt would stall the event loop."""
+    return await run_in_thread_draining(hash_password, password)
+
+
+async def verify_password_async(plain: str, hashed: str) -> bool:
+    """``verify_password`` in a worker thread; bcrypt would stall the event loop."""
+    return await run_in_thread_draining(verify_password, plain, hashed)
+
+
+class LocalAuthProvider:
+    """Authenticates users via username and bcrypt-hashed password.
+
+    Implements the AuthProvider protocol.
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self.db = db
+
+    async def authenticate(
+        self, *, username: str, password: str
+    ) -> AuthenticatedIdentity:
+        """Validate credentials and return an AuthenticatedIdentity.
+
+        Raises AuthenticationError on any failure (wrong user, wrong password,
+        or deactivated account).
+        """
+        # A locking read. An admin reset holds FOR UPDATE on this row while
+        # writing the new hash and revoking credentials; without a lock, a
+        # login reading the row before that commit could verify the STALE
+        # hash and mint tokens carrying the POST-reset token_version and
+        # revocation horizon, surviving the revocation. Blocking means the
+        # verify runs against whatever the reset committed.
+        #
+        # FOR NO KEY UPDATE, not FOR SHARE: the login handler's last_login_at
+        # UPDATE needs it, and two concurrent FOR SHARE logins would each try
+        # to upgrade and deadlock. This mode serializes them without blocking
+        # FOR KEY SHARE (this request's refresh_tokens insert) and still
+        # conflicts with the reset's FOR UPDATE.
+        #
+        # The lock is held until the router commits after minting tokens. Lock
+        # ordering is acyclic: the reset takes the admin-lifecycle advisory
+        # lock then this row; login and change_password take only this row.
+        result = await self.db.execute(
+            select(User)
+            .where(func.lower(User.username) == func.lower(username))
+            .with_for_update(key_share=True)
+        )
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            # Timing-attack prevention: still verify against a dummy hash
+            await verify_password_async(password, DUMMY_HASH)
+            raise AuthenticationError("Invalid credentials")
+
+        if user.password_hash is None:
+            # OAuth-only users have no local password hash, and handing pwdlib
+            # an empty string would raise an uncaught UnknownHashError (500,
+            # skipping the login.failure audit). Still verify against the
+            # dummy hash for timing-attack parity, then always fail.
+            await verify_password_async(password, DUMMY_HASH)
+            raise AuthenticationError("Invalid credentials")
+
+        try:
+            valid = await verify_password_async(password, user.password_hash)
+        except UnknownHashError:
+            # Defense in depth: any other unparseable/corrupted stored hash
+            # is a login failure, not a 500.
+            valid = False
+        if not valid:
+            raise AuthenticationError("Invalid credentials")
+
+        return AuthenticatedIdentity(
+            user_id=user.id,
+            username=user.username,
+            email=user.email,
+        )

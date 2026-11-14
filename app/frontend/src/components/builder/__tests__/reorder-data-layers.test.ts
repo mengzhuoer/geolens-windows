@@ -1,0 +1,135 @@
+import { describe, it, expect, vi } from 'vitest';
+import { reorderDataLayers } from '@/components/builder/map-sync';
+
+function createMockMap(existingLayerIds: string[] = []) {
+  const existing = new Set(existingLayerIds);
+  return {
+    getLayer: vi.fn((id: string) => (existing.has(id) ? { id } : undefined)),
+    moveLayer: vi.fn(),
+  } as unknown as import('maplibre-gl').Map;
+}
+
+describe('reorderDataLayers', () => {
+  it('moves layers in reverse order so first in array ends up on top', () => {
+    const map = createMockMap([
+      'layer-a', 'layer-a-extrusion', 'layer-a-outline',
+      'layer-b', 'layer-b-extrusion', 'layer-b-outline',
+      'layer-c', 'layer-c-extrusion', 'layer-c-outline',
+    ]);
+    const layers = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+
+    reorderDataLayers(map, layers);
+
+    const calls = (map.moveLayer as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: string[]) => c[0],
+    );
+    // Data/extrusion/outline layers moved in reverse: c, b, a (so a ends up on top)
+    expect(calls).toEqual([
+      'layer-c', 'layer-c-extrusion', 'layer-c-outline',
+      'layer-b', 'layer-b-extrusion', 'layer-b-outline',
+      'layer-a', 'layer-a-extrusion', 'layer-a-outline',
+    ]);
+  });
+
+  it('skips layers not present on the map', () => {
+    const map = createMockMap(['layer-a', 'layer-c']);
+    const layers = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+
+    reorderDataLayers(map, layers);
+
+    const calls = (map.moveLayer as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: string[]) => c[0],
+    );
+    // layer-b and all companion layers not on map — skipped
+    expect(calls).toEqual(['layer-c', 'layer-a']);
+  });
+
+  it('moves extrusion layers after their fill layer so 3D data renders above flat fills', () => {
+    const map = createMockMap(['layer-a', 'layer-a-extrusion']);
+    const layers = [{ id: 'a' }];
+
+    reorderDataLayers(map, layers);
+
+    const calls = (map.moveLayer as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: string[]) => c[0],
+    );
+    expect(calls).toEqual(['layer-a', 'layer-a-extrusion']);
+  });
+
+  it('keeps DEM color relief immediately below its hillshade layer when reordering', () => {
+    const map = createMockMap(['layer-dem-colorrelief', 'layer-dem']);
+    const layers = [{ id: 'dem' }];
+
+    reorderDataLayers(map, layers);
+
+    const calls = (map.moveLayer as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: string[]) => c[0],
+    );
+    expect(calls).toEqual(['layer-dem-colorrelief', 'layer-dem']);
+  });
+
+  it('moves color-relief companions with each DEM layer in reverse layer order', () => {
+    const map = createMockMap([
+      'layer-a-colorrelief', 'layer-a',
+      'layer-b-colorrelief', 'layer-b',
+    ]);
+    const layers = [{ id: 'a' }, { id: 'b' }];
+
+    reorderDataLayers(map, layers);
+
+    const calls = (map.moveLayer as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: string[]) => c[0],
+    );
+    expect(calls).toEqual([
+      'layer-b-colorrelief', 'layer-b',
+      'layer-a-colorrelief', 'layer-a',
+    ]);
+  });
+
+  it('moves mixed-geometry family sublayers with their parent (fix #431 codex r1)', () => {
+    const map = createMockMap([
+      'layer-a', 'layer-a-outline', 'layer-a-lines', 'layer-a-points',
+      'layer-b',
+    ]);
+    const layers = [{ id: 'a' }, { id: 'b' }];
+
+    reorderDataLayers(map, layers);
+
+    const calls = (map.moveLayer as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: string[]) => c[0],
+    );
+    // The mixed sublayers travel with layer a and preserve the adapter's add
+    // order (fill < outline < lines < points; last moved ends topmost).
+    expect(calls).toEqual([
+      'layer-b',
+      'layer-a', 'layer-a-outline', 'layer-a-lines', 'layer-a-points',
+    ]);
+  });
+
+  it('does nothing for empty layers array', () => {
+    const map = createMockMap([]);
+
+    reorderDataLayers(map, []);
+
+    expect(map.moveLayer).not.toHaveBeenCalled();
+  });
+
+  it('moves label layers after data layers so labels render on top', () => {
+    const map = createMockMap([
+      'layer-a', 'layer-a-label',
+      'layer-b', 'layer-b-label',
+    ]);
+    const layers = [{ id: 'a' }, { id: 'b' }];
+
+    reorderDataLayers(map, layers);
+
+    const calls = (map.moveLayer as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c: string[]) => c[0],
+    );
+    // Data layers first (reverse), then label layers (reverse)
+    expect(calls).toEqual([
+      'layer-b', 'layer-a',         // data pass
+      'layer-b-label', 'layer-a-label',  // label pass
+    ]);
+  });
+});

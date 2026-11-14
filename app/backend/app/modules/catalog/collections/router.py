@@ -1,0 +1,477 @@
+"""Collection API endpoints: CRUD, membership, and dataset listing."""
+
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from sqlalchemy import select
+
+from app.modules.audit.service import AuditEvent, audit_emit
+from app.platform.cache import get_cache, tenant_cache_key
+from app.platform.cache.tiles import invalidate_catalog_cache
+from app.core.identity import Identity
+from app.modules.auth.dependencies import get_optional_user, require_permission
+from app.modules.auth.models import User
+from app.modules.catalog.authorization import (
+    can_view_dataset_provenance,
+    check_datasets_access_bulk,
+    get_user_roles,
+    visible_lineage_summaries,
+    visible_vrt_extents,
+)
+from app.modules.catalog.collections.schemas import (
+    AddDatasetsResponse,
+    CollectionAddDatasetsRequest,
+    CollectionCreate,
+    CollectionListResponse,
+    CollectionResponse,
+    CollectionUpdate,
+)
+from app.modules.catalog.collections.service import (
+    add_datasets_to_collection,
+    batch_collection_dataset_counts,
+    batch_collection_extents,
+    check_collection_ownership,
+    create_collection,
+    delete_collection,
+    get_collection,
+    get_collection_datasets,
+    list_collections,
+    lock_collection_for_write,
+    remove_dataset_from_collection,
+    update_collection,
+)
+from app.modules.catalog.datasets.domain.helpers import dataset_to_response
+from app.modules.catalog.datasets.domain.schemas import DatasetListResponse
+from app.core.dependencies import get_db
+from app.standards.ogc.errors import ERROR_RESPONSES_WRITE, FORBIDDEN_RESPONSE
+
+router = APIRouter(
+    prefix="/catalog/collections", tags=["Datasets"], responses=ERROR_RESPONSES_WRITE
+)
+
+
+def _collection_to_response(
+    collection, dataset_count: int, extent_data: dict
+) -> CollectionResponse:
+    return CollectionResponse(
+        id=collection.id,
+        name=collection.name,
+        description=collection.description,
+        created_by=collection.created_by,
+        created_at=collection.created_at,
+        updated_at=collection.updated_at,
+        dataset_count=dataset_count,
+        extent_bbox=extent_data.get("extent_bbox"),
+        temporal_start=extent_data.get("temporal_start"),
+        temporal_end=extent_data.get("temporal_end"),
+    )
+
+
+# Dual-shape decorator so both trailing-slash (canonical) and
+# no-slash variants hit this handler, closing the 404 from
+# redirect_slashes=False.
+@router.post(
+    "",
+    response_model=CollectionResponse,
+    status_code=status.HTTP_201_CREATED,
+    include_in_schema=False,
+)
+@router.post(
+    "/", response_model=CollectionResponse, status_code=status.HTTP_201_CREATED
+)
+async def create_collection_endpoint(
+    body: CollectionCreate,
+    request: Request,
+    user: Identity = Depends(require_permission("manage_collections")),
+    db: AsyncSession = Depends(get_db),
+) -> CollectionResponse:
+    """Create a new collection."""
+    try:
+        collection = await create_collection(db, body.name, body.description, user.id)
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=user.id,
+                action="collection.create",
+                resource_type="collection",
+                resource_id=collection.id,
+                details={"name": body.name},
+                ip_address=request.client.host if request.client else None,
+            ),
+        )
+        await db.commit()
+        await db.refresh(collection)
+        # Without this, an admin's newly created collection stays hidden behind
+        # the 60s catalog:collections:admin cache until it expires. Matches the
+        # invalidate call in the update/delete/dataset-membership handlers.
+        await invalidate_catalog_cache()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Collection with name '{body.name}' already exists",
+        )
+
+    return _collection_to_response(
+        collection,
+        dataset_count=0,
+        extent_data={"extent_bbox": None, "temporal_start": None, "temporal_end": None},
+    )
+
+
+_CATALOG_CACHE_TTL = 60  # seconds
+
+
+# Dual-shape decorator; see POST above.
+@router.get(
+    "",
+    response_model=CollectionListResponse,
+    include_in_schema=False,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+@router.get(
+    "/",
+    response_model=CollectionListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_collections_endpoint(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> CollectionListResponse:
+    """List all collections with dataset_count and extent computed per-user."""
+    user_roles = await get_user_roles(db, user) if user is not None else set()
+
+    # Cache admin views only (non-admin results vary by user identity)
+    is_admin = "admin" in user_roles
+    cache_key = (
+        tenant_cache_key(f"catalog:collections:admin:{skip}:{limit}")
+        if is_admin
+        else None
+    )
+
+    if cache_key:
+        cache = get_cache()
+        cached = await cache.get(cache_key)
+        if cached is not None:
+            return CollectionListResponse(**cached)
+
+    collections, total = await list_collections(db, skip=skip, limit=limit)
+
+    coll_ids = [c.id for c in collections]
+    extent_map = await batch_collection_extents(db, coll_ids, user, user_roles)
+    count_map = await batch_collection_dataset_counts(db, coll_ids, user, user_roles)
+    default_extent = {"extent_bbox": None, "temporal_start": None, "temporal_end": None}
+    responses = [
+        _collection_to_response(
+            coll, count_map.get(coll.id, 0), extent_map.get(coll.id, default_extent)
+        )
+        for coll in collections
+    ]
+
+    response = CollectionListResponse(collections=responses, total=total)
+
+    if cache_key:
+        cache = get_cache()
+        await cache.set(
+            cache_key, response.model_dump(mode="json"), ttl=_CATALOG_CACHE_TTL
+        )
+
+    return response
+
+
+@router.get(
+    "/{collection_id}",
+    response_model=CollectionResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_collection_endpoint(
+    collection_id: uuid.UUID,
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> CollectionResponse:
+    """Get a single collection with dataset_count and extent."""
+    collection = await get_collection(db, collection_id)
+    if collection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+
+    user_roles = await get_user_roles(db, user) if user is not None else set()
+    coll_ids = [collection_id]
+    extent_map = await batch_collection_extents(db, coll_ids, user, user_roles)
+    count_map = await batch_collection_dataset_counts(db, coll_ids, user, user_roles)
+    default_extent = {"extent_bbox": None, "temporal_start": None, "temporal_end": None}
+
+    return _collection_to_response(
+        collection,
+        count_map.get(collection_id, 0),
+        extent_map.get(collection_id, default_extent),
+    )
+
+
+@router.patch("/{collection_id}", response_model=CollectionResponse)
+async def update_collection_endpoint(
+    collection_id: uuid.UUID,
+    body: CollectionUpdate,
+    request: Request,
+    user: Identity = Depends(require_permission("manage_collections")),
+    db: AsyncSession = Depends(get_db),
+) -> CollectionResponse:
+    """Update a collection's name and/or description. Owner or admin only."""
+    existing = await get_collection(db, collection_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+    await check_collection_ownership(db, existing, user)
+    await lock_collection_for_write(db, collection_id)
+    try:
+        collection = await update_collection(
+            db, collection_id, name=body.name, description=body.description
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=user.id,
+            action="collection.update",
+            resource_type="collection",
+            resource_id=collection_id,
+            # mode="json" so a future non-JSON scalar on
+            # CollectionUpdate cannot reach the JSONB column as a raw object.
+            details=body.model_dump(mode="json", exclude_none=True),
+            ip_address=request.client.host if request.client else None,
+        ),
+    )
+    await db.commit()
+    # Re-load the row so attributes are fresh (commit expires the ORM
+    # object; the subsequent _collection_to_response read would otherwise
+    # trigger lazy-load IO outside the greenlet -> MissingGreenlet).
+    await db.refresh(collection)
+    await invalidate_catalog_cache()
+
+    user_roles = await get_user_roles(db, user)
+    coll_ids = [collection_id]
+    extent_map = await batch_collection_extents(db, coll_ids, user, user_roles)
+    count_map = await batch_collection_dataset_counts(db, coll_ids, user, user_roles)
+    default_extent = {"extent_bbox": None, "temporal_start": None, "temporal_end": None}
+
+    return _collection_to_response(
+        collection,
+        count_map.get(collection_id, 0),
+        extent_map.get(collection_id, default_extent),
+    )
+
+
+@router.delete("/{collection_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_collection_endpoint(
+    collection_id: uuid.UUID,
+    request: Request,
+    user: Identity = Depends(require_permission("manage_collections")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Delete a collection. Owner or admin only."""
+    existing = await get_collection(db, collection_id)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+    await check_collection_ownership(db, existing, user)
+    await lock_collection_for_write(db, collection_id)
+    try:
+        name = await delete_collection(db, collection_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=user.id,
+            action="collection.delete",
+            resource_type="collection",
+            resource_id=collection_id,
+            details={"name": name},
+            ip_address=request.client.host if request.client else None,
+        ),
+    )
+    await db.commit()
+    await invalidate_catalog_cache()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{collection_id}/datasets/", response_model=AddDatasetsResponse)
+async def add_datasets_endpoint(
+    collection_id: uuid.UUID,
+    body: CollectionAddDatasetsRequest,
+    request: Request,
+    user: Identity = Depends(require_permission("manage_collections")),
+    db: AsyncSession = Depends(get_db),
+) -> AddDatasetsResponse:
+    """Add datasets to a collection. Collection owner or admin only."""
+    collection = await get_collection(db, collection_id)
+    if collection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+    await check_collection_ownership(db, collection, user)
+
+    # Authorize each linked dataset at write time (mirrors
+    # the FK-relationship and VRT checks, since manage_collections alone
+    # doesn't gate link targets); batched via check_datasets_access_bulk.
+    user_roles = await get_user_roles(db, user)
+    await check_datasets_access_bulk(db, body.dataset_ids, user, user_roles)
+
+    await lock_collection_for_write(db, collection_id)
+    try:
+        count = await add_datasets_to_collection(
+            db, collection_id, body.dataset_ids, user.id
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=user.id,
+            action="collection.add_datasets",
+            resource_type="collection",
+            resource_id=collection_id,
+            details={"dataset_ids": [str(d) for d in body.dataset_ids]},
+            ip_address=request.client.host if request.client else None,
+        ),
+    )
+    await db.commit()
+    await invalidate_catalog_cache()
+
+    return AddDatasetsResponse(added=count)
+
+
+@router.delete(
+    "/{collection_id}/datasets/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT
+)
+async def remove_dataset_endpoint(
+    collection_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+    request: Request,
+    user: Identity = Depends(require_permission("manage_collections")),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Remove a dataset from a collection. Collection owner or admin only."""
+    collection = await get_collection(db, collection_id)
+    if collection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+    await check_collection_ownership(db, collection, user)
+
+    await lock_collection_for_write(db, collection_id)
+    removed = await remove_dataset_from_collection(db, collection_id, dataset_id)
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset membership not found",
+        )
+
+    await audit_emit(
+        db,
+        AuditEvent(
+            user_id=user.id,
+            action="collection.remove_dataset",
+            resource_type="collection",
+            resource_id=collection_id,
+            details={"dataset_id": str(dataset_id)},
+            ip_address=request.client.host if request.client else None,
+        ),
+    )
+    await db.commit()
+    await invalidate_catalog_cache()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{collection_id}/datasets/",
+    response_model=DatasetListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_collection_datasets_endpoint(
+    collection_id: uuid.UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetListResponse:
+    """Get datasets in a collection with RBAC filtering."""
+    collection = await get_collection(db, collection_id)
+    if collection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found",
+        )
+
+    user_roles = await get_user_roles(db, user) if user is not None else set()
+    datasets, total = await get_collection_datasets(
+        db, collection_id, user, user_roles, skip=skip, limit=limit
+    )
+
+    # Build actor map for created_by_display and last_edited_by_display
+    actor_ids: set = set()
+    for d in datasets:
+        if d.record.created_by:
+            actor_ids.add(d.record.created_by)
+        if d.record.updated_by:
+            actor_ids.add(d.record.updated_by)
+    actor_map: dict = {}
+    if actor_ids:
+        rows = await db.execute(select(User).where(User.id.in_(actor_ids)))
+        actor_map = {u.id: u for u in rows.scalars()}
+
+    # One visibility query for the page, not one per row.
+    lineage = await visible_lineage_summaries(
+        db, [d.record for d in datasets], user, user_roles
+    )
+    vrt_extents = await visible_vrt_extents(
+        db,
+        [d.id for d in datasets if d.record.record_type == "vrt_dataset"],
+        user,
+        user_roles,
+    )
+
+    return DatasetListResponse(
+        datasets=[
+            dataset_to_response(
+                d,
+                actors_by_id=actor_map,
+                vrt_extents=vrt_extents,
+                lineage_summary=lineage[d.record_id],
+                # per-row, same reasoning as the plain dataset list.
+                can_view_provenance=can_view_dataset_provenance(
+                    d.record, user, user_roles
+                ),
+            )
+            for d in datasets
+        ],
+        total=total,
+    )

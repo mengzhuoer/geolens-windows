@@ -1,0 +1,200 @@
+import { API_BASE } from '@/lib/constants';
+import { recordTypeCapabilities } from '@/lib/record-types';
+import type { TileConfig } from '@/api/settings';
+import type { DatasetResponse, DistributionResponse } from '@/types/api';
+
+const ABSOLUTE_URL_RE = /^[a-zA-Z][a-zA-Z\d+.-]*:/;
+
+export function stripTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, '');
+}
+
+// Lets callers tell a same-origin relative GeoLens API path (needs the
+// session's bearer token) from an already-qualified external URL (a manual
+// distribution) that resolveDistributionUrl leaves untouched and that must
+// never receive it.
+export function isAbsoluteUrl(value: string): boolean {
+  return ABSOLUTE_URL_RE.test(value) || value.startsWith('//');
+}
+
+// A `{z}`/`{x}`/`{y}`-style placeholder names a TEMPLATE, not a resource; no
+// single fetch resolves it.
+const TILE_TEMPLATE_RE = /\{[^{}]+\}/;
+
+/**
+ * A URL a single fetch can resolve to a resource, as opposed to a tile URL
+ * template or a bare object-storage key. Raster/VRT distributions store the
+ * latter as their `url` (e.g. `rasters/<dataset_id>/<sha256>/source.cog.tif`,
+ * not the real `/datasets/{id}/download/cog` route, which needs a download
+ * token from `mintDownloadToken`). Every GeoLens-generated same-origin API
+ * path is written with a leading slash (backend `_DISTRIBUTION_TEMPLATES`), so
+ * that is the signal used to exclude a raw storage key.
+ */
+export function isFetchableDistributionUrl(value: string): boolean {
+  if (TILE_TEMPLATE_RE.test(value)) return false;
+  if (isAbsoluteUrl(value)) return true;
+  return value.startsWith('/');
+}
+
+function normalizeApiBasePath(value: string): string {
+  return value.startsWith('/') ? value : `/${value}`;
+}
+
+// Lets callers compare an absolute distribution url against THIS instance's
+// API origin, resolved as api/client.ts resolves `API_BASE`.
+function getRuntimeApiBaseUrl(): string | null {
+  const configuredApiBase = API_BASE.trim();
+
+  if (configuredApiBase) {
+    if (isAbsoluteUrl(configuredApiBase)) {
+      return stripTrailingSlashes(configuredApiBase);
+    }
+
+    if (typeof window !== 'undefined' && window.location.origin) {
+      return `${stripTrailingSlashes(window.location.origin)}${normalizeApiBasePath(configuredApiBase)}`;
+    }
+
+    return normalizeApiBasePath(configuredApiBase);
+  }
+
+  if (typeof window !== 'undefined' && window.location.origin) {
+    return `${stripTrailingSlashes(window.location.origin)}/api`;
+  }
+
+  return null;
+}
+
+/** True when `value`'s canonical URL.origin and path prefix match this
+ * instance's API (getRuntimeApiBaseUrl()); not a raw string-prefix compare. */
+export function isSameOriginAbsoluteUrl(value: string): boolean {
+  if (!isAbsoluteUrl(value)) return false;
+  const apiBase = getRuntimeApiBaseUrl();
+  if (!apiBase) return false;
+
+  const parseBase = typeof window !== 'undefined' ? window.location.href : undefined;
+  let valueUrl: URL;
+  let apiBaseUrl: URL;
+  try {
+    valueUrl = new URL(value, parseBase);
+    apiBaseUrl = new URL(apiBase, parseBase);
+  } catch {
+    return false;
+  }
+
+  if (valueUrl.origin !== apiBaseUrl.origin) return false;
+
+  const basePath = stripTrailingSlashes(apiBaseUrl.pathname);
+  return valueUrl.pathname === basePath || valueUrl.pathname.startsWith(`${basePath}/`);
+}
+
+export function getPublicApiBaseUrl(
+  tileConfig?: Pick<TileConfig, 'public_api_url' | 'public_base_url'> | null,
+): string | null {
+  const configuredApiUrl = tileConfig?.public_api_url?.trim();
+  if (configuredApiUrl) {
+    return stripTrailingSlashes(configuredApiUrl);
+  }
+
+  const configuredBaseUrl = tileConfig?.public_base_url?.trim();
+  if (configuredBaseUrl) {
+    if (isAbsoluteUrl(API_BASE.trim())) {
+      return stripTrailingSlashes(API_BASE.trim());
+    }
+
+    const runtimeApiBaseUrl = getRuntimeApiBaseUrl();
+    if (runtimeApiBaseUrl && isAbsoluteUrl(runtimeApiBaseUrl)) {
+      try {
+        const runtimePath = new URL(runtimeApiBaseUrl).pathname.replace(/\/+$/, '');
+        return `${stripTrailingSlashes(configuredBaseUrl)}${runtimePath || '/api'}`;
+      } catch {
+        return `${stripTrailingSlashes(configuredBaseUrl)}${normalizeApiBasePath(API_BASE)}`;
+      }
+    }
+
+    return `${stripTrailingSlashes(configuredBaseUrl)}${normalizeApiBasePath(API_BASE)}`;
+  }
+
+  return getRuntimeApiBaseUrl();
+}
+
+/** An app-origin path, such as `tileset.url`, as an absolute URL. */
+export function appOriginUrl(path: string): string {
+  return isAbsoluteUrl(path) ? path : `${window.location.origin}${path}`;
+}
+
+export function resolveDistributionUrl(url: string, publicApiBaseUrl: string | null | undefined): string {
+  if (!url) {
+    return url;
+  }
+
+  if (isAbsoluteUrl(url)) {
+    return url;
+  }
+
+  if (!publicApiBaseUrl) {
+    return url;
+  }
+
+  const baseUrl = stripTrailingSlashes(publicApiBaseUrl);
+  return url.startsWith('/') ? `${baseUrl}${url}` : `${baseUrl}/${url.replace(/^\/+/, '')}`;
+}
+
+/** Resolve distribution URL by type, falling back to null if not found. */
+function resolveByType(
+  distributions: DistributionResponse[],
+  predicate: (d: DistributionResponse) => boolean,
+  publicApiBaseUrl: string | null | undefined,
+): string | null {
+  const dist = distributions.find(predicate);
+  return dist ? resolveDistributionUrl(dist.url, publicApiBaseUrl) : null;
+}
+
+// The key requirement applies to this instance's own tile route, not to an
+// external tile service someone registered as a distribution.
+const GEOLENS_VECTOR_TILE_RE = /\/tiles\/data\.[^/?#]+\/\{z\}\/\{x\}\/\{y\}\.pbf/;
+
+function isGeoLensVectorTileUrl(url: string, publicApiBaseUrl: string | null | undefined): boolean {
+  if (!GEOLENS_VECTOR_TILE_RE.test(url)) return false;
+  if (!isAbsoluteUrl(url) || isSameOriginAbsoluteUrl(url)) return true;
+  return !!publicApiBaseUrl && url.startsWith(`${stripTrailingSlashes(publicApiBaseUrl)}/`);
+}
+
+/** A non-public dataset's own tile template with the API key placeholder desktop GIS clients fill in. */
+export function vectorTileUrlForClients(
+  url: string,
+  visibility: DatasetResponse['visibility'],
+  publicApiBaseUrl: string | null | undefined,
+): string {
+  if (visibility === 'public' || !isGeoLensVectorTileUrl(url, publicApiBaseUrl)) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}api_key={your_key}`;
+}
+
+export interface DatasetAccessEndpoints {
+  csvExportUrl: string | null;
+  ogcFeaturesUrl: string | null;
+  vectorTilesUrl: string | null;
+}
+
+export function getDatasetAccessEndpoints(
+  dataset: Pick<DatasetResponse, 'id' | 'record_type' | 'table_name' | 'visibility'>,
+  publicApiBaseUrl: string | null | undefined,
+  distributions: DistributionResponse[] = [],
+): DatasetAccessEndpoints {
+  const { featureTable, tileToken } = recordTypeCapabilities(dataset.record_type);
+  const isTable = dataset.record_type === 'table';
+  const vectorTilesUrl =
+    resolveByType(distributions, (d) => d.distribution_type === 'vector_tiles', publicApiBaseUrl)
+    ?? (!isTable && tileToken === 'vector' && dataset.table_name
+      ? resolveDistributionUrl(`/tiles/data.${dataset.table_name}/{z}/{x}/{y}.pbf`, publicApiBaseUrl)
+      : null);
+
+  return {
+    ogcFeaturesUrl:
+      resolveByType(distributions, (d) => d.distribution_type === 'ogc_features', publicApiBaseUrl)
+      ?? (featureTable ? resolveDistributionUrl(`/collections/${dataset.id}/items`, publicApiBaseUrl) : null),
+    csvExportUrl:
+      resolveByType(distributions, (d) => d.distribution_type === 'download' && d.format === 'csv', publicApiBaseUrl)
+      ?? (featureTable ? resolveDistributionUrl(`/datasets/${dataset.id}/export?format=csv`, publicApiBaseUrl) : null),
+    vectorTilesUrl: vectorTilesUrl && vectorTileUrlForClients(vectorTilesUrl, dataset.visibility, publicApiBaseUrl),
+  };
+}

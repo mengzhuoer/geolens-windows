@@ -1,0 +1,531 @@
+"""Parameterized PostGIS analysis preview operations.
+
+Server-built SQL only: every statement renders from a fixed template plus
+Pydantic-validated parameters, executed through the read-only sandbox rails
+(``execute_safe``): READ ONLY transaction, statement timeout, reader-role
+downgrade, row cap, tenant schema rewrite, per-user concurrency lock. No
+user- or LLM-authored SQL reaches this path, so the LLM-oriented AST
+validator (``validate_and_execute``) is deliberately not used -- widening
+its allowlist for this path would expand the *chat* attack surface for no
+benefit here.
+
+Expression rendering (and its injection rules) is shared with the async
+materialize worker via ``app.platform.analysis_sql``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+
+from asyncpg import BitString
+from sqlalchemy import text
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.catalog.datasets.domain._sql_safety import _safe_table_ref
+from app.modules.catalog.datasets.domain.models import Dataset
+from app.modules.catalog.datasets.domain.schemas import (
+    AnalysisPreviewRequest,
+    AnalysisPreviewResponse,
+)
+from app.platform.analysis_sql import (
+    INTERSECT_SOURCE_GID_COLUMN,
+    MEASURE_OUTPUT_COLUMNS,
+    NOT_EMPTY_PREDICATE,
+    binds_referenced_by,
+    render_bbox_predicate,
+    render_clip_layer_join,
+    render_filtered_table_ref,
+    render_geometry_expr,
+    render_intersect_preview,
+    render_measure_columns,
+    render_select_by_location_count,
+    render_select_by_location_where,
+    render_spatial_join,
+    render_spatial_join_match_count,
+    spatial_join_output_columns,
+)
+from app.platform.extensions import get_catalog_port
+from app.platform.sandbox.executor import DEFAULT_MAX_RESULT_BYTES, execute_safe
+from app.platform.sandbox.schemas import SandboxError
+
+PREVIEW_FEATURE_CAP = 500
+
+# A compiled layer filter: a WHERE fragment and the bind parameters it names.
+LayerFilter = tuple[str, list[Any]]
+
+
+# Previews may hold two connections each and dataset aggregates one, so a
+# quarter of the pool as slots for each leaves a quarter for other traffic.
+# External poolers hide their capacity; use the default budget in that mode.
+_EXTERNAL_POOLER_PREVIEW_BOUND = 3
+
+
+def preview_slot_bound() -> int:
+    from app.core.config import settings
+
+    if settings.db_use_external_pooler:
+        return _EXTERNAL_POOLER_PREVIEW_BOUND
+    # db_max_overflow uses -1 for "unlimited"; treat that as no extra headroom
+    # rather than letting a negative shrink the budget.
+    overflow = max(0, settings.db_max_overflow)
+    return max(1, (settings.db_pool_size + overflow) // 4)
+
+
+_MAX_CONCURRENT_PREVIEWS = preview_slot_bound()
+_preview_slots = asyncio.Semaphore(_MAX_CONCURRENT_PREVIEWS)
+_GEOJSON_PRECISION = 6
+
+
+async def compile_layer_filter(
+    db: AsyncSession,
+    dataset: Dataset,
+    cql2: dict[str, Any] | None,
+    *,
+    bind_prefix: str,
+    live_columns: list[dict] | None = None,
+) -> LayerFilter | None:
+    """Validate a layer's CQL2-JSON filter against its live columns and compile it.
+
+    The parser, whitelist and literal type checks are the ones the OGC items
+    ``filter`` parameter runs. Raises ValueError naming the problem when the
+    filter is malformed, too large, or reads a column the table lacks. The
+    caller has already checked access to ``dataset``, and may pass the
+    table's ``live_columns`` when it has read them already.
+    """
+    if cql2 is None:
+        return None
+    from fastapi import HTTPException
+
+    from app.standards.ogc.filtering import (
+        compile_feature_cql2_ast,
+        feature_queryable_columns,
+        parse_feature_cql2,
+    )
+
+    try:
+        filter_expr = json.dumps(cql2, ensure_ascii=False, separators=(",", ":"))
+    except RecursionError as exc:
+        raise ValueError("Invalid CQL2 expression: filter nests too deeply") from exc
+    try:
+        ast_root = parse_feature_cql2(filter_expr, "cql2-json")
+        if live_columns is None:
+            live_columns = await get_catalog_port().get_column_info(
+                db, dataset.table_name
+            )
+        queryables = feature_queryable_columns(live_columns, dataset.geometry_type)
+        where_sql, binds = compile_feature_cql2_ast(
+            ast_root, queryables, bind_prefix=bind_prefix
+        )
+    except HTTPException as exc:
+        raise ValueError(str(exc.detail)) from exc
+    return where_sql, binds
+
+
+def _filtered_ref(table_ref: str, layer_filter: LayerFilter | None) -> str:
+    return render_filtered_table_ref(
+        table_ref, layer_filter[0] if layer_filter else None
+    )
+
+
+async def resolve_source_feature_count(
+    db: AsyncSession,
+    dataset: Dataset,
+    *,
+    cap: int,
+    layer_filter: LayerFilter | None = None,
+) -> int:
+    """Return the cached count, or probe live rows up to ``cap + 1``.
+
+    Unknown counts must be measured so enqueue limits cannot be bypassed. A
+    filtered layer is always measured, since the cached count is the whole
+    table's.
+    """
+    if dataset.feature_count is not None and layer_filter is None:
+        return dataset.feature_count
+    from app.core.db.tenant_schema import tenant_data_schema
+    from app.core.db.tenant_session import current_tenant_var
+    from app.core.tenancy import is_multi_tenant
+
+    schema = tenant_data_schema(current_tenant_var.get() if is_multi_tenant() else None)
+    ref = _filtered_ref(
+        _safe_table_ref(dataset.table_name, schema=schema), layer_filter
+    )
+    binds = layer_filter[1] if layer_filter else []
+    result = await db.execute(
+        text(
+            f"SELECT count(*) FROM (SELECT 1 FROM {ref} AS _t LIMIT :lim) AS _n"  # noqa: S608
+        ).bindparams(*binds, lim=cap + 1)
+    )
+    return int(result.scalar_one())
+
+
+async def _resolve_live_source_count(
+    db: AsyncSession,
+    table_ref: str,
+    bbox: list[float] | None,
+    user_id: uuid.UUID,
+    binds: list[Any],
+) -> int | None:
+    """Return an exact source count over the viewport and filter, or None on failure.
+
+    The cached feature_count covers the whole table and cannot describe a
+    viewport or a filtered layer. Run through execute_safe inside
+    _preview_slots so this query shares the preview connection budget. Pass a
+    logical data-schema table_ref; execute_safe rewrites the tenant schema.
+    """
+    where = f" WHERE {render_bbox_predicate(bbox, src='_t')}" if bbox else ""
+    count_sql = f"SELECT count(*)::bigint AS source_count FROM {table_ref} AS _t{where}"
+    try:
+        result = await execute_safe(
+            db,
+            count_sql,
+            row_limit=1,
+            concurrency_key=str(user_id),
+            binds=binds_referenced_by(count_sql, binds),
+        )
+    except SandboxError:
+        return None
+    return int(result.rows[0][0]) if result.rows else None
+
+
+def build_preview_sql(
+    table_ref: str,
+    request: AnalysisPreviewRequest,
+    mask_table_ref: str | None = None,
+    join_table_ref: str | None = None,
+) -> str:
+    """Render the preview SELECT for one operation. Pure; unit-testable.
+
+    ``table_ref`` (and ``mask_table_ref`` for layer-sourced clip masks,
+    ``join_table_ref`` for spatial joins) must come from ``_safe_table_ref``
+    (logical ``data`` schema; the sandbox executor rewrites it to the tenant
+    schema in multi-tenant).
+    """
+    if request.operation == "intersect" and mask_table_ref is not None:
+        # Intersect is a grouped join, not a per-row expression. Its renderer
+        # receives bbox directly and includes match_count as a window to avoid
+        # repeating the overlay.
+        return render_intersect_preview(
+            table_ref,
+            mask_table_ref,
+            geojson_precision=_GEOJSON_PRECISION,
+            bbox=request.bbox,
+        )
+    extra_cols = ""
+    extra_joins = ""
+    if join_table_ref is not None:
+        # Unlike every other operation, the geometry comes back
+        # unchanged, so the preview MUST carry join_count as a property or
+        # it renders pixel-identical to the layer already on the map.
+        cols, extra_joins = render_spatial_join(
+            join_table_ref, src="_src", join_fields=request.join_fields
+        )
+        extra_cols = f", {cols}"
+    elif request.operation == "measure":
+        # Same reason -- the measured value IS the result and the
+        # geometry is unchanged, so it has to ride along as a property.
+        cols, extra_joins = render_measure_columns(src="_src")
+        extra_cols = f", {cols}"
+    if mask_table_ref is not None and request.operation == "select_by_location":
+        # A selection keeps whole geometries, so the row filter IS
+        # the operation; the identity lateral keeps the query shape (and
+        # NOT_EMPTY_PREDICATE) common with every other branch.
+        cte = ""
+        lateral = "(SELECT geom_4326 AS geom_out OFFSET 0)"
+        where = render_select_by_location_where(mask_table_ref, src="_src")
+    elif mask_table_ref is not None:
+        # Layer-sourced clip previews subdivide the mask once and
+        # join it per row instead of unioning the whole layer per request;
+        # see render_clip_layer_join for the measured rationale.
+        cte, lateral, where = render_clip_layer_join(mask_table_ref, src="_src")
+        cte = f"{cte} "
+    else:
+        cte = ""
+        expr, where = render_geometry_expr(
+            request.operation,
+            distance_meters=request.distance_meters,
+            mask=request.mask,
+        )
+        lateral = f"(SELECT {expr} AS geom_out OFFSET 0)"
+    # Filter empty results before the row cap so boundary-only clips cannot
+    # hide valid matches. OFFSET 0 prevents repeated evaluation of geom_out;
+    # keeping bbox in the predicates preserves index-driven gid ordering.
+    extra_predicates = NOT_EMPTY_PREDICATE
+    if request.bbox is not None:
+        extra_predicates = (
+            f"{extra_predicates} AND {render_bbox_predicate(request.bbox, src='_src')}"
+        )
+    filters = (
+        f"{where} AND {extra_predicates}" if where else f" WHERE {extra_predicates}"
+    )
+    return (
+        f"{cte}SELECT gid,"
+        f" ST_AsGeoJSON(_op.geom_out, {_GEOJSON_PRECISION}) AS geometry_json"
+        f"{extra_cols}"
+        f" FROM {table_ref} AS _src"
+        f" CROSS JOIN LATERAL {lateral} AS _op"
+        f"{extra_joins}"
+        f"{filters}"
+        f" ORDER BY gid"
+    )
+
+
+def _preview_extra_columns(
+    request: AnalysisPreviewRequest, join_table_ref: str | None
+) -> list[str]:
+    """Property names the preview carries beyond ``gid``, in SELECT order.
+
+    Mirrors the ``extra_cols`` branches in ``build_preview_sql``: the rows come
+    back positional, so the two must agree or properties land under the wrong
+    names. One function per side rather than one shared renderer because the
+    SQL side needs table aliases the caller owns.
+    """
+    if join_table_ref is not None:
+        return spatial_join_output_columns(request.join_fields)
+    if request.operation == "measure":
+        return list(MEASURE_OUTPUT_COLUMNS)
+    if request.operation == "intersect":
+        return [INTERSECT_SOURCE_GID_COLUMN]
+    return []
+
+
+def _json_safe(value: Any) -> Any:
+    """Make one transferred property value JSON-serializable.
+
+    A ``bytea`` column comes back as raw ``bytes`` and a ``bit`` or
+    ``bit varying`` column as asyncpg's ``BitString``; Pydantic's JSON
+    serializer 500s on both. Encode bytes as PostgreSQL's ``\\x``-hex,
+    matching ``to_jsonb(t.*)`` in the features API, and bits as their
+    ``'1010'`` text.
+
+    Recursive: a ``bytea[]`` comes back as a list of ``bytes`` (a
+    scalar-only check would miss it). Natively-serializable scalars
+    (datetime, date, Decimal, UUID) pass through untouched.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "\\x" + bytes(value).hex()
+    if isinstance(value, BitString):
+        # as_string() groups bits by four with spaces; PostgreSQL's text has none.
+        return value.as_string().replace(" ", "")
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    return value
+
+
+def _extend_bbox(bbox: list[float] | None, coords: Any) -> list[float] | None:
+    """Fold a GeoJSON coordinate array into a [minx, miny, maxx, maxy] bbox."""
+    if not isinstance(coords, (list, tuple)) or not coords:
+        return bbox
+    if isinstance(coords[0], (int, float)):
+        x, y = float(coords[0]), float(coords[1])
+        if bbox is None:
+            return [x, y, x, y]
+        bbox[0] = min(bbox[0], x)
+        bbox[1] = min(bbox[1], y)
+        bbox[2] = max(bbox[2], x)
+        bbox[3] = max(bbox[3], y)
+        return bbox
+    for part in coords:
+        bbox = _extend_bbox(bbox, part)
+    return bbox
+
+
+async def run_analysis_preview(
+    db: AsyncSession,
+    dataset: Dataset,
+    request: AnalysisPreviewRequest,
+    user_id: uuid.UUID,
+    *,
+    mask_dataset: Dataset | None = None,
+    join_dataset: Dataset | None = None,
+    source_filter: LayerFilter | None = None,
+    mask_filter: LayerFilter | None = None,
+    join_filter: LayerFilter | None = None,
+    release_session: bool = False,
+) -> AnalysisPreviewResponse:
+    """Execute a preview operation and assemble a GeoJSON FeatureCollection.
+
+    Capped at ``PREVIEW_FEATURE_CAP`` features (``truncated`` set on hit).
+    Shares the sandbox's per-user advisory lock namespace with AI data
+    queries. ``mask_dataset``/``join_dataset``: the CALLER owns their
+    visibility check, same as the source dataset's (Rule 1 on both).
+
+    ``release_session`` OPT-IN only: the rollback that returns the pooled
+    connection expires EVERY ORM instance, including ``User``, whose next
+    attribute read raises ``MissingGreenlet``. Only pass it from a caller
+    reading nothing off the session afterwards -- the REST endpoint
+    qualifies, and no middleware reads the ORM user after the handler; the AI
+    chat tool does NOT (reads ``user.id`` again after).
+
+    ``request.bbox``, when present, scopes the row cap to the
+    viewport before ``ORDER BY gid`` applies; the AI chat tool never sets it.
+
+    ``source_filter``/``mask_filter``/``join_filter`` come from
+    ``compile_layer_filter`` on the matching dataset, and every query reads
+    each layer through its filter.
+    """
+    table_ref = _filtered_ref(_safe_table_ref(dataset.table_name), source_filter)
+    mask_table_ref = (
+        _filtered_ref(_safe_table_ref(mask_dataset.table_name), mask_filter)
+        if mask_dataset is not None
+        else None
+    )
+    join_table_ref = (
+        _filtered_ref(_safe_table_ref(join_dataset.table_name), join_filter)
+        if join_dataset is not None
+        else None
+    )
+    filter_binds = [
+        bind
+        for layer_filter in (source_filter, mask_filter, join_filter)
+        if layer_filter is not None
+        for bind in layer_filter[1]
+    ]
+    sql = build_preview_sql(table_ref, request, mask_table_ref, join_table_ref)
+    # The uncapped total that goes beside the capped preview, or None when the
+    # operation has no such number. Rendered here, with the table refs already
+    # in hand, and run after the geometry query below.
+    count_sql: str | None = None
+    if join_table_ref is not None:
+        count_sql = render_spatial_join_match_count(
+            table_ref, join_table_ref, bbox=request.bbox
+        )
+    elif request.operation == "select_by_location":
+        count_sql = render_select_by_location_count(
+            table_ref, mask_table_ref=mask_table_ref, mask=request.mask
+        )
+    # Names of the properties this operation adds, in SELECT order (after gid
+    # and the geometry). The rows come back positional, so this follows
+    # build_preview_sql's extra_cols.
+    extra_columns = _preview_extra_columns(request, join_table_ref)
+    # Read ORM state before rollback releases the caller's connection.
+    # execute_safe needs its own connection for READ ONLY and SET LOCAL ROLE.
+    source_feature_count = dataset.feature_count
+    # Whether a live count over the viewport and source filter overrides the
+    # cached snapshot above. Cheap check only; the count runs inside the
+    # _preview_slots block below via execute_safe, on its own connection.
+    live_count_needed = (
+        request.bbox is not None or source_filter is not None
+    ) and request.operation not in _ROW_FILTERING_OPERATIONS
+    if release_session:
+        await db.rollback()
+    # Fail fast at the bound rather than queueing -- the client
+    # holds a request open, so waiting turns a fast failure into a slow one.
+    # `.locked()` then `async with` is atomic here despite looking like
+    # check-then-act: no await between them, and acquiring a free-slot
+    # semaphore doesn't yield to the loop.
+    if _preview_slots.locked():
+        # Its own category, not query_busy: "you already have one running"
+        # is a misleading explanation for a user whose first preview is
+        # being refused because the server is busy.
+        raise SandboxError(
+            "query_at_capacity",
+            "The server is running its maximum number of analysis previews. "
+            "Try again in a moment.",
+        )
+    async with _preview_slots:
+        # The live denominator is read in this slot too, and first, so a
+        # preview whose denominator loses the race for the sandbox's per-user
+        # advisory lock still gets a geometry result even if the count is None.
+        source_feature_count = (
+            await _resolve_live_source_count(
+                db, table_ref, request.bbox, user_id, filter_binds
+            )
+            if live_count_needed
+            else source_feature_count
+        )
+        result = await execute_safe(
+            db,
+            sql,
+            row_limit=PREVIEW_FEATURE_CAP,
+            concurrency_key=str(user_id),
+            max_result_bytes=DEFAULT_MAX_RESULT_BYTES,
+            binds=binds_referenced_by(sql, filter_binds),
+        )
+        # Same slot as the geometry query: both open their own sandbox
+        # connection, so releasing the semaphore between them would let
+        # _MAX_CONCURRENT_PREVIEWS stop bounding connections while the uncapped,
+        # both-layer count query still runs (the geometry query stops at
+        # PREVIEW_FEATURE_CAP).
+        resolved_match_count = (
+            await _resolve_match_count(db, count_sql, user_id, filter_binds)
+            if count_sql is not None
+            else None
+        )
+    features: list[dict[str, Any]] = []
+    bbox: list[float] | None = None
+    # Intersect carries its uncapped total as a window column. Seed zero because
+    # an empty result has no row from which to read that valid total.
+    inline_match_count: int | None = 0 if request.operation == "intersect" else None
+    for row in result.rows:
+        if request.operation == "intersect":
+            inline_match_count = int(row[-1])
+        gid, geometry_json = row[0], row[1]
+        if geometry_json is None:
+            continue
+        geometry = json.loads(geometry_json)
+        if not geometry.get("coordinates"):
+            # Empty results (e.g. a clip that only grazes a boundary).
+            continue
+        bbox = _extend_bbox(bbox, geometry.get("coordinates"))
+        properties: dict[str, Any] = {"gid": gid}
+        properties.update(
+            (name, _json_safe(value)) for name, value in zip(extra_columns, row[2:])
+        )
+        features.append(
+            {"type": "Feature", "geometry": geometry, "properties": properties}
+        )
+    return AnalysisPreviewResponse(
+        geojson={"type": "FeatureCollection", "features": features},
+        feature_count=len(features),
+        truncated=result.truncated,
+        bbox=bbox,
+        # buffer/centroid are 1:1 per feature, so the source count IS the
+        # output total and lets clients render "500 of N" on truncation.
+        # spatial_join is 1:1 too — it adds columns and keeps every row.
+        # clip and select_by_location filter rows, so their totals are
+        # unknowable from the source count. select_by_location answers the same
+        # question exactly, through match_count below.
+        source_feature_count=(
+            source_feature_count
+            if request.operation not in _ROW_FILTERING_OPERATIONS
+            else None
+        ),
+        match_count=(
+            inline_match_count
+            if request.operation == "intersect"
+            else resolved_match_count
+        ),
+    )
+
+
+# Operations that drop source rows, so the source's own feature count says
+# nothing about how many features the result has.
+_ROW_FILTERING_OPERATIONS = ("clip", "select_by_location", "intersect")
+
+
+async def _resolve_match_count(
+    db: AsyncSession, count_sql: str, user_id: uuid.UUID, binds: list[Any]
+) -> int | None:
+    """Return the full match count, or ``None`` if the count query fails.
+
+    Count separately because capped preview rows cannot establish a total.
+    Lock contention or timeout must not discard an otherwise successful preview.
+    """
+    try:
+        result = await execute_safe(
+            db,
+            count_sql,
+            row_limit=1,
+            concurrency_key=str(user_id),
+            binds=binds_referenced_by(count_sql, binds),
+        )
+    except SandboxError:
+        return None
+    return int(result.rows[0][0]) if result.rows else None

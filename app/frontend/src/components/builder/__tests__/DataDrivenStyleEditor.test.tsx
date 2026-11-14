@@ -1,0 +1,1737 @@
+import { render, screen, waitFor, within } from '@/test/test-utils';
+import userEvent from '@testing-library/user-event';
+import { useColumnValues, useColumnStats } from '@/hooks/use-maps';
+import { useAttributes } from '@/components/dataset/hooks/use-dataset';
+import { categoricalFallbackOf, getRampColors, nextRotatingRamp } from '@/lib/color-ramps';
+import { equalIntervalBreaks } from '@/lib/classification';
+import { MAP_COLORS } from '@/lib/map-colors';
+import { DataDrivenStyleEditor } from '../DataDrivenStyleEditor';
+import type { MapLayerResponse, StyleConfig } from '@/types/api';
+
+// --- Polyfills ---
+
+// Radix Select uses ResizeObserver internally
+(globalThis as unknown as { ResizeObserver: typeof ResizeObserver }).ResizeObserver =
+  class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+Element.prototype.hasPointerCapture = vi.fn(() => false);
+Element.prototype.releasePointerCapture = vi.fn();
+Element.prototype.scrollIntoView = vi.fn();
+
+// --- Mocks ---
+
+vi.mock('@/hooks/use-maps', () => ({
+  useColumnValues: vi.fn(),
+  useColumnStats: vi.fn(),
+}));
+
+vi.mock('@/components/dataset/hooks/use-dataset', () => ({
+  useAttributes: vi.fn(),
+}));
+
+const mockUseAttributes = vi.mocked(useAttributes);
+const mockUseColumnValues = vi.mocked(useColumnValues);
+const mockUseColumnStats = vi.mocked(useColumnStats);
+
+// Render HexColorPicker as a simple button that fires onChange with a known color
+vi.mock('react-colorful', () => ({
+  HexColorPicker: ({ onChange }: { color?: string; onChange: (hex: string) => void }) => (
+    <button data-testid="hex-color-picker" onClick={() => onChange('#ff0000')}>
+      pick
+    </button>
+  ),
+  HexColorInput: () => null,
+}));
+
+// Render popover content inline (jsdom has no portal/positioning support)
+vi.mock('@/components/ui/popover', () => ({
+  Popover: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
+  PopoverTrigger: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
+  PopoverContent: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
+}));
+
+// Mock map-sync to avoid maplibre-gl setup in jsdom
+vi.mock('@/components/builder/map-sync', () => ({
+  getLayerType: (geomType: string | null) => {
+    const gt = (geomType ?? '').toUpperCase();
+    if (gt.includes('POINT')) return 'circle';
+    if (gt.includes('LINE')) return 'line';
+    return 'fill';
+  },
+}));
+
+// Mock ColorRampPicker to avoid chroma.scale errors in jsdom and allow ramp selection
+vi.mock('../ColorRampPicker', () => ({
+  ColorRampPicker: ({ rampName, onChange }: { rampName: string; onChange: (name: string) => void; mode: string }) => (
+    <div data-testid="color-ramp-picker">
+      <span>{rampName}</span>
+      <button onClick={() => onChange('Paired')}>Paired</button>
+      <button onClick={() => onChange('Set3')}>Set 3</button>
+    </div>
+  ),
+}));
+
+// --- Helpers ---
+
+/**
+ * A colour expression in paint, which is what a real save writes
+ * alongside a colour classification — the two are written together and persist together.
+ * Fixtures that pair a classification with a flat colour model a layer that cannot come
+ * out of a save, and the editor now REGENERATES for one (that disagreement is the #918
+ * bug), so a guard test needs the paint half to be testing the guard at all.
+ *
+ * Takes the column so every fixture pairs its expression with its OWN config: the
+ * reconciliation also treats an expression reading a DIFFERENT column as orphaned, since
+ * a config claiming `era` cannot describe a map drawn by `status`. Only the shape and the
+ * column matter here, not the stops.
+ */
+const colorExprFor = (column: string) => ['match', ['get', column], 'a', '#e41a1c', '#377eb8'];
+
+function makeLayer(overrides: Partial<MapLayerResponse> = {}): MapLayerResponse {
+  return {
+    id: 'layer-1',
+    dataset_id: 'ds-1',
+    dataset_name: 'Test Dataset',
+    dataset_geometry_type: 'Polygon',
+    dataset_table_name: 'test_table',
+    dataset_extent_bbox: null,
+    dataset_column_info: [
+      { name: 'typeA', type: 'varchar' },
+      { name: 'population', type: 'integer' },
+    ],
+    dataset_feature_count: 100,
+    dataset_sample_values: null,
+    display_name: null,
+    sort_order: 0,
+    visible: true,
+    opacity: 1,
+    paint: { 'fill-color': '#3b82f6' },
+    layout: {},
+    filter: null,
+    ...overrides,
+  } as MapLayerResponse;
+}
+
+/** Minimal query-result shape — the component only destructures `data`. */
+function hookData<T>(data: T) {
+  return { data } as unknown as ReturnType<typeof useColumnValues>;
+}
+
+function noData() {
+  return { data: undefined } as unknown as ReturnType<typeof useColumnValues>;
+}
+
+// --- Tests ---
+
+describe('DataDrivenStyleEditor', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockUseColumnValues.mockReturnValue(noData());
+    mockUseColumnStats.mockReturnValue(
+      noData() as unknown as ReturnType<typeof useColumnStats>,
+    );
+    mockUseAttributes.mockReturnValue({
+      data: { attributes: [] },
+      isPending: false,
+    } as unknown as ReturnType<typeof useAttributes>);
+  });
+
+  describe('categorical style from an integer column', () => {
+    it('offers an integer column but not a float column in categorical mode', async () => {
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_column_info: [
+              { name: 'typeA', type: 'varchar' },
+              { name: 'code', type: 'smallint' },
+              { name: 'ratio', type: 'double precision' },
+            ],
+          })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+      await userEvent.setup().click(screen.getByRole('combobox', { name: 'Column' }));
+      expect(await screen.findByRole('option', { name: 'code' })).toBeDefined();
+      expect(screen.getByRole('option', { name: 'typeA' })).toBeDefined();
+      expect(screen.queryByRole('option', { name: 'ratio' })).toBeNull();
+    });
+
+    it('matches the numeric codes and carries the value labels', async () => {
+      mockUseColumnValues.mockReturnValue(hookData({ values: [1, 2], count: 2 }));
+      mockUseAttributes.mockReturnValue({
+        data: {
+          attributes: [
+            { field_name: 'population', is_current: true, value_labels: { '1': 'Hospital' } },
+          ],
+        },
+        isPending: false,
+      } as unknown as ReturnType<typeof useAttributes>);
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor layer={makeLayer()} onStyleConfigChange={onStyleConfigChange} />,
+      );
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('combobox', { name: 'Column' }));
+      await user.click(await screen.findByRole('option', { name: 'population' }));
+
+      await waitFor(() => expect(onStyleConfigChange).toHaveBeenCalled());
+      const [, config, paint] = onStyleConfigChange.mock.calls.at(-1)!;
+      const match = (paint as Record<string, unknown[]>)['fill-color'][3] as unknown[];
+      expect(match.slice(0, 2)).toEqual(['match', ['get', 'population']]);
+      expect(match[2]).toBe(1);
+      expect(match[4]).toBe(2);
+      expect((config as StyleConfig).categories).toEqual([
+        { value: 1, label: 'Hospital', color: expect.any(String) },
+        { value: 2, color: expect.any(String) },
+      ]);
+    });
+
+    it('keeps saved labels when a ramp change regenerates a float-coded style', async () => {
+      mockUseColumnValues.mockReturnValue(hookData({ values: [1.5, 2.5], count: 2 }));
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_column_info: [{ name: 'ratio', type: 'double precision' }],
+            style_config: {
+              mode: 'categorical',
+              column: 'ratio',
+              ramp: 'Set2',
+              categories: [
+                { value: 1.5, label: 'Low', color: '#111111' },
+                { value: 2.5, color: '#222222' },
+              ],
+            },
+            paint: { 'fill-color': colorExprFor('ratio') },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+      await userEvent.setup().click(screen.getByRole('button', { name: /Paired/i }));
+
+      await waitFor(() => expect(onStyleConfigChange).toHaveBeenCalled());
+      const [, config] = onStyleConfigChange.mock.calls.at(-1)!;
+      expect((config as StyleConfig).categories).toEqual([
+        { value: 1.5, label: 'Low', color: expect.any(String) },
+        { value: 2.5, color: expect.any(String) },
+      ]);
+    });
+
+    it('points to graduated mode only for columns categorical mode leaves out', () => {
+      const hint = /numeric columns available in graduated mode/;
+      const { unmount } = render(
+        <DataDrivenStyleEditor layer={makeLayer()} onStyleConfigChange={vi.fn()} />,
+      );
+      expect(screen.queryByText(hint)).toBeNull();
+      unmount();
+
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_column_info: [
+              { name: 'population', type: 'integer' },
+              { name: 'ratio', type: 'double precision' },
+            ],
+          })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+      expect(screen.getByText(hint).textContent).toMatch(/^1 /);
+    });
+  });
+
+  describe('useEffect guard — categorical', () => {
+    const VALUES = ['cat1', 'cat2', 'cat3'];
+    const RAMP = 'Set2';
+    const COLORS = getRampColors(RAMP, VALUES.length);
+
+    function matchingCategoricalConfig(): StyleConfig {
+      return {
+        mode: 'categorical',
+        column: 'typeA',
+        ramp: RAMP,
+        categories: VALUES.map((v, i) => ({ value: v, color: COLORS[i] })),
+      };
+    }
+
+    it('preserves colors on re-mount when style_config matches hook data', async () => {
+      const config = matchingCategoricalConfig();
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': colorExprFor('typeA') } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      // Give the useEffect a chance to run; the guard should pass and skip the callback
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+    });
+
+    // The guard above compares the saved config against this
+    // component's own state, which assumes paint agrees with config — so it cannot
+    // detect the one case where it doesn't. A layer arrives here orphaned from STORAGE
+    // (written straight through the API/SDK/AI, or saved before the write boundary
+    // enforced the pairing), where no in-session write happened for the boundary to
+    // reconcile. Skipping meant the map drew a flat colour while this editor and the
+    // legend both reported attribute styling. Regenerating is the repair.
+    it('regenerates when the saved config matches but paint carries no expression', async () => {
+      const config = matchingCategoricalConfig();
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': '#3b82f6' } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalledTimes(1);
+      });
+      const [, newConfig, newPaint] = onStyleConfigChange.mock.calls[0];
+      expect((newConfig as StyleConfig).mode).toBe('categorical');
+      // ...and the expression the config always claimed is finally in paint.
+      expect(Array.isArray((newPaint as Record<string, unknown>)['fill-color'])).toBe(true);
+    });
+
+    // The mirror of the case above, and the harder one. When the
+    // claim is retired from OUTSIDE this editor — the commit boundary retiring one whose
+    // expression an Advanced JSON paint replacement removed, or Reset destroying one —
+    // regenerating would overwrite the paint the user explicitly asked for. Local
+    // `column`/`mode` are a third copy of the classification and have to follow the
+    // layer, or the editor silently reverts the edit that retired it.
+    it('does not re-assert a classification the layer no longer claims', async () => {
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      const { rerender } = render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            style_config: matchingCategoricalConfig(),
+            paint: { 'fill-color': colorExprFor('typeA') },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+      await waitFor(() => expect(onStyleConfigChange).not.toHaveBeenCalled());
+
+      // Exactly what the boundary commits after a paint replacement: no `mode`, the
+      // user's column/ramp selections kept, and a flat colour in paint.
+      rerender(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            style_config: { column: 'typeA', ramp: RAMP } as StyleConfig,
+            paint: { 'fill-color': '#3b82f6' },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      // Nothing written back — the replaced paint stands.
+      await waitFor(() => expect(onStyleConfigChange).not.toHaveBeenCalled());
+    });
+
+    // The closed-editor half of the same hazard. The transition
+    // guard above only sees a claim being retired while this component is MOUNTED; when
+    // the paint replacement happens with the panel closed, the editor mounts fresh with
+    // no transition to observe. It seeds local `column` from the config and defaults local
+    // `mode` to 'categorical', so a retired config that still carried its column read as a
+    // live categorical classification and the effect re-applied it over the user's paint.
+    // The reconciliation drops `column`/`ramp` for exactly this reason; this pins the
+    // consequence at the component, where the damage would appear.
+    it('does not classify on mount from a column with no mode behind it', async () => {
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            style_config: { builder: { outlineWidth: 2 } } as StyleConfig,
+            paint: { 'fill-color': '#3b82f6' },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => expect(onStyleConfigChange).not.toHaveBeenCalled());
+    });
+
+    it('regenerates colors when categories do not match hook data', async () => {
+      const staleConfig: StyleConfig = {
+        mode: 'categorical',
+        column: 'typeA',
+        ramp: RAMP,
+        categories: [
+          { value: 'old1', color: '#aaaaaa' },
+          { value: 'old2', color: '#bbbbbb' },
+        ],
+      };
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: staleConfig })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalledTimes(1);
+      });
+
+      const [layerId, newConfig] = onStyleConfigChange.mock.calls[0];
+      expect(layerId).toBe('layer-1');
+      expect((newConfig as StyleConfig).mode).toBe('categorical');
+      expect((newConfig as StyleConfig).column).toBe('typeA');
+      expect((newConfig as StyleConfig).ramp).toBe(RAMP);
+      expect((newConfig as StyleConfig).categories).toHaveLength(VALUES.length);
+    });
+
+    it('leaves boolean values out of the categories and the match expression', async () => {
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: ['north', true, 'south'], count: 3 }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: { mode: 'categorical', column: 'typeA', ramp: RAMP } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => expect(onStyleConfigChange).toHaveBeenCalledTimes(1));
+      const [, newConfig, paint] = onStyleConfigChange.mock.calls[0];
+      expect((newConfig as StyleConfig).categories!.map((c) => c.value)).toEqual(['north', 'south']);
+      expect(JSON.stringify(paint)).not.toContain('true');
+    });
+
+    it('regenerates colors when ramp changes via ColorRampPicker', async () => {
+      const config = matchingCategoricalConfig();
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': colorExprFor('typeA') } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+
+      const user = userEvent.setup();
+      const pairedButton = screen.getByRole('button', { name: /Paired/i });
+      await user.click(pairedButton);
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalledTimes(1);
+      });
+
+      const [, newConfig] = onStyleConfigChange.mock.calls[0];
+      expect((newConfig as StyleConfig).ramp).toBe('Paired');
+    });
+
+    it('resolves custom ramp to Set2 when regenerating categorical colors', async () => {
+      const customConfig: StyleConfig = {
+        mode: 'categorical',
+        column: 'typeA',
+        ramp: 'custom',
+        categories: [{ value: 'stale', color: '#000000' }],
+      };
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: customConfig })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      // setRamp('Set2') inside the effect triggers a second render cycle,
+      // so we wait for the callback and check the first call's config
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalled();
+      });
+
+      const [, newConfig] = onStyleConfigChange.mock.calls[0];
+      expect((newConfig as StyleConfig).ramp).toBe('Set2');
+
+      const expectedColors = getRampColors('Set2', VALUES.length);
+      const categories = (newConfig as StyleConfig).categories!;
+      categories.forEach((cat, i) => {
+        expect(cat.color).toBe(expectedColors[i]);
+      });
+    });
+  });
+
+  describe('recoverable validation copy', () => {
+    it('explains how to recover when categorical mode has no text columns', () => {
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ dataset_column_info: [{ name: 'ratio', type: 'double precision' }] })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByText(/Categorical styles need a text or integer column/i)).toBeInTheDocument();
+    });
+
+    it('explains missing imported style columns without changing style config', () => {
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            style_config: {
+              mode: 'graduated',
+              column: 'old_population',
+              ramp: 'YlOrRd',
+              classCount: 5,
+              method: 'equal_interval',
+            },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      expect(screen.getByText(/Column "old_population" is no longer available/i)).toBeInTheDocument();
+      expect(onStyleConfigChange).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('useEffect guard — graduated', () => {
+    // The graduated-colour effect carries the same orphan check as
+    // the categorical one — a settled config whose expression is missing from paint
+    // regenerates instead of skipping. Wired separately, so pinned separately.
+    it('regenerates a settled graduated config when paint carries no expression', async () => {
+      const breaks = equalIntervalBreaks(0, 100, 5);
+      const settled: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'YlOrRd',
+        method: 'equal_interval',
+        classCount: 5,
+        target: 'color',
+        breaks,
+        colors: getRampColors('YlOrRd', 5),
+      };
+      mockUseColumnStats.mockReturnValue(
+        hookData({
+          min: 0,
+          max: 100,
+          count: 100,
+          mean: 50,
+          quantiles: [],
+        }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: settled, paint: { 'fill-color': '#3b82f6' } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalledTimes(1);
+      });
+      const [, , newPaint] = onStyleConfigChange.mock.calls[0];
+      expect(Array.isArray((newPaint as Record<string, unknown>)['fill-color'])).toBe(true);
+    });
+
+    it('writes no style when the column stats omit min and max', async () => {
+      const settled: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'YlOrRd',
+        method: 'equal_interval',
+        classCount: 5,
+        target: 'color',
+        breaks: equalIntervalBreaks(0, 100, 5),
+        colors: getRampColors('YlOrRd', 5),
+      };
+      mockUseColumnStats.mockReturnValue(
+        hookData({ count: 0, quantiles: [] }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: settled, paint: { 'fill-color': '#3b82f6' } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(onStyleConfigChange).not.toHaveBeenCalled();
+    });
+
+    it('resolves custom ramp to YlOrRd when regenerating graduated colors', async () => {
+      const customConfig: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'custom',
+        method: 'equal_interval',
+        classCount: 5,
+      };
+      mockUseColumnStats.mockReturnValue(
+        hookData({
+          min: 0,
+          max: 100,
+          count: 100,
+          mean: 50,
+          quantiles: [],
+        }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: customConfig })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalled();
+      });
+
+      const [, newConfig] = onStyleConfigChange.mock.calls[0];
+      expect((newConfig as StyleConfig).ramp).toBe('YlOrRd');
+
+      const expectedBreaks = equalIntervalBreaks(0, 100, 5);
+      const expectedColors = getRampColors('YlOrRd', 5);
+      expect((newConfig as StyleConfig).breaks).toEqual(expectedBreaks);
+      expect((newConfig as StyleConfig).colors).toEqual(expectedColors);
+    });
+  });
+
+  describe('per-category and per-class color editing', () => {
+    it('handleCategoryColorChange sets ramp to custom', async () => {
+      const VALUES = ['cat1', 'cat2'];
+      const RAMP = 'Set2';
+      const COLORS = getRampColors(RAMP, VALUES.length);
+      const config: StyleConfig = {
+        mode: 'categorical',
+        column: 'typeA',
+        ramp: RAMP,
+        categories: VALUES.map((v, i) => ({ value: v, color: COLORS[i] })),
+      };
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': colorExprFor('typeA') } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+
+      const user = userEvent.setup();
+      const pickers = screen.getAllByTestId('hex-color-picker');
+      await user.click(pickers[0]);
+
+      // handleCategoryColorChange fires onStyleConfigChange after 200ms debounce;
+      // setRamp('custom') may trigger a second useEffect run
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalled();
+      }, { timeout: 1000 });
+      // The first call is from handleCategoryColorChange
+      const [layerId, newConfig] = onStyleConfigChange.mock.calls[0];
+      expect(layerId).toBe('layer-1');
+      expect((newConfig as StyleConfig).ramp).toBe('custom');
+      expect((newConfig as StyleConfig).categories![0].color).toBe('#ff0000');
+      expect((newConfig as StyleConfig).categories![1].color).toBe(COLORS[1]);
+    });
+
+    it.each([
+      ['a case expression', ['case', ['==', ['get', 'typeA'], null], '#123456', ['match', ['get', 'typeA'], 'cat1', '#e41a1c', 'cat2', '#377eb8', '#123456']]],
+      ['a bare match expression', ['match', ['get', 'typeA'], 'cat1', '#e41a1c', 'cat2', '#377eb8', '#123456']],
+    ])('editing a category colour keeps a custom fallback colour (%s)', async (_label, expression) => {
+      const VALUES = ['cat1', 'cat2'];
+      const config: StyleConfig = {
+        mode: 'categorical',
+        column: 'typeA',
+        ramp: 'Set2',
+        categories: VALUES.map((v, i) => ({ value: v, color: getRampColors('Set2', 2)[i] })),
+      };
+      mockUseColumnValues.mockReturnValue(hookData({ values: VALUES, count: VALUES.length }));
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': expression } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await userEvent.setup().click(screen.getAllByTestId('hex-color-picker')[0]);
+      await waitFor(() => expect(onStyleConfigChange).toHaveBeenCalled(), { timeout: 1000 });
+
+      const paint = onStyleConfigChange.mock.calls[0][2] as Record<string, unknown>;
+      const written = paint['fill-color'] as unknown[];
+      expect(categoricalFallbackOf(written)).toBe('#123456');
+      expect(JSON.stringify(written)).not.toContain('#cccccc');
+    });
+
+    describe('boolean column (AI style)', () => {
+      const AI_EXPR = [
+        'match', ['to-string', ['get', 'active']], 'true', '#66c2a5', 'false', '#fc8d62', '#cccccc',
+      ];
+      const aiLayer = () =>
+        makeLayer({
+          dataset_column_info: [{ name: 'active', type: 'boolean' }],
+          paint: { 'fill-color': AI_EXPR },
+          style_config: {
+            mode: 'categorical',
+            column: 'active',
+            ramp: 'Set2',
+            categories: [
+              { value: 'true', color: '#66c2a5' },
+              { value: 'false', color: '#fc8d62' },
+            ],
+          } as StyleConfig,
+        });
+
+      beforeEach(() => {
+        mockUseColumnValues.mockReturnValue(hookData({ values: [true, false], count: 2 }));
+      });
+
+      it('keeps the style when the editor opens on it', async () => {
+        const onStyleConfigChange = vi.fn();
+        render(<DataDrivenStyleEditor layer={aiLayer()} onStyleConfigChange={onStyleConfigChange} />);
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+
+      it('writes a to-string match with true/false labels when a category color changes', async () => {
+        const onStyleConfigChange = vi.fn();
+        render(<DataDrivenStyleEditor layer={aiLayer()} onStyleConfigChange={onStyleConfigChange} />);
+
+        await userEvent.setup().click(screen.getAllByTestId('hex-color-picker')[0]);
+
+        await waitFor(() => expect(onStyleConfigChange).toHaveBeenCalled(), { timeout: 1000 });
+        const [, config, paint] = onStyleConfigChange.mock.calls[0];
+        expect((config as StyleConfig).categories).toEqual([
+          { value: 'true', color: '#ff0000' },
+          { value: 'false', color: '#fc8d62' },
+        ]);
+        expect(JSON.stringify((paint as Record<string, unknown>)['fill-color'])).toContain(
+          '["match",["to-string",["get","active"]],"true","#ff0000","false","#fc8d62"',
+        );
+      });
+    });
+
+    it('handleGraduatedColorChange sets ramp to custom', async () => {
+      const breaks = equalIntervalBreaks(0, 100, 3);
+      const colors = getRampColors('YlOrRd', 3);
+      const config: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'YlOrRd',
+        method: 'equal_interval',
+        classCount: 3,
+        breaks,
+        colors,
+      };
+      mockUseColumnStats.mockReturnValue(
+        hookData({
+          min: 0,
+          max: 100,
+          count: 100,
+          mean: 50,
+          quantiles: [],
+        }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': colorExprFor('population') } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+
+      const user = userEvent.setup();
+      const pickers = screen.getAllByTestId('hex-color-picker');
+      await user.click(pickers[0]);
+
+      // After 200ms debounce, onStyleConfigChange should have been called
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalled();
+      }, { timeout: 1000 });
+      const [layerId, newConfig] = onStyleConfigChange.mock.calls[0];
+      expect(layerId).toBe('layer-1');
+      expect((newConfig as StyleConfig).ramp).toBe('custom');
+      expect((newConfig as StyleConfig).colors![0]).toBe('#ff0000');
+      expect((newConfig as StyleConfig).colors!.slice(1)).toEqual(colors.slice(1));
+    });
+
+    it('keeps the saved null colour when a class colour changes', async () => {
+      const breaks = equalIntervalBreaks(0, 100, 3);
+      const colors = getRampColors('YlOrRd', 3);
+      const config: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'custom',
+        method: 'manual',
+        classCount: 3,
+        breaks,
+        colors,
+        nullColor: 'rgba(0,0,0,0)',
+      };
+      mockUseColumnStats.mockReturnValue(
+        hookData({ min: 0, max: 100, count: 100, mean: 50, quantiles: [] }) as unknown as ReturnType<
+          typeof useColumnStats
+        >,
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': colorExprFor('population') } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      const user = userEvent.setup();
+      await user.click(screen.getAllByTestId('hex-color-picker')[0]);
+
+      await waitFor(() => expect(onStyleConfigChange).toHaveBeenCalled(), { timeout: 1000 });
+      const [, newConfig, newPaint] = onStyleConfigChange.mock.calls[0];
+      expect((newConfig as StyleConfig).nullColor).toBe('rgba(0,0,0,0)');
+      expect((newPaint as Record<string, unknown[]>)['fill-color'][2]).toBe('rgba(0,0,0,0)');
+    });
+  });
+
+  describe('imported numeric categories', () => {
+    it('leaves a config with typed numeric categories alone on open', async () => {
+      const values = [1, 2, 3];
+      const config: StyleConfig = {
+        mode: 'categorical',
+        column: 'population',
+        ramp: 'custom',
+        categories: [
+          { value: 1, color: '#ff0000' },
+          { value: 2, color: '#00ff00' },
+          { value: 3, color: '#0000ff' },
+        ],
+      };
+      mockUseColumnValues.mockReturnValue(hookData({ values, count: values.length }));
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': colorExprFor('population') } })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+    });
+
+    it('shows the column and class labels of an imported style on an integer field', async () => {
+      const values = [1, 2];
+      const config: StyleConfig = {
+        mode: 'categorical',
+        column: 'population',
+        ramp: 'custom',
+        categories: [
+          { value: 1, label: 'Hospital', color: '#ff0000' },
+          { value: 2, label: 'Clinic', color: '#00ff00' },
+        ],
+      };
+      mockUseColumnValues.mockReturnValue(hookData({ values, count: values.length }));
+
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: config, paint: { 'fill-color': colorExprFor('population') } })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByRole('combobox', { name: 'Column' }).textContent).toContain('population');
+      expect(screen.getByText('Hospital (1)')).toBeDefined();
+      expect(screen.getByText('Clinic (2)')).toBeDefined();
+    });
+  });
+
+  describe('target selector', () => {
+    it('shows a target selector with Color and Radius options for a point layer in graduated mode', async () => {
+      const config: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'YlOrRd',
+        method: 'equal_interval',
+        classCount: 5,
+      };
+      mockUseColumnStats.mockReturnValue(
+        hookData({
+          min: 0,
+          max: 100,
+          count: 100,
+          mean: 50,
+          quantiles: [],
+        }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: 'Point',
+            paint: { 'circle-color': '#3b82f6' },
+            style_config: config,
+          })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+
+      // Target selector should be visible (i18n renders "Target" label)
+      expect(screen.getByText('Target')).toBeDefined();
+    });
+
+    it('keeps an imported null colour through a colour to radius to colour toggle', async () => {
+      const breaks = equalIntervalBreaks(0, 100, 3);
+      const colors = getRampColors('YlOrRd', 3);
+      const config: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'custom',
+        method: 'equal_interval',
+        classCount: 3,
+        breaks,
+        colors,
+        nullColor: 'rgba(0,0,0,0)',
+        target: 'color',
+      };
+      mockUseColumnStats.mockReturnValue(
+        hookData({ min: 0, max: 100, count: 100, mean: 50, quantiles: [0, 50, 100] }) as unknown as ReturnType<
+          typeof useColumnStats
+        >,
+      );
+      const onStyleConfigChange = vi.fn();
+      const pointLayer = (cfg: StyleConfig, paint: Record<string, unknown>) =>
+        makeLayer({ dataset_geometry_type: 'Point', style_config: cfg, paint });
+      const { rerender } = render(
+        <DataDrivenStyleEditor
+          layer={pointLayer(config, { 'circle-color': colorExprFor('population') })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('combobox', { name: 'Target' }));
+      await user.click(await screen.findByRole('option', { name: 'Radius' }));
+      await waitFor(() => expect(onStyleConfigChange).toHaveBeenCalled());
+      const [, sizeConfig, sizePaint] = onStyleConfigChange.mock.calls.at(-1)!;
+      expect((sizeConfig as StyleConfig).target).toBe('radius');
+      expect((sizeConfig as StyleConfig).nullColor).toBe('rgba(0,0,0,0)');
+
+      onStyleConfigChange.mockClear();
+      rerender(
+        <DataDrivenStyleEditor
+          layer={pointLayer(sizeConfig as StyleConfig, sizePaint as Record<string, unknown>)}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+      await user.click(screen.getByRole('combobox', { name: 'Target' }));
+      await user.click(await screen.findByRole('option', { name: 'Color' }));
+      await waitFor(() => expect(onStyleConfigChange).toHaveBeenCalled());
+      const [, colorConfig, colorPaint] = onStyleConfigChange.mock.calls.at(-1)!;
+      expect((colorConfig as StyleConfig).nullColor).toBe('rgba(0,0,0,0)');
+      expect((colorPaint as Record<string, unknown[]>)['circle-color'][2]).toBe('rgba(0,0,0,0)');
+    });
+
+    it('does NOT show a target selector for a polygon layer in graduated mode', async () => {
+      const config: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'YlOrRd',
+        method: 'equal_interval',
+        classCount: 5,
+      };
+      mockUseColumnStats.mockReturnValue(
+        hookData({
+          min: 0,
+          max: 100,
+          count: 100,
+          mean: 50,
+          quantiles: [],
+        }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: 'Polygon',
+            paint: { 'fill-color': '#3b82f6' },
+            style_config: config,
+          })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+
+      // Target selector should NOT be visible for polygon
+      expect(screen.queryByText('Target')).toBeNull();
+    });
+
+    it('does NOT show a target selector in categorical mode for a point layer', async () => {
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: ['a', 'b'], count: 2 }),
+      );
+
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: 'Point',
+            paint: { 'circle-color': '#3b82f6' },
+          })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+
+      // Categorical mode — target selector should NOT be shown
+      expect(screen.queryByText('Target')).toBeNull();
+    });
+
+    it('clears stale size style_config when switching a graduated radius style to categorical', async () => {
+      const onStyleConfigChange = vi.fn();
+      const user = userEvent.setup();
+
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: 'Point',
+            paint: {
+              'circle-color': ['step', ['get', 'population'], '#fee8c8', 20, '#fdbb84'],
+              'circle-radius': ['step', ['get', 'population'], 2, 20, 8],
+            },
+            style_config: {
+              mode: 'graduated',
+              column: 'population',
+              ramp: 'YlOrRd',
+              method: 'equal_interval',
+              classCount: 5,
+              target: 'radius',
+              sizes: [2, 4, 6, 8, 10],
+              sizeRange: [2, 10],
+              breaks: [20, 40, 60, 80],
+            },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await user.click(screen.getAllByRole('combobox')[0]);
+      await user.click(await screen.findByRole('option', { name: 'Categorical' }));
+
+      // The clear paths now pass `replace` so they can drop the
+      // pattern colour stash; with no builder block the config is still null.
+      expect(onStyleConfigChange).toHaveBeenCalledWith('layer-1', null, expect.objectContaining({
+        'circle-color': MAP_COLORS.default.fill,
+        'circle-radius': 5,
+      }), { replace: true });
+      expect(onStyleConfigChange).not.toHaveBeenCalledWith(
+        'layer-1',
+        expect.objectContaining({ target: 'radius' }),
+        expect.anything(),
+      );
+    });
+
+  });
+
+  describe('B-003 / UX-L1: no phantom dirty on open', () => {
+    it('does not emit onStyleConfigChange opening on a seeded graduated-size config missing classCount/sizeRange', async () => {
+      // Restless Earth showcase quake layer shape (scripts/seed-showcase.py) —
+      // no classCount, no sizeRange; both are fully implied by sizes/breaks.
+      const seededConfig: StyleConfig = {
+        mode: 'graduated',
+        column: 'mag',
+        ramp: 'YlOrRd',
+        target: 'radius',
+        method: 'manual',
+        breaks: [5, 6, 7],
+        sizes: [3, 5, 8, 12],
+        colors: ['#ffffb2', '#fecc5c', '#fd8d3c', '#e31a1c'],
+      };
+
+      mockUseColumnStats.mockReturnValue(
+        hookData({
+          min: 1.2,
+          max: 8,
+          count: 500,
+          mean: 4,
+          quantiles: [],
+        }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: 'Point',
+            dataset_column_info: [{ name: 'mag', type: 'double precision' }],
+            paint: { 'circle-color': '#3b82f6' },
+            style_config: seededConfig,
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+    });
+
+    it('does not emit onStyleConfigChange opening on a seeded graduated-color config missing classCount', async () => {
+      // 3D-buildings showcase layer shape (scripts/seed-showcase.py) — colors
+      // (7) + breaks (6) but no classCount; classCount is implied by colors.length.
+      const seededConfig: StyleConfig = {
+        mode: 'graduated',
+        column: 'height_roof',
+        ramp: 'Plasma',
+        target: 'color',
+        method: 'quantile',
+        breaks: [60, 120, 250, 450, 750, 1200],
+        colors: [
+          '#0d0887',
+          '#5601a4',
+          '#900da3',
+          '#cb4679',
+          '#ed7953',
+          '#fdb42f',
+          '#f0f921',
+        ],
+      };
+
+      mockUseColumnStats.mockReturnValue(
+        hookData({
+          min: 0,
+          max: 1500,
+          count: 1000,
+          mean: 300,
+          quantiles: [60, 120, 250, 450, 750, 1200],
+        }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: 'Polygon',
+            dataset_column_info: [{ name: 'height_roof', type: 'double precision' }],
+            // The seeded layer carries its ramp as a paint expression too (a `case`
+            // wrapping a `match`, see scripts/seed-showcase.py) — shape and column matter.
+            paint: { 'fill-color': colorExprFor('height_roof') },
+            style_config: seededConfig,
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe('WR-01: target/mode-aware classCount derivation', () => {
+    it('derives classCount from sizes.length (not colors.length) for a double-encoded radius-target config with divergent lengths', async () => {
+      // A "double-encoded" graduated-radius layer that also carries a color
+      // ramp (as the Restless Earth quake layer does) with colors/sizes
+      // deliberately diverging in length. sizes.length (4) is the
+      // semantically correct basis for the size-target classCount, not
+      // colors.length (6).
+      const seededConfig: StyleConfig = {
+        mode: 'graduated',
+        column: 'mag',
+        ramp: 'YlOrRd',
+        target: 'radius',
+        method: 'equal_interval',
+        sizes: [3, 5, 8, 12],
+        colors: ['#ffffb2', '#fed976', '#feb24c', '#fd8d3c', '#f03b20', '#bd0026'],
+        sizeRange: [3, 12],
+      };
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: 'Point',
+            dataset_column_info: [{ name: 'mag', type: 'double precision' }],
+            paint: { 'circle-color': '#3b82f6', 'circle-radius': 5 },
+            style_config: seededConfig,
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      const classesRow = screen.getByText('Classes').closest('div');
+      expect(classesRow).not.toBeNull();
+      expect(within(classesRow as HTMLElement).getByText('4')).toBeInTheDocument();
+
+      // No spurious write on mount either — same guard the tests pin.
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+    });
+
+    it('does not carry a stale classCount/sizeRange from a categorical config into a later graduated switch', async () => {
+      // A categorical config with stray graduated-shaped fields left over
+      // from a prior graduated session (plausible via AI edits, since
+      // StyleConfig is an open bag). classCount/sizeRange must NOT be
+      // derived from these stray fields on mount, and must still be at
+      // their defaults after switching to graduated mode.
+      const staleConfig: StyleConfig = {
+        mode: 'categorical',
+        column: 'typeA',
+        ramp: 'Set2',
+        categories: [{ value: 'cat1', color: '#111111' }],
+        // Stray graduated leftovers — should be inert in categorical mode.
+        classCount: 8,
+        colors: ['#a', '#b', '#c', '#d', '#e', '#f', '#g', '#h'],
+        sizeRange: [9, 25],
+      };
+
+      mockUseColumnStats.mockReturnValue(
+        hookData({
+          min: 0,
+          max: 100,
+          count: 100,
+          mean: 50,
+          quantiles: [],
+        }) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      const user = userEvent.setup();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: staleConfig })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+
+      // Switch categorical -> graduated
+      await user.click(screen.getAllByRole('combobox')[0]);
+      await user.click(await screen.findByRole('option', { name: 'Graduated' }));
+
+      // handleModeChange clears `column` on any mode switch — pick a numeric
+      // column so the (mode === 'graduated' && column) gated Classes slider
+      // renders.
+      await user.click(screen.getAllByRole('combobox')[1]);
+      await user.click(await screen.findByRole('option', { name: 'population' }));
+
+      const classesRow = await screen.findByText('Classes');
+      const classesContainer = classesRow.closest('div');
+      expect(classesContainer).not.toBeNull();
+      // Must be the default (5), not the stale derived value (8).
+      expect(within(classesContainer as HTMLElement).getByText('5')).toBeInTheDocument();
+    });
+  });
+
+  describe('classification methods (ENH-04)', () => {
+    function graduatedConfig(method: StyleConfig['method'] = 'equal_interval'): StyleConfig {
+      return {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'YlOrRd',
+        classCount: 5,
+        method,
+      };
+    }
+
+    function statsWith(extra: Record<string, unknown> = {}) {
+      return hookData({
+        min: 0,
+        max: 100,
+        count: 100,
+        mean: 50,
+        quantiles: [20, 40, 60, 80],
+        ...extra,
+      }) as unknown as ReturnType<typeof useColumnStats>;
+    }
+
+    it('jenks method produces strictly ascending breaks in the persisted config', async () => {
+      mockUseColumnStats.mockReturnValue(statsWith());
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: graduatedConfig('jenks') })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onStyleConfigChange).toHaveBeenCalled();
+      });
+      const [, newConfig] = onStyleConfigChange.mock.calls[0];
+      const breaks = (newConfig as StyleConfig).breaks!;
+      expect(breaks.length).toBeGreaterThan(0);
+      for (let i = 1; i < breaks.length; i++) {
+        expect(breaks[i]).toBeGreaterThan(breaks[i - 1]);
+      }
+      expect((newConfig as StyleConfig).method).toBe('jenks');
+    });
+
+    it('shows the manual-breaks editor and persists entered ascending breaks', async () => {
+      mockUseColumnStats.mockReturnValue(statsWith());
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            style_config: { ...graduatedConfig('manual'), breaks: [10, 20] },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      // The manual editor renders numeric inputs seeded from the persisted breaks.
+      const rows = await screen.findAllByLabelText(/Break value/i);
+      expect(rows.length).toBeGreaterThanOrEqual(2);
+
+      const user = userEvent.setup();
+      await user.clear(rows[0]);
+      await user.type(rows[0], '15');
+      await user.clear(rows[1]);
+      await user.type(rows[1], '30');
+
+      await waitFor(() => {
+        // The latest manual write should carry the freshly-typed ascending breaks.
+        const manualCalls = onStyleConfigChange.mock.calls.filter(
+          ([, cfg]) => (cfg as StyleConfig)?.method === 'manual',
+        );
+        expect(manualCalls.length).toBeGreaterThan(0);
+        const last = manualCalls[manualCalls.length - 1];
+        expect((last[1] as StyleConfig).breaks).toEqual([15, 30]);
+      });
+    });
+
+    it('warns and does not write a config for non-ascending manual breaks', async () => {
+      mockUseColumnStats.mockReturnValue(statsWith());
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            style_config: { ...graduatedConfig('manual'), breaks: [10, 20] },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      const rows = await screen.findAllByLabelText(/Break value/i);
+      const user = userEvent.setup();
+      // Make them descending: 50 then 5 → invalid.
+      await user.clear(rows[0]);
+      await user.type(rows[0], '50');
+      await user.clear(rows[1]);
+      await user.type(rows[1], '5');
+
+      // Inline warning is shown.
+      expect(
+        await screen.findByText(/strictly ascending order/i),
+      ).toBeInTheDocument();
+
+      // No graduated manual config written for the invalid input.
+      const manualWrite = onStyleConfigChange.mock.calls.find(
+        ([, cfg]) =>
+          (cfg as StyleConfig)?.method === 'manual' &&
+          JSON.stringify((cfg as StyleConfig)?.breaks) === JSON.stringify([50, 5]),
+      );
+      expect(manualWrite).toBeUndefined();
+    });
+
+    it('disables the std-dev option when stddev is unavailable', async () => {
+      // No stddev on the stats response → option gated.
+      mockUseColumnStats.mockReturnValue(statsWith());
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: graduatedConfig() })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+
+      const user = userEvent.setup();
+      // Open the method select (the graduated method combobox).
+      const comboboxes = screen.getAllByRole('combobox');
+      await user.click(comboboxes[comboboxes.length - 1]);
+      const stdDevOption = await screen.findByRole('option', { name: /Standard Deviation/i });
+      expect(stdDevOption).toHaveAttribute('aria-disabled', 'true');
+    });
+
+    it('resets target to color when handleClear is called', async () => {
+      const config: StyleConfig = {
+        mode: 'graduated',
+        column: 'population',
+        ramp: 'YlOrRd',
+        method: 'equal_interval',
+        classCount: 5,
+        target: 'radius',
+        sizes: [2, 6, 10, 14, 18],
+        sizeRange: [2, 18],
+        breaks: [20, 40, 60, 80],
+      };
+
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: 'Point',
+            paint: { 'circle-color': '#3b82f6', 'circle-radius': ['step', ['get', 'population'], 2, 20, 6, 40, 10, 60, 14, 80, 18] },
+            style_config: config,
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      const user = userEvent.setup();
+      const clearBtn = screen.getByRole('button', { name: /clear/i });
+      await user.click(clearBtn);
+
+      expect(onStyleConfigChange).toHaveBeenCalled();
+      const [layerId, clearedConfig] = onStyleConfigChange.mock.calls[0];
+      expect(layerId).toBe('layer-1');
+      // config should be null after clear
+      expect(clearedConfig).toBeNull();
+    });
+
+    // A Mode switch on a patterned-but-unclassified layer used
+    // to drop the pattern and expose the default blue, leaving the user's colour in
+    // the stash only — exploring the Mode selector should not repaint the layer a
+    // colour it never had.
+    it('restores the stashed colour and clears the stash when switching mode', async () => {
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_column_info: [{ name: 'ratio', type: 'double precision' }],
+            paint: { 'fill-pattern': 'geolens-fill-hatch', 'fill-opacity': 0.3 },
+            style_config: { builder: { fillColorSaved: '#ff0000', outlineWidth: 2 } },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await userEvent.setup().click(screen.getByText('Switch to graduated mode'));
+
+      const [, config, paint, opts] = onStyleConfigChange.mock.calls[0];
+      expect('fill-pattern' in paint).toBe(false);
+      expect(paint['fill-color']).toBe('#ff0000');
+      expect(opts).toEqual({ replace: true });
+      expect(config?.builder?.fillColorSaved).toBeUndefined();
+      expect(config?.builder?.outlineWidth).toBe(2);
+    });
+
+    it('falls back to the default colour when a patterned layer has no stash', async () => {
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            paint: { 'fill-pattern': 'geolens-fill-hatch' },
+            style_config: { mode: 'categorical', column: 'typeA', ramp: 'Set2' },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await userEvent.setup().click(screen.getByRole('button', { name: /clear/i }));
+
+      const [, config, paint] = onStyleConfigChange.mock.calls[0];
+      expect('fill-pattern' in paint).toBe(false);
+      expect(paint['fill-color']).toBe(MAP_COLORS.default.fill);
+      expect(config).toBeNull();
+    });
+
+    // The clear paths write a non-data-driven config, so the exclusion
+    // in handleStyleConfigChange does not fire for them. A surviving fill-pattern
+    // would win over the freshly defaulted fill-color on the map.
+    it('drops a surviving fill-pattern when clearing a ramp', async () => {
+      const onStyleConfigChange = vi.fn();
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            paint: {
+              'fill-color': ['match', ['get', 'typeA'], 'a', '#ff0000', '#00ff00'],
+              'fill-pattern': 'geolens-fill-hatch',
+            },
+            style_config: { mode: 'categorical', column: 'typeA', ramp: 'Set2' },
+          })}
+          onStyleConfigChange={onStyleConfigChange}
+        />,
+      );
+
+      await userEvent.setup().click(screen.getByRole('button', { name: /clear/i }));
+
+      const [, config, paint] = onStyleConfigChange.mock.calls[0];
+      expect(config).toBeNull();
+      expect('fill-pattern' in paint).toBe(false);
+      expect(paint['fill-color']).toBe(MAP_COLORS.default.fill);
+    });
+  });
+
+  describe('ENH-08: ramp rotation + data-character suggestion', () => {
+    const VALUES = ['cat1', 'cat2', 'cat3'];
+    const STATS = {
+      min: 0,
+      max: 100,
+      count: 100,
+      mean: 50,
+      quantiles: [25, 50, 75],
+    };
+
+    it('two fresh graduated layers at different rotation indices get different default ramps', async () => {
+      // Fresh graduated layers: style_config has column + mode but NO ramp saved.
+      // Effect 2 fires because column is set + stats available → persists the rotated ramp.
+      mockUseColumnStats.mockReturnValue(
+        hookData(STATS) as unknown as ReturnType<typeof useColumnStats>,
+      );
+
+      const ramp0 = nextRotatingRamp('graduated', 0); // 'YlOrRd'
+      const ramp2 = nextRotatingRamp('graduated', 2); // 'Greens'
+      expect(ramp0).not.toBe(ramp2);
+
+      const onChange0 = vi.fn();
+      const onChange2 = vi.fn();
+
+      // Cast as StyleConfig: deliberately omitting ramp to represent a fresh
+      // layer state (as-if the saved config had no ramp field set).
+      const gradConfigNoRamp = {
+        mode: 'graduated' as const,
+        column: 'population',
+        method: 'equal_interval' as const,
+        classCount: 5,
+      } as StyleConfig;
+
+      const { unmount: unmount0 } = render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ id: 'g0', style_config: { ...gradConfigNoRamp } })}
+          onStyleConfigChange={onChange0}
+          rampRotationIndex={0}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onChange0).toHaveBeenCalled();
+      });
+      unmount0();
+
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ id: 'g2', style_config: { ...gradConfigNoRamp } })}
+          onStyleConfigChange={onChange2}
+          rampRotationIndex={2}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(onChange2).toHaveBeenCalled();
+      });
+
+      const c0 = onChange0.mock.calls[0][1] as StyleConfig;
+      const c2 = onChange2.mock.calls[0][1] as StyleConfig;
+      expect(c0.ramp).toBe(ramp0);
+      expect(c2.ramp).toBe(ramp2);
+      // Key assertion: N adds → N distinct ramps (different rotation indices → different ramps)
+      expect(c0.ramp).not.toBe(c2.ramp);
+    });
+
+    it('fresh layer ColorRampPicker displays the rotated default — two adds show distinct ramps', () => {
+      // Without selecting a column, the ramp state is visible via the ColorRampPicker
+      // only after a column is selected. Here we verify the INITIAL ramp state by
+      // checking rampName shown in the picker when the component first enters mode with column.
+      const ramp0 = nextRotatingRamp('categorical', 0); // 'Set2'
+      const ramp1 = nextRotatingRamp('categorical', 1); // 'Paired'
+      expect(ramp0).not.toBe(ramp1);
+
+      // Mount a categorical layer that already has a column selected so the picker renders.
+      // No ramp saved → fresh layer uses rotated default.
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      // Cast as StyleConfig: deliberately omitting ramp to represent a fresh
+      // layer (as-if no ramp was ever saved). The column is already set so the
+      // ColorRampPicker renders immediately — we can inspect the displayed ramp.
+      const freshNoRamp0 = {
+        mode: 'categorical' as const,
+        column: 'typeA',
+      } as StyleConfig;
+
+      const { unmount: u0 } = render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ id: 'fresh-0', style_config: freshNoRamp0 })}
+          onStyleConfigChange={vi.fn()}
+          rampRotationIndex={0}
+        />,
+      );
+      // ColorRampPicker receives rampName from ramp state; verify it shows index-0 ramp
+      const picker0 = screen.getByTestId('color-ramp-picker');
+      expect(picker0.textContent).toContain(ramp0);
+      u0();
+
+      const freshNoRamp1 = {
+        mode: 'categorical' as const,
+        column: 'typeA',
+      } as StyleConfig;
+
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ id: 'fresh-1', style_config: freshNoRamp1 })}
+          onStyleConfigChange={vi.fn()}
+          rampRotationIndex={1}
+        />,
+      );
+      const picker1 = screen.getByTestId('color-ramp-picker');
+      expect(picker1.textContent).toContain(ramp1);
+      expect(ramp0).not.toBe(ramp1);
+    });
+
+    it('a layer with a saved ramp keeps that ramp regardless of rotation index', async () => {
+      const SAVED_RAMP = 'Inferno';
+      const savedConfig: StyleConfig = {
+        mode: 'categorical',
+        column: 'typeA',
+        ramp: SAVED_RAMP,
+        categories: VALUES.map((v, i) => ({ value: v, color: getRampColors(SAVED_RAMP, VALUES.length)[i] })),
+      };
+      mockUseColumnValues.mockReturnValue(
+        hookData({ values: VALUES, count: VALUES.length }),
+      );
+
+      const onStyleConfigChange = vi.fn();
+      // rampRotationIndex=5 would select a non-Inferno ramp, but saved ramp wins
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: savedConfig, paint: { 'fill-color': colorExprFor('typeA') } })}
+          onStyleConfigChange={onStyleConfigChange}
+          rampRotationIndex={5}
+        />,
+      );
+
+      // Guard recognizes config matches → no callback → saved ramp preserved
+      await waitFor(() => {
+        expect(onStyleConfigChange).not.toHaveBeenCalled();
+      });
+
+      // The ColorRampPicker shows the saved ramp name
+      const picker = screen.getByTestId('color-ramp-picker');
+      expect(picker.textContent).toContain(SAVED_RAMP);
+    });
+  });
+
+  // The values endpoint pages at 100 (500 max), so its length is a page
+  // size. The warning used to report it as the category count, and the swatch list
+  // stopped there with nothing saying it was a prefix.
+  describe('#960 honest category counts', () => {
+    const PAGE = Array.from({ length: 100 }, (_, i) => `cat${i}`);
+
+    function renderCategorical(distinctCount: number | null) {
+      mockUseColumnValues.mockReturnValue(hookData({ values: PAGE, count: PAGE.length }));
+      mockUseColumnStats.mockReturnValue(
+        (distinctCount == null
+          ? noData()
+          : hookData({ distinct_count: distinctCount, data_type: 'categorical' })
+        ) as unknown as ReturnType<typeof useColumnStats>,
+      );
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({ style_config: { mode: 'categorical', column: 'typeA', ramp: 'Set2' } })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+    }
+
+    it('reports the true distinct count and says the list is a prefix', () => {
+      renderCategorical(4000);
+      const warning = screen.getByText(/4,?000 categories/);
+      expect(warning).toBeInTheDocument();
+      expect(warning.textContent).toMatch(/first 100/);
+      expect(screen.queryByText(/^100 categories/)).toBeNull();
+    });
+
+    it('keeps the plain warning when the page holds every category', () => {
+      renderCategorical(100);
+      const warning = screen.getByText(/100 categories/);
+      expect(warning.textContent).not.toMatch(/first/);
+    });
+
+    it('falls back to the page length when no stats are available', () => {
+      renderCategorical(null);
+      expect(screen.getByText(/100 categories/)).toBeInTheDocument();
+    });
+
+    it('calls useColumnStats for the categorical column, not only the graduated one', () => {
+      renderCategorical(4000);
+      expect(mockUseColumnStats).toHaveBeenCalledWith('ds-1', 'typeA');
+    });
+  });
+
+  // A ramp on a mixed-geometry layer only colours the polygons, because
+  // getColorProperty resolves 'other' to fill-color and the mixed adapter filters
+  // that key out of the line and circle sublayers.
+  describe('#952 mixed-geometry colour scope hint', () => {
+    function renderWithGeometry(geometryType: string) {
+      mockUseColumnValues.mockReturnValue(hookData({ values: ['a', 'b'], count: 2 }));
+      render(
+        <DataDrivenStyleEditor
+          layer={makeLayer({
+            dataset_geometry_type: geometryType,
+            style_config: { mode: 'categorical', column: 'typeA', ramp: 'Set2' },
+          })}
+          onStyleConfigChange={vi.fn()}
+        />,
+      );
+    }
+
+    it.each(['GEOMETRY', 'GEOMETRYCOLLECTION'])('shows the hint for %s', (gt) => {
+      renderWithGeometry(gt);
+      expect(screen.getByText(/Colors apply to polygon features/)).toBeInTheDocument();
+    });
+
+    // Only the two generic sentinels route to the mixed adapter; an exotic or absent
+    // type keeps the plain fill fallback and has no line/point sublayers to describe.
+    it.each(['Polygon', 'MultiLineString', 'Point', 'CURVE', ''])('does NOT show the hint for %s', (gt) => {
+      renderWithGeometry(gt);
+      expect(screen.queryByText(/Colors apply to polygon features/)).toBeNull();
+    });
+  });
+});

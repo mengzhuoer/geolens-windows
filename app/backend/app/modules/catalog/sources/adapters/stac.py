@@ -1,0 +1,627 @@
+"""STAC API adapter: connect, list collections, and search items over httpx.
+
+The user-supplied STAC API URL is SSRF-validated upstream by the router;
+timeouts are enforced via STAC_TIMEOUT / DEFAULT_CHECK_TIMEOUT.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import replace
+from typing import Any, Literal, TypedDict
+from urllib.parse import urljoin
+
+import httpx
+import structlog
+from pydantic import HttpUrl
+
+from app.core.service_tokens import (
+    STAC_SERVICE_FORMAT,
+    ServiceCredential,
+    build_credential_header,
+)
+from app.core.url_redaction import (
+    carries_registered_credential,
+    has_url_credentials,
+    redact_exception_text,
+)
+from app.platform.security import make_safe_client, same_origin
+from app.platform.probe_bounds import bounded_probe_exchange, bounded_probe_read
+from app.platform.service_endpoints import (
+    DEFAULT_CHECK_TIMEOUT,
+    OGC_JSON_ACCEPT,
+    EndpointCheckFailedError,
+)
+
+# StacImportItem.title caps at 500; an untitled item falls back to its id,
+# which may be longer.
+_MAX_TITLE_CHARS = 500
+
+logger = structlog.stdlib.get_logger(__name__)
+
+# Maximum items to return per search request
+MAX_SEARCH_ITEMS = 100
+# Maximum collections to return from one listing
+MAX_COLLECTIONS = 1000
+# Connection timeout for STAC API requests
+STAC_TIMEOUT = 30.0
+
+
+def projection_epsg(properties: dict[str, Any]) -> int | None:
+    """Return an EPSG identifier from Projection Extension v2 or legacy data."""
+    projection_code = properties.get("proj:code")
+    if isinstance(projection_code, str) and projection_code.startswith("EPSG:"):
+        code = projection_code.removeprefix("EPSG:")
+        if code.isdecimal():
+            return int(code)
+
+    legacy_epsg = properties.get("proj:epsg")
+    if isinstance(legacy_epsg, int) and not isinstance(legacy_epsg, bool):
+        return legacy_epsg
+    return None
+
+
+# STAC sets no length limit on an asset key, so this is GeoLens's own bound
+# on the string that ends up in `origin_ref`; applied at capture (here) as
+# well as at the import model, since a key too long for the model would
+# 422 the caller's whole search batch. An over-long key just imports
+# without one, and refresh falls back to matching on the href.
+MAX_ASSET_KEY_CHARS = 255
+
+# Width of DatasetAsset.media_type (String(100)); the same capture-side
+# bound and reason as MAX_ASSET_KEY_CHARS above.
+MAX_ASSET_MEDIA_TYPE_CHARS = 100
+
+
+def storable_media_type(media_type: str | None) -> str | None:
+    """The asset's declared media type if it fits the column, else None.
+
+    Applied here and again on refresh, so every writer of
+    ``DatasetAsset.media_type`` carries the column's bound.
+    """
+    if not isinstance(media_type, str) or len(media_type) > MAX_ASSET_MEDIA_TYPE_CHARS:
+        return None
+    return media_type
+
+
+def storable_asset_key(key: str | None) -> str | None:
+    """The asset key if it is short enough to carry, else None.
+
+    ``""`` is a legal STAC asset key and is deliberately NOT refused here:
+    STAC re-resolution tests a stored key with ``is not None``, never
+    truthiness, so ``""`` still means "recorded" and a resolve can
+    round-trip a moved asset without losing the key.
+    """
+    if key is None or len(key) > MAX_ASSET_KEY_CHARS:
+        return None
+    return key
+
+
+# Keys a published COG hides behind, in try order: `data`/`visual` are the
+# STAC-common spellings, `image` the older one, `B04` Sentinel-2's red band.
+_PREFERRED_ASSET_KEYS: tuple[str, ...] = ("data", "visual", "image", "B04")
+
+
+def pick_data_asset(assets: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """The item's primary data asset, as ``(key, asset)``, or None.
+
+    Shared by search and by refresh re-picking from the same item fetched
+    again later, so both agree instead of drifting to a different band. The
+    key is returned alongside the asset because it is the durable name that
+    survives an href moving.
+
+    Non-dict entries are skipped: a malformed catalog with a scalar asset
+    value must not raise inside search.
+    """
+    if not isinstance(assets, dict):
+        return None
+    for key in _PREFERRED_ASSET_KEYS:
+        asset = assets.get(key)
+        if isinstance(asset, dict) and asset:
+            return key, asset
+    for key, asset in assets.items():
+        if isinstance(asset, dict) and "data" in (asset.get("roles") or []):
+            return key, asset
+    return None
+
+
+def storable_href(href: Any, base_url: str) -> str | None:
+    """Resolve *href* against *base_url*, or None if it may not be STORED.
+
+    Shared by ``self_link_href`` for the item href and here for the asset
+    href. Both end up in ``origin_ref``, so they clear the same bar as the
+    import request model: pydantic ``HttpUrl``, the model's 4096 cap, and
+    the ADR-002 invariant-4 credential refusal (a signed URL must never
+    reach the source binding).
+
+    A relative href is legal STAC, so it is resolved BEFORE any check —
+    otherwise ``//user:pw@host/x`` could smuggle userinfo past a raw scan.
+    """
+    if not isinstance(href, str) or not href.strip():
+        return None
+    try:
+        resolved = urljoin(base_url, href)
+        HttpUrl(resolved)
+    except ValueError:
+        return None
+    if len(resolved) > 4096 or has_url_credentials(resolved):
+        return None
+    # Nor does the origin get to hand the caller's own credential back for
+    # storage: `has_url_credentials` allowlists parameter NAMES, while this
+    # asks whether the value is one this request composed.
+    if carries_registered_credential(resolved):
+        return None
+    return resolved
+
+
+def self_link_href(
+    feature: dict[str, Any], base_url: str, catalog_url: str | None = None
+) -> str | None:
+    """The item's own canonical href, from its ``rel="self"`` link.
+
+    Search is the ONE place GeoLens holds a STAC item document, so it is
+    the only place the item's own href can be captured. Without it,
+    ``origin_ref``'s ``item_href`` stays unwritten and the health probe can
+    only ever check the asset, never a withdrawal from the catalog.
+
+    A relative href is legal STAC, so it is resolved against the response's
+    actual URL before any check. ``storable_href`` then drops a non-http(s)
+    or credentialed href rather than surfacing it: a credentialed one would
+    otherwise turn an optional convenience into a 422 for the caller's
+    whole import batch.
+
+    ``catalog_url`` fences the result to the origin the caller submitted.
+    This pointer becomes ``origin_ref["item_href"]``, which a later
+    credentialed refresh anchors on, so a catalog that advertises an
+    off-origin self link here could name the host its own key is sent to.
+    """
+    links = feature.get("links")
+    # A malformed scalar `links` must cost only this optional field, not 502
+    # the whole search.
+    for link in links if isinstance(links, list) else []:
+        if not isinstance(link, dict) or link.get("rel") != "self":
+            continue
+        resolved = storable_href(link.get("href"), base_url)
+        if resolved is None:
+            continue
+        if catalog_url is not None and not same_origin(catalog_url, resolved):
+            logger.warning("STAC search: self link is off the submitted origin")
+            continue
+        return resolved
+    return None
+
+
+# Bound on the body a catalog's POST next link may ask the follow-up to send.
+MAX_NEXT_BODY_BYTES = 16384
+MAX_NEXT_HREF_CHARS = 4096
+
+
+def _resolved_next_href(href: Any, base_url: str) -> str | None:
+    """*href* resolved against *base_url*, or None if it is not a plain http(s) URL.
+
+    Unlike ``storable_href`` this keeps a ``token`` query parameter, which is
+    how pagination cursors travel; the link is fetched once and never stored.
+    """
+    if not isinstance(href, str) or not href.strip():
+        return None
+    try:
+        resolved = urljoin(base_url, href)
+        parsed = httpx.URL(resolved)
+    except (ValueError, httpx.InvalidURL):
+        return None
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.userinfo
+        or len(resolved) > MAX_NEXT_HREF_CHARS
+        or carries_registered_credential(resolved)
+    ):
+        return None
+    return resolved
+
+
+def next_page_link(
+    data: dict[str, Any], response_url: str, catalog_url: str
+) -> dict[str, Any] | None:
+    """The response's ``rel="next"`` link as ``{method, href, body, merge}``, or None.
+
+    The follow-up request carries the caller's credential, so a link that
+    leaves the submitted catalog's origin, carries credentials of its own or
+    cannot be stored is dropped, leaving the result as the last page.
+    """
+    links = data.get("links")
+    for link in links if isinstance(links, list) else []:
+        if not isinstance(link, dict) or link.get("rel") != "next":
+            continue
+        href = _resolved_next_href(link.get("href"), response_url)
+        if href is None:
+            return None
+        if not same_origin(catalog_url, href):
+            logger.warning("STAC search: next link is off the submitted origin")
+            return None
+        # A cursor carried in headers cannot be replayed safely: echoing
+        # client-held headers to the catalog would be an injection and
+        # credential channel, so such a catalog offers no further pages.
+        if link.get("headers"):
+            return None
+        method = str(link.get("method") or "GET").upper()
+        if method not in ("GET", "POST"):
+            return None
+        body = link.get("body") if method == "POST" else None
+        if body is not None:
+            if not isinstance(body, dict):
+                return None
+            serialized = json.dumps(body)
+            if len(serialized) > MAX_NEXT_BODY_BYTES or carries_registered_credential(
+                serialized
+            ):
+                return None
+        return {
+            "method": method,
+            "href": href,
+            "body": body,
+            "merge": link.get("merge") is True,
+        }
+    return None
+
+
+def _follow_up_request(
+    next_page: dict[str, Any], base_body: dict[str, Any]
+) -> tuple[str, str, dict[str, Any] | None]:
+    """The ``(method, url, body)`` that fetches *next_page*, as advertised.
+
+    The link may be signed or opaque, so nothing is added to it: a merge
+    link's body overrides the original request's fields, any other body is
+    sent alone.
+    """
+    method = next_page["method"]
+    next_body = next_page.get("body")
+    if method == "GET":
+        return method, next_page["href"], None
+    if next_page.get("merge"):
+        return method, next_page["href"], {**base_body, **(next_body or {})}
+    return method, next_page["href"], next_body
+
+
+def _following_page(
+    data: dict[str, Any],
+    response_url: str,
+    catalog_url: str,
+    followed: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The next link, unless it repeats the one just followed.
+
+    A catalog answering with the link already followed would loop the caller
+    on one page forever.
+    """
+    following = next_page_link(data, response_url, catalog_url)
+    return None if following == followed else following
+
+
+def _make_client(credential_header: str | None = None) -> httpx.AsyncClient:
+    """Shared httpx client for STAC API requests.
+
+    Uses make_safe_client() so the per-hop SSRF revalidation hook covers
+    every redirect a STAC probe follows.
+
+    ``credential_header`` names the header this request carries, so a 302
+    to another origin is refused rather than followed with the caller's
+    key. Passed even for ``Authorization``, which httpx would silently
+    strip, because a refusal says what happened.
+    """
+    return make_safe_client(timeout=STAC_TIMEOUT, credential_header=credential_header)
+
+
+async def connect_stac_api(
+    url: str, credential: ServiceCredential | None = None
+) -> dict | None:
+    """Validate a STAC API URL and return landing page info, or None.
+
+    The whole function runs under ``DEFAULT_CHECK_TIMEOUT``, for the same
+    reason as ``probe_ogcapi``.
+
+    ``credential`` becomes a header here, keeping ``build_credential_header``
+    the tree's only producer of one.
+    """
+    try:
+        async with asyncio.timeout(DEFAULT_CHECK_TIMEOUT):
+            return await _connect_stac_api_within_deadline(url, credential)
+    except TimeoutError:
+        logger.debug("STAC connect: deadline exceeded", url=url)
+        return None
+
+
+async def _connect_stac_api_within_deadline(
+    url: str, credential: ServiceCredential | None = None
+) -> dict | None:
+    headers = {"Accept": "application/json"}
+    pair: tuple[str, str] | None = None
+    if credential is not None:
+        pair = build_credential_header(
+            replace(credential, service_format=STAC_SERVICE_FORMAT)
+        )
+        if pair is not None:
+            headers[pair[0]] = pair[1]
+    async with _make_client(None if pair is None else pair[0]) as client:
+        try:
+            # Bounded read, not a plain `client.get` — see
+            # `bounded_probe_read`'s docstring.
+            body, _ = await bounded_probe_read(
+                client, url, headers=headers, accept=OGC_JSON_ACCEPT
+            )
+        except (
+            httpx.HTTPStatusError,
+            httpx.TransportError,
+            EndpointCheckFailedError,
+        ) as exc:
+            logger.debug(
+                "STAC connect failed", url=url, error=redact_exception_text(exc)
+            )
+            return None
+
+        try:
+            data = json.loads(body)
+        except (
+            Exception
+        ):  # broad: json.loads can throw varied decoder errors; treat as non-STAC
+            logger.debug("STAC connect: non-JSON response", url=url)
+            return None
+
+        # A `200 []`/`200 null`/`200 "x"` response is valid JSON but not a
+        # dict, and `.get(...)` on it would raise `AttributeError` instead of
+        # degrading to "not a STAC API" below.
+        if not isinstance(data, dict):
+            logger.debug("STAC connect: non-dict response", url=url)
+            return None
+
+        # Must have stac_version or a type of "Catalog" or "API".
+        if not data.get("stac_version") and data.get("type") not in ("Catalog", "API"):
+            logger.debug("STAC connect: not a STAC API", url=url)
+            return None
+
+        return {
+            "id": data.get("id", "unknown"),
+            "title": data.get("title", data.get("id", "STAC Catalog")),
+            "description": data.get("description", ""),
+            "stac_version": data.get("stac_version", "unknown"),
+            "conforms_to": data.get("conformsTo", []),
+        }
+
+
+class StacCollectionDict(TypedDict):
+    """Shape of a single collection entry returned by ``list_stac_collections``."""
+
+    id: str
+    title: str
+    description: str
+    license: str | None
+    keywords: list[str]
+    bbox: list[float] | None
+    temporal_start: str | None
+    temporal_end: str | None
+    item_count: int | None
+
+
+async def list_stac_collections(
+    url: str, credential: ServiceCredential | None = None
+) -> list[StacCollectionDict]:
+    """Fetch collections from a STAC API.
+
+    Returns at most ``MAX_COLLECTIONS`` entries.
+
+    Carries the same credential the landing-page read carried, so a
+    protected catalog answers both or neither.
+    """
+    collections_url = url.rstrip("/") + "/collections"
+
+    headers: dict[str, str] = {}
+    pair: tuple[str, str] | None = None
+    if credential is not None:
+        pair = build_credential_header(
+            replace(credential, service_format=STAC_SERVICE_FORMAT)
+        )
+        if pair is not None:
+            headers[pair[0]] = pair[1]
+    async with asyncio.timeout(DEFAULT_CHECK_TIMEOUT):
+        async with _make_client(None if pair is None else pair[0]) as client:
+            body, _ = await bounded_probe_read(
+                client, collections_url, headers=headers, accept=OGC_JSON_ACCEPT
+            )
+    data = json.loads(body)
+
+    raw_collections = data.get("collections", [])
+    if len(raw_collections) > MAX_COLLECTIONS:
+        logger.warning(
+            "STAC collections: server returned more than the cap",
+            returned=len(raw_collections),
+            cap=MAX_COLLECTIONS,
+        )
+        raw_collections = raw_collections[:MAX_COLLECTIONS]
+    result = []
+    for c in raw_collections:
+        extent = c.get("extent", {})
+        spatial = extent.get("spatial", {})
+        temporal = extent.get("temporal", {})
+
+        bbox = spatial.get("bbox", [[]])[0] if spatial.get("bbox") else None
+        time_interval = (
+            temporal.get("interval", [[]])[0] if temporal.get("interval") else None
+        )
+
+        # Some STAC APIs include item count in collection metadata
+        item_count = c.get("numberMatched") or c.get("numberReturned")
+
+        result.append(
+            {
+                "id": c["id"],
+                "title": c.get("title", c["id"]),
+                "description": c.get("description", ""),
+                "license": c.get("license"),
+                "keywords": c.get("keywords", []),
+                "bbox": bbox,
+                "temporal_start": time_interval[0]
+                if time_interval and len(time_interval) > 0
+                else None,
+                "temporal_end": time_interval[1]
+                if time_interval and len(time_interval) > 1
+                else None,
+                "item_count": item_count,
+            }
+        )
+
+    return result
+
+
+async def search_stac_items(
+    url: str,
+    *,
+    collections: list[str] | None = None,
+    bbox: list[float] | None = None,
+    datetime_range: str | None = None,
+    limit: int = 20,
+    credential: ServiceCredential | None = None,
+    next_page: dict[str, Any] | None = None,
+    max_cloud_cover: float | None = None,
+    cloud_cover_mode: Literal["query", "filter"] | None = None,
+) -> dict[str, Any]:
+    """Search for items in a STAC API.
+
+    Returns a dict with items list, matched count and the ``next_page`` link
+    (None on the last page). ``next_page`` is a link this function returned
+    earlier; the caller must have validated its href against the catalog.
+
+    Carries the same credential the connect and collections reads carried,
+    so search and import agree about what the catalog publishes.
+    """
+    search_url = url.rstrip("/") + "/search"
+    limit = min(limit, MAX_SEARCH_ITEMS)
+
+    body: dict[str, Any] = {"limit": limit}
+    if collections:
+        body["collections"] = collections
+    if bbox:
+        body["bbox"] = bbox
+    if datetime_range:
+        body["datetime"] = datetime_range
+    if max_cloud_cover is not None and cloud_cover_mode == "query":
+        body["query"] = {"eo:cloud_cover": {"lte": max_cloud_cover}}
+    elif max_cloud_cover is not None and cloud_cover_mode == "filter":
+        body["filter-lang"] = "cql2-json"
+        body["filter"] = {
+            "op": "<=",
+            "args": [{"property": "eo:cloud_cover"}, max_cloud_cover],
+        }
+
+    method = "POST"
+    if next_page is not None:
+        method, search_url, body = _follow_up_request(next_page, body)
+
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    pair: tuple[str, str] | None = None
+    if credential is not None:
+        pair = build_credential_header(
+            replace(credential, service_format=STAC_SERVICE_FORMAT)
+        )
+        if pair is not None:
+            headers[pair[0]] = pair[1]
+    async with asyncio.timeout(DEFAULT_CHECK_TIMEOUT):
+        async with _make_client(None if pair is None else pair[0]) as client:
+            raw, resp = await bounded_probe_exchange(
+                client,
+                method,
+                search_url,
+                headers=headers,
+                accept=OGC_JSON_ACCEPT,
+                json_body=body,
+            )
+    data = json.loads(raw)
+
+    features = data.get("features", [])
+    # Items past the limit are dropped, which leaves the catalog's cursor
+    # beyond them, so such a page ends paging rather than skipping items.
+    over_returned = len(features) > limit
+    if over_returned:
+        logger.warning(
+            "STAC search: server returned more items than requested",
+            requested=limit,
+            returned=len(features),
+        )
+        features = features[:limit]
+    matched = data.get("numberMatched") or data.get("context", {}).get("matched")
+
+    items = []
+    for f in features:
+        # A catalog can reflect the credential it was just sent into anything
+        # it publishes, and only `item_href` passes `storable_href` here. The
+        # rest of this item is echoed back to `/import` by the client, whose
+        # own request registers no credential and so cannot recognise one,
+        # and is then stored. Judged over the whole feature rather than one
+        # field, since `id`, `collection` and `title` reach storage too.
+        if carries_registered_credential(json.dumps(f)):
+            logger.warning("STAC search: item reflects the request credential")
+            continue
+        props = f.get("properties", {})
+        assets = f.get("assets", {})
+
+        # The primary data asset (COG), through the same choice the refresh
+        # strategy re-makes later.
+        picked = pick_data_asset(assets)
+        data_asset_key, data_asset = picked if picked else (None, None)
+
+        thumbnail = assets.get("thumbnail") or next(
+            (a for a in assets.values() if "thumbnail" in (a.get("roles") or [])),
+            None,
+        )
+
+        # `datetime` may be null when a start/end range is given.
+        dt = props.get("datetime")
+        dt_start = props.get("start_datetime") or dt
+        dt_end = props.get("end_datetime") or dt
+
+        # Surface file:size so the frontend can show an estimated download
+        # size before the user commits to a multi-GB fetch.
+        data_asset_size_bytes = data_asset.get("file:size") if data_asset else None
+        if not isinstance(data_asset_size_bytes, int):
+            data_asset_size_bytes = None
+
+        items.append(
+            {
+                "id": f.get("id"),
+                "collection": f.get("collection"),
+                # resp.url is the LOGICAL post-redirect URL (the SSRF
+                # transport restores the hostname after each pinned hop), so a
+                # relative self link resolves against the caller's host, never
+                # the pinned IP.
+                "item_href": self_link_href(f, str(resp.url), url),
+                "bbox": f.get("bbox"),
+                "datetime": dt,
+                "datetime_start": dt_start,
+                "datetime_end": dt_end,
+                "title": str(props.get("title") or f.get("id") or "")[
+                    :_MAX_TITLE_CHARS
+                ],
+                "epsg": projection_epsg(props),
+                "gsd": props.get("gsd"),
+                "cloud_cover": props.get("eo:cloud_cover"),
+                "data_asset_href": data_asset.get("href") if data_asset else None,
+                # Bounded to fit DatasetAsset.media_type.
+                "data_asset_type": storable_media_type(
+                    data_asset.get("type") if data_asset else None
+                ),
+                # Durable name that survives the href moving, so refresh can
+                # follow the move instead of re-picking.
+                "data_asset_key": storable_asset_key(data_asset_key),
+                "data_asset_size_bytes": data_asset_size_bytes,
+                "thumbnail_href": thumbnail.get("href") if thumbnail else None,
+                "asset_count": len(assets),
+            }
+        )
+
+    return {
+        "items": items,
+        "matched": matched,
+        "returned": len(items),
+        "next_page": None
+        if over_returned
+        else _following_page(data, str(resp.url), url, next_page),
+    }

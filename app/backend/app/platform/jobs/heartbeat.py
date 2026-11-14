@@ -1,0 +1,418 @@
+"""Worker lease helpers for long-running ingest jobs."""
+
+import asyncio
+import re
+import uuid
+from contextlib import suppress
+from datetime import datetime, timezone
+
+import structlog
+from sqlalchemy import text, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db.sqlstate import sqlstate
+from app.platform.jobs import ledger
+from app.platform.jobs.ledger import StaleIngestAttempt
+from app.platform.jobs.models import IngestJob
+
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+# Lease shared by the materialize cap (router_analysis.py) and the
+# job-status auto-fail (platform/jobs/sweep.py), so API and poller agree. 10x
+# the renewal interval so one missed renewal can't admit a second concurrent CTAS.
+ANALYSIS_MATERIALIZE_LEASE_SECONDS = 300.0
+
+
+# Shared by the code that MAKES these names and the code that RECOGNISES
+# them. Narrow: `parcels_staging` is a legitimate user title.
+# POSIX syntax so Postgres `~` and Python `re` agree (test_staging_table_names_1858.py).
+ATTEMPT_STAGING_NAME_PATTERN = r"_staging_[0-9a-f]{32}$"
+
+_ATTEMPT_STAGING_NAME_RE = re.compile(ATTEMPT_STAGING_NAME_PATTERN)
+
+
+def attempt_scoped_staging_table(base_table: str, attempt_id: uuid.UUID) -> str:
+    """Return a PostgreSQL-safe physical staging name owned by one attempt."""
+    suffix = f"_staging_{attempt_id.hex}"
+    return f"{base_table[: 63 - len(suffix)]}{suffix}"
+
+
+def is_attempt_scoped_staging_table(table_name: str) -> bool:
+    """Whether *table_name* is a physical staging table owned by an attempt.
+
+    A killed worker's table outlives it until the stale sweep drops it. Left
+    unrecognised, table discovery would let bulk registration bind a
+    permanent dataset to a table the next attempt can rename away.
+    """
+    return _ATTEMPT_STAGING_NAME_RE.search(table_name) is not None
+
+
+# POSIX syntax, like the staging pattern, so discovery's `~` and Python agree.
+# The version number is optional: a version kept before datasets kept several
+# has none.
+PREVIOUS_VERSION_NAME_PATTERN = r"_previous_([0-9]+_)?[0-9a-f]{32}$"
+
+_PREVIOUS_VERSION_NAME_RE = re.compile(PREVIOUS_VERSION_NAME_PATTERN)
+
+
+def previous_version_table(
+    base_table: str, dataset_id: uuid.UUID, version_number: int
+) -> str:
+    """Return the name of the table that keeps one previous version of a dataset.
+
+    The number precedes the id so the 58 characters a primary key's name
+    keeps (``rename_pkey_to_match_table``) differ between versions.
+    """
+    suffix = f"_previous_{version_number}_{dataset_id.hex}"
+    return f"{base_table[: 63 - len(suffix)]}{suffix}"
+
+
+def is_previous_version_table(table_name: str) -> bool:
+    """Whether *table_name* is a dataset's retained previous-version table."""
+    return _PREVIOUS_VERSION_NAME_RE.search(table_name) is not None
+
+
+async def previous_version_name_claimed(session: AsyncSession, name: str) -> bool:
+    """Whether a catalog dataset uses *name* as its own table, so it is no previous version."""
+    claimed = await session.scalar(
+        text("SELECT 1 FROM catalog.datasets WHERE table_name = :name LIMIT 1"),
+        {"name": name},
+    )
+    return claimed is not None
+
+
+async def resolve_ingest_job_attempt(
+    job_id: uuid.UUID,
+    attempt_id: str | uuid.UUID | None,
+) -> uuid.UUID | None:
+    """Resolve a delivery token, adopting only a pre-migration queued job.
+
+    Deployments can already have tokenless Procrastinate deliveries when the
+    attempt-fencing migration lands. Existing rows remain NULL so exactly one
+    such delivery may atomically attach a token while the job is still pending.
+    New and retried jobs already have a token and therefore cannot be adopted by
+    a tokenless delivery.
+    """
+    if attempt_id is not None:
+        return (
+            attempt_id if isinstance(attempt_id, uuid.UUID) else uuid.UUID(attempt_id)
+        )
+
+    from app.core.db import async_session
+
+    adopted_attempt = uuid.uuid4()
+    async with async_session() as session:
+        result = await session.execute(
+            update(IngestJob)
+            .where(
+                IngestJob.id == job_id,
+                IngestJob.attempt_id.is_(None),
+                IngestJob.status == "pending",
+            )
+            .values(attempt_id=adopted_attempt)
+        )
+        await session.commit()
+        if result.rowcount:  # type: ignore[attr-defined]
+            return adopted_attempt
+    return None
+
+
+# The budget an attempt-fenced failure write spends on its own ingest_jobs
+# row. A long holder is a LATER attempt's phase bracket, whose id
+# the fence no longer matches, so no wait starts and a wait past this is stuck.
+JOB_ERROR_WRITE_TIMEOUT_MS = 10_000
+
+
+# The two SQLSTATEs the budget itself produces: statement_timeout and
+# lock_timeout. Any other DBAPIError out of the failure write is a database
+# problem, reported under the sibling event rather than as an expiry.
+ERROR_WRITE_EXPIRY_CODES = ("57014", "55P03")
+
+
+def log_job_error_write_failure(
+    exc: BaseException,
+    *,
+    job_id: str,
+    task: str,
+    budget_ms: int | None = None,
+) -> None:
+    """Record a failed terminal job write as its own event.
+
+    The caller must swallow *exc* and re-raise whatever it was already handling:
+    this write is secondary, and letting it out replaces the cause the operator
+    needs with a lock timeout.
+    """
+    budget_ms = JOB_ERROR_WRITE_TIMEOUT_MS if budget_ms is None else budget_ms
+    code = sqlstate(exc)
+    structlog.get_logger().warning(
+        "job_error_write_timeout"
+        if code in ERROR_WRITE_EXPIRY_CODES
+        else "job_error_write_failed",
+        job_id=job_id,
+        task=task,
+        sqlstate=code,
+        budget_ms=budget_ms,
+    )
+
+
+async def arm_job_error_write_budget(
+    session: AsyncSession, *, budget_ms: int | None = None
+) -> None:
+    """Bound this transaction's wait on the job row at the error-write budget.
+
+    Issue it on the transaction that carries the failure UPDATE and after any
+    rollback on that session: ``SET LOCAL`` dies with the transaction, so an
+    arm placed before a rollback or a commit is gone by the next statement.
+
+    ``budget_ms`` is for a caller that already sits under an outer deadline.
+    The shared budget is the default, not a floor.
+    """
+    # Resolved here, not as a default: the module global is what a test
+    # patches, and a default argument would freeze it at import.
+    budget = JOB_ERROR_WRITE_TIMEOUT_MS if budget_ms is None else budget_ms
+    await session.execute(text(f"SET LOCAL lock_timeout = {int(budget)}"))
+    await session.execute(text(f"SET LOCAL statement_timeout = {int(budget)}"))
+
+
+async def update_ingest_job_for_attempt(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    *,
+    values: dict[str, object],
+    expected_status: str = "running",
+) -> bool:
+    """Apply a job mutation only while the caller owns the active attempt.
+
+    Refuses, before any statement, ``values`` that name a column the ledger
+    owns: a job's status, reason, completion time and fence change only there.
+    """
+    if owned := ledger.OWNED_COLUMNS & values.keys():
+        raise ValueError(f"the ledger writes {sorted(owned)} itself")
+    result = await session.execute(
+        update(IngestJob)
+        .where(
+            IngestJob.id == job_id,
+            IngestJob.attempt_id == attempt_id,
+            IngestJob.status == expected_status,
+        )
+        .values(**values)
+    )
+    return bool(result.rowcount)  # type: ignore[attr-defined]
+
+
+async def write_job_failure_for_attempt(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    *,
+    task_name: str,
+    reason: str | BaseException,
+    budget_ms: int | None = None,
+) -> bool | None:
+    """Fail the running job through the ledger and commit, under the error-write budget.
+
+    ``reason`` is stored redacted; a missing or ``None`` reason raises TypeError
+    before the session is touched.
+
+    Returns whether the fence matched, or ``None`` when the write did not
+    happen at all and the transaction was ended: the budget expired or the
+    connection went. A write error never raises, because every caller reaches
+    it from a failure path where a raise would replace the cause with a lock
+    timeout.
+
+    ``None`` is not a fence miss. A caller that treats it as one drops
+    cleanup that belongs to an attempt still owning the job row. On
+    ``None`` the row stays ``running`` for the stale sweep to settle.
+
+    Issue it AFTER any rollback on *session*: ``SET LOCAL`` dies with the
+    transaction, so a budget armed before one is gone by the next statement.
+
+    A caller under an outer deadline passes a ``budget_ms`` that fits inside
+    it, or the deadline cancels this write before it can report anything.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    if reason is None:
+        raise TypeError("a failure write needs a reason")
+    budget_ms = JOB_ERROR_WRITE_TIMEOUT_MS if budget_ms is None else budget_ms
+    try:
+        # The connection first, on its own deadline: `SET LOCAL` cannot bound a
+        # wait for the POOL, which on an exhausted pool is `db_pool_timeout`
+        # (30s) before any statement runs. Nothing is in flight yet, so this is
+        # the one point in the write that is safe to cancel.
+        await asyncio.wait_for(session.connection(), timeout=budget_ms / 1000)
+        await arm_job_error_write_budget(session, budget_ms=budget_ms)
+        fenced = await ledger.fail(session, job_id, attempt_id, reason=reason)
+        await session.commit()
+        return fenced
+    except (SQLAlchemyError, TimeoutError) as write_failure:
+        # Wider than DBAPIError: a pool timeout is a SQLAlchemyError, and
+        # letting one out would replace the failure the caller is handling.
+        with suppress(Exception):  # broad: best-effort, the caller keeps its cause
+            await session.rollback()
+        log_job_error_write_failure(
+            write_failure, job_id=str(job_id), task=task_name, budget_ms=budget_ms
+        )
+        return None
+
+
+async def require_ingest_job_update(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    *,
+    values: dict[str, object],
+    expected_status: str = "running",
+) -> None:
+    """Apply a fenced mutation or abort the stale worker's transaction."""
+    if not await update_ingest_job_for_attempt(
+        session,
+        job_id,
+        attempt_id,
+        values=values,
+        expected_status=expected_status,
+    ):
+        raise StaleIngestAttempt(
+            f"Ingest attempt {attempt_id} no longer owns job {job_id}"
+        )
+
+
+async def resolve_ingest_attempt_or_skip(
+    job_id: str,
+    attempt_id: str | uuid.UUID | None,
+    *,
+    task_label: str = "ingest",
+) -> tuple[uuid.UUID, uuid.UUID] | None:
+    """Parse the job id and resolve its delivery token, or signal a skip.
+
+    Returns ``(job_uuid, attempt_uuid)``, or ``None`` when a
+    tokenless legacy delivery could not adopt the pending job — the caller
+    must return without touching the row.
+    """
+    job_uuid = uuid.UUID(job_id)
+    attempt_uuid = await resolve_ingest_job_attempt(job_uuid, attempt_id)
+    if attempt_uuid is None:
+        structlog.get_logger().warning(
+            f"Tokenless {task_label} delivery could not adopt pending legacy job",
+            job_id=job_id,
+        )
+        return None
+    return job_uuid, attempt_uuid
+
+
+async def claim_job_attempt_and_start_heartbeat(
+    session: AsyncSession,
+    job_uuid: uuid.UUID,
+    attempt_uuid: uuid.UUID,
+    *,
+    job: IngestJob | None = None,
+    current_step: str | None = None,
+) -> "asyncio.Task[None] | None":
+    """Claim the pending attempt, commit, and start the lease heartbeat.
+
+    Rolls back and returns ``None`` when the caller no longer owns
+    the attempt. When ``job``/``current_step`` are given, stamps the first
+    progress step in the same commit so polling sees a fresh signal on its
+    first poll after pickup.
+    """
+    if not await ledger.claim(session, job_uuid, attempt_uuid):
+        await session.rollback()
+        return None
+    if job is not None and current_step is not None:
+        job.current_step = current_step
+        job.progress = 0.0
+    await session.commit()
+    return asyncio.create_task(maintain_ingest_job_heartbeat(job_uuid, attempt_uuid))
+
+
+async def renew_ingest_job_heartbeat(job_id: uuid.UUID, attempt_id: uuid.UUID) -> bool:
+    """Renew a running job's lease and return whether a row was updated."""
+    from app.core.db import async_session
+
+    async with async_session() as session:
+        result = await session.execute(
+            update(IngestJob)
+            .where(
+                IngestJob.id == job_id,
+                IngestJob.attempt_id == attempt_id,
+                IngestJob.status == "running",
+            )
+            .values(heartbeat_at=datetime.now(timezone.utc))
+        )
+        await session.commit()
+        return bool(result.rowcount)  # type: ignore[attr-defined]
+
+
+async def maintain_ingest_job_heartbeat(
+    job_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    *,
+    interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+) -> None:
+    """Renew a job lease until the task ends or the row leaves `running`."""
+    logger = structlog.get_logger()
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            if not await renew_ingest_job_heartbeat(job_id, attempt_id):
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # broad: heartbeat lease renewal is best-effort
+            # Must not mask the ingest result; the next interval retries.
+            logger.warning(
+                "ingest_job_heartbeat_failed",
+                job_id=str(job_id),
+                attempt_id=str(attempt_id),
+                exc_info=True,
+            )
+
+
+async def renew_vrt_generation_heartbeat(generation_id: uuid.UUID) -> bool:
+    from app.core.db import async_session
+    from app.processing.raster.models import VrtGeneration
+
+    async with async_session() as session:
+        result = await session.execute(
+            update(VrtGeneration)
+            .where(
+                VrtGeneration.id == generation_id,
+                VrtGeneration.status == "running",
+            )
+            .values(heartbeat_at=datetime.now(timezone.utc))
+        )
+        await session.commit()
+        return bool(result.rowcount)  # type: ignore[attr-defined]
+
+
+async def maintain_vrt_generation_heartbeat(
+    generation_id: uuid.UUID,
+    *,
+    interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+) -> None:
+    """Renew a VRT generation lease until completion or cancellation."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            if not await renew_vrt_generation_heartbeat(generation_id):
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # broad: heartbeat lease renewal is best-effort
+            structlog.get_logger().warning(
+                "vrt_generation_heartbeat_failed",
+                generation_id=str(generation_id),
+                exc_info=True,
+            )
+
+
+async def stop_ingest_job_heartbeat(task: asyncio.Task[None] | None) -> None:
+    """Cancel and await a best-effort heartbeat task."""
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

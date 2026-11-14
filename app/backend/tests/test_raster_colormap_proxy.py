@@ -1,0 +1,920 @@
+"""Tests for raster_tile_proxy colormap_name + stretch query param handling.
+
+Covers:
+- colormap_name=viridis → titiler URL contains colormap_name=viridis
+- colormap_name omitted → titiler URL unchanged (no colormap_name appended)
+- colormap_name=gray → treated as default/no-op (not appended)
+- colormap_name outside allowlist → 422, Titiler NOT called
+- stretch=percentile/stddev → accepted, minmax fallback with logged warning
+- stretch=evil → 422
+- DEM (render_params starts with algorithm=) → colormap_name NOT appended
+
+Multi-band rescale and configurable bounds (backend):
+- 3-band raster + stretch=percentile → exactly 3 rescale= fragments
+- 1-band raster + stretch=percentile → exactly 1 rescale= fragment
+- band_count=4 capped at 3 → exactly 3 rescale= fragments
+- band_count None → falls back to 1 fragment, no crash
+- pmin/pmax/sigma configurable bounds, forwarded as repeated p= to /cog/statistics
+- _band_stats_cache keyed by (open_path, pmin, pmax) — isolation between bounds
+- 422 validation on invalid pmin/pmax/sigma before Titiler called
+- contract pinned (p=/percentile_<N> forwarding)
+
+Security: invalid colormap must be rejected before Titiler is called.
+Security: invalid pmin/pmax/sigma rejected before Titiler called.
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any
+from unittest.mock import MagicMock
+
+import httpx
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Helpers & fixture construction
+# ---------------------------------------------------------------------------
+
+_DATASET_ID = uuid.uuid4()
+_TILE_PATH = f"/tiles/raster-proxy/{_DATASET_ID}/0/0/0.png"
+
+
+def _make_auth_response(
+    open_path: str = "/app/staging/rasters/test.tif",
+    render_params: str = "bidx=1&rescale=0,65535",
+    band_count: int = 1,
+    data_range_default: bool = False,
+) -> httpx.Response:
+    """Build a fake raster-auth-check response matching the real handler's shape."""
+    return MagicMock(
+        status_code=200,
+        headers={
+            "X-GeoLens-Asset-OpenPath": open_path,
+            "X-GeoLens-Cache-Status": "public",
+            "X-GeoLens-Render-Params": render_params,
+            "X-GeoLens-Band-Count": str(band_count),
+            **({"X-GeoLens-Data-Range-Default": "1"} if data_range_default else {}),
+        },
+        content=b"",
+    )
+
+
+def _make_titiler_ok_response() -> MagicMock:
+    png_magic = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    return MagicMock(
+        status_code=200, content=png_magic, headers={"content-type": "image/png"}
+    )
+
+
+# Per-band statistics returned by the mocked Titiler /cog/statistics endpoint.
+# Values mirror the real ADK DEM COG. Expected stretch rescales:
+#   percentile → rescale=512.66,1304.31  (percentile_2, percentile_98)
+#   stddev     → rescale=490.6,1228.19   (mean ± 2σ, lo clamped to band min)
+#
+# Extended with b2/b3 for multi-band tests + percentile_5/percentile_95
+# for configurable-bounds tests.
+_BAND_STATS: dict[str, Any] = {
+    "b1": {
+        "min": 490.6,
+        "max": 1625.6,
+        "mean": 787.77,
+        "std": 220.21,
+        "percentile_2": 512.66,
+        "percentile_98": 1304.31,
+        "percentile_5": 530.0,
+        "percentile_95": 1280.0,
+    },
+    "b2": {
+        "min": 10.0,
+        "max": 200.0,
+        "mean": 100.0,
+        "std": 30.0,
+        "percentile_2": 20.0,
+        "percentile_98": 185.0,
+        "percentile_5": 25.0,
+        "percentile_95": 180.0,
+    },
+    "b3": {
+        "min": 5.0,
+        "max": 180.0,
+        "mean": 90.0,
+        "std": 25.0,
+        "percentile_2": 15.0,
+        "percentile_98": 170.0,
+        "percentile_5": 18.0,
+        "percentile_95": 165.0,
+    },
+}
+
+
+def _make_titiler_stats_response(payload: dict | None = None) -> MagicMock:
+    """Mock a Titiler /cog/statistics JSON response.
+
+    When payload is None, returns _BAND_STATS (which now includes b1/b2/b3 for
+    multi-band tests). Individual tests may override via self._stats_payload.
+    """
+    resp = MagicMock(status_code=200)
+    resp.json = MagicMock(return_value=payload if payload is not None else _BAND_STATS)
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestRasterColormapProxy:
+    """raster_tile_proxy colormap_name / stretch parameter handling."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_auth_check(self, monkeypatch):
+        """Replace raster_auth_check so tests don't touch the DB."""
+        self._auth_render_params = "bidx=1&rescale=0,65535"
+        self._auth_open_path = "/app/staging/rasters/test.tif"
+        self._auth_data_range_default = False
+        self._auth_band_count = 1  # default single-band; override in multi-band tests
+
+        async def _fake_auth_check(request, dataset_id, user=None, db=None):
+            return _make_auth_response(
+                self._auth_open_path,
+                self._auth_render_params,
+                self._auth_band_count,
+                self._auth_data_range_default,
+            )
+
+        from app.platform.storage import titiler_url
+        from app.processing.tiles import router as tiles_router
+
+        monkeypatch.setattr(tiles_router, "raster_auth_check", _fake_auth_check)
+        # The fake check answers with a path under this managed root.
+        monkeypatch.setattr(titiler_url, "_managed_prefix", lambda: "/app/staging/")
+
+    @pytest.fixture(autouse=True)
+    def _patch_titiler_client(self, monkeypatch):
+        """Replace _titiler_client.get with a mock; capture called URL(s).
+
+        Returns a statistics JSON for /cog/statistics URLs (stretch path) and a
+        PNG for tile URLs. ``self._stats_payload`` lets a test override the stats
+        response (e.g. to simulate a stats failure)."""
+        self._titiler_calls: list[str] = []
+        self._stats_payload: dict | None = None
+        self._stats_status: int = 200
+
+        async def _fake_get(url: str) -> MagicMock:
+            self._titiler_calls.append(url)
+            if "/statistics" in url:
+                if self._stats_status != 200:
+                    return MagicMock(
+                        status_code=self._stats_status, json=MagicMock(return_value={})
+                    )
+                return _make_titiler_stats_response(self._stats_payload)
+            return _make_titiler_ok_response()
+
+        from app.processing.tiles import router as tiles_router
+
+        mock_client = MagicMock()
+        mock_client.get = _fake_get
+        monkeypatch.setattr(tiles_router, "_titiler_client", mock_client)
+
+    @pytest.fixture(autouse=True)
+    def _clear_stats_cache(self):
+        """Clear the module-level band-stats cache between tests (it is keyed by
+        open_path, which is identical across these tests)."""
+        from app.processing.tiles import router as tiles_router
+
+        tiles_router._band_stats_cache.clear()
+        tiles_router._band_stats_failures.clear()
+        yield
+        tiles_router._band_stats_cache.clear()
+        tiles_router._band_stats_failures.clear()
+
+    @property
+    def _tile_titiler_calls(self) -> list[str]:
+        """Titiler tile calls only (excludes /cog/statistics stretch lookups)."""
+        return [u for u in self._titiler_calls if "/statistics" not in u]
+
+    @property
+    def _stats_titiler_calls(self) -> list[str]:
+        """Titiler /cog/statistics calls only."""
+        return [u for u in self._titiler_calls if "/statistics" in u]
+
+    # ------------------------------------------------------------------
+    # Behavior: colormap_name=viridis → URL contains colormap_name=viridis
+    # ------------------------------------------------------------------
+
+    async def test_colormap_viridis_appended_to_titiler_url(self, client):
+        """colormap_name=viridis is forwarded to Titiler for single-band rasters."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"colormap_name": "viridis"},
+        )
+        assert resp.status_code in (200, 204)
+        assert len(self._titiler_calls) == 1
+        assert "colormap_name=viridis" in self._titiler_calls[0], (
+            f"Expected colormap_name=viridis in Titiler URL, got: {self._titiler_calls[0]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Behavior: colormap_name omitted → URL unchanged (no colormap_name)
+    # ------------------------------------------------------------------
+
+    async def test_no_colormap_no_colormap_name_in_titiler_url(self, client):
+        """When colormap_name is omitted, Titiler URL has no colormap_name param."""
+        resp = await client.get(_TILE_PATH)
+        assert resp.status_code in (200, 204)
+        assert len(self._titiler_calls) == 1
+        assert "colormap_name" not in self._titiler_calls[0], (
+            f"Unexpected colormap_name in Titiler URL: {self._titiler_calls[0]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Behavior: colormap_name=gray → no-op (not appended to Titiler URL)
+    # ------------------------------------------------------------------
+
+    async def test_colormap_gray_not_appended(self, client):
+        """colormap_name=gray is a no-op — not forwarded to Titiler."""
+        resp = await client.get(_TILE_PATH, params={"colormap_name": "gray"})
+        assert resp.status_code in (200, 204)
+        assert len(self._titiler_calls) == 1
+        assert "colormap_name" not in self._titiler_calls[0], (
+            f"gray colormap should not appear in Titiler URL: {self._titiler_calls[0]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Behavior: colormap_name outside allowlist → 422; Titiler NOT called
+    # BLOCKING security test
+    # ------------------------------------------------------------------
+
+    async def test_invalid_colormap_returns_422(self, client):
+        """Out-of-allowlist colormap_name → 422; Titiler never called."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"colormap_name": "not_a_real_map"},
+        )
+        assert resp.status_code == 422, (
+            f"Expected 422 for invalid colormap, got: {resp.status_code}"
+        )
+        # BLOCKING: Titiler must NOT have been called
+        assert len(self._titiler_calls) == 0, (
+            f"Titiler was called despite invalid colormap (T-1140-01 violation): {self._titiler_calls}"
+        )
+
+    async def test_injection_attempt_colormap_returns_422(self, client):
+        """Colormap injection attempt → 422; Titiler never called."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"colormap_name": "viridis&evil=injection"},
+        )
+        assert resp.status_code == 422
+        assert len(self._titiler_calls) == 0, (
+            "Titiler was invoked despite injection attempt (T-1140-01 violation)"
+        )
+
+    # ------------------------------------------------------------------
+    # Behavior: stretch=percentile/stddev → accepted, minmax fallback
+    # ------------------------------------------------------------------
+
+    async def test_stretch_percentile_computes_rescale(self, client):
+        """stretch=percentile overrides the dtype rescale with
+        [percentile_2, percentile_98] from Titiler band statistics."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"colormap_name": "plasma", "stretch": "percentile"},
+        )
+        assert resp.status_code in (200, 204)
+        # One /cog/statistics lookup + one tile request
+        assert len(self._stats_titiler_calls) == 1
+        assert len(self._tile_titiler_calls) == 1
+        tile_url = self._tile_titiler_calls[0]
+        assert "colormap_name=plasma" in tile_url
+        # Stats-based rescale present; original dtype rescale (0,65535) replaced
+        assert "rescale=512.66,1304.31" in tile_url, tile_url
+        assert "rescale=0,65535" not in tile_url, tile_url
+
+    async def test_stretch_stddev_computes_rescale(self, client):
+        """stretch=stddev overrides rescale with mean±2σ,
+        clamped to the band [min, max]."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"colormap_name": "inferno", "stretch": "stddev"},
+        )
+        assert resp.status_code in (200, 204)
+        assert len(self._stats_titiler_calls) == 1
+        tile_url = self._tile_titiler_calls[0]
+        # mean 787.77 ± 2·220.21 = [347.35, 1228.19]; lo clamped to band min 490.6
+        assert "rescale=490.6,1228.19" in tile_url, tile_url
+        assert "rescale=0,65535" not in tile_url, tile_url
+
+    async def test_stretch_minmax_no_statistics_call(self, client):
+        """stretch=minmax keeps the dtype rescale and does NOT call /cog/statistics."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"colormap_name": "magma", "stretch": "minmax"},
+        )
+        assert resp.status_code in (200, 204)
+        assert len(self._stats_titiler_calls) == 0
+        assert len(self._tile_titiler_calls) == 1
+        assert "rescale=0,65535" in self._tile_titiler_calls[0]
+
+    async def test_stretch_stats_unavailable_falls_back_to_minmax(self, client):
+        """When /cog/statistics fails, stretch falls back to the dtype minmax rescale."""
+        self._stats_status = 500
+        resp = await client.get(
+            _TILE_PATH,
+            params={"colormap_name": "viridis", "stretch": "percentile"},
+        )
+        assert resp.status_code in (200, 204)
+        assert len(self._stats_titiler_calls) == 1  # attempted once
+        tile_url = self._tile_titiler_calls[0]
+        assert "rescale=0,65535" in tile_url, tile_url  # original rescale preserved
+        assert "no-store" in resp.headers["cache-control"]
+
+    async def test_float_default_stretch_uses_the_data_range(self, client):
+        self._auth_render_params = "rescale=0,1.0"
+        self._auth_data_range_default = True
+        for params in ({}, {"stretch": "minmax"}):
+            resp = await client.get(_TILE_PATH, params=params)
+            assert resp.status_code in (200, 204)
+            tile_url = self._tile_titiler_calls[-1]
+            assert "rescale=490.6,1625.6" in tile_url, tile_url
+            assert "rescale=0,1.0" not in tile_url, tile_url
+            assert "no-store" not in resp.headers["cache-control"]
+        assert len(self._stats_titiler_calls) == 1, "second tile reuses the cache"
+
+    async def test_float_default_stretch_without_statistics_keeps_dtype_rescale(
+        self, client
+    ):
+        self._auth_render_params = "rescale=0,1.0"
+        self._auth_data_range_default = True
+        self._stats_status = 500
+        resp = await client.get(_TILE_PATH)
+        assert resp.status_code in (200, 204)
+        assert "rescale=0,1.0" in self._tile_titiler_calls[0]
+        assert "no-store" in resp.headers["cache-control"]
+
+    async def test_unflagged_raster_default_stretch_makes_no_statistics_call(
+        self, client
+    ):
+        resp = await client.get(_TILE_PATH)
+        assert resp.status_code in (200, 204)
+        assert len(self._stats_titiler_calls) == 0
+        assert "rescale=0,65535" in self._tile_titiler_calls[0]
+
+    async def test_float_custom_percentile_scans_once(self, client):
+        self._auth_render_params = "rescale=0,1.0"
+        self._auth_data_range_default = True
+        resp = await client.get(
+            _TILE_PATH, params={"stretch": "percentile", "pmin": 5, "pmax": 95}
+        )
+        assert resp.status_code in (200, 204)
+        assert len(self._stats_titiler_calls) == 1
+        assert "rescale=530.0,1280.0" in self._tile_titiler_calls[0]
+        assert "rescale=0,1.0" not in self._tile_titiler_calls[0]
+
+    async def test_stretch_not_applied_to_dem(self, client):
+        """For DEM (algorithm=terrainrgb), stretch is ignored — no statistics call."""
+        self._auth_render_params = "algorithm=terrainrgb"
+        resp = await client.get(_TILE_PATH, params={"stretch": "percentile"})
+        assert resp.status_code in (200, 204)
+        assert len(self._stats_titiler_calls) == 0
+        assert "algorithm=terrainrgb" in self._tile_titiler_calls[0]
+
+    async def test_stretch_statistics_cached_across_tiles(self, client):
+        """The band-statistics lookup is cached — repeated tiles call /statistics once."""
+        for _ in range(3):
+            resp = await client.get(
+                _TILE_PATH,
+                params={"colormap_name": "plasma", "stretch": "percentile"},
+            )
+            assert resp.status_code in (200, 204)
+        assert len(self._stats_titiler_calls) == 1, self._stats_titiler_calls
+        assert len(self._tile_titiler_calls) == 3
+
+    # ------------------------------------------------------------------
+    # Behavior: stretch=evil → 422
+    # ------------------------------------------------------------------
+
+    async def test_invalid_stretch_returns_422(self, client):
+        """stretch value outside Literal allowlist → 422."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"stretch": "evil"},
+        )
+        assert resp.status_code == 422
+        assert len(self._titiler_calls) == 0
+
+    # ------------------------------------------------------------------
+    # Behavior: DEM render_params (algorithm=) → colormap_name NOT appended
+    # ------------------------------------------------------------------
+
+    async def test_dem_render_params_colormap_not_appended(self, client, monkeypatch):
+        """For DEM layers (render_params starts with algorithm=), colormap_name is NOT forwarded.
+
+        The terrainrgb algorithm must not be overridden by a colormap.
+        """
+        # Override the auth fixture to return DEM render params
+        self._auth_render_params = "algorithm=terrainrgb"
+
+        resp = await client.get(
+            _TILE_PATH,
+            params={"colormap_name": "viridis"},
+        )
+        assert resp.status_code in (200, 204)
+        assert len(self._titiler_calls) == 1
+        assert "colormap_name" not in self._titiler_calls[0], (
+            f"colormap_name must NOT be appended to DEM algorithm URL: {self._titiler_calls[0]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Additional allowlist colormaps
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "cmap", ["inferno", "plasma", "magma", "ylorrd", "bugn", "terrain"]
+    )
+    async def test_all_allowlist_colormaps_forwarded(self, client, cmap: str):
+        """All 8 allowlist colormaps (except gray) are forwarded to Titiler."""
+        resp = await client.get(_TILE_PATH, params={"colormap_name": cmap})
+        assert resp.status_code in (200, 204)
+        assert len(self._titiler_calls) == 1
+        assert f"colormap_name={cmap}" in self._titiler_calls[0]
+
+    # ------------------------------------------------------------------
+    # Multi-band rescale
+    # ------------------------------------------------------------------
+
+    async def test_three_band_stretch_produces_three_rescale_fragments(self, client):
+        """3-band raster + stretch=percentile → exactly 3 rescale= fragments.
+
+        The raster_tile_proxy must use n_bands=min(band_count or 1, 3) so each
+        band gets its own independent rescale= from Titiler per-band stats.
+        """
+        self._auth_band_count = 3
+        self._auth_render_params = (
+            "bidx=1&bidx=2&bidx=3&rescale=0,255&rescale=0,255&rescale=0,255"
+        )
+        resp = await client.get(_TILE_PATH, params={"stretch": "percentile"})
+        assert resp.status_code in (200, 204)
+        tile_url = self._tile_titiler_calls[0]
+        assert tile_url.count("rescale=") == 3, (
+            f"Expected exactly 3 rescale= fragments for 3-band input, got: {tile_url.count('rescale=')} in {tile_url}"
+        )
+
+    async def test_one_band_stretch_produces_one_rescale_fragment(self, client):
+        """1-band raster + stretch=percentile → exactly 1 rescale= fragment."""
+        self._auth_band_count = 1
+        resp = await client.get(_TILE_PATH, params={"stretch": "percentile"})
+        assert resp.status_code in (200, 204)
+        tile_url = self._tile_titiler_calls[0]
+        assert tile_url.count("rescale=") == 1, (
+            f"Expected exactly 1 rescale= fragment for 1-band input, got: {tile_url.count('rescale=')} in {tile_url}"
+        )
+
+    async def test_four_band_stretch_capped_at_three_rescale_fragments(self, client):
+        """band_count=4 is capped at 3 → exactly 3 rescale= fragments."""
+        self._auth_band_count = 4
+        self._auth_render_params = (
+            "bidx=1&bidx=2&bidx=3&rescale=0,255&rescale=0,255&rescale=0,255"
+        )
+        resp = await client.get(_TILE_PATH, params={"stretch": "percentile"})
+        assert resp.status_code in (200, 204)
+        tile_url = self._tile_titiler_calls[0]
+        assert tile_url.count("rescale=") == 3, (
+            f"Expected exactly 3 rescale= fragments (cap=3) for band_count=4, got: {tile_url.count('rescale=')} in {tile_url}"
+        )
+
+    async def test_missing_band_count_falls_back_to_one_rescale_fragment(
+        self, client, monkeypatch
+    ):
+        """band_count missing/None → 1 rescale= fragment, no crash."""
+        from app.processing.tiles import router as tiles_router
+
+        # Simulate absent X-GeoLens-Band-Count header — router must fall back to 1.
+        async def _fake_auth_no_band_count(request, dataset_id, user=None, db=None):
+            return MagicMock(
+                status_code=200,
+                headers={
+                    "X-GeoLens-Asset-OpenPath": self._auth_open_path,
+                    "X-GeoLens-Cache-Status": "public",
+                    "X-GeoLens-Render-Params": self._auth_render_params,
+                    # No X-GeoLens-Band-Count header
+                },
+                content=b"",
+            )
+
+        monkeypatch.setattr(tiles_router, "raster_auth_check", _fake_auth_no_band_count)
+        resp = await client.get(_TILE_PATH, params={"stretch": "percentile"})
+        assert resp.status_code in (200, 204)
+        tile_url = self._tile_titiler_calls[0]
+        assert tile_url.count("rescale=") == 1, (
+            f"Expected 1 rescale= fragment when band_count absent, got: {tile_url.count('rescale=')} in {tile_url}"
+        )
+
+    # ------------------------------------------------------------------
+    # Configurable bounds (backend)
+    # ------------------------------------------------------------------
+
+    async def test_custom_pmin_pmax_forwarded_as_repeated_p_params(self, client):
+        """pmin=5&pmax=95 → statistics URL raw query contains p=5&p=95."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"stretch": "percentile", "pmin": 5, "pmax": 95},
+        )
+        assert resp.status_code in (200, 204)
+        assert len(self._stats_titiler_calls) == 1
+        stats_url = self._stats_titiler_calls[0]
+        assert "p=5" in stats_url and "p=95" in stats_url, (
+            f"Expected p=5&p=95 in statistics URL, got: {stats_url}"
+        )
+
+    async def test_custom_pmin_pmax_reads_dynamic_percentile_keys(self, client):
+        """pmin=5&pmax=95 → rescale uses percentile_5/percentile_95 values."""
+        resp = await client.get(
+            _TILE_PATH,
+            params={"stretch": "percentile", "pmin": 5, "pmax": 95},
+        )
+        assert resp.status_code in (200, 204)
+        tile_url = self._tile_titiler_calls[0]
+        # b1 percentile_5=530.0, percentile_95=1280.0
+        assert "rescale=530.0,1280.0" in tile_url, (
+            f"Expected rescale=530.0,1280.0 from percentile_5/percentile_95, got: {tile_url}"
+        )
+
+    async def test_cache_key_isolation_different_bounds(self, client):
+        """[critical] Two requests with different pmin/pmax produce distinct
+        _band_stats_cache entries keyed (open_path, pmin, pmax).
+
+        This is the critical acceptance gate: without bounds in the cache key, the second
+        request would silently use the first's cached p2/p98 stats.
+        """
+        from app.processing.tiles import router as tiles_router
+
+        open_path = self._auth_open_path
+
+        # First request: default p2/p98
+        resp1 = await client.get(
+            _TILE_PATH,
+            params={"stretch": "percentile"},  # defaults to pmin=2, pmax=98
+        )
+        assert resp1.status_code in (200, 204)
+
+        # Second request: custom p5/p95
+        resp2 = await client.get(
+            _TILE_PATH,
+            params={"stretch": "percentile", "pmin": 5, "pmax": 95},
+        )
+        assert resp2.status_code in (200, 204)
+
+        # Both cache entries must exist — distinct keys, distinct stats
+        cache = tiles_router._band_stats_cache
+        assert (open_path, 2.0, 98.0) in cache, (
+            f"Expected cache key (open_path, 2.0, 98.0) but got keys: {list(cache.keys())}"
+        )
+        assert (open_path, 5.0, 95.0) in cache, (
+            f"Expected cache key (open_path, 5.0, 95.0) but got keys: {list(cache.keys())}"
+        )
+        assert len(cache) == 2, (
+            f"Expected exactly 2 distinct cache entries, got {len(cache)}: {list(cache.keys())}"
+        )
+
+        # The two tile URLs must carry different rescale= values
+        tile_urls = self._tile_titiler_calls
+        assert len(tile_urls) == 2
+        rescale_vals = [u for u in tile_urls]
+        assert rescale_vals[0] != rescale_vals[1], (
+            "Both tile requests produced identical URLs — cache isolation failed"
+        )
+
+    async def test_custom_sigma_computes_different_rescale(self, client):
+        """sigma=3 → mean ± 3·std (distinct from default sigma=2)."""
+        # Default sigma=2: rescale=490.6,1228.19 (lo clamped to 490.6)
+        # sigma=3: mean=787.77, std=220.21 → 127.14..1448.4 → clamped lo=490.6, hi=1448.4
+        resp = await client.get(
+            _TILE_PATH,
+            params={"stretch": "stddev", "sigma": 3},
+        )
+        assert resp.status_code in (200, 204)
+        tile_url = self._tile_titiler_calls[0]
+        # With sigma=3: hi = 787.77 + 3*220.21 = 787.77 + 660.63 = 1448.4
+        assert "rescale=490.6,1448.4" in tile_url, (
+            f"Expected sigma=3 rescale=490.6,1448.4, got: {tile_url}"
+        )
+        # Must differ from sigma=2 result
+        assert "rescale=490.6,1228.19" not in tile_url
+
+    async def test_default_pmin_pmax_preserves_percentile_2_98(self, client):
+        """absent pmin/pmax → reads percentile_2/percentile_98 (unchanged behavior)."""
+        resp = await client.get(_TILE_PATH, params={"stretch": "percentile"})
+        assert resp.status_code in (200, 204)
+        tile_url = self._tile_titiler_calls[0]
+        assert "rescale=512.66,1304.31" in tile_url, (
+            f"Default pmin/pmax must use percentile_2/percentile_98, got: {tile_url}"
+        )
+
+    async def test_default_sigma_preserves_two_stddev(self, client):
+        """absent sigma → 2.0·std (unchanged behavior)."""
+        resp = await client.get(_TILE_PATH, params={"stretch": "stddev"})
+        assert resp.status_code in (200, 204)
+        tile_url = self._tile_titiler_calls[0]
+        # mean=787.77, std=220.21, sigma=2 → [347.35, 1228.19]; lo clamped to 490.6
+        assert "rescale=490.6,1228.19" in tile_url, (
+            f"Default sigma must be 2.0, got: {tile_url}"
+        )
+
+    @pytest.mark.parametrize(
+        "bad_params,description",
+        [
+            ({"pmin": 95, "pmax": 5}, "pmin>=pmax"),
+            ({"pmin": -1, "pmax": 98}, "pmin<0"),
+            ({"pmin": 2, "pmax": 101}, "pmax>100"),
+            ({"sigma": 0}, "sigma=0"),
+            ({"sigma": -1}, "sigma<0"),
+        ],
+    )
+    async def test_invalid_bounds_returns_422_before_titiler(
+        self, client, bad_params, description
+    ):
+        """Invalid pmin/pmax/sigma → HTTP 422; Titiler tile-fetch NOT called.
+
+        Security: untrusted bounds must be validated before any Titiler call.
+        """
+        params = {"stretch": "percentile" if "sigma" not in bad_params else "stddev"}
+        params.update(bad_params)
+        resp = await client.get(_TILE_PATH, params=params)
+        assert resp.status_code == 422, (
+            f"Expected 422 for {description}, got {resp.status_code}"
+        )
+        # Titiler tile-fetch client must NOT have been invoked
+        assert len(self._tile_titiler_calls) == 0, (
+            f"Titiler was called despite invalid bounds ({description}): {self._tile_titiler_calls}"
+        )
+
+    @pytest.mark.parametrize(
+        "bad_params,description",
+        [
+            ({"pmin": 200}, "pmin>100 under an inactive stretch mode"),
+            ({"pmax": 101}, "pmax>100 under an inactive stretch mode"),
+            ({"pmin": -1}, "pmin<0 under an inactive stretch mode"),
+            ({"sigma": 0}, "sigma=0 under an inactive stretch mode"),
+            ({"sigma": -1}, "sigma<0 under an inactive stretch mode"),
+            # Pmin=1e309 (FastAPI coerces this literal
+            # to `inf`) under stretch=minmax -- minmax is inactive for
+            # pmin/pmax the same as stddev is, so this must be ignored the
+            # same as any other out-of-range value, never a 500.
+            (
+                {"pmin": "1e309"},
+                "pmin non-finite (1e309) under an inactive stretch mode",
+            ),
+        ],
+    )
+    async def test_out_of_range_bounds_are_ignored_under_an_inactive_stretch_mode(
+        self, client, bad_params, description
+    ):
+        """pmin/pmax/sigma are read and
+        validated ONLY when the active stretch mode reads them -- stretch=
+        minmax reads neither pmin/pmax nor sigma, so an out-of-range value
+        under it is ignored, not rejected.
+
+        This inverts what the first version of this fix pinned (validate regardless of
+        mode). That version made "inactive" a claim the API could contradict:
+        frontend/nginx.conf's raster proxy_cache_key blanks an inactive value
+        out of the cache key so a random one cannot defeat the cache, and a
+        cache HIT must never answer with a status an uncached request would
+        not have given. That version closed the gap by validating anyway and only
+        blanking well-formed values, but that still had two residuals (a
+        joint pmin/pmax ordering nginx cannot cheaply check, and a repeated
+        query parameter, where nginx reads the FIRST occurrence and this
+        endpoint's scalar Query reads the LAST). Making "inactive" mean
+        "ignored" here closes both: there is no verdict left to disagree
+        with, on either side, for a value that is never read.
+        """
+        params = {"stretch": "minmax"}
+        params.update(bad_params)
+        resp = await client.get(_TILE_PATH, params=params)
+        assert resp.status_code in (200, 204), (
+            f"Expected {description} to be ignored (200/204), got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        assert len(self._tile_titiler_calls) == 1, (
+            f"Expected the tile fetch to proceed for {description}, got "
+            f"{self._tile_titiler_calls}"
+        )
+        # minmax never computes stats, active or not.
+        assert len(self._stats_titiler_calls) == 0
+
+    # ------------------------------------------------------------------
+    # "inactive means ignored" was decided at the
+    # validation gate but not enforced on eff_pmin/eff_pmax/eff_sigma
+    # themselves -- they were resolved from "was the parameter merely
+    # present", so an inactive parameter's RAW value still reached
+    # _fetch_band_statistics/_compute_stretch_rescale. A non-finite value
+    # (pmin=1e309, which FastAPI's float coercion turns into `inf`) is
+    # inside nginx's canonical float grammar (frontend/nginx.conf), so
+    # nginx blanked it and shared a cache key with a plain stddev request:
+    # cached 200 once warm, 500 (int(inf) -> OverflowError inside
+    # _fetch_band_statistics) on the first, cold request.
+    # ------------------------------------------------------------------
+
+    async def test_inactive_non_finite_pmin_under_stddev_matches_the_bare_request(
+        self, client
+    ):
+        """pmin is inactive under stretch=stddev (only sigma is read). A
+        non-finite pmin=1e309 must resolve to the SAME default (2.0) as an
+        absent pmin -- not crash int(pmin) inside _fetch_band_statistics,
+        and not reach Titiler's statistics call with its raw value at all.
+        Proven two ways: the second call's rendered tile URL is identical to
+        the bare call's, and it issues NO second /cog/statistics request --
+        it resolves to the SAME (open_path, eff_pmin, eff_pmax) cache key as
+        the bare request and hits _band_stats_cache instead."""
+        resp_bare = await client.get(_TILE_PATH, params={"stretch": "stddev"})
+        assert resp_bare.status_code in (200, 204)
+        bare_tile_url = self._tile_titiler_calls[0]
+        assert len(self._stats_titiler_calls) == 1
+
+        self._titiler_calls.clear()
+
+        resp_inf = await client.get(
+            _TILE_PATH, params={"stretch": "stddev", "pmin": "1e309"}
+        )
+        assert resp_inf.status_code in (200, 204), (
+            "Expected an inactive, non-finite pmin under stddev to be "
+            f"ignored (200/204), got {resp_inf.status_code}: {resp_inf.text}"
+        )
+        assert self._tile_titiler_calls[0] == bare_tile_url, (
+            "An inactive, non-finite pmin must render the identical tile "
+            f"as an absent pmin: {self._tile_titiler_calls[0]!r} != "
+            f"{bare_tile_url!r}"
+        )
+        # A cache hit, not a fresh statistics call carrying the raw pmin --
+        # proves eff_pmin resolved to the SAME key (open_path, 2.0, 98.0) as
+        # the bare request, not to (open_path, inf, 98.0).
+        assert len(self._stats_titiler_calls) == 0, (
+            "Expected the resolved default to hit _band_stats_cache instead "
+            f"of issuing a new statistics call: {self._stats_titiler_calls}"
+        )
+
+    async def test_active_non_finite_pmin_returns_422_before_titiler(self, client):
+        """pmin IS active under stretch=percentile. math.isfinite() must
+        reject a non-finite pmin explicitly (rather than relying on inf's
+        IEEE-754 comparison behavior, `inf < x` is False, to fail the
+        existing 0<=pmin<pmax<=100 bound check) -- 1e309 is well inside
+        nginx's canonical float grammar, so this must 422 before Titiler is
+        ever called on the ACTIVE path too."""
+        resp = await client.get(
+            _TILE_PATH, params={"stretch": "percentile", "pmin": "1e309"}
+        )
+        assert resp.status_code == 422
+        assert len(self._tile_titiler_calls) == 0
+        assert len(self._stats_titiler_calls) == 0
+
+    async def test_active_non_finite_sigma_returns_422_before_titiler(self, client):
+        """sigma IS active under stretch=stddev. A non-finite sigma=1e309
+        must 422 -- previously `sigma > 0` alone let `inf > 0` (True) pass,
+        which would have reached _compute_stretch_rescale's
+        `mean - sigma*std` / `mean + sigma*std` and produced a literal
+        inf/-inf rescale fragment instead of a clean 422."""
+        resp = await client.get(
+            _TILE_PATH, params={"stretch": "stddev", "sigma": "1e309"}
+        )
+        assert resp.status_code == 422
+        assert len(self._tile_titiler_calls) == 0
+        assert len(self._stats_titiler_calls) == 0
+
+    async def test_dem_with_custom_bounds_no_rescale(self, client):
+        """DEM (algorithm= render_params) ignores pmin/pmax/sigma — no rescale injected."""
+        self._auth_render_params = "algorithm=terrainrgb"
+        resp = await client.get(
+            _TILE_PATH,
+            params={"stretch": "percentile", "pmin": 5, "pmax": 95},
+        )
+        assert resp.status_code in (200, 204)
+        # No /cog/statistics call for DEM
+        assert len(self._stats_titiler_calls) == 0
+        tile_url = self._tile_titiler_calls[0]
+        assert "rescale=" not in tile_url, (
+            f"DEM tile URL must not contain rescale=: {tile_url}"
+        )
+
+    # ------------------------------------------------------------------
+    # Contract-pinning test
+    # ------------------------------------------------------------------
+
+    async def test_spike01_p_param_forwarding_and_dynamic_percentile_key(self, client):
+        """Contract pin: _fetch_band_statistics forwards p=pmin&p=pmax as
+        repeated query params; _compute_stretch_rescale reads percentile_<pmin>/percentile_<pmax>
+        dynamically (not hardcoded percentile_2/percentile_98).
+
+        Live evidence: 1153-SPIKE.md confirmed Titiler /cog/statistics honors arbitrary p= params
+        and returns percentile_<N> keys (e.g. p=5&p=95 → percentile_5/percentile_95).
+        This test pins that contract in the unit-test layer so regressions are caught
+        without re-running the live spike.
+        """
+        # With pmin=5&pmax=95, the stats URL must contain p=5 and p=95
+        resp = await client.get(
+            _TILE_PATH,
+            params={"stretch": "percentile", "pmin": 5, "pmax": 95},
+        )
+        assert resp.status_code in (200, 204)
+        stats_url = self._stats_titiler_calls[0]
+        assert "p=5" in stats_url, (
+            f"SPIKE-01: p=5 not forwarded to statistics URL: {stats_url}"
+        )
+        assert "p=95" in stats_url, (
+            f"SPIKE-01: p=95 not forwarded to statistics URL: {stats_url}"
+        )
+
+        # The resulting tile URL must use percentile_5/percentile_95 values (530.0 / 1280.0)
+        # NOT the hardcoded percentile_2/percentile_98 values (512.66 / 1304.31)
+        tile_url = self._tile_titiler_calls[0]
+        assert "rescale=530.0,1280.0" in tile_url, (
+            f"SPIKE-01: tile URL must use percentile_5/percentile_95 values, got: {tile_url}"
+        )
+        assert "rescale=512.66,1304.31" not in tile_url, (
+            f"SPIKE-01: tile URL must NOT use hardcoded percentile_2/percentile_98 values: {tile_url}"
+        )
+
+    # ------------------------------------------------------------------
+    # A-fix (#315 follow-up): proxy-polluted {fmt} must be sanitized so the
+    # Titiler URL is never malformed with a double "?". Some reverse-proxy
+    # rewrites URL-encode the request query into the PATH, delivering
+    # fmt="png?stretch=...".
+    # ------------------------------------------------------------------
+
+    async def test_proxy_polluted_fmt_query_in_path_is_sanitized(self, client):
+        """fmt='png?stretch=...' (query encoded ONLY into the path) renders a tile
+        with a well-formed single-'?' Titiler URL, AND the buried stretch is
+        recovered + applied (not silently dropped to the default tile — Codex P2)."""
+        # '?' + '&' percent-encoded into the fmt path segment (a path-encoding proxy
+        # that did NOT also forward the query as a real ?query string).
+        resp = await client.get(
+            f"/tiles/raster-proxy/{_DATASET_ID}/0/0/0.png%3Fstretch=percentile"
+        )
+        assert resp.status_code in (200, 204)
+        assert len(self._tile_titiler_calls) == 1
+        url = self._tile_titiler_calls[0]
+        assert url.count("?") == 1, f"Titiler URL must have exactly one '?': {url}"
+        # endpoint must be the clean ".png" with the query starting at url=
+        assert "/0/0/0.png?url=" in url, f"Polluted fmt leaked into endpoint: {url}"
+        assert "stretch=" not in url.split("?", 1)[0], (
+            f"Pollution before the query separator: {url}"
+        )
+        # The recovered stretch=percentile must be APPLIED: a /cog/statistics lookup
+        # ran and the tile rescale is the percentile (512.66,1304.31), not default.
+        assert self._stats_titiler_calls, "buried stretch was dropped (no stats fetch)"
+        assert "rescale=512.66,1304.31" in url, (
+            f"recovered stretch=percentile not applied to tile URL: {url}"
+        )
+
+    async def test_proxy_recovers_buried_pmin_pmax_from_fmt(self, client):
+        """Buried pmin/pmax in the path are recovered and forwarded to /cog/statistics."""
+        resp = await client.get(
+            f"/tiles/raster-proxy/{_DATASET_ID}/0/0/0.png%3Fstretch=percentile%26pmin=5%26pmax=95"
+        )
+        assert resp.status_code in (200, 204)
+        assert self._stats_titiler_calls, "no stats fetch for recovered percentile"
+        stats_url = self._stats_titiler_calls[0]
+        assert "p=5" in stats_url and "p=95" in stats_url, (
+            f"recovered pmin/pmax not forwarded to statistics URL: {stats_url}"
+        )
+
+    async def test_proxy_rejects_unsupported_fmt(self, client):
+        """A non-image fmt is rejected with 400 (hardening: {fmt} feeds an upstream URL)."""
+        resp = await client.get(f"/tiles/raster-proxy/{_DATASET_ID}/0/0/0.exe")
+        assert resp.status_code == 400
+        assert not self._tile_titiler_calls, "Titiler must not be called for a bad fmt"
+
+    async def test_a_buried_query_over_the_field_count_bound_degrades_not_500(
+        self, client
+    ):
+        """`{fmt}` is attacker-reachable on an
+        unauthenticated tile URL, with no credential or source registration
+        needed -- a live path, unlike most of this round's other sites.
+        `max_num_fields=MAX_QUERY_FIELDS` on the buried-query recovery
+        parse, with the resulting `ValueError` degrading to "no buried
+        params recovered" (the same outcome an unpolluted request
+        produces), not a raw 500.
+        """
+        from app.platform.service_endpoints import MAX_QUERY_FIELDS
+
+        # A real `stretch=percentile` is IN the bomb, past the field-count
+        # bound: without the fix, `parse_qs` still recovers it (this exact
+        # shape is what `test_proxy_polluted_fmt_query_in_path_is_sanitized`
+        # above proves triggers a `/cog/statistics` lookup) -- so a
+        # discriminating test needs a recognized key present, not just an
+        # oversized field count with no key the recovery logic reads at all.
+        filler = "%26".join(f"a{n}=1" for n in range(MAX_QUERY_FIELDS))
+        bomb = f"stretch=percentile%26{filler}"
+        resp = await client.get(f"/tiles/raster-proxy/{_DATASET_ID}/0/0/0.png%3F{bomb}")
+        assert resp.status_code in (200, 204)
+        # No buried recovery ran, so this rendered as the plain default tile:
+        # a single '?', no stats lookup, the buried `stretch=percentile`
+        # NOT applied despite being present in the bomb.
+        assert self._tile_titiler_calls
+        url = self._tile_titiler_calls[0]
+        assert url.count("?") == 1
+        assert not self._stats_titiler_calls, (
+            "the field-count bound should have refused this parse before "
+            "the buried stretch=percentile was ever recovered"
+        )

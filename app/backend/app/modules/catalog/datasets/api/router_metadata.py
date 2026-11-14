@@ -1,0 +1,727 @@
+"""Dataset metadata endpoints: attributes, column stats, versions, and relationships."""
+
+import uuid
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.audit.service import AuditEvent, audit_emit
+from app.core.identity import Identity
+from app.core.record_types import capabilities
+from app.modules.auth.dependencies import (
+    get_current_active_user,
+    get_optional_user,
+    require_permission,
+)
+from app.modules.catalog.authorization import (
+    can_view_dataset_provenance,
+    check_dataset_access,
+    check_dataset_access_or_anonymous,
+    check_dataset_write_access,
+    lock_dataset_rows_for_write,
+)
+from app.modules.catalog.datasets.domain.schemas import (
+    AttributeMetadataListResponse,
+    AttributeMetadataResponse,
+    AttributeMetadataUpdate,
+    ColumnStatsResponse,
+    ColumnValuesResponse,
+    DatasetGroupsResponse,
+    DatasetGroupsUpdate,
+    DatasetRelationshipCreate,
+    DatasetRelationshipListResponse,
+    DatasetRelationshipResponse,
+    DatasetRowsResponse,
+    DatasetVersionListResponse,
+    DatasetVersionResponse,
+)
+from app.modules.catalog.datasets.domain.service import (
+    GroupNotJoinedError,
+    UnknownGroupsError,
+    dataset_groups,
+    get_dataset,
+    get_dataset_versions,
+    set_dataset_groups,
+)
+from app.core.dependencies import get_db
+from app.platform.cache.tiles import invalidate_catalog_cache
+from app.standards.ogc.errors import ERROR_RESPONSES_WRITE, FORBIDDEN_RESPONSE
+
+router = APIRouter(
+    prefix="/datasets", tags=["Datasets - Metadata"], responses=ERROR_RESPONSES_WRITE
+)
+
+
+@router.get(
+    "/{dataset_id}/versions/",
+    response_model=DatasetVersionListResponse,
+    # Read-gated (check_dataset_access_or_anonymous
+    # below), not write-gated -- see datasets/api/router.py:get_single_dataset.
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_dataset_versions_endpoint(
+    dataset_id: uuid.UUID,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetVersionListResponse:
+    """Get paginated version history for a dataset.
+
+    A caller who is neither the owner nor an administrator gets the version
+    timeline (filenames, formats, feature counts) but not ``file_hash`` or
+    ``uploaded_by``. This prevents public version history from identifying
+    editors.
+    """
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+
+    # Visibility check — returns resolved user_roles to avoid duplicate DB query
+    user_roles = await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+    can_view_provenance = can_view_dataset_provenance(dataset.record, user, user_roles)
+
+    versions, total = await get_dataset_versions(db, dataset_id, skip=skip, limit=limit)
+
+    return DatasetVersionListResponse(
+        versions=[
+            DatasetVersionResponse(
+                id=v.id,
+                dataset_id=v.dataset_id,
+                version_number=v.version_number,
+                source_filename=v.source_filename,
+                source_format=v.source_format,
+                feature_count=v.feature_count,
+                srid=v.srid,
+                geometry_type=v.geometry_type,
+                file_hash=v.file_hash if can_view_provenance else None,
+                uploaded_by=v.uploaded_by if can_view_provenance else None,
+                uploaded_at=v.uploaded_at,
+                restored_from_version=v.restored_from_version,
+            )
+            for v in versions
+        ],
+        total=total,
+    )
+
+
+@router.get(
+    "/{dataset_id}/attributes/",
+    response_model=AttributeMetadataListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_attributes_endpoint(
+    dataset_id: uuid.UUID,
+    include_removed: bool = Query(False),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> AttributeMetadataListResponse:
+    """List all attribute metadata for a dataset."""
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+    from app.modules.catalog.datasets.domain.service import list_attributes
+
+    attributes = await list_attributes(db, dataset_id, include_removed=include_removed)
+    return AttributeMetadataListResponse(
+        attributes=[AttributeMetadataResponse.model_validate(a) for a in attributes],
+        total=len(attributes),
+    )
+
+
+@router.get(
+    "/{dataset_id}/attributes/{attribute_id}/",
+    response_model=AttributeMetadataResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_attribute_endpoint(
+    dataset_id: uuid.UUID,
+    attribute_id: uuid.UUID,
+    user: Identity = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> AttributeMetadataResponse:
+    """Get a single attribute metadata entry."""
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    await check_dataset_access(db, dataset, dataset_id, user)
+    from app.modules.catalog.datasets.domain.service import get_attribute
+
+    attr = await get_attribute(db, attribute_id)
+    if attr is None or attr.dataset_id != dataset.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attribute not found"
+        )
+    return AttributeMetadataResponse.model_validate(attr)
+
+
+@router.patch(
+    "/{dataset_id}/attributes/{attribute_id}/", response_model=AttributeMetadataResponse
+)
+async def update_attribute_endpoint(
+    dataset_id: uuid.UUID,
+    attribute_id: uuid.UUID,
+    body: AttributeMetadataUpdate,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> AttributeMetadataResponse:
+    """Update user-editable attribute metadata fields."""
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    await check_dataset_write_access(db, dataset, dataset_id, user)
+    from app.modules.catalog.datasets.domain.service import (
+        get_attribute as get_attr_svc,
+    )
+    from app.modules.catalog.datasets.domain.service import (
+        ValueLabelsOverBudget,
+        update_attribute,
+    )
+    from app.modules.catalog.features.service import lock_catalog_rows_for_write
+
+    attr = await get_attr_svc(db, attribute_id)
+    if attr is None or attr.dataset_id != dataset.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attribute not found"
+        )
+    try:
+        # exclude_unset, not exclude_none, so an explicit null clears the field
+        updates = body.model_dump(exclude_unset=True)
+        if updates:
+            # The pair before the attribute row, the order every
+            # column DDL holds; attribute-first is an ABBA against them.
+            await lock_catalog_rows_for_write(db, dataset)
+            attr = await update_attribute(db, attribute_id, **updates)
+            dataset.record.updated_by = user.id
+            await audit_emit(
+                db,
+                AuditEvent(
+                    user_id=user.id,
+                    action="attribute.edit",
+                    resource_type="dataset",
+                    resource_id=dataset_id,
+                    details={
+                        "attribute_id": str(attr.id),
+                        "field_name": attr.field_name,
+                        "changed_fields": sorted(updates.keys()),
+                    },
+                ),
+            )
+            await db.commit()
+        await db.refresh(attr)
+    except ValueLabelsOverBudget:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Value labels for this dataset are over the 1 MB limit.",
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attribute not found"
+        )
+    return AttributeMetadataResponse.model_validate(attr)
+
+
+@router.post(
+    "/{dataset_id}/attributes/{attribute_id}/reset/",
+    response_model=AttributeMetadataResponse,
+)
+async def reset_attribute_endpoint(
+    dataset_id: uuid.UUID,
+    attribute_id: uuid.UUID,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> AttributeMetadataResponse:
+    """Reset attribute metadata to auto-populated values, clearing user_modified_fields."""
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    await check_dataset_write_access(db, dataset, dataset_id, user)
+    from app.modules.catalog.datasets.domain.service import (
+        get_attribute as get_attr_svc,
+    )
+    from app.modules.catalog.datasets.domain.service import (
+        reset_attribute,
+        sample_example_values,
+    )
+    from app.modules.catalog.features.service import lock_catalog_rows_for_write
+
+    attr = await get_attr_svc(db, attribute_id)
+    if attr is None or attr.dataset_id != dataset.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attribute not found"
+        )
+    try:
+        # Data table, then the pair, then the attribute row: every
+        # column DDL holds its ALTER TABLE before it takes the pair.
+        examples = await sample_example_values(
+            db, dataset.table_name, attr.field_name, attr.data_type
+        )
+        await lock_catalog_rows_for_write(db, dataset)
+        attr = await reset_attribute(
+            db, attribute_id, dataset.table_name, example_values=examples
+        )
+        dataset.record.updated_by = user.id
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=user.id,
+                action="attribute.reset",
+                resource_type="dataset",
+                resource_id=dataset_id,
+                details={
+                    "attribute_id": str(attr.id),
+                    "field_name": attr.field_name,
+                    "changed_fields": [
+                        "title",
+                        "description",
+                        "units",
+                        "domain_type",
+                        "semantic_role",
+                        "value_labels",
+                        "example_values",
+                        "user_modified_fields",
+                    ],
+                },
+            ),
+        )
+        await db.commit()
+        await db.refresh(attr)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Attribute not found"
+        )
+    return AttributeMetadataResponse.model_validate(attr)
+
+
+@router.get(
+    "/{dataset_id}/columns/{column_name}/values/",
+    response_model=ColumnValuesResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_column_values(
+    dataset_id: uuid.UUID,
+    column_name: str,
+    limit: int = Query(100, ge=1, le=500),
+    user: Identity = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> ColumnValuesResponse:
+    """Get distinct values for a dataset column (for categorical styling)."""
+    from app.modules.catalog.datasets.domain.column_stats import get_distinct_values
+
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+
+    await check_dataset_access(db, dataset, dataset_id, user)
+
+    # Raster/VRT datasets have a synthetic table_name with no backing
+    # data.<table>; answer 404 instead of an UndefinedTableError 500.
+    if not capabilities(dataset.record.record_type).feature_table:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Dataset '{dataset_id}' is a raster dataset and has no tabular "
+                "columns; use the tile/coverage endpoints."
+            ),
+        )
+
+    try:
+        values = await get_distinct_values(db, dataset.table_name, column_name, limit)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except (ProgrammingError, OperationalError):
+        # A non-raster dataset whose backing data.<table> is missing
+        # (cold-evicted / partial ingest) raises here. Convert to a 503
+        # rather than letting it surface as an unhandled 500.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Dataset table is temporarily unavailable",
+        )
+
+    return ColumnValuesResponse(values=values, count=len(values))
+
+
+@router.get(
+    "/{dataset_id}/columns/{column_name}/stats/",
+    response_model=ColumnStatsResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_column_stats_endpoint(
+    dataset_id: uuid.UUID,
+    column_name: str,
+    user: Identity = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> ColumnStatsResponse:
+    """Get statistics for a numeric dataset column (for graduated styling)."""
+    from app.modules.catalog.datasets.domain.column_stats import get_column_stats
+
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+
+    await check_dataset_access(db, dataset, dataset_id, user)
+
+    try:
+        stats = await get_column_stats(db, dataset.table_name, column_name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    return ColumnStatsResponse(**stats)
+
+
+@router.get(
+    "/{dataset_id}/relationships/",
+    response_model=DatasetRelationshipListResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def list_dataset_relationships(
+    dataset_id: uuid.UUID,
+    skip: int = Query(0, ge=0, description="Number of relationships to skip."),
+    limit: int = Query(
+        100,
+        ge=1,
+        le=1000,
+        description="Maximum number of relationships to return. Capped at 1000.",
+    ),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetRelationshipListResponse:
+    """List FK relationships for a dataset.
+
+    Paginated via ``skip`` and ``limit`` to bound response size for datasets
+    with large numbers of auto-detected relationships. Returns the standard
+    list envelope (``relationships`` + ``total``) so callers can detect whether
+    more pages exist; ``total`` counts the visible relationships before
+    pagination.
+    """
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    user_roles = await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+
+    from app.modules.catalog.datasets.domain.service import (
+        list_relationships_with_total,
+    )
+
+    items, total = await list_relationships_with_total(
+        db, dataset.record_id, user=user, user_roles=user_roles, skip=skip, limit=limit
+    )
+    return DatasetRelationshipListResponse(
+        relationships=[DatasetRelationshipResponse(**item) for item in items],
+        total=total,
+    )
+
+
+@router.post(
+    "/{dataset_id}/relationships/",
+    response_model=DatasetRelationshipResponse,
+    status_code=201,
+)
+async def create_dataset_relationship(
+    dataset_id: uuid.UUID,
+    body: DatasetRelationshipCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: Identity = Depends(require_permission("edit_metadata")),
+) -> DatasetRelationshipResponse:
+    """Create a new FK relationship. Editor+ required."""
+    from app.modules.catalog.datasets.domain.service import (
+        create_relationship,
+        validate_relationship_columns,
+    )
+
+    # Resolve dataset_id to record_id (FK references catalog.records.id)
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    # Owner-or-admin of the SOURCE dataset: the relationship is attached to
+    # it. The target only needs to be readable (visibility check below).
+    user_roles = await check_dataset_write_access(db, dataset, dataset_id, current_user)
+
+    from app.modules.catalog.datasets.domain.models import Dataset
+
+    # Accept either a Dataset.id (list/create responses) or the
+    # underlying record_id (the original input contract).
+    target_result = await db.execute(
+        select(Dataset).where(Dataset.id == body.target_dataset_id)
+    )
+    target_dataset = target_result.scalar_one_or_none()
+    if target_dataset is None:
+        target_result = await db.execute(
+            select(Dataset).where(Dataset.record_id == body.target_dataset_id)
+        )
+        target_dataset = target_result.scalar_one_or_none()
+    if target_dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Target dataset not found"
+        )
+    await check_dataset_access(
+        db, target_dataset, target_dataset.id, current_user, user_roles=user_roles
+    )
+
+    # Normalize the target to its record_id (the FK column references
+    # catalog.records.id) regardless of which id form the client supplied.
+    body = body.model_copy(update={"target_dataset_id": target_dataset.record_id})
+    try:
+        validate_relationship_columns(dataset, target_dataset, body)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        )
+    await lock_dataset_rows_for_write(db, dataset, also=target_dataset)
+    rel = await create_relationship(db, dataset.record_id, body)
+    await db.commit()
+    # FK columns store catalog.records.id, but the response
+    # carries dereferenceable Dataset.id so /collections/{id} resolves
+    # them, matching the LIST path (_visible_relationships).
+    return DatasetRelationshipResponse(
+        id=rel.id,
+        source_dataset_id=dataset.id,
+        target_dataset_id=target_dataset.id,
+        source_column=rel.source_column,
+        target_column=rel.target_column,
+        relationship_type=rel.relationship_type,
+        label=rel.label,
+        target_dataset_title=target_dataset.record.title
+        if target_dataset.record
+        else None,
+    )
+
+
+@router.delete("/relationships/{relationship_id}/", status_code=204)
+async def delete_dataset_relationship(
+    relationship_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: Identity = Depends(require_permission("edit_metadata")),
+) -> Response:
+    """Delete a FK relationship. Editor+ required."""
+    from app.modules.catalog.datasets.domain.service import (
+        delete_relationship,
+        get_relationship_datasets,
+    )
+
+    relationship = await get_relationship_datasets(db, relationship_id)
+    if relationship is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Relationship not found"
+        )
+    _rel, source_dataset, target_dataset = relationship
+    # Owner-or-admin of the SOURCE dataset (the relationship belongs to it);
+    # the target only needs to remain readable.
+    user_roles = await check_dataset_write_access(
+        db, source_dataset, source_dataset.id, current_user
+    )
+    await check_dataset_access(
+        db, target_dataset, target_dataset.id, current_user, user_roles=user_roles
+    )
+
+    await lock_dataset_rows_for_write(db, source_dataset)
+    try:
+        await delete_relationship(db, relationship_id)
+        await db.commit()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Relationship not found"
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/{dataset_id}/features/{gid}/related/{relationship_id}/",
+    response_model=DatasetRowsResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def get_feature_related_records(
+    dataset_id: uuid.UUID,
+    gid: int,
+    relationship_id: uuid.UUID,
+    request: Request,
+    limit: int = Query(50, ge=1, le=500),
+    after: int = Query(0, ge=0),
+    user: Identity | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetRowsResponse:
+    """Get related records for a feature via FK relationship."""
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    await check_dataset_access_or_anonymous(db, dataset, dataset_id, user)
+
+    from app.modules.catalog.datasets.domain.service import (
+        get_related_records,
+        get_relationship_datasets,
+    )
+
+    relationship = await get_relationship_datasets(db, relationship_id)
+    if relationship is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Relationship not found"
+        )
+    rel, _source_dataset, target_dataset = relationship
+    if rel.source_dataset_id != dataset.record_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Relationship not found"
+        )
+    await check_dataset_access_or_anonymous(db, target_dataset, target_dataset.id, user)
+
+    async def may_repair(candidate_id: uuid.UUID) -> bool:
+        # A read-only API key must not reach a catalog write through its owner.
+        if (
+            user is None
+            or request.headers.get("X-Api-Key")
+            or request.query_params.get("api_key")
+        ):
+            return False
+        # The refresh path rolled the session back, which expired the caller.
+        user_state = sa_inspect(user, raiseerr=False)
+        if user_state is not None and user_state.session is db.sync_session:
+            await db.refresh(user)
+        candidate = await get_dataset(db, candidate_id)
+        if candidate is None:
+            return False
+        try:
+            await check_dataset_write_access(db, candidate, candidate_id, user)
+        except HTTPException:
+            return False
+        return True
+
+    try:
+        result = await get_related_records(
+            db,
+            dataset_id,
+            gid,
+            relationship_id,
+            source_record_id=dataset.record_id,
+            limit=limit,
+            after=after,
+            may_repair=may_repair,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    return DatasetRowsResponse(**result)
+
+
+@router.put(
+    "/{dataset_id}/groups",
+    response_model=DatasetGroupsResponse,
+    include_in_schema=False,
+)
+@router.put(
+    "/{dataset_id}/groups/",
+    response_model=DatasetGroupsResponse,
+    responses={403: FORBIDDEN_RESPONSE},
+)
+async def set_dataset_groups_endpoint(
+    dataset_id: uuid.UUID,
+    body: DatasetGroupsUpdate,
+    request: Request,
+    user: Identity = Depends(require_permission("edit_metadata")),
+    db: AsyncSession = Depends(get_db),
+) -> DatasetGroupsResponse:
+    """Share a dataset with exactly these sharing groups (owner or admin).
+
+    An owner may add only groups they belong to (403); an admin may add any.
+    A private dataset shared with a group becomes restricted, and a restricted
+    one left with no group or role grant becomes private; internal and public
+    datasets keep their audience. 404 for an unknown group, and 422 when the
+    change would hide the dataset from viewers of the owner's shared maps or
+    let a VRT reach people who cannot see all of its sources.
+    """
+    dataset = await get_dataset(db, dataset_id)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    user_roles = await check_dataset_write_access(db, dataset, dataset_id, user)
+    warnings: list[str] = []
+    try:
+        changed = await set_dataset_groups(
+            db,
+            dataset,
+            body.group_ids,
+            actor=user,
+            is_admin="admin" in user_roles,
+            warnings_out=warnings,
+        )
+    except UnknownGroupsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "message": "Group not found",
+                "group_ids": [str(group_id) for group_id in exc.group_ids],
+            },
+        )
+    except GroupNotJoinedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can share a dataset only with groups you belong to.",
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        )
+    visibility = dataset.record.visibility
+    if changed:
+        await audit_emit(
+            db,
+            AuditEvent(
+                user_id=user.id,
+                action="metadata.edit",
+                resource_type="dataset",
+                resource_id=dataset_id,
+                details={
+                    "group_ids": sorted(str(group_id) for group_id in body.group_ids),
+                    "visibility": visibility,
+                },
+                ip_address=request.client.host if request.client else None,
+            ),
+        )
+    groups = await dataset_groups(db, dataset_id)
+    await db.commit()
+    if changed:
+        await invalidate_catalog_cache()
+    return DatasetGroupsResponse(
+        visibility=visibility,
+        groups=groups,
+        metadata_warnings=warnings or None,
+    )

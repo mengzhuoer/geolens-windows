@@ -1,0 +1,343 @@
+import { useId, useState } from 'react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { useNavigate, Link } from 'react-router';
+import { useQueryClient } from '@tanstack/react-query';
+import { useTranslation } from 'react-i18next';
+import { useCanSetPublicVisibility } from '@/hooks/use-settings';
+import { useDiscoverTables, useBulkRegister, useDatasetCountHint } from '@/components/import/hooks/use-ingest';
+import { queryKeys } from '@/lib/query-keys';
+import type { BulkRegisterResult, DiscoveredTable } from '@/types/api';
+import { toast } from 'sonner';
+import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { CheckCircle2, XCircle, Database, Search } from 'lucide-react';
+import { getGeometryTypeLabel } from '@/i18n/labels';
+import { formatNumber } from '@/lib/format';
+import { describeFailureReason } from '@/lib/failure-reason';
+
+// `restricted` is not offered at import time: a non-admin owner who picked it
+// would lock themselves out, and the dataset Access tab owns group sharing.
+type DatasetVisibilityChoice = 'private' | 'internal' | 'public';
+
+// The schema discovery scans for unregistered tables.
+const DISCOVERY_SCHEMA = 'data';
+
+// Discovery's refusal codes, each with a sentence under register.refusal.
+const REFUSAL_CODES = new Set(['source_srid_undeclared', 'source_gid_unusable']);
+
+function toDisplayName(tableName: string): string {
+  return tableName
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+export function RegisterForm() {
+  const { t } = useTranslation('import');
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { data, isLoading, error: discoverError } = useDiscoverTables();
+  const bulkRegister = useBulkRegister();
+
+  const [selected, setSelected] = useState<string | null>(null);
+  const [search, setSearch] = useState('');
+  const [visibility, setVisibility] = useState<DatasetVisibilityChoice>('private');
+  const [results, setResults] = useState<BulkRegisterResult[] | null>(null);
+
+  const tables = data?.tables ?? [];
+  const tablesEmpty = tables.length === 0;
+  const { data: datasetCountHint } = useDatasetCountHint(tablesEmpty && !isLoading);
+
+  const filtered = tables.filter((t) =>
+    t.table_name.toLowerCase().includes(search.toLowerCase()),
+  );
+  const activeTable = tables.find((t) => t.table_name === selected) ?? null;
+
+  function handleToggle(tableName: string) {
+    setSelected((prev) => (prev === tableName ? null : tableName));
+  }
+
+  async function handleRegister() {
+    if (!activeTable) return;
+
+    try {
+      const response = await bulkRegister.mutateAsync({
+        tables: [{
+          table_name: activeTable.table_name,
+          title: toDisplayName(activeTable.table_name),
+          visibility,
+        }],
+      });
+      setResults(response.results);
+
+      const successes = response.results.filter((r) => r.status === 'success');
+      const errors = response.results.filter((r) => r.status === 'error');
+
+      if (errors.length > 0) toast.error(t('register.failedToast', { count: errors.length }));
+      if (successes.length > 0) toast.success(t('register.successToast', { count: successes.length }));
+
+      await queryClient.invalidateQueries({ queryKey: queryKeys.ingest.discoverTables });
+
+      if (successes.length === 1 && errors.length === 0 && successes[0].dataset_id) {
+        navigate(`/datasets/${successes[0].dataset_id}`);
+      }
+    } catch {
+      toast.error(t('register.registerFailed'));
+    }
+  }
+
+  function handleRegisterMore() {
+    setResults(null);
+    setSelected(null);
+    queryClient.invalidateQueries({ queryKey: queryKeys.ingest.discoverTables });
+  }
+
+  if (results) {
+    const successes = results.filter((r) => r.status === 'success');
+    const errors = results.filter((r) => r.status === 'error');
+
+    return (
+      <div className="overflow-hidden rounded-xl border border-border bg-card p-5 space-y-4">
+        <h3 className="text-sm font-semibold">{t('register.resultsTitle')}</h3>
+        {successes.length > 0 && (
+          <div className="space-y-1.5">
+            {successes.map((r) => (
+              <div key={r.table_name} className="flex items-center gap-2 text-sm">
+                <CheckCircle2 className="h-4 w-4 text-success shrink-0" />
+                <span className="font-mono">{r.table_name}</span>
+                {r.dataset_id && (
+                  <Link
+                    to={`/datasets/${r.dataset_id}`}
+                    className="text-primary underline underline-offset-4 text-xs ms-auto"
+                  >
+                    {t('register.viewDataset')}
+                  </Link>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {errors.length > 0 && (
+          <div className="space-y-1.5">
+            {errors.map((r) => (
+              <div key={r.table_name} className="flex items-center gap-2 text-sm">
+                <XCircle className="h-4 w-4 text-destructive shrink-0" />
+                <span className="font-mono">{r.table_name}</span>
+                {r.error && (
+                  <span className="text-xs text-muted-foreground ms-auto">
+                    {describeFailureReason(r.error, t('register.internalFailure'))}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <Button variant="outline" onClick={handleRegisterMore}>
+          {t('register.registerMore')}
+        </Button>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center rounded-xl border border-border bg-card py-12">
+        <span className="flex items-center gap-2 text-sm text-muted-foreground">
+          <span className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          {t('register.discovering')}
+        </span>
+      </div>
+    );
+  }
+
+  if (discoverError) {
+    return (
+      <div className="rounded-xl border border-border bg-card p-6">
+        <p role="alert" className="text-sm text-destructive">
+          {t('register.discoverFailed')}
+        </p>
+      </div>
+    );
+  }
+
+  if (tablesEmpty) {
+    const allRegistered = (datasetCountHint ?? 0) > 0;
+    return (
+      <div className="rounded-xl border border-border bg-card py-12 text-center">
+        <Database
+          className={cn(
+            'mx-auto mb-3 size-8',
+            allRegistered ? 'text-success' : 'text-muted-foreground',
+          )}
+        />
+        <h3 className="text-base font-medium mb-1.5">
+          {allRegistered
+            ? t('register.emptyStateAllRegistered.title')
+            : t('register.emptyStateNoTables.title')}
+        </h3>
+        <p className="text-sm text-muted-foreground max-w-md mx-auto">
+          {allRegistered
+            ? t('register.emptyStateAllRegistered.body')
+            : t('register.emptyStateNoTables.body')}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid min-h-[420px] overflow-hidden rounded-xl border border-border bg-card md:grid-cols-[280px_1fr]">
+      {/* Left sidebar */}
+      <aside
+        aria-label={t('register.tablesSidebarLabel', { defaultValue: 'Discovered tables' })}
+        className="border-e border-border bg-surface-0 py-3"
+      >
+        <div className="px-3 pb-2.5">
+          <div className="relative">
+            <Search className="absolute start-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={t('register.searchPlaceholder', { defaultValue: 'Search tables…' })}
+              className="h-8 ps-8 text-xs"
+            />
+          </div>
+        </div>
+
+        <div className="eyebrow px-3.5 py-1.5 flex items-center gap-1.5">
+          <Database className="size-2.5" />
+          {t('register.tableCount', { schema: DISCOVERY_SCHEMA, count: filtered.length })}
+        </div>
+
+        <div className="max-h-80 overflow-y-auto">
+          {filtered.map((table) => (
+            <button
+              key={table.table_name}
+              onClick={() => handleToggle(table.table_name)}
+              className={cn(
+                'grid w-full grid-cols-[14px_1fr_auto] items-center gap-2 px-3.5 py-1.5 text-start text-xs cursor-pointer',
+                'hover:bg-surface-2',
+                selected === table.table_name && 'bg-primary/10',
+              )}
+            >
+              <Database className={cn('size-3', selected === table.table_name ? 'text-primary' : 'text-muted-foreground')} />
+              <span className={cn('truncate', selected === table.table_name && 'text-primary font-semibold')}>
+                {table.table_name}
+              </span>
+              <span className="font-mono text-2xs text-muted-foreground tracking-wide">
+                {table.estimated_rows != null ? formatNumber(table.estimated_rows) : '—'}
+              </span>
+            </button>
+          ))}
+        </div>
+      </aside>
+
+      {/* Right detail panel */}
+      <div className="p-5">
+        {activeTable ? (
+          <TableDetail
+            table={activeTable}
+            visibility={visibility}
+            onVisibilityChange={setVisibility}
+            onRegister={handleRegister}
+            isPending={bulkRegister.isPending}
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+            {t('register.selectHint', { defaultValue: 'Select a table from the list to see its schema and register it.' })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function TableDetail({
+  table,
+  visibility,
+  onVisibilityChange,
+  onRegister,
+  isPending,
+}: {
+  table: DiscoveredTable;
+  visibility: DatasetVisibilityChoice;
+  onVisibilityChange: (v: DatasetVisibilityChoice) => void;
+  onRegister: () => void;
+  isPending: boolean;
+}) {
+  const { t } = useTranslation('import');
+  // Hide the Public option when the restrict_public_visibility
+  // instance setting caps non-admins at non-public (server enforces via 403).
+  const canSetPublic = useCanSetPublicVisibility();
+  const refusal = table.refusal_reason ?? null;
+  const refusalId = useId();
+
+  return (
+    <>
+      <p className="eyebrow mb-2.5">
+        {DISCOVERY_SCHEMA} / <span className="font-medium text-foreground normal-case">{table.table_name}</span>
+      </p>
+      <h2 className="text-xl font-medium tracking-tight mb-1.5">{table.table_name}</h2>
+      <p className="text-xs text-muted-foreground mb-5 max-w-lg">
+        {t('register.detailDesc', {
+          defaultValue: 'Register to expose as a GeoLens dataset — tiled on the fly, no copy.',
+        })}
+      </p>
+
+      {/* Stats grid */}
+      <dl className="mb-5 grid grid-cols-2 gap-px overflow-hidden rounded-lg border border-border bg-border sm:grid-cols-4">
+        {[
+          { label: t('register.stats.rows'), value: table.estimated_rows != null ? formatNumber(table.estimated_rows) : '—' },
+          { label: t('register.stats.geometry'), value: table.geometry_type ? getGeometryTypeLabel(t, table.geometry_type) : t('register.stats.none') },
+          { label: 'SRID', value: table.srid != null ? `EPSG:${table.srid}` : '—' },
+          { label: t('register.stats.type'), value: table.geometry_type ? t('register.stats.spatial') : t('register.stats.nonSpatial') },
+        ].map((stat) => (
+          <div key={stat.label} className="bg-card px-3.5 py-2.5">
+            <dt className="eyebrow mb-1">{stat.label}</dt>
+            <dd className="text-sm font-medium tracking-tight">{stat.value}</dd>
+          </div>
+        ))}
+      </dl>
+
+      {refusal && (
+        <p id={refusalId} role="alert" className="max-w-lg text-xs text-destructive">
+          {REFUSAL_CODES.has(refusal) ? t(`register.refusal.${refusal}`) : refusal}
+        </p>
+      )}
+
+      {/* Actions */}
+      <fieldset disabled={isPending} className="flex items-center gap-3 flex-wrap mt-5 disabled:opacity-60">
+        {/* Native <select> → themed ui/select. */}
+        <Select
+          value={visibility}
+          onValueChange={(v) => onVisibilityChange(v as DatasetVisibilityChoice)}
+        >
+          <SelectTrigger className="w-auto min-w-[160px]" aria-label={t('register.visibilityLabel', { defaultValue: 'Visibility' })}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="private">{t('register.visibilityPrivate')}</SelectItem>
+            <SelectItem value="internal">{t('register.visibilityInternal')}</SelectItem>
+            {canSetPublic && (
+              <SelectItem value="public">{t('register.visibilityPublic')}</SelectItem>
+            )}
+          </SelectContent>
+        </Select>
+        <Button
+          onClick={onRegister}
+          disabled={isPending || refusal !== null}
+          aria-describedby={refusal ? refusalId : undefined}
+        >
+          {isPending ? (
+            <span className="flex items-center gap-2">
+              <span className="h-3 w-3 animate-spin rounded-full border-2 border-primary-foreground border-t-transparent" />
+              {t('register.registering')}
+            </span>
+          ) : (
+            t('register.registerButton', { count: 1, defaultValue: 'Register as dataset' })
+          )}
+        </Button>
+      </fieldset>
+    </>
+  );
+}

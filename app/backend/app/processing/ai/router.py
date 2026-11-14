@@ -1,0 +1,942 @@
+"""AI map generation and metadata assistance endpoints."""
+
+import json
+import uuid as uuid_mod
+from collections.abc import AsyncIterator, Awaitable
+from datetime import datetime, timedelta, timezone
+from typing import TypeVar
+
+import anyio
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
+from sqlalchemy import func, select
+from sse_starlette.sse import EventSourceResponse, ServerSentEvent
+from sqlalchemy.ext.asyncio import AsyncSession
+
+# Provider-SDK exception classes are imported lazily inside
+# `_call_llm_endpoint`, so processing/ has no top-level provider-SDK imports.
+
+from app.processing.ai.chat_service import (
+    build_dataset_chat_system_prompt,
+    chat_edit_map,
+)
+from app.processing.ai.llm_loop import ToolLoopExhaustedError
+from app.processing.ai.schemas import (
+    ChatMapLayer,
+    ChatRequest,
+    ChatResponse,
+    DatasetChatRequest,
+    MapGenerateRequest,
+    MapGenerateResponse,
+    SSEActionsEvent,
+    SSEChatDoneEvent,
+    SSEErrorEvent,
+    SSEMapDoneEvent,
+    SSETokenEvent,
+    SSEToolResultEvent,
+    SSEToolStartEvent,
+)
+from app.processing.ai.streaming import stream_chat_edit
+from app.processing.ai.metadata_schemas import (
+    KeywordSuggestionsResponse,
+    LineageDraftResponse,
+    MetadataAssistRequest,
+    QualityStatementDraftResponse,
+    SummaryDraftResponse,
+)
+from app.processing.ai.metadata_service import (
+    generate_keyword_suggestions,
+    generate_lineage_draft,
+    generate_quality_statement_draft,
+    generate_summary_draft,
+)
+from app.processing.ai.service import (
+    _should_send_sample_values,
+    generate_map_from_prompt,
+    stream_generate_map,
+)
+from typing import TYPE_CHECKING
+
+from app.core.identity import Identity
+from app.platform.extensions import get_processing_port
+from app.modules.auth.dependencies import require_permission
+from app.core.ai_credentials import builtin_providers_configured
+from app.core.dependencies import get_db
+from app.core.persistent_config import (
+    AI_ENABLED,
+    LLM_PROVIDER,
+    MAX_AI_TOKENS_PER_USER_PER_DAY,
+    llm_model_unset,
+)
+from app.processing.ai.token_usage import AITokenUsage
+from app.platform.cache import get_cache
+from app.platform.ratelimit import limiter
+from app.platform.sandbox.validator import build_table_allowlist
+from app.standards.ogc.errors import BAD_GATEWAY_RESPONSE, ERROR_RESPONSES_AUTH
+
+if TYPE_CHECKING:
+    from app.core.processing_port import ProcessingPort
+
+_T = TypeVar("_T")
+
+logger = structlog.stdlib.get_logger(__name__)
+
+router = APIRouter(prefix="/ai", tags=["Maps"], responses=ERROR_RESPONSES_AUTH)
+
+# AI endpoints call external LLM APIs, so they are rate limited to prevent quota
+# exhaustion. Map generation/chat: 10/min (heavy, multi-step tool loops).
+# Metadata assist: 20/min (lighter, single LLM call).
+_AI_GENERATE_LIMIT = "10/minute"
+_AI_METADATA_LIMIT = "20/minute"
+
+
+def _sse_response_contract(
+    *event_models: type[BaseModel], example: str
+) -> dict[int, dict]:
+    """Describe SSE framing and the JSON payload carried by each data field."""
+    return {
+        200: {
+            "description": "Server-Sent Events stream",
+            "content": {
+                "text/event-stream": {
+                    "schema": {
+                        "type": "string",
+                        "description": (
+                            "UTF-8 server-sent event frames. Each data field contains "
+                            "one JSON event payload described by "
+                            "x-geolens-event-schema."
+                        ),
+                    },
+                    "example": example,
+                    "x-geolens-event-schema": {
+                        "oneOf": [
+                            {"$ref": (f"#/components/schemas/{model.__name__}")}
+                            for model in event_models
+                        ]
+                    },
+                }
+            },
+        }
+    }
+
+
+_MAP_STREAM_RESPONSES = _sse_response_contract(
+    SSEToolStartEvent,
+    SSEToolResultEvent,
+    SSEMapDoneEvent,
+    SSEErrorEvent,
+    example=(
+        'event: tool_start\ndata: {"type":"tool_start","tool":"create_map",'
+        '"label":"Building map..."}\n\n'
+        'event: done\ndata: {"type":"done","map_id":"0190...",'
+        '"map_name":"Flood risk","explanation":"Created the map",'
+        '"datasets_used":["Flood zones"]}\n\n'
+    ),
+)
+
+_CHAT_STREAM_RESPONSES = _sse_response_contract(
+    SSETokenEvent,
+    SSEToolStartEvent,
+    SSEToolResultEvent,
+    SSEActionsEvent,
+    SSEChatDoneEvent,
+    SSEErrorEvent,
+    example=(
+        'event: token\ndata: {"type":"token","text":"Updated "}\n\n'
+        'event: actions\ndata: {"type":"actions","actions":[]}\n\n'
+        'event: done\ndata: {"type":"done","explanation":"Updated the map"}\n\n'
+    ),
+)
+
+
+def _sse_error_event(
+    message: object, *, status_code: int | None = None
+) -> ServerSentEvent:
+    """Serialize one consistent error frame for failures raised by the router."""
+    payload = {"type": "error", "message": message}
+    if status_code is not None:
+        payload["status"] = status_code
+    return ServerSentEvent(
+        data=json.dumps(payload, default=str),
+        event="error",
+    )
+
+
+# Shared permission handle so the availability probe and the budget gate below
+# resolve the same `use_ai_chat` check exactly once.
+_require_ai_chat = require_permission("use_ai_chat")
+
+
+class AIAvailabilityResponse(BaseModel):
+    """Public-safe AI readiness signal.
+
+    The response exposes no provider, model, or key details. Editors with
+    ``use_ai_chat`` can use it without access to the admin-only AI status.
+    """
+
+    available: bool
+
+
+async def _ai_availability(db: AsyncSession) -> bool:
+    """Return whether builder chat is usable WITHOUT raising or leaking detail.
+
+    Same readiness predicate as ``_check_ai_available`` (AI enabled at runtime
+    AND the admin-selected LLM provider has its credentials), collapsed to a
+    boolean so a permitted editor gets a graceful disabled state instead of a
+    403/503. Provider and key specifics are never surfaced.
+    """
+    if not await AI_ENABLED.get(db):
+        return False
+    provider = await LLM_PROVIDER.get(db)
+    keys = builtin_providers_configured()
+    return bool(keys.get(provider)) and not await llm_model_unset(db, provider)
+
+
+async def _check_ai_available(db: AsyncSession) -> None:
+    """Raise if AI is not configured or has been disabled at runtime.
+
+    Raises 403 when an admin has disabled the feature (policy decision) and
+    503 when the admin-selected LLM provider lacks credentials or a model.
+    """
+    if not await AI_ENABLED.get(db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="AI features are disabled by administrator",
+        )
+    provider = await LLM_PROVIDER.get(db)
+    keys = builtin_providers_configured()
+    if not keys.get(provider):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Selected LLM provider API key not configured",
+        )
+    if await llm_model_unset(db, provider):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Selected LLM provider has no model configured",
+        )
+
+
+async def _check_ai_budget(db: AsyncSession, user: Identity) -> int:
+    """Enforce the per-user rolling 24h AI token budget and return the cap.
+
+    slowapi's per-IP limits cap request *frequency*, not cumulative token
+    spend, so an editor could sustain heavy multi-round tool loops
+    indefinitely. Sums ``catalog.ai_token_usage`` (via
+    ``ix_ai_token_usage_user_created``) and 429s once the user's 24h
+    input+output tokens reach the operator-set cap.
+    ``MAX_AI_TOKENS_PER_USER_PER_DAY`` defaults to 0 (unlimited).
+    """
+    cap = await MAX_AI_TOKENS_PER_USER_PER_DAY.get(db)
+    if cap <= 0:
+        return cap
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    used = await db.scalar(
+        select(
+            func.coalesce(
+                func.sum(AITokenUsage.input_tokens + AITokenUsage.output_tokens), 0
+            )
+        ).where(AITokenUsage.user_id == user.id, AITokenUsage.created_at >= cutoff)
+    )
+    if used is not None and used >= cap:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Daily AI token budget exceeded. Try again later.",
+        )
+    return cap
+
+
+# Usage lands only as each provider call returns, so requests that pass the
+# budget check together each spend unseen by the others. Bounding a capped
+# user's requests in flight bounds that overshoot.
+_MAX_AI_REQUESTS_IN_FLIGHT = 2
+# Outlives the longest gated request (map generation's 300 s tool loop); a
+# slot expires on its own only when its worker died without releasing it.
+_IN_FLIGHT_SLOT_TTL_SECONDS = 600
+
+
+async def _claim_in_flight_slot(user: Identity) -> tuple[str, str] | None:
+    """Take one of the user's in-flight slots: ``(key, token)``, or None when all are held."""
+    cache = get_cache()
+    token = uuid_mod.uuid4().hex
+    for slot in range(_MAX_AI_REQUESTS_IN_FLIGHT):
+        key = f"ai:in_flight:{user.id}:{slot}"
+        if await cache.set_if_absent(key, token, ttl=_IN_FLIGHT_SLOT_TTL_SECONDS):
+            return key, token
+    return None
+
+
+async def enforce_ai_token_budget(
+    user: Identity = Depends(_require_ai_chat),
+    db: AsyncSession = Depends(get_db),
+) -> AsyncIterator[Identity]:
+    """AI-endpoint gate: ``use_ai_chat`` permission + the per-user token budget.
+
+    Runs before the handler body (and before any SSE stream opens), so an
+    over-budget caller gets a clean 429 rather than a mid-stream failure.
+    With a daily cap set, the caller also holds one of a few per-user
+    in-flight slots until the response, streamed or not, has finished.
+    """
+    if await _check_ai_budget(db, user) <= 0:
+        yield user
+        return
+    claim = await _claim_in_flight_slot(user)
+    if claim is None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many AI requests in progress. Try again when one finishes.",
+        )
+    try:
+        yield user
+    finally:
+        # Shielded: a client that disconnects mid-stream cancels the response,
+        # and the slot must still be released.
+        with anyio.CancelScope(shield=True):
+            await get_cache().compare_and_delete(*claim)
+
+
+@router.get("/availability/", response_model=AIAvailabilityResponse)
+async def ai_availability_endpoint(
+    user: Identity = Depends(_require_ai_chat),
+    db: AsyncSession = Depends(get_db),
+) -> AIAvailabilityResponse:
+    """Report whether builder AI chat is usable.
+
+    Requires ``use_ai_chat``. Returns ``available=false`` when provider keys
+    are missing and 403 when the caller lacks permission.
+    """
+    return AIAvailabilityResponse(available=await _ai_availability(db))
+
+
+async def _validate_chat_layers(
+    db: AsyncSession,
+    user: Identity,
+    map_id: str,
+    layers: list[ChatMapLayer],
+    *,
+    port: "ProcessingPort",
+) -> tuple[list[ChatMapLayer], str | None, bool]:
+    """Validate map view-access and overwrite layer metadata with authoritative DB values.
+
+    - Verifies the map exists and the current user can VIEW it (404 otherwise).
+    - Resolves each layer's dataset_table_name from the DB by dataset_id.
+    - Rejects layers whose datasets the user cannot access.
+    - Drops client-supplied sample values when sending them to the LLM is off.
+
+    **Access model:** chat is read-only with respect to map state (edits apply
+    client-side and persist only at Save, which is owner-gated), so it is gated
+    on VIEW access, not ownership. Returned ``can_edit`` (owner-or-admin)
+    selects the AI tool set; a view-only caller gets read-only tools.
+
+    **Visibility:** does NOT filter by ``visible``; analysis sees every layer
+    regardless of visibility state, which is a viewer-only decluttering signal.
+    A future visible-only scope needs an explicit ``include_hidden: bool``, not
+    a silent change here.
+
+    Returns (validated_layers, basemap_style, can_edit).
+    """
+    from app.modules.catalog.maps.models import Map as MapORM
+    from app.modules.catalog.maps._router_helpers import (
+        _can_edit_map,
+        check_map_access,
+    )
+
+    try:
+        map_uuid = uuid_mod.UUID(map_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid map_id"
+        )
+
+    map_obj = await db.execute(select(MapORM).where(MapORM.id == map_uuid))
+    map_row = map_obj.scalar_one_or_none()
+    if not map_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Map not found"
+        )
+    # Gate on VIEW access, not ownership: a non-viewer gets 404 (no existence
+    # oracle), same as a missing map. can_edit selects the AI tool set so a
+    # viewer can ask questions but cannot use the AI to edit.
+    await check_map_access(db, map_row, user)
+    can_edit = await _can_edit_map(map_row, user, db)
+    basemap_style = getattr(map_row, "basemap_style", None)
+
+    if not layers:
+        return layers, basemap_style, can_edit
+
+    allowed_tables = await build_table_allowlist(db, user)
+
+    dataset_ids = list({layer.dataset_id for layer in layers})
+    try:
+        dataset_uuids = [uuid_mod.UUID(did) for did in dataset_ids]
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid dataset_id in layers",
+        )
+
+    rows = await port.get_datasets_meta_by_ids(db, dataset_uuids)
+    # rows: (id, table_name, geometry_type)
+    dataset_meta: dict[str, dict] = {
+        str(row[0]): {"table_name": row[1], "geometry_type": row[2]} for row in rows
+    }
+    send_samples = await _should_send_sample_values(db)
+
+    validated: list[ChatMapLayer] = []
+    for layer in layers:
+        ds = dataset_meta.get(layer.dataset_id)
+        if not ds:
+            logger.warning(
+                "Chat layer references unknown dataset", dataset_id=layer.dataset_id
+            )
+            continue
+        if ds["table_name"] not in allowed_tables:
+            logger.warning(
+                "Chat layer references inaccessible dataset",
+                dataset_id=layer.dataset_id,
+                table_name=ds["table_name"],
+            )
+            continue
+        # Overwrite client-supplied metadata with authoritative values
+        layer.dataset_table_name = ds["table_name"]
+        if ds["geometry_type"]:
+            layer.geometry_type = ds["geometry_type"]
+        if not send_samples:
+            layer.sample_values = None
+        validated.append(layer)
+
+    return validated, basemap_style, can_edit
+
+
+@router.post(
+    "/generate-map/",
+    response_model=MapGenerateResponse,
+    responses={502: BAD_GATEWAY_RESPONSE},
+)
+@limiter.limit(_AI_GENERATE_LIMIT)
+async def generate_map_endpoint(
+    request: Request,
+    body: MapGenerateRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> MapGenerateResponse:
+    """Generate a map from a natural language prompt using an LLM."""
+    await _check_ai_available(db)
+
+    user_roles = await port.get_user_roles(db, user)
+
+    result = await _call_llm_endpoint(
+        generate_map_from_prompt(
+            db, user, user_roles, body.prompt, language=body.language, port=port
+        ),
+        error_prefix="AI map generation",
+        tool_loop_message="Map generation required too many steps. Try a simpler prompt.",
+        unexpected_message="AI map generation failed unexpectedly",
+    )
+
+    await db.commit()
+    return MapGenerateResponse(**result)
+
+
+@router.post(
+    "/generate-map/stream/",
+    response_class=EventSourceResponse,
+    responses=_MAP_STREAM_RESPONSES,
+)
+@limiter.limit(_AI_GENERATE_LIMIT)
+async def generate_map_stream_endpoint(
+    request: Request,
+    body: MapGenerateRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> EventSourceResponse:
+    """Generate a map from a natural language prompt with streaming progress events."""
+
+    async def event_generator():
+        # Validation runs inside the generator so failures yield a streaming
+        # error event rather than a raw HTTP 500 the SSE client cannot decode.
+        try:
+            await _check_ai_available(db)
+            user_roles = await port.get_user_roles(db, user)
+        except HTTPException as exc:
+            yield _sse_error_event(
+                exc.detail,
+                status_code=exc.status_code,
+            )
+            return
+        except (
+            Exception
+        ):  # broad: pre-flight validation can fail unpredictably in async SSE context
+            logger.exception("Map generation pre-flight error")
+            yield _sse_error_event(
+                "An unexpected error occurred",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        try:
+            async for event in stream_generate_map(
+                db, user, user_roles, body.prompt, language=body.language, port=port
+            ):
+                if await request.is_disconnected():
+                    break
+                # default=str: events can carry Decimal/datetime from query_data rows
+                yield ServerSentEvent(
+                    data=json.dumps(event, default=str), event=event["type"]
+                )
+        except Exception:  # broad: SSE stream generator — any unhandled error must yield a graceful error event
+            logger.exception("Map generation stream error")
+            yield _sse_error_event(
+                "An unexpected error occurred",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    return EventSourceResponse(event_generator())
+
+
+@router.post(
+    "/chat/", response_model=ChatResponse, responses={502: BAD_GATEWAY_RESPONSE}
+)
+@limiter.limit(_AI_GENERATE_LIMIT)
+async def chat_endpoint(
+    request: Request,
+    body: ChatRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> ChatResponse:
+    """Chat-based map editing: send a message and get back edit actions."""
+    await _check_ai_available(db)
+
+    validated_layers, basemap_style, can_edit = await _validate_chat_layers(
+        db, user, body.map_id, body.layers, port=port
+    )
+    user_roles = await port.get_user_roles(db, user)
+
+    return await _call_llm_endpoint(
+        chat_edit_map(
+            db,
+            user,
+            user_roles,
+            body.message,
+            validated_layers,
+            language=body.language,
+            history=body.history or None,
+            basemap_style=basemap_style,
+            port=port,
+            map_id=body.map_id,
+            can_edit=can_edit,
+        ),
+        error_prefix="Chat map editing",
+        tool_loop_message="Request required too many steps. Try a simpler instruction.",
+        unexpected_message="Chat map editing failed unexpectedly",
+    )
+
+
+@router.post(
+    "/chat/stream/",
+    response_class=EventSourceResponse,
+    responses=_CHAT_STREAM_RESPONSES,
+)
+@limiter.limit(_AI_GENERATE_LIMIT)
+async def chat_stream_endpoint(
+    request: Request,
+    body: ChatRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> EventSourceResponse:
+    """Chat-based map editing with server-sent event streaming."""
+
+    async def event_generator():
+        # Validation runs inside the generator so failures yield a streaming
+        # error event rather than a raw HTTP 500 the SSE client cannot decode.
+        try:
+            await _check_ai_available(db)
+            validated_layers, basemap_style, can_edit = await _validate_chat_layers(
+                db, user, body.map_id, body.layers, port=port
+            )
+            user_roles = await port.get_user_roles(db, user)
+        except HTTPException as exc:
+            # The SSE body is always a 200 stream, so the HTTP status rides in
+            # the error event for the client to classify it (403/503 → banner)
+            # instead of treating it as a generic retryable failure.
+            yield _sse_error_event(
+                exc.detail,
+                status_code=exc.status_code,
+            )
+            return
+        except (
+            Exception
+        ):  # broad: pre-flight validation can fail unpredictably in async SSE context
+            logger.exception("Chat pre-flight error")
+            yield _sse_error_event(
+                "An unexpected error occurred",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        try:
+            async for event in stream_chat_edit(
+                db,
+                user,
+                user_roles,
+                body.message,
+                validated_layers,
+                language=body.language,
+                history=body.history or None,
+                basemap_style=basemap_style,
+                port=port,
+                map_id=body.map_id,
+                can_edit=can_edit,
+            ):
+                if await request.is_disconnected():
+                    break
+                # default=str: events can carry Decimal/datetime from query_data rows
+                yield ServerSentEvent(
+                    data=json.dumps(event, default=str), event=event["type"]
+                )
+        except Exception:  # broad: SSE stream generator — any unhandled error must yield a graceful error event
+            logger.exception("Chat stream error")
+            yield _sse_error_event(
+                "An unexpected error occurred",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    return EventSourceResponse(event_generator())
+
+
+async def _validate_chat_dataset(
+    db: AsyncSession,
+    user: Identity,
+    dataset_id: str,
+    *,
+    port: "ProcessingPort",
+) -> ChatMapLayer:
+    """Resolve and authorize a dataset for dataset-scoped chat.
+
+    Authorization mirrors ``_authorize_metadata_dataset``: the
+    attacker-controlled ``dataset_id`` is access-checked with
+    ``check_dataset_access``, which raises 404 on denial, the same as for a
+    nonexistent dataset, so it is not an existence oracle.
+
+    Returns a server-built ChatMapLayer with only authoritative DB values.
+    Raster/VRT datasets are rejected: their pixels live in object storage,
+    not a queryable ``data.*`` table.
+    """
+    try:
+        dsid = uuid_mod.UUID(dataset_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid dataset_id",
+        )
+    dataset = await port.get_dataset(db, dsid)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    await port.check_dataset_access(db, dataset, dsid, user)
+
+    record = getattr(dataset, "record", None)
+    record_type = getattr(record, "record_type", None)
+    if record_type not in ("vector_dataset", "table"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="AI chat is only available for vector and table datasets",
+        )
+
+    sample_values = None
+    if dataset.sample_values and await _should_send_sample_values(db):
+        sample_values = {
+            k: (v[:5] if isinstance(v, list) else v)
+            for k, v in dataset.sample_values.items()
+        }
+
+    title = getattr(record, "title", None)
+    # column_info is capped at 50 columns to bound token usage.
+    return ChatMapLayer(
+        id=str(dsid),
+        name=title or dataset.table_name,
+        dataset_id=str(dsid),
+        dataset_table_name=dataset.table_name,
+        geometry_type=dataset.geometry_type,
+        column_info=dataset.column_info[:50] if dataset.column_info else None,
+        dataset_title=title,
+        feature_count=dataset.feature_count,
+        sample_values=sample_values,
+    )
+
+
+@router.post(
+    "/chat/dataset/stream/",
+    response_class=EventSourceResponse,
+    responses=_CHAT_STREAM_RESPONSES,
+)
+@limiter.limit(_AI_GENERATE_LIMIT)
+async def dataset_chat_stream_endpoint(
+    request: Request,
+    body: DatasetChatRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> EventSourceResponse:
+    """Dataset-scoped AI chat: ask questions about a single dataset's data.
+
+    Read-only by construction — ``can_edit=False`` selects the query_data-only
+    tool set, and a dataset-framed system prompt replaces the map-editing one.
+    Reuses the whole map-chat streaming pipeline (SQL generation, sandbox
+    validation, RBAC table allowlist, token budgeting) with one synthetic
+    server-built layer.
+    """
+
+    async def event_generator():
+        # Validation runs inside the generator so failures yield a streaming
+        # error event rather than a raw HTTP 500 the SSE client cannot decode.
+        try:
+            await _check_ai_available(db)
+            layer = await _validate_chat_dataset(db, user, body.dataset_id, port=port)
+            user_roles = await port.get_user_roles(db, user)
+        except HTTPException as exc:
+            yield _sse_error_event(exc.detail, status_code=exc.status_code)
+            return
+        except (
+            Exception
+        ):  # broad: pre-flight validation can fail unpredictably in async SSE context
+            logger.exception("Dataset chat pre-flight error")
+            yield _sse_error_event(
+                "An unexpected error occurred",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        try:
+            async for event in stream_chat_edit(
+                db,
+                user,
+                user_roles,
+                body.message,
+                [layer],
+                language=body.language,
+                history=body.history or None,
+                port=port,
+                # The "dataset:" prefix keeps the schema-context cache
+                # partition disjoint from map-id partitions.
+                map_id=f"dataset:{body.dataset_id}",
+                can_edit=False,
+                system_prompt_override=build_dataset_chat_system_prompt(
+                    layer, language=body.language
+                ),
+                # Enforces the dataset scope: without this the sandbox
+                # allowlist is user-wide and generated SQL could reach any
+                # table the user can see.
+                restrict_tables=frozenset({layer.dataset_table_name}),
+                # Dataset chat has no map, so the overlay-only run_analysis
+                # tool is withheld.
+                has_map=False,
+            ):
+                if await request.is_disconnected():
+                    break
+                # default=str: events can carry Decimal/datetime from query_data rows
+                yield ServerSentEvent(
+                    data=json.dumps(event, default=str), event=event["type"]
+                )
+        except Exception:  # broad: SSE stream generator — any unhandled error must yield a graceful error event
+            logger.exception("Dataset chat stream error")
+            yield _sse_error_event(
+                "An unexpected error occurred",
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    return EventSourceResponse(event_generator())
+
+
+async def _call_llm_endpoint(
+    coro: Awaitable[_T],
+    *,
+    error_prefix: str,
+    tool_loop_message: str | None = None,
+    unexpected_message: str = "AI metadata generation failed unexpectedly",
+) -> _T:
+    """Shared error handler for AI endpoints (chat, generate-map, metadata).
+
+    Maps the standard LLM exception taxonomy to HTTP errors:
+      - ValueError                      → 422 (caller-supplied detail)
+      - ToolLoopExhaustedError          → 422 (when tool_loop_message is set)
+      - APIConnectionError (provider)   → 502 "Could not connect to LLM provider"
+      - APIError (provider)             → 502 "LLM provider returned an error"
+      - Anything else                   → 500 with caller-supplied message
+
+    Pass ``tool_loop_message`` for endpoints that run multi-step tool loops
+    (chat, generate-map). Metadata endpoints don't tool-loop, so leave it None.
+    """
+    # Deferred so provider SDKs don't load at module import time; used only
+    # in the `except` clauses below.
+    import anthropic
+    import openai
+
+    try:
+        return await coro
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(e),
+        )
+    except ToolLoopExhaustedError:
+        if tool_loop_message is None:
+            # Metadata endpoints don't tool-loop; degrade gracefully anyway.
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Request required too many steps. Try a simpler instruction.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=tool_loop_message,
+        )
+    except (anthropic.APIConnectionError, openai.APIConnectionError) as e:
+        logger.warning(f"{error_prefix} connection error", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not connect to LLM provider",
+        )
+    except (anthropic.APIError, openai.APIError) as e:
+        logger.warning(f"{error_prefix} API error", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM provider returned an error",
+        )
+    except (
+        Exception
+    ):  # broad: LLM service can throw arbitrary errors beyond APIError subtypes
+        logger.exception(f"{error_prefix.lower().replace(' ', '_')}_failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=unexpected_message,
+        )
+
+
+async def _authorize_metadata_dataset(
+    db: AsyncSession, dataset_id: str, user: Identity, port: "ProcessingPort"
+) -> None:
+    """Authorize the attacker-controlled body.dataset_id before AI metadata
+    generation. Without this, any editor (default role has ``use_ai_chat``)
+    can read ANY user's PRIVATE dataset (metadata, source_url/filename, column
+    schema, sample values), because ``_build_dataset_context`` loads it with no
+    visibility filter and echoes it into the LLM prompt/response.
+    Authorize in the handler, not inside ``_build_dataset_context``: its
+    ``dataset_id``-keyed TTL cache has no ``user`` param, so a cache hit would
+    bypass an in-service check. ``check_dataset_access`` raises 404 on denial,
+    the same as for a nonexistent dataset, so it is not an existence oracle.
+
+    Goes through ProcessingPort, not a direct catalog import, so an
+    Enterprise/Cloud port can observe this authorization.
+    """
+    try:
+        dsid = uuid_mod.UUID(dataset_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid dataset_id",
+        )
+    dataset = await port.get_dataset(db, dsid)
+    if dataset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found"
+        )
+    await port.check_dataset_access(db, dataset, dsid, user)
+
+
+@router.post(
+    "/metadata/summary/",
+    response_model=SummaryDraftResponse,
+    responses={502: BAD_GATEWAY_RESPONSE},
+)
+@limiter.limit(_AI_METADATA_LIMIT)
+async def generate_metadata_summary(
+    request: Request,
+    body: MetadataAssistRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> SummaryDraftResponse:
+    """Generate an AI-drafted summary for a dataset."""
+    await _check_ai_available(db)
+    await _authorize_metadata_dataset(db, body.dataset_id, user, port)
+    return await _call_llm_endpoint(
+        generate_summary_draft(db, body.dataset_id, port=port, user_id=user.id),
+        error_prefix="AI metadata summary generation",
+    )
+
+
+@router.post(
+    "/metadata/keywords/",
+    response_model=KeywordSuggestionsResponse,
+    responses={502: BAD_GATEWAY_RESPONSE},
+)
+@limiter.limit(_AI_METADATA_LIMIT)
+async def generate_metadata_keywords(
+    request: Request,
+    body: MetadataAssistRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> KeywordSuggestionsResponse:
+    """Generate AI-suggested keywords for a dataset."""
+    await _check_ai_available(db)
+    await _authorize_metadata_dataset(db, body.dataset_id, user, port)
+    user_roles = await port.get_user_roles(db, user)
+    return await _call_llm_endpoint(
+        generate_keyword_suggestions(
+            db, body.dataset_id, port=port, user=user, user_roles=user_roles
+        ),
+        error_prefix="AI metadata keyword generation",
+    )
+
+
+@router.post(
+    "/metadata/lineage/",
+    response_model=LineageDraftResponse,
+    responses={502: BAD_GATEWAY_RESPONSE},
+)
+@limiter.limit(_AI_METADATA_LIMIT)
+async def generate_metadata_lineage(
+    request: Request,
+    body: MetadataAssistRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> LineageDraftResponse:
+    """Generate an AI-drafted lineage summary for a dataset."""
+    await _check_ai_available(db)
+    await _authorize_metadata_dataset(db, body.dataset_id, user, port)
+    return await _call_llm_endpoint(
+        generate_lineage_draft(db, body.dataset_id, port=port, user_id=user.id),
+        error_prefix="AI metadata lineage generation",
+    )
+
+
+@router.post(
+    "/metadata/quality-statement/",
+    response_model=QualityStatementDraftResponse,
+    responses={502: BAD_GATEWAY_RESPONSE},
+)
+@limiter.limit(_AI_METADATA_LIMIT)
+async def generate_metadata_quality_statement(
+    request: Request,
+    body: MetadataAssistRequest,
+    user: Identity = Depends(enforce_ai_token_budget),
+    db: AsyncSession = Depends(get_db),
+    port: "ProcessingPort" = Depends(get_processing_port),
+) -> QualityStatementDraftResponse:
+    """Generate an AI-drafted quality statement for a dataset."""
+    await _check_ai_available(db)
+    await _authorize_metadata_dataset(db, body.dataset_id, user, port)
+    return await _call_llm_endpoint(
+        generate_quality_statement_draft(
+            db, body.dataset_id, port=port, user_id=user.id
+        ),
+        error_prefix="AI metadata quality statement generation",
+    )

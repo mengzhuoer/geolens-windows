@@ -1,0 +1,233 @@
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { useValidation } from '@/components/dataset/hooks/use-dataset';
+import { ValidationStatus } from '@/components/dataset/ValidationStatus';
+import type { ValidationIssue } from '@/types/api';
+
+vi.mock('@/components/dataset/hooks/use-dataset', () => ({
+  useValidation: vi.fn(),
+}));
+
+vi.mock('@/hooks/use-settings', () => ({
+  useFeatureFlags: () => ({
+    data: {
+      enable_dataset_editing: false,
+      require_metadata_for_publish: false,
+    },
+  }),
+}));
+
+const mockUseValidation = vi.mocked(useValidation);
+
+function createValidationResult({
+  isValid = true,
+  errors = [],
+  warnings = [],
+}: {
+  isValid?: boolean;
+  errors?: ValidationIssue[];
+  warnings?: ValidationIssue[];
+} = {}): ReturnType<typeof useValidation> {
+  return {
+    data: {
+      is_valid: isValid,
+      errors,
+      warnings,
+      quality_score: null,
+    },
+    isLoading: false,
+  } as ReturnType<typeof useValidation>;
+}
+
+describe('ValidationStatus', () => {
+  it.each([
+    [1, 1, '1 issue found', '1 warning'],
+    [2, 2, '2 issues found', '2 warnings'],
+  ])('pluralizes the status badge for %i issue(s)', (errors, warnings, issuesText, warningsText) => {
+    const issue = (field: string): ValidationIssue => ({ field, message: `Missing ${field}`, severity: 'error' });
+    mockUseValidation.mockReturnValue(
+      createValidationResult({
+        isValid: false,
+        errors: Array.from({ length: errors }, (_, i) => issue(`f${i}`)),
+      }),
+    );
+    const { unmount } = render(<ValidationStatus datasetId="dataset-1" canEdit />);
+    expect(screen.getByText(issuesText)).toBeInTheDocument();
+    unmount();
+
+    mockUseValidation.mockReturnValue(
+      createValidationResult({
+        warnings: Array.from({ length: warnings }, (_, i) => ({ ...issue(`w${i}`), severity: 'warning' as const })),
+      }),
+    );
+    render(<ValidationStatus datasetId="dataset-1" canEdit />);
+    expect(screen.getByText(warningsText)).toBeInTheDocument();
+  });
+
+  beforeEach(() => {
+    mockUseValidation.mockReturnValue(createValidationResult());
+  });
+
+  it('renders helper guidance without repeating the itemized issues', () => {
+    mockUseValidation.mockReturnValue(
+      createValidationResult({
+        isValid: false,
+        errors: [
+          { field: 'source_url', message: 'Missing source URL', severity: 'error' },
+          { field: 'source_url', message: 'Source URL is required', severity: 'error' },
+        ],
+        warnings: [
+          { field: 'update_frequency', message: 'Missing update cadence', severity: 'warning' },
+        ],
+      }),
+    );
+
+    render(<ValidationStatus datasetId="dataset-1" canEdit />);
+
+    expect(screen.getByTestId('validation-helper-text')).toHaveTextContent(/Troubleshoot/i);
+    expect(screen.queryByTestId('validation-likely-causes')).not.toBeInTheDocument();
+    expect(screen.getByText(/Missing source URL/)).toBeInTheDocument();
+    expect(screen.getByTestId('validation-troubleshoot-trigger')).toBeInTheDocument();
+  });
+
+  it('opens and closes the in-app troubleshoot dialog from inline trigger', async () => {
+    const user = userEvent.setup();
+    mockUseValidation.mockReturnValue(
+      createValidationResult({
+        isValid: false,
+        errors: [{ field: 'title', message: 'Title is required', severity: 'error' }],
+      }),
+    );
+
+    render(<ValidationStatus datasetId="dataset-1" canEdit />);
+
+    await user.click(screen.getByTestId('validation-troubleshoot-trigger'));
+
+    expect(screen.getByTestId('validation-troubleshoot-dialog')).toBeInTheDocument();
+    expect(screen.getByText(/validation troubleshooting/i)).toBeInTheDocument();
+    expect(screen.getByTestId('validation-troubleshoot-errors')).toBeInTheDocument();
+
+    await user.click(screen.getByTestId('validation-troubleshoot-close'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('validation-troubleshoot-dialog')).not.toBeInTheDocument();
+    });
+  });
+
+  it('offers field navigation from troubleshoot for issues with known destinations', async () => {
+    const user = userEvent.setup();
+    const onNavigateToField = vi.fn();
+    mockUseValidation.mockReturnValue(
+      createValidationResult({
+        isValid: false,
+        errors: [{ field: 'summary', message: 'Summary is required', severity: 'error' }],
+      }),
+    );
+
+    render(
+      <ValidationStatus
+        datasetId="dataset-1"
+        canEdit
+        onNavigateToField={onNavigateToField}
+      />,
+    );
+
+    await user.click(screen.getByTestId('validation-troubleshoot-trigger'));
+    await user.click(screen.getByRole('button', { name: 'Go to field' }));
+
+    expect(onNavigateToField).toHaveBeenCalledWith('summary');
+  });
+
+  it('offers readers issue details and a maintainer route without edit instructions', async () => {
+    const user = userEvent.setup();
+    mockUseValidation.mockReturnValue(createValidationResult({
+      isValid: false,
+      errors: [{ field: 'summary', message: 'Summary is required', severity: 'error' }],
+    }));
+    render(<ValidationStatus datasetId="dataset-1" onNavigateToField={vi.fn()} />);
+
+    expect(screen.getByTestId('validation-helper-text')).toHaveTextContent('Ask the dataset owner');
+    await user.click(screen.getByTestId('validation-troubleshoot-trigger'));
+    expect(screen.getByTestId('validation-troubleshoot-errors')).toBeInTheDocument();
+    expect(screen.queryByTestId('validation-troubleshoot-next-steps')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Go to field' })).not.toBeInTheDocument();
+  });
+
+  it('does not show troubleshoot affordance for clean datasets', () => {
+    mockUseValidation.mockReturnValue(createValidationResult({ isValid: true }));
+
+    render(<ValidationStatus datasetId="dataset-1" />);
+
+    expect(screen.getByText(/ready to publish/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('validation-helper-text')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('validation-troubleshoot-trigger')).not.toBeInTheDocument();
+  });
+
+  it('applies semantic color tokens to status icons', () => {
+    mockUseValidation.mockReturnValue(
+      createValidationResult({
+        isValid: false,
+        errors: [{ field: 'title', message: 'Required', severity: 'error' }],
+        warnings: [{ field: 'summary', message: 'Recommended', severity: 'warning' }],
+      }),
+    );
+
+    const { container } = render(<ValidationStatus datasetId="dataset-1" />);
+
+    expect(container.querySelector('.text-destructive')).toBeInTheDocument();
+  });
+
+  it('applies success color token when valid', () => {
+    mockUseValidation.mockReturnValue(createValidationResult({ isValid: true }));
+
+    const { container } = render(<ValidationStatus datasetId="dataset-1" />);
+
+    expect(container.querySelector('.text-success')).toBeInTheDocument();
+  });
+
+  it('keeps compact mode concise while still exposing troubleshoot action for warnings', () => {
+    mockUseValidation.mockReturnValue(
+      createValidationResult({
+        isValid: true,
+        warnings: [{ field: 'lineage_summary', message: 'Missing lineage summary', severity: 'warning' }],
+      }),
+    );
+
+    render(<ValidationStatus datasetId="dataset-1" mode="compact" />);
+
+    expect(screen.getByTestId('validation-status-compact')).toBeInTheDocument();
+    expect(screen.getByTestId('validation-likely-causes-compact')).toHaveTextContent(/Likely:/i);
+    expect(screen.getByTestId('validation-troubleshoot-trigger')).toBeInTheDocument();
+  });
+  it('shows localized field labels and links each message to its editor section', async () => {
+    const user = userEvent.setup();
+    const onNavigateToField = vi.fn();
+    mockUseValidation.mockReturnValue(createValidationResult({
+      isValid: false,
+      errors: [
+        { field: 'lineage_summary', message: 'Lineage summary is required', severity: 'error' },
+        { field: 'srid', message: 'CRS is required', severity: 'error' },
+      ],
+      warnings: [{ field: 'attribute_descriptions', message: '3 attributes missing descriptions', severity: 'warning' }],
+    }));
+    render(<ValidationStatus datasetId="dataset-1" canEdit onNavigateToField={onNavigateToField} />);
+
+    expect(screen.queryByText(/lineage_summary|attribute_descriptions|srid/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Go to field: Lineage summary' }));
+    expect(onNavigateToField).toHaveBeenCalledWith('lineage_summary');
+    await user.click(screen.getByRole('button', { name: 'Go to field: Attribute descriptions' }));
+    expect(onNavigateToField).toHaveBeenCalledWith('attribute_descriptions');
+    expect(screen.getByText('Coordinate reference system:')).toBeInTheDocument();
+  });
+
+  it('shows a localized label without a link for readers', () => {
+    mockUseValidation.mockReturnValue(createValidationResult({
+      isValid: false,
+      errors: [{ field: 'source_url', message: 'Source URL is required', severity: 'error' }],
+    }));
+    render(<ValidationStatus datasetId="dataset-1" onNavigateToField={vi.fn()} />);
+
+    expect(screen.getByText('Source URL:')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Go to field/ })).not.toBeInTheDocument();
+  });
+});

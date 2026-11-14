@@ -1,0 +1,298 @@
+/**
+ * PR #274 follow-up regression test — drops during the upload-config fetch
+ *
+ * The dropzone used to be disabled while useUploadConfig was fetching, which
+ * made react-dropzone silently swallow files staged in that window (no toast,
+ * no request, no same-page recovery). UploadForm now queues those drops and
+ * flushes them once the query settles, re-applying the batch cap with the
+ * fresh quota.
+ */
+import { render, screen, act, waitFor } from '@/test/test-utils';
+import { UploadForm } from '../UploadForm';
+import { clearUploadBatch } from '@/api/upload-session';
+
+// ---------------------------------------------------------------------------
+// Module mocks
+// ---------------------------------------------------------------------------
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, opts?: Record<string, unknown>) => {
+      if (typeof opts?.defaultValue === 'string') return opts.defaultValue;
+      return key;
+    },
+  }),
+}));
+
+vi.mock('@/api/ingest', () => ({
+  uploadFile: vi.fn(),
+  uploadPresigned: vi.fn(),
+  previewFile: vi.fn(),
+  commitImport: vi.fn(),
+}));
+
+// Controllable useUploadConfig state — tests mutate this then rerender.
+let mockConfig: { data: unknown; isFetching: boolean } = { data: null, isFetching: false };
+vi.mock('@/components/import/hooks/use-ingest', () => ({
+  useUploadConfig: () => mockConfig,
+}));
+
+// Stub the dropzone: expose onFilesAccepted via buttons so tests can stage
+// drops without real DOM file inputs.
+vi.mock('../FileDropzone', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../FileDropzone')>();
+  return {
+    effectiveBatchLimit: original.effectiveBatchLimit,
+    FileDropzone: ({
+      onFilesAccepted,
+      remainingQuota,
+      allowedExtensions,
+      maxSizeMb,
+    }: {
+      onFilesAccepted: (files: File[]) => void;
+      remainingQuota?: number | null;
+      allowedExtensions?: string[];
+      maxSizeMb?: number;
+    }) => (
+      <div
+        data-testid="file-dropzone"
+        data-remaining-quota={String(remainingQuota)}
+        data-allowed-extensions={String(allowedExtensions)}
+        data-max-size-mb={String(maxSizeMb)}
+      >
+        <button
+          data-testid="drop-pointcloud"
+          onClick={() => onFilesAccepted([new File(['LASF'], 'terrain.copc.laz')])}
+        >
+          Drop point cloud
+        </button>
+        <button
+          data-testid="drop-one"
+          onClick={() => onFilesAccepted([new File(['{}'], 'a.geojson')])}
+        >
+          Drop one
+        </button>
+        <button
+          data-testid="drop-two"
+          onClick={() =>
+            onFilesAccepted([new File(['{}'], 'b.geojson'), new File(['{}'], 'c.geojson')])
+          }
+        >
+          Drop two
+        </button>
+        <button
+          data-testid="drop-mixed"
+          onClick={() => {
+            const oversized = new File(['{}'], 'huge.geojson');
+            Object.defineProperty(oversized, 'size', { value: 50 * 1024 * 1024 });
+            onFilesAccepted([new File(['{}'], 'good.geojson'), new File(['x'], 'evil.exe'), oversized]);
+          }}
+        >
+          Drop mixed
+        </button>
+      </div>
+    ),
+  };
+});
+
+vi.mock('../BulkUploadProgress', () => ({
+  BulkUploadProgress: () => <div data-testid="bulk-upload-progress" />,
+}));
+vi.mock('../BulkReviewList', () => ({
+  BulkReviewList: () => <div data-testid="bulk-review-list" />,
+}));
+vi.mock('../BulkTrackingList', () => ({
+  BulkTrackingList: () => <div data-testid="bulk-tracking-list" />,
+}));
+
+vi.mock('sonner', () => ({
+  toast: { success: vi.fn(), warning: vi.fn(), error: vi.fn() },
+}));
+
+// ---------------------------------------------------------------------------
+
+import { uploadFile, previewFile } from '@/api/ingest';
+import { toast } from 'sonner';
+
+const mockUploadFile = vi.mocked(uploadFile);
+const mockPreviewFile = vi.mocked(previewFile);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // UploadForm drives uploads through the module-scoped
+  // upload-session singleton — reset it so a batch left in-flight (most of
+  // these tests never commit or remove their dropped file) is not ADOPTED
+  // by the next test's render() instead of starting from the dropzone.
+  clearUploadBatch();
+  mockConfig = { data: null, isFetching: false };
+  mockUploadFile.mockResolvedValue({ job_id: 'job-1' } as never);
+  mockPreviewFile.mockResolvedValue({
+    source_filename: 'a.geojson',
+    columns: [],
+    row_count: 1,
+    geometry_type: 'Point',
+    crs: null,
+    latlon_candidates: null,
+  } as never);
+});
+
+afterEach(() => {
+  clearUploadBatch();
+});
+
+describe('UploadForm — queued drops during config fetch', () => {
+  it('queues a drop while fetching and processes it once the config settles', async () => {
+    mockConfig = { data: null, isFetching: true };
+    const { rerender } = render(<UploadForm />);
+
+    await act(async () => {
+      screen.getByTestId('drop-one').click();
+    });
+
+    // Still fetching: nothing processed, nothing swallowed silently.
+    expect(mockUploadFile).not.toHaveBeenCalled();
+    expect(screen.getByTestId('file-dropzone')).toBeInTheDocument();
+
+    mockConfig = { data: { remaining_dataset_quota: null }, isFetching: false };
+    await act(async () => {
+      rerender(<UploadForm />);
+    });
+
+    await waitFor(() => expect(mockUploadFile).toHaveBeenCalledTimes(1));
+  });
+
+  it('merges multiple drops staged in the same fetch window', async () => {
+    mockConfig = { data: null, isFetching: true };
+    const { rerender } = render(<UploadForm />);
+
+    await act(async () => {
+      screen.getByTestId('drop-one').click();
+    });
+    await act(async () => {
+      screen.getByTestId('drop-two').click();
+    });
+
+    mockConfig = { data: { remaining_dataset_quota: null }, isFetching: false };
+    await act(async () => {
+      rerender(<UploadForm />);
+    });
+
+    // All three files from both drops upload — the second drop didn't
+    // overwrite the first.
+    await waitFor(() => expect(mockUploadFile).toHaveBeenCalledTimes(3));
+  });
+
+  it('trims a queued batch to the fresh quota and rejects the overflow per file', async () => {
+    mockConfig = { data: null, isFetching: true };
+    const { rerender } = render(<UploadForm />);
+
+    await act(async () => {
+      screen.getByTestId('drop-two').click();
+    });
+
+    // Fresh quota allows only 1 dataset — the first file uploads and the
+    // second gets a per-file rejection toast, matching react-dropzone v19's
+    // maxFiles behavior (accept up to the limit, not wholesale rejection).
+    mockConfig = { data: { remaining_dataset_quota: 1 }, isFetching: false };
+    await act(async () => {
+      rerender(<UploadForm />);
+    });
+
+    await waitFor(() => expect(mockUploadFile).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(toast.error)).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-applies extension and size gates from the settled config to queued drops', async () => {
+    // During the fetch window the dropzone validated against nothing — the
+    // flush must reject what the settled config rejects.
+    mockConfig = { data: null, isFetching: true };
+    const { rerender } = render(<UploadForm />);
+
+    await act(async () => {
+      screen.getByTestId('drop-mixed').click();
+    });
+
+    mockConfig = {
+      data: {
+        remaining_dataset_quota: null,
+        allowed_extensions: '.geojson,.zip',
+        max_file_size_bytes: 10 * 1024 * 1024,
+      },
+      isFetching: false,
+    };
+    await act(async () => {
+      rerender(<UploadForm />);
+    });
+
+    // Only good.geojson survives: evil.exe (extension) and huge.geojson (50MB
+    // vs 10MB cap) are rejected with the dropzone's own toast.
+    await waitFor(() => expect(mockUploadFile).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(toast.error)).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes permissive gates to the dropzone while fetching, the live ones after', async () => {
+    // Cached stale values during the refetch window must not reach
+    // react-dropzone's maxFiles/accept/maxSize — they would reject drops the
+    // fresh config allows before the queue could re-validate them.
+    mockConfig = {
+      data: {
+        remaining_dataset_quota: 1,
+        allowed_extensions: '.zip',
+        max_file_size_bytes: 1024 * 1024,
+      },
+      isFetching: true,
+    };
+    const { rerender } = render(<UploadForm />);
+    const dz = screen.getByTestId('file-dropzone');
+    expect(dz).toHaveAttribute('data-remaining-quota', 'null');
+    expect(dz).toHaveAttribute('data-allowed-extensions', 'undefined');
+    expect(dz).toHaveAttribute('data-max-size-mb', 'undefined');
+
+    mockConfig = {
+      data: {
+        remaining_dataset_quota: 7,
+        allowed_extensions: '.zip,.geojson',
+        max_file_size_bytes: 10 * 1024 * 1024,
+      },
+      isFetching: false,
+    };
+    await act(async () => {
+      rerender(<UploadForm />);
+    });
+    const settled = screen.getByTestId('file-dropzone');
+    expect(settled).toHaveAttribute('data-remaining-quota', '7');
+    expect(settled).toHaveAttribute('data-allowed-extensions', '.zip,.geojson');
+    expect(settled).toHaveAttribute('data-max-size-mb', '10');
+  });
+
+  it('processes immediately when the config is already settled', async () => {
+    mockConfig = { data: { remaining_dataset_quota: null }, isFetching: false };
+    render(<UploadForm />);
+
+    await act(async () => {
+      screen.getByTestId('drop-one').click();
+    });
+
+    await waitFor(() => expect(mockUploadFile).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(toast.error)).not.toHaveBeenCalled();
+  });
+
+  it('sends a .laz file with the pointcloud kind', async () => {
+    mockConfig = {
+      data: { remaining_dataset_quota: null, allowed_extensions: '.geojson,.laz' },
+      isFetching: false,
+    };
+    render(<UploadForm />);
+
+    await act(async () => {
+      screen.getByRole('radio', { name: 'upload.kindPointCloud' }).click();
+    });
+    await act(async () => {
+      screen.getByTestId('drop-pointcloud').click();
+    });
+
+    await waitFor(() => expect(mockUploadFile).toHaveBeenCalledTimes(1));
+    expect(mockUploadFile.mock.calls[0][0].name).toBe('terrain.copc.laz');
+    expect(mockUploadFile.mock.calls[0][2]).toBe('pointcloud');
+  });
+});

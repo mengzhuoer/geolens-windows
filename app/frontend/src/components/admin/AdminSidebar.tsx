@@ -1,0 +1,331 @@
+import { useLocation, Link, NavLink } from 'react-router';
+import { useTranslation } from 'react-i18next';
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarMenu,
+  SidebarMenuItem,
+  SidebarMenuButton,
+  SidebarMenuBadge,
+  SidebarHeader,
+  SidebarFooter,
+  SidebarRail,
+} from '@/components/ui/sidebar';
+import {
+  LayoutDashboard,
+  Users,
+  UsersRound,
+  Briefcase,
+  ScrollText,
+  Link2,
+  Wrench,
+  Settings,
+  Shield,
+  Brain,
+  Globe,
+  Map,
+  HardDrive,
+  Paintbrush,
+  Lock,
+  ArrowLeft,
+} from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
+import {
+  useFailedJobCount,
+  useUserCount,
+  usePublishedMapCount,
+  useAuditLogCount,
+} from '@/hooks/use-admin';
+import { useEdition } from '@/hooks/use-edition';
+import { useEnterpriseOnlyTabs } from '@/hooks/use-settings';
+import { usePermissions } from '@/hooks/use-permissions';
+import { useSettingsAdmin } from '@/hooks/use-settings-admin';
+import { useGroupAdmin } from '@/hooks/use-admin-groups';
+import { semanticBadgeColors } from '@/lib/status-colors';
+import type { Capability } from '@/lib/capabilities';
+
+// The destructive recipe an alert badge needs, matching the
+// `failed` pill in the jobs table (both come from `semanticBadgeColors`).
+// SidebarMenuBadge pins its color with `peer-hover/menu-button:` and
+// `peer-data-[active=true]/menu-button:` variants, so those prefixes have to
+// be re-declared here — a bare `text-destructive` reverts to the accent color
+// the moment the row is hovered or becomes the active route.
+const ALERT_BADGE_CLASSES = [
+  'border',
+  semanticBadgeColors.destructive,
+  'peer-hover/menu-button:text-destructive',
+  'peer-data-[active=true]/menu-button:text-destructive',
+].join(' ');
+
+const overviewItems = [
+  { labelKey: 'adminNav.overview', to: '/admin/overview', icon: LayoutDashboard, capability: 'manage_users' },
+] as const;
+
+// A badge that counts a PROBLEM rather than a total. It renders in destructive
+// colors, is spoken as "N failed jobs" instead of a naked number, and rewrites
+// the nav target to the matching filtered list so the number the user clicked
+// equals the number the list shows.
+type AlertBadge = {
+  /** Query string appended to `to` while the badge is visible. */
+  filter: string;
+  /** Plural i18n key rendered with `{ count }` for the spoken/hover label. */
+  labelKey: string;
+};
+
+type OperationItem = {
+  labelKey: string;
+  to: string;
+  icon: LucideIcon;
+  badgeKey?: 'users' | 'failed' | 'audit' | 'sharedMaps';
+  alertBadge?: AlertBadge;
+  enterpriseOnly?: boolean;
+  capability: Capability;
+  // SAML calls the mode-aware /settings/oauth-providers/ API
+  // (manage_tenants in multi-tenant mode), not raw manage_settings, and groups
+  // switch to manage_tenants the same way, so visibility must follow the
+  // mode-aware hooks rather than `capability`.
+  gate?: 'settings' | 'groups';
+};
+
+const operationsItems: readonly OperationItem[] = [
+  { labelKey: 'adminNav.users', to: '/admin/users', icon: Users, badgeKey: 'users', capability: 'manage_users' },
+  { labelKey: 'adminNav.groups', to: '/admin/groups', icon: UsersRound, capability: 'manage_users', gate: 'groups' },
+  {
+    labelKey: 'adminNav.jobs',
+    to: '/admin/jobs',
+    icon: Briefcase,
+    badgeKey: 'failed',
+    alertBadge: { filter: 'status=failed', labelKey: 'adminNav.failedJobs' },
+    capability: 'manage_users',
+  },
+  { labelKey: 'adminNav.auditLog', to: '/admin/audit', icon: ScrollText, badgeKey: 'audit', capability: 'manage_settings' },
+  { labelKey: 'adminNav.sharedMaps', to: '/admin/shared-maps', icon: Link2, badgeKey: 'sharedMaps', capability: 'manage_users' },
+  { labelKey: 'adminNav.saml', to: '/admin/saml', icon: Lock, enterpriseOnly: true, capability: 'manage_settings', gate: 'settings' },
+];
+
+// Fallback for when /settings/enterprise-tabs/ is unreachable (boot, network
+// failure). Must match the backend `_ENTERPRISE_ONLY_TABS` frozenset in
+// `backend/app/modules/settings/router.py` so community sidebars never flash
+// forbidden tabs. The hook below is the canonical source.
+const FALLBACK_ENTERPRISE_ONLY_TABS: string[] = ['branding', 'appearance'];
+
+// Declarative settings-nav entries. `tabKey` (when set) is the Settings tab
+// key the route corresponds to (e.g. '/admin/settings/appearance' ->
+// 'appearance'); its enterpriseOnly flag is derived from the server-driven set
+// inside the component. Entries without a tabKey (config-ops) are not Settings
+// tabs and carry a static enterpriseOnly flag.
+type SettingsNavBaseItem = {
+  labelKey: string;
+  to: string;
+  icon: LucideIcon;
+  tabKey?: string; // Settings tab key (omitted for non-tab routes)
+  enterpriseOnly?: boolean; // Static fallback for non-tab routes only
+};
+
+const settingsItemsBase: readonly SettingsNavBaseItem[] = [
+  { labelKey: 'admin:settings.tabs.general', to: '/admin/settings/general', icon: Settings, tabKey: 'general' },
+  { labelKey: 'admin:settings.tabs.auth', to: '/admin/settings/auth', icon: Shield, tabKey: 'auth' },
+  { labelKey: 'admin:settings.tabs.ai', to: '/admin/settings/ai', icon: Brain, tabKey: 'ai' },
+  { labelKey: 'admin:settings.tabs.network', to: '/admin/settings/network', icon: Globe, tabKey: 'network' },
+  { labelKey: 'admin:settings.tabs.storage', to: '/admin/settings/storage', icon: HardDrive, tabKey: 'storage' },
+  { labelKey: 'admin:settings.tabs.map', to: '/admin/settings/map', icon: Map, tabKey: 'map' },
+  { labelKey: 'admin:settings.tabs.appearance', to: '/admin/settings/appearance', icon: Paintbrush, tabKey: 'appearance' },
+  { labelKey: 'admin:settings.tabs.permissions', to: '/admin/settings/permissions', icon: Lock, tabKey: 'permissions' },
+  // /admin/config-ops is not a Settings tab — it has its own route. Its
+  // enterprise gating is independent of the Settings-tab registry.
+  { labelKey: 'adminNav.configOps', to: '/admin/config-ops', icon: Wrench, enterpriseOnly: false },
+];
+
+/**
+ * Admin section navigation sidebar.
+ *
+ * Renders the admin navigation tree (Overview, Users, Jobs, Audit, Shared Maps,
+ * Settings sub-tabs, Config Ops) with active-route highlighting, total count
+ * badges for Users / Published Maps / Audit Log plus a failed-jobs ALERT badge
+ * (each capped at 999+), and visibility filtering for `enterpriseOnly` items
+ * via the `useEdition` hook. See `AlertBadge` for why Jobs is styled and
+ * linked differently from the total badges.
+ */
+export function AdminSidebar() {
+  const { pathname } = useLocation();
+  const { t } = useTranslation();
+  const { can } = usePermissions();
+  const canManageUsers = can('manage_users');
+  const canManageSettings = can('manage_settings');
+  const { data: userCount } = useUserCount(canManageUsers);
+  const { data: failedJobCount } = useFailedJobCount(canManageUsers);
+  const { data: auditLogCount } = useAuditLogCount(canManageSettings);
+  const { data: publishedMapCount } = usePublishedMapCount(canManageUsers);
+  const { isEnterprise } = useEdition();
+  // The /settings/* API (including /settings/enterprise-tabs/)
+  // flips to manage_tenants in multi-tenant mode — gate the Settings nav
+  // group and its query on the mode-aware hook, not raw manage_settings.
+  const canAdminSettings = useSettingsAdmin();
+  const canAdminGroups = useGroupAdmin();
+  const { data: enterpriseTabsData } = useEnterpriseOnlyTabs({
+    enabled: canAdminSettings,
+  });
+
+  // Derive each Settings tab's enterpriseOnly flag from the server-driven
+  // list, falling back to the local default while the hook loads or errors so
+  // community sidebars don't flash forbidden tabs.
+  const enterpriseTabKeys = enterpriseTabsData?.tabs ?? FALLBACK_ENTERPRISE_ONLY_TABS;
+  const settingsItems = settingsItemsBase.map(item => ({
+    ...item,
+    enterpriseOnly:
+      item.tabKey !== undefined
+        ? enterpriseTabKeys.includes(item.tabKey)
+        : item.enterpriseOnly ?? false,
+  }));
+
+  const gates = { settings: canAdminSettings, groups: canAdminGroups };
+  const visibleOverviewItems = overviewItems.filter(item => can(item.capability));
+  const visibleSettingsItems = canAdminSettings
+    ? settingsItems.filter(item => !item.enterpriseOnly || isEnterprise)
+    : [];
+  const visibleOperationsItems = operationsItems.filter(
+    item =>
+      (item.gate ? gates[item.gate] : can(item.capability)) &&
+      (!item.enterpriseOnly || isEnterprise),
+  );
+
+  const badgeCounts: Record<string, number | undefined> = {
+    users: userCount,
+    failed: failedJobCount,
+    audit: auditLogCount,
+    sharedMaps: publishedMapCount,
+  };
+
+  // Cap large counts at 999+ in the small sidebar badge.
+  const capBadge = (n: number) => (n > 999 ? '999+' : String(n));
+
+  return (
+    // top-14 + height calc keep the viewport-fixed sidebar below the sticky
+    // h-14 navbar: without the offset the navbar buries the sidebar header and
+    // slides over it during macOS elastic overscroll. env(safe-area-inset-top)
+    // keeps the header clear of the navbar on notched devices.
+    <Sidebar
+      collapsible="icon"
+      variant="sidebar"
+      side="left"
+      className="top-[calc(3.5rem+env(safe-area-inset-top))] h-[calc(100svh-3.5rem-env(safe-area-inset-top))]"
+    >
+      <SidebarHeader className="px-4 py-3 group-data-[collapsible=icon]:hidden">
+        <span className="eyebrow">{t('adminNav.admin')}</span>
+      </SidebarHeader>
+      <SidebarContent>
+        {/* Overview */}
+        {visibleOverviewItems.length > 0 && <SidebarGroup>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {visibleOverviewItems.map(({ labelKey, to, icon: Icon }) => (
+                <SidebarMenuItem key={to}>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={pathname === to}
+                    tooltip={t(labelKey)}
+                  >
+                    <NavLink to={to}>
+                      <Icon />
+                      <span>{t(labelKey)}</span>
+                    </NavLink>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>}
+
+        {/* Operations */}
+        {visibleOperationsItems.length > 0 && <SidebarGroup>
+          <SidebarGroupLabel className="eyebrow">{t('adminNav.operations')}</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {visibleOperationsItems.map(({ labelKey, to, icon: Icon, badgeKey, alertBadge }) => {
+                const count = badgeKey ? badgeCounts[badgeKey] : undefined;
+                const showBadge = count !== undefined && count > 0;
+                // The alert treatment applies only while the badge
+                // is actually showing. At zero there is nothing to alert about,
+                // so the row stays a plain link to the unfiltered list.
+                const alertLabel =
+                  showBadge && alertBadge ? t(alertBadge.labelKey, { count }) : undefined;
+                const href = alertLabel && alertBadge ? `${to}?${alertBadge.filter}` : to;
+                return (
+                  <SidebarMenuItem key={to}>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={pathname.startsWith(to)}
+                      tooltip={t(labelKey)}
+                    >
+                      {/* `title` is a hover affordance only — a link takes its
+                          accessible name from its contents, so the row is still
+                          announced as its label. */}
+                      <NavLink to={href} title={alertLabel}>
+                        <Icon />
+                        <span>{t(labelKey)}</span>
+                      </NavLink>
+                    </SidebarMenuButton>
+                    {showBadge && (
+                      <SidebarMenuBadge
+                        className={alertLabel ? ALERT_BADGE_CLASSES : undefined}
+                      >
+                        {alertLabel ? (
+                          <>
+                            <span aria-hidden="true">{capBadge(count)}</span>
+                            <span className="sr-only">{alertLabel}</span>
+                          </>
+                        ) : (
+                          capBadge(count)
+                        )}
+                      </SidebarMenuBadge>
+                    )}
+                  </SidebarMenuItem>
+                );
+              })}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>}
+
+        {/* Settings */}
+        {visibleSettingsItems.length > 0 && <SidebarGroup>
+          <SidebarGroupLabel className="eyebrow">{t('adminNav.settings')}</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {visibleSettingsItems.map(({ labelKey, to, icon: Icon }) => (
+                <SidebarMenuItem key={to}>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={pathname === to || pathname.startsWith(to)}
+                    tooltip={t(labelKey)}
+                  >
+                    <NavLink to={to}>
+                      <Icon />
+                      <span>{t(labelKey)}</span>
+                    </NavLink>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>}
+      </SidebarContent>
+      <SidebarFooter>
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton asChild tooltip={t('adminNav.backToApp')}>
+              {/* The search workspace lives at "/". */}
+              <Link to="/">
+                <ArrowLeft className="rtl-mirror" />
+                <span>{t('adminNav.backToApp')}</span>
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarFooter>
+      <SidebarRail />
+    </Sidebar>
+  );
+}

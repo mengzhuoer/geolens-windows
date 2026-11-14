@@ -1,0 +1,57 @@
+import type React from 'react';
+import { FillEditor } from './FillEditor';
+import { LineEditor } from './LineEditor';
+import { CircleEditor } from './CircleEditor';
+import { SymbolEditor } from './SymbolEditor';
+import { HeatmapEditor } from './HeatmapEditor';
+import { ClusterEditor } from './ClusterEditor';
+import type { BaseStyleEditorProps } from './types';
+
+/**
+ * Dispatch key type for the RenderModeSwitch lookup table, derived from
+ * geomType + PointRenderMode (for circle layers).
+ */
+export type EditorDispatchKey =
+  | 'fill'
+  | 'line'
+  | 'circle'
+  | 'heatmap'
+  | 'symbol'
+  | 'cluster';
+
+interface RenderModeSwitchProps extends BaseStyleEditorProps {
+  /**
+   * The resolved dispatch key, computed by the orchestrator from geomType +
+   * renderMode. Narrowed to EditorDispatchKey (no `| string` widening) so a typo
+   * or new render mode is a compile error, not a silent DEV-warn + null render.
+   */
+  dispatchKey: EditorDispatchKey;
+}
+
+/**
+ * Lookup-table component dispatcher: a record of EditorDispatchKey → Component.
+ * An unrecognized dispatchKey logs a DEV-only warning and returns null.
+ */
+const editorComponents: Record<EditorDispatchKey, React.ComponentType<BaseStyleEditorProps>> = {
+  fill: FillEditor,
+  line: LineEditor,
+  circle: CircleEditor,
+  heatmap: HeatmapEditor,
+  symbol: SymbolEditor,
+  cluster: ClusterEditor,
+};
+
+export function RenderModeSwitch({ dispatchKey, ...rest }: RenderModeSwitchProps): React.JSX.Element | null {
+  const Editor = editorComponents[dispatchKey];
+
+  // Defensive runtime guard: the narrowed type makes this unreachable in normal
+  // use, but a bad upstream cast would still land here rather than crash.
+  if (!Editor) {
+    if (import.meta.env.DEV) {
+      console.warn(`[RenderModeSwitch] Unrecognized dispatchKey: "${dispatchKey}". Returning null.`);
+    }
+    return null;
+  }
+
+  return <Editor {...rest} />;
+}

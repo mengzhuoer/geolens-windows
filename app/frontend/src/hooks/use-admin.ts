@@ -1,0 +1,524 @@
+import { useQuery, useQueries, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
+import { useEffect, useRef } from 'react';
+import { queryKeys } from '@/lib/query-keys';
+import {
+  getCatalogStats,
+  listUsers,
+  listUserNames,
+  listAdminJobs,
+  listAuditLogs,
+  createUser,
+  updateUser,
+  deactivateUser,
+  resetUserPassword,
+  deleteUser,
+  approveUser,
+  rejectUser,
+  listApiKeys,
+  createApiKey,
+  revokeApiKey,
+  getAIStatus,
+  listShareTokens,
+  adminRevokeShareToken,
+  listAdminEmbedTokens,
+  bulkRevokeEmbedTokens,
+  getInfrastructure,
+  getEmbeddingStats,
+  triggerBackfill,
+} from '@/api/admin';
+import type { ApiKeyScope } from '@/types/api';
+import { toast } from 'sonner';
+import i18n from '@/i18n/i18n';
+import { cancelJob, getJobStatus, retryJob } from '@/api/ingest';
+import { ApiError } from '@/api/client';
+import { logger } from '@/lib/logger';
+
+export function useCatalogStats(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.admin.stats,
+    queryFn: getCatalogStats,
+    staleTime: 30_000,
+    enabled: options?.enabled,
+  });
+}
+
+export function useUserList(params: {
+  skip: number;
+  limit: number;
+  status?: string;
+  role?: string;
+  search?: string;
+  sort?: string;
+  order?: string;
+}) {
+  const { skip, limit, status, role, search, sort, order } = params;
+  return useQuery({
+    queryKey: queryKeys.admin.users(skip, limit, status, search, sort, order, role),
+    queryFn: () => listUsers({ skip, limit, status, role, search, sort, order }),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useUserNames(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.admin.userNames,
+    queryFn: listUserNames,
+    staleTime: 60_000,
+    enabled: options?.enabled,
+  });
+}
+
+export function useAuditLogs(params: {
+  user_id?: string;
+  action?: string;
+  resource_type?: string;
+  resource_id?: string;
+  date_from?: string;
+  date_to?: string;
+  search?: string;
+  skip?: number;
+  limit?: number;
+  sort?: string;
+  order?: string;
+}, options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.admin.auditLogs(params),
+    queryFn: () => listAuditLogs(params),
+    placeholderData: keepPreviousData,
+    enabled: options?.enabled,
+  });
+}
+
+export function useAdminJobs(params: {
+  status?: string;
+  user_id?: string;
+  search?: string;
+  skip?: number;
+  limit?: number;
+  sort?: string;
+  order?: string;
+}) {
+  return useQuery({
+    queryKey: queryKeys.admin.jobs(params),
+    queryFn: () => listAdminJobs(params),
+    placeholderData: keepPreviousData,
+    // A retried job can settle within a second, so poll while the
+    // current page still has a pending/running row instead of relying on the
+    // retry mutation's one-shot invalidate.
+    refetchInterval: (q) => {
+      const jobs = q.state.data?.jobs ?? [];
+      const hasActive = jobs.some((j) => j.status === 'pending' || j.status === 'running');
+      if (hasActive) return 3_000;
+      // Accepting a held replacement changes no job status, so a page showing
+      // one is rechecked slowly.
+      return jobs.some((j) => j.review_state === 'awaiting') ? 15_000 : false;
+    },
+    refetchIntervalInBackground: false,
+  });
+}
+
+export function useFailedJobCount(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.admin.failedJobCount,
+    queryFn: async () => {
+      const result = await listAdminJobs({ status: 'failed', limit: 1 });
+      return result.total;
+    },
+    staleTime: 60_000,
+    enabled,
+  });
+}
+
+// Total counts for the Operations sidebar badges, each read off a 1-row list query.
+export function useUserCount(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.admin.userCount,
+    queryFn: async () => (await listUsers({ skip: 0, limit: 1 })).total,
+    staleTime: 60_000,
+    enabled,
+  });
+}
+
+export function usePublishedMapCount(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.admin.publishedMapCount,
+    queryFn: async () => (await listShareTokens({ skip: 0, limit: 1 })).total,
+    staleTime: 60_000,
+    enabled,
+  });
+}
+
+export function useAuditLogCount(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.admin.auditLogCount,
+    queryFn: async () => (await listAuditLogs({ skip: 0, limit: 1 })).total,
+    staleTime: 60_000,
+    enabled,
+  });
+}
+
+export function useRetryAdminJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (jobId: string) => retryJob(jobId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allJobs });
+    },
+    onError: (err) => {
+      logger.error('[useRetryAdminJob]', err);
+      toast.error(i18n.t('admin:errors.retryJobFailed'));
+    },
+  });
+}
+
+// Admin cancel reuses the shared /jobs/{id}/cancel route, as admin retry reuses /retry.
+export function useCancelAdminJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (jobId: string) => cancelJob(jobId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allJobs });
+    },
+    onError: (err) => {
+      logger.error('[useCancelAdminJob]', err);
+      toast.error(i18n.t('admin:errors.cancelJobFailed'));
+    },
+  });
+}
+
+// User mutations follow the application pattern of confirming success with a toast.
+export function useCreateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { username: string; password: string; email?: string; role: string }) =>
+      createUser(data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allUsers });
+      toast.success(i18n.t('admin:users.toasts.created'));
+    },
+    onError: () => { toast.error(i18n.t('admin:errors.createUserFailed')); },
+  });
+}
+
+export function useUpdateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ userId, data }: { userId: string; data: { email?: string | null; is_active?: boolean; status?: 'active' | 'suspended' | 'deactivated'; role?: string } }) =>
+      updateUser(userId, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allUsers });
+      toast.success(i18n.t('admin:users.toasts.updated'));
+    },
+    onError: () => { toast.error(i18n.t('admin:errors.updateUserFailed')); },
+  });
+}
+
+export function useDeactivateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (userId: string) => deactivateUser(userId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allUsers });
+      toast.success(i18n.t('admin:users.toasts.deactivated'));
+    },
+    // Surface the backend reason (e.g. "Cannot deactivate the last admin user")
+    // instead of a generic failure. ApiError.message is the translated detail.
+    onError: (err) => {
+      toast.error(err instanceof ApiError ? err.message : i18n.t('admin:users.deactivateDialog.error'));
+    },
+  });
+}
+
+export function useResetUserPassword() {
+  return useMutation({
+    mutationFn: ({ userId, password }: { userId: string; password: string }) =>
+      resetUserPassword(userId, password),
+    // No invalidation: a reset changes no field the user list renders.
+    onSuccess: () => { toast.success(i18n.t('admin:users.toasts.passwordReset')); },
+    // Same reasoning as useDeactivateUser: the backend reason is specific
+    // (an identity-provider account, a policy refusal), so surface it.
+    onError: (err) => {
+      toast.error(err instanceof ApiError ? err.message : i18n.t('admin:users.resetPasswordDialog.error'));
+    },
+  });
+}
+
+export function useDeleteUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (userId: string) => deleteUser(userId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allUsers });
+      toast.success(i18n.t('admin:users.toasts.deleted'));
+    },
+    onError: () => { toast.error(i18n.t('admin:errors.deleteUserFailed')); },
+  });
+}
+
+export function useApproveUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ userId, role }: { userId: string; role: string }) =>
+      approveUser(userId, role),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allUsers });
+      toast.success(i18n.t('admin:users.toasts.approved'));
+    },
+    onError: () => { toast.error(i18n.t('admin:users.approveDialog.error')); },
+  });
+}
+
+export function useRejectUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (userId: string) => rejectUser(userId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allUsers });
+      toast.success(i18n.t('admin:users.toasts.rejected'));
+    },
+    onError: () => { toast.error(i18n.t('admin:users.rejectDialog.error')); },
+  });
+}
+
+// AI status is cached across consumers. No idle polling: the result is
+// re-fetched on staleTime expiry or via explicit invalidation (e.g. after mutating
+// AI config). 60s staleTime keeps multi-consumer mounts from refetching; 5min gcTime
+// keeps the cache warm across page transitions.
+export function useAIStatus(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.admin.aiStatus,
+    queryFn: getAIStatus,
+    staleTime: 60_000,
+    gcTime: 5 * 60_000,
+    enabled: options?.enabled,
+  });
+}
+
+export function useShareTokens(params: {
+  skip?: number;
+  limit?: number;
+  search?: string;
+  status?: string;
+  sort?: string;
+  order?: string;
+} = {}) {
+  const { skip = 0, limit = 50, search, status, sort, order } = params;
+  return useQuery({
+    queryKey: queryKeys.admin.shareTokens(skip, limit, search, status, sort, order),
+    queryFn: () => listShareTokens({ skip, limit, search, status, sort, order }),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useAdminRevokeShareToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (tokenId: string) => adminRevokeShareToken(tokenId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allShareTokens });
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allEmbedTokens });
+    },
+    onError: () => { toast.error(i18n.t('admin:shareTokens.revokeFailed')); },
+  });
+}
+
+export function useAdminEmbedTokens(params: {
+  skip?: number;
+  limit?: number;
+  map_id?: string;
+  map_search?: string;
+  creator?: string;
+  status?: string;
+}) {
+  return useQuery({
+    queryKey: queryKeys.admin.embedTokens(params),
+    queryFn: () => listAdminEmbedTokens(params),
+    placeholderData: keepPreviousData,
+  });
+}
+
+export function useBulkRevokeEmbedTokens() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (tokenIds: string[]) => bulkRevokeEmbedTokens(tokenIds),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allEmbedTokens });
+      qc.invalidateQueries({ queryKey: queryKeys.admin.allShareTokens });
+    },
+    onError: () => { toast.error(i18n.t('admin:embedTokens.bulkRevokeFailed')); },
+  });
+}
+
+// Fetch each page under its own cache key so create and revoke invalidations
+// refresh the flattened result without local append or dedupe state.
+const API_KEYS_PAGE_SIZE = 50;
+
+export function useApiKeys(userId: string, pageCount: number = 1) {
+  const queries = useQueries({
+    queries: Array.from({ length: pageCount }, (_, i) => ({
+      queryKey: queryKeys.admin.apiKeys(userId, i),
+      queryFn: () =>
+        listApiKeys(userId, { skip: i * API_KEYS_PAGE_SIZE, limit: API_KEYS_PAGE_SIZE }),
+      enabled: !!userId,
+    })),
+  });
+
+  const items = queries.flatMap((q) => q.data?.items ?? []);
+  const total = queries[0]?.data?.total;
+  const isLoading = queries.some((q) => q.isLoading);
+  // Surface the first failed page and retry only its query; otherwise a gap
+  // would leave the "Load more" control available indefinitely.
+  const failedPageIndex = queries.findIndex((q) => q.isError);
+  const isError = failedPageIndex !== -1;
+  const error = isError ? queries[failedPageIndex].error : null;
+  const hasMore = !isError && total !== undefined && total > items.length;
+
+  function retryFailedPage() {
+    if (failedPageIndex !== -1) {
+      void queries[failedPageIndex].refetch();
+    }
+  }
+
+  return { items, total, isLoading, isError, error, retryFailedPage, hasMore };
+}
+
+export function useCreateApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      userId,
+      name,
+      scope,
+      expiresAt,
+    }: {
+      userId: string;
+      name: string;
+      scope: ApiKeyScope;
+      expiresAt?: string | null;
+    }) => createApiKey(userId, name, { scope, expiresAt }),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.apiKeys(variables.userId) });
+    },
+    onError: () => { toast.error(i18n.t('admin:apiKeys.createError')); },
+  });
+}
+
+export function useRevokeApiKey() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ keyId }: { keyId: string; userId: string }) =>
+      revokeApiKey(keyId),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.apiKeys(variables.userId) });
+    },
+    onError: () => { toast.error(i18n.t('admin:apiKeys.revokeError')); },
+  });
+}
+
+// Accept an enabled option so consumers can gate this manage_users probe with
+// the effective capability. Without it, settings-only operators and the
+// admin → logout transition frame would issue a guaranteed 401/403 request.
+export function useEmbeddingStats(options?: { enabled?: boolean }) {
+  return useQuery({
+    queryKey: queryKeys.admin.embeddingStats,
+    queryFn: getEmbeddingStats,
+    staleTime: 30_000,
+    enabled: options?.enabled,
+    // The response decides the rate. A run in flight is watched
+    // closely; an idle panel still looks occasionally, because a run somebody
+    // else starts is what disables these buttons and nothing else would tell a
+    // tab that is already open. Never polls while the tab is in the background.
+    refetchInterval: (q) => (q.state.data?.current_run ? 4_000 : 30_000),
+    refetchIntervalInBackground: false,
+  });
+}
+
+// Backfill embeddings. allTenants also queues a run for every other tenant in a
+// multi-tenant deployment; a single-tenant one ignores it.
+interface BackfillOptions {
+  force?: boolean;
+  allTenants?: boolean;
+}
+
+export function useBackfillEmbeddings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ force = false, allTenants = false }: BackfillOptions = {}) =>
+      triggerBackfill(force, allTenants),
+    // Refetch so the response exposes the run in flight and starts progress polling.
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.admin.embeddingStats });
+    },
+    onError: (err) => {
+      logger.error('[useBackfillEmbeddings]', err);
+      // A run already in flight is refused rather than failed; "backfill failed"
+      // would misreport a healthy catalog.
+      if (err instanceof ApiError && err.status === 409) {
+        toast.warning(i18n.t('admin:errors.backfillAlreadyRunning'));
+        return;
+      }
+      toast.error(i18n.t('admin:errors.backfillFailed'));
+    },
+  });
+}
+
+// Track the queued run because the mutation resolves before the work completes.
+// Refresh coverage and report the terminal result once for that job.
+export function useBackfillJobStatus(jobId: string | null) {
+  const qc = useQueryClient();
+  const settledFor = useRef<string | null>(null);
+
+  const query = useQuery({
+    queryKey: queryKeys.ingest.jobStatus(jobId),
+    queryFn: () => getJobStatus(jobId as string),
+    enabled: Boolean(jobId),
+    refetchInterval: (q) => {
+      // No data is the absence of an answer rather than evidence that the run
+      // ended, so keep polling through a failed initial read.
+      if (!q.state.data) return 4_000;
+      const status = q.state.data.status;
+      return status === 'pending' || status === 'running' ? 4_000 : false;
+    },
+    refetchIntervalInBackground: false,
+  });
+
+  const status = query.data?.status;
+  useEffect(() => {
+    if (!jobId || !status) return;
+    if (status === 'pending' || status === 'running') return;
+    // Once per job: the query stays mounted with terminal data, so without
+    // this the effect would re-toast on every unrelated re-render.
+    if (settledFor.current === jobId) return;
+    settledFor.current = jobId;
+    qc.invalidateQueries({ queryKey: queryKeys.admin.embeddingStats });
+    if (status === 'cancelled') {
+      // A requested cancellation is informational rather than a failure.
+      toast.info(i18n.t('admin:ai.backfillRunCancelled'));
+      return;
+    }
+    if (status !== 'complete') {
+      toast.error(i18n.t('admin:ai.backfillRunFailed'));
+      return;
+    }
+    // A run that finished with rejected records is not a clean success; the
+    // queued job status must carry the same fact the synchronous endpoint returns.
+    const failed = query.data?.rows_failed ?? 0;
+    if (failed > 0) {
+      toast.warning(i18n.t('admin:ai.backfillFinishedWithErrors', { errors: failed }));
+      return;
+    }
+    toast.success(i18n.t('admin:ai.backfillFinished'));
+  }, [jobId, status, query.data?.rows_failed, qc]);
+
+  return query;
+}
+
+export function useInfrastructure() {
+  return useQuery({
+    queryKey: queryKeys.admin.infrastructure,
+    queryFn: getInfrastructure,
+    // 30s polling is intentional — infrastructure status is advisory, not time-critical.
+    // Shorter intervals increase backend load with no UX benefit for admin dashboards.
+    refetchInterval: 30_000,
+  });
+}

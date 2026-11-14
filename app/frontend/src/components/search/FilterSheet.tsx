@@ -1,0 +1,663 @@
+import { lazy, Suspense, useCallback, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Loader2, MapPin, SlidersHorizontal } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { FilterChip } from './FilterChip';
+import { KeywordFacetPicker } from './KeywordFacetPicker';
+import { SaveSearchButton } from './SavedSearches';
+import { useSearchStore } from '@/stores/search-store';
+import { useResetOnEpoch } from '@/hooks/use-reset-on-epoch';
+import { useAuthStore } from '@/stores/auth-store';
+import { useCatalogSummary, useFacets } from '@/components/search/hooks/use-search';
+import { getGeometryTypeLabel, getSearchSortLabel } from '@/i18n/labels';
+import { recordTypeCapabilities } from '@/lib/record-types';
+
+const GEOMETRY_TYPES = [
+  'POINT',
+  'LINESTRING',
+  'POLYGON',
+  'MULTIPOINT',
+  'MULTILINESTRING',
+  'MULTIPOLYGON',
+] as const;
+const SORT_OPTIONS = ['relevance', 'date_added', 'name', 'last_updated'] as const;
+const ANY_GEOMETRY_VALUE = '__all__';
+
+const LazyBboxMapPicker = lazy(async () => {
+  const module = await import('./BboxMapPicker');
+  return { default: module.BboxMapPicker };
+});
+
+function MapPickerFallback() {
+  const { t } = useTranslation('search');
+
+  return (
+    <div className="flex h-40 items-center justify-center rounded-xl border bg-muted/20 text-sm text-muted-foreground">
+      <Loader2 className="me-2 size-4 animate-spin" />
+      {t('bbox.loading', { defaultValue: 'Loading map...' })}
+    </div>
+  );
+}
+
+/** Parse an OGC datetime interval into [start, end] for display. */
+function parseTemporalInterval(datetime: string): [string, string] {
+  if (!datetime) return ['', ''];
+  const parts = datetime.split('/');
+  if (parts.length === 2) {
+    return [
+      parts[0] === '..' ? '' : parts[0],
+      parts[1] === '..' ? '' : parts[1],
+    ];
+  }
+  return [datetime, ''];
+}
+
+interface FilterSheetProps {
+  totalResults: number | undefined;
+  allTypesTotal?: number;
+}
+
+/**
+ * Mobile filter sheet: a condensed bar with chip row plus a full-screen bottom
+ * sheet replicating all catalog filter controls for small viewports.
+ *
+ * State source: all filter state is read from `useSearchStore` (zustand).
+ */
+export function FilterSheet({ totalResults, allTypesTotal }: FilterSheetProps) {
+  const { t } = useTranslation('search');
+  const filterTriggerRef = useRef<HTMLButtonElement>(null);
+  const geometryType = useSearchStore((s) => s.geometry_type);
+  const bbox = useSearchStore((s) => s.bbox);
+  const dateFrom = useSearchStore((s) => s.date_from);
+  const dateTo = useSearchStore((s) => s.date_to);
+  const sortBy = useSearchStore((s) => s.sort_by);
+  const recordType = useSearchStore((s) => s.record_type);
+  const collectionId = useSearchStore((s) => s.collection_id);
+  const sourceOrganization = useSearchStore((s) => s.source_organization);
+  const srid = useSearchStore((s) => s.srid);
+  const datetime = useSearchStore((s) => s.datetime);
+  const selectedKeywords = useSearchStore((s) => s.keywords);
+  const geometry = useSearchStore((s) => s.geometry);
+  const q = useSearchStore((s) => s.q);
+  const resetEpoch = useSearchStore((s) => s.resetEpoch);
+  const token = useAuthStore((s) => s.token);
+
+  const { data: facets } = useFacets();
+  const counts = facets?.record_type ?? {};
+  const allTypeCount =
+    allTypesTotal ??
+    ((counts.vector_dataset ?? 0) +
+    (counts.raster_dataset ?? 0) +
+    (counts.vrt_dataset ?? 0) +
+    (counts.table ?? 0) +
+    (counts.tiles3d_dataset ?? 0) +
+    (counts.pointcloud_dataset ?? 0));
+
+  const { data: summaries } = useCatalogSummary();
+
+  const [temporalStart, temporalEnd] = parseTemporalInterval(datetime);
+  const organizations = summaries?.source_organization ?? [];
+  const srids = summaries?.srid ?? [];
+
+  const handleTemporalChange = (start: string, end: string) => {
+    let interval = '';
+    if (start && end) interval = `${start}/${end}`;
+    else if (start) interval = `${start}/..`;
+    else if (end) interval = `../${end}`;
+    useSearchStore.getState().setFilter('datetime', interval);
+  };
+
+  const hasActiveFilters =
+    geometryType !== '' || bbox !== '' || dateFrom !== '' || dateTo !== '' || recordType !== '' || collectionId !== '' || sourceOrganization !== '' || srid !== '' || datetime !== '' || selectedKeywords.length > 0;
+  const hasToolbarChanges = hasActiveFilters || sortBy !== 'relevance';
+  const hasSearchState = hasToolbarChanges || q !== '';
+  const activeFilterCount = [geometryType, bbox, dateFrom || dateTo, recordType, collectionId, sourceOrganization, srid, datetime, selectedKeywords.length > 0 ? 'kw' : ''].filter(Boolean).length;
+  const activeGeomLabel = geometryType ? getGeometryTypeLabel(t, geometryType) : null;
+  const showsTableToggle = counts.table !== undefined;
+  const showsTiles3dToggle = counts.tiles3d_dataset !== undefined;
+  const showsPointcloudToggle = counts.pointcloud_dataset !== undefined;
+  const showGeometryFilter =
+    !recordType || (recordTypeCapabilities(recordType).tileToken === 'vector' && recordType !== 'table');
+  const showSridFilter = srids.length > 0 && recordType !== 'table';
+  const getRecordTypeLabel = (value: string) => {
+    switch (value) {
+      case 'vector_dataset':
+        return t('filters.vector', { defaultValue: 'Vector' });
+      case 'raster_dataset':
+        return t('filters.raster', { defaultValue: 'Raster' });
+      case 'vrt_dataset':
+        return t('filters.vrt', { defaultValue: 'Virtual Raster' });
+      case 'table':
+        return t('card.table', { defaultValue: 'Table' });
+      case 'tiles3d_dataset':
+        return t('card.tiles3d', { defaultValue: '3D Tiles' });
+      case 'pointcloud_dataset':
+        return t('card.pointcloud', { defaultValue: 'Point cloud' });
+      default:
+        return value;
+    }
+  };
+
+  const [bboxOpen, setBboxOpen] = useState(false);
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+  const [localDateFrom, setLocalDateFrom] = useState(dateFrom);
+  const [localDateTo, setLocalDateTo] = useState(dateTo);
+
+  const syncLocalDates = () => {
+    setLocalDateFrom(useSearchStore.getState().date_from);
+    setLocalDateTo(useSearchStore.getState().date_to);
+  };
+
+  // As FilterPanel's resetDateDraft: an identity change bumps resetEpoch even
+  // when the dates were already '', so a draft would survive to repopulate the
+  // cleared store on Apply. Closes the whole sheet and its nested bbox popover,
+  // since everything in it is this identity's in-progress edit.
+  const resetSheetDraft = useCallback(() => {
+    setLocalDateFrom(useSearchStore.getState().date_from);
+    setLocalDateTo(useSearchStore.getState().date_to);
+    setBboxOpen(false);
+    setMobileFiltersOpen(false);
+  }, []);
+  useResetOnEpoch(resetEpoch, resetSheetDraft);
+
+  const handleApplyDate = () => {
+    useSearchStore.getState().setFilter('date_from', localDateFrom);
+    useSearchStore.getState().setFilter('date_to', localDateTo);
+  };
+
+  const dateChipLabel = (() => {
+    if (dateFrom && dateTo) return `${dateFrom} - ${dateTo}`;
+    if (dateFrom) return dateFrom;
+    if (dateTo) return dateTo;
+    return '';
+  })();
+  const dataCoverageDateChipLabel = `${t('filters.dataCoverageDate', { defaultValue: 'Dates covered by the data' })}: ${temporalStart || '..'} - ${temporalEnd || '..'}`;
+
+  const clearFilters = () => {
+    useSearchStore.getState().resetFilters();
+    setLocalDateFrom('');
+    setLocalDateTo('');
+  };
+
+  const totalResultsLabel =
+    totalResults !== undefined
+      ? bbox || geometry
+        ? t('filters.spatialResultCount', { count: totalResults, defaultValue: 'Showing {{count}} in selected area' })
+        : t('filters.datasetCount', { count: totalResults })
+      : null;
+
+  const renderMapPicker = () => (
+    <Suspense fallback={<MapPickerFallback />}>
+      <LazyBboxMapPicker
+        onBboxSelected={(bboxValue) => {
+          useSearchStore.getState().setFilter('bbox', bboxValue);
+          setBboxOpen(false);
+        }}
+      />
+    </Suspense>
+  );
+
+  return (
+    <>
+      {/* ---- Mobile bar + chip row ---- */}
+      <div className="space-y-4 lg:hidden">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-sm text-muted-foreground">
+            {totalResultsLabel ? <span>{totalResultsLabel}</span> : null}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              ref={filterTriggerRef}
+              type="button"
+              variant={activeFilterCount > 0 ? 'default' : 'outline'}
+              size="sm"
+              className="rounded-md border-border/60 shadow-sm"
+              onClick={() => {
+                syncLocalDates();
+                setMobileFiltersOpen(true);
+              }}
+            >
+              <SlidersHorizontal className="size-4" />
+              {t('filters.filtersButton', { defaultValue: 'Filters' })}
+              {activeFilterCount > 0 && (
+                <span className="rounded-sm bg-background/20 px-1.5 py-0 text-mini font-semibold">
+                  {activeFilterCount}
+                </span>
+              )}
+            </Button>
+            {token && hasSearchState && <SaveSearchButton />}
+          </div>
+        </div>
+
+        {hasActiveFilters && (
+          <div className="flex flex-wrap items-center gap-2">
+            {recordType && (
+              <FilterChip
+                label={getRecordTypeLabel(recordType)}
+                onRemove={() => useSearchStore.getState().setFilter('record_type', '')}
+              />
+            )}
+            {collectionId && facets?.collections && (
+              <FilterChip
+                label={facets.collections.find((c) => c.id === collectionId)?.name || t('filters.collection', { defaultValue: 'Collection' })}
+                onRemove={() => useSearchStore.getState().setFilter('collection_id', '')}
+              />
+            )}
+            {geometryType && (
+              <FilterChip
+                label={activeGeomLabel || geometryType}
+                onRemove={() => useSearchStore.getState().setFilter('geometry_type', '')}
+              />
+            )}
+            {sourceOrganization && (
+              <FilterChip
+                label={sourceOrganization}
+                onRemove={() => useSearchStore.getState().setFilter('source_organization', '')}
+              />
+            )}
+            {srid && (
+              <FilterChip
+                label={`EPSG:${srid}`}
+                onRemove={() => useSearchStore.getState().setFilter('srid', '')}
+              />
+            )}
+            {bbox && (
+              <FilterChip
+                label={t('filters.areaSelected', { defaultValue: 'Area selected' })}
+                onRemove={() => {
+                  const store = useSearchStore.getState();
+                  store.setFilter('bbox', '');
+                  store.setFilter('geometry', '');
+                  store.setFilter('spatial_predicate', 'intersects');
+                }}
+              />
+            )}
+            {(dateFrom || dateTo) && (
+              <FilterChip
+                label={dateChipLabel}
+                onRemove={() => {
+                  useSearchStore.getState().setFilter('date_from', '');
+                  useSearchStore.getState().setFilter('date_to', '');
+                  setLocalDateFrom('');
+                  setLocalDateTo('');
+                }}
+              />
+            )}
+            {datetime && (
+              <FilterChip
+                label={dataCoverageDateChipLabel}
+                onRemove={() => useSearchStore.getState().setFilter('datetime', '')}
+              />
+            )}
+            {selectedKeywords.length > 0 && selectedKeywords.map((kw) => (
+              <FilterChip
+                key={kw}
+                label={kw}
+                onRemove={() => {
+                  const next = selectedKeywords.filter((k) => k !== kw);
+                  useSearchStore.getState().setFilter('keywords', next);
+                }}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ---- Mobile filter sheet (full-screen overlay) ---- */}
+      <Sheet
+        open={mobileFiltersOpen}
+        onOpenChange={(open) => {
+          if (open) syncLocalDates();
+          if (!open) setBboxOpen(false);
+          setMobileFiltersOpen(open);
+        }}
+      >
+        <SheetContent
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            const trigger = filterTriggerRef.current;
+            if (trigger && trigger.getClientRects().length > 0) trigger.focus();
+            else document.querySelector<HTMLElement>('main')?.focus();
+          }}
+          side="bottom"
+          className="max-h-[85vh] rounded-t-3xl border-x-0 border-b-0 px-0"
+        >
+          <SheetHeader className="px-4 pb-2">
+            <SheetTitle>
+              {t('filters.filtersButton', { defaultValue: 'Filters' })}
+            </SheetTitle>
+            <SheetDescription>
+              {t('filters.sheetDescription', {
+                defaultValue: 'Refine results without leaving the search page.',
+              })}
+            </SheetDescription>
+          </SheetHeader>
+
+          <div className="space-y-5 overflow-y-auto px-4 pb-6">
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-foreground">
+              {t('filters.type', { defaultValue: 'Type' })}
+            </label>
+            <ToggleGroup
+              type="single"
+              value={recordType || 'all'}
+              onValueChange={(val) =>
+                useSearchStore.getState().setFilter('record_type', val === 'all' ? '' : val)
+              }
+              className="w-full flex-wrap"
+            >
+              <ToggleGroupItem value="all" className="flex-1 text-xs">
+                {t('filters.allTypes', { defaultValue: 'All' })}
+                {(allTypesTotal !== undefined || Object.keys(counts).length > 0) && ` (${allTypeCount})`}
+              </ToggleGroupItem>
+              <ToggleGroupItem value="vector_dataset" className="flex-1 text-xs" disabled={counts.vector_dataset === 0}>
+                {t('filters.vector', { defaultValue: 'Vector' })}
+                {counts.vector_dataset !== undefined && ` (${counts.vector_dataset})`}
+              </ToggleGroupItem>
+              <ToggleGroupItem value="raster_dataset" className="flex-1 text-xs" disabled={counts.raster_dataset === 0}>
+                {t('filters.raster', { defaultValue: 'Raster' })}
+                {counts.raster_dataset !== undefined && ` (${counts.raster_dataset})`}
+              </ToggleGroupItem>
+              <ToggleGroupItem value="vrt_dataset" className="flex-1 text-xs" disabled={counts.vrt_dataset === 0}>
+                {t('filters.vrt', { defaultValue: 'VRT' })}
+                {counts.vrt_dataset !== undefined && ` (${counts.vrt_dataset})`}
+              </ToggleGroupItem>
+              {showsTableToggle && (
+                <ToggleGroupItem value="table" className="flex-1 text-xs" disabled={counts.table === 0}>
+                  {t('card.table', { defaultValue: 'Table' })}
+                  {counts.table !== undefined && ` (${counts.table})`}
+                </ToggleGroupItem>
+              )}
+              {showsTiles3dToggle && (
+                <ToggleGroupItem value="tiles3d_dataset" className="flex-1 text-xs" disabled={counts.tiles3d_dataset === 0}>
+                  {t('card.tiles3d', { defaultValue: '3D Tiles' })}
+                  {` (${counts.tiles3d_dataset})`}
+                </ToggleGroupItem>
+              )}
+              {showsPointcloudToggle && (
+                <ToggleGroupItem value="pointcloud_dataset" className="flex-1 text-xs" disabled={counts.pointcloud_dataset === 0}>
+                  {t('card.pointcloud', { defaultValue: 'Point cloud' })}
+                  {` (${counts.pointcloud_dataset})`}
+                </ToggleGroupItem>
+              )}
+            </ToggleGroup>
+          </div>
+
+          {showGeometryFilter && (
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-foreground">
+              {t('filters.geometry')}
+            </label>
+            <Select
+              value={geometryType || ANY_GEOMETRY_VALUE}
+              onValueChange={(val) =>
+                useSearchStore
+                  .getState()
+                  .setFilter('geometry_type', val === ANY_GEOMETRY_VALUE ? '' : val)
+              }
+            >
+              <SelectTrigger className="w-full" aria-label={t('filters.geometry')}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ANY_GEOMETRY_VALUE}>
+                  {t('filters.anyGeometry', { defaultValue: 'Any geometry' })}
+                </SelectItem>
+                {GEOMETRY_TYPES.map((geom) => (
+                  <SelectItem key={geom} value={geom}>
+                    {getGeometryTypeLabel(t, geom)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          )}
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-foreground">
+              {t('filters.keywords', { defaultValue: 'Keywords' })}
+            </label>
+            <KeywordFacetPicker facets={facets?.keywords} isLoading={!facets} />
+          </div>
+
+          {facets?.collections && facets.collections.length > 0 && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground">
+                {t('filters.collection', { defaultValue: 'Collection' })}
+              </label>
+              <Select
+                value={collectionId || '__all__'}
+                onValueChange={(val) =>
+                  useSearchStore.getState().setFilter('collection_id', val === '__all__' ? '' : val)
+                }
+              >
+                <SelectTrigger className="w-full" aria-label={t('filters.collection', { defaultValue: 'Collection' })}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">{t('filters.anyCollection', { defaultValue: 'Any collection' })}</SelectItem>
+                  {facets.collections.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>
+                      {c.name} ({c.dataset_count})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          {organizations.length > 0 && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground">
+                {t('filters.organization')}
+              </label>
+              <Select
+                value={sourceOrganization || '__all__'}
+                onValueChange={(val) =>
+                  useSearchStore.getState().setFilter('source_organization', val === '__all__' ? '' : val)
+                }
+              >
+                <SelectTrigger className="w-full" aria-label={t('filters.organization')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">{t('filters.anyOrganization')}</SelectItem>
+                  {organizations.map((org) => (
+                    <SelectItem key={org} value={org}>{org}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          {showSridFilter && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-foreground">
+                {t('filters.crs')}
+              </label>
+              <Select
+                value={srid || '__all__'}
+                onValueChange={(val) =>
+                  useSearchStore.getState().setFilter('srid', val === '__all__' ? '' : val)
+                }
+              >
+                <SelectTrigger className="w-full" aria-label={t('filters.crs')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">{t('filters.anyCrs')}</SelectItem>
+                  {srids.map((s) => (
+                    <SelectItem key={s} value={String(s)}>{`EPSG:${s}`}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <label className="text-sm font-medium text-foreground">
+                {t('filters.location')}
+              </label>
+              {bbox && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    const store = useSearchStore.getState();
+                    store.setFilter('bbox', '');
+                    store.setFilter('geometry', '');
+                    store.setFilter('spatial_predicate', 'intersects');
+                  }}
+                >
+                  {t('filters.clearLocation', { defaultValue: 'Clear location' })}
+                </Button>
+              )}
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full justify-start"
+              onClick={() => setBboxOpen((open) => !open)}
+            >
+              <MapPin className="size-4" />
+              {bbox
+                ? t('filters.updateLocation', {
+                    defaultValue: 'Update location area',
+                  })
+                : t('filters.location')}
+            </Button>
+            {bbox && (
+              <p className="text-xs text-muted-foreground">
+                {t('filters.locationApplied', {
+                  defaultValue: 'A map area is currently limiting the results.',
+                })}
+              </p>
+            )}
+            {bboxOpen ? renderMapPicker() : null}
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-foreground">
+              {t('filters.dateRange')}
+            </label>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
+                <Label htmlFor="filter-sheet-date-from" className="text-xs font-medium text-muted-foreground">
+                  {t('filters.dateFrom')}
+                </Label>
+                <Input
+                  id="filter-sheet-date-from"
+                  type="date"
+                  value={localDateFrom}
+                  onChange={(e) => setLocalDateFrom(e.target.value)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="filter-sheet-date-to" className="text-xs font-medium text-muted-foreground">
+                  {t('filters.dateTo')}
+                </Label>
+                <Input
+                  id="filter-sheet-date-to"
+                  type="date"
+                  value={localDateTo}
+                  onChange={(e) => setLocalDateTo(e.target.value)}
+                />
+              </div>
+            </div>
+            <Button
+              size="sm"
+              onClick={handleApplyDate}
+              disabled={!localDateFrom && !localDateTo}
+            >
+              {t('filters.apply')}
+            </Button>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-foreground">
+              {t('filters.dataCoverageDate', { defaultValue: 'Dates covered by the data' })}
+            </label>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
+                <Label htmlFor="filter-sheet-temporal-start" className="text-xs font-medium text-muted-foreground">
+                  {t('filters.dateFrom')}
+                </Label>
+                <Input
+                  id="filter-sheet-temporal-start"
+                  type="date"
+                  value={temporalStart}
+                  onChange={(e) => handleTemporalChange(e.target.value, temporalEnd)}
+                />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="filter-sheet-temporal-end" className="text-xs font-medium text-muted-foreground">
+                  {t('filters.dateTo')}
+                </Label>
+                <Input
+                  id="filter-sheet-temporal-end"
+                  type="date"
+                  value={temporalEnd}
+                  onChange={(e) => handleTemporalChange(temporalStart, e.target.value)}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-foreground">
+              {t('filters.sort')}
+            </label>
+            <Select
+              value={sortBy}
+              onValueChange={(val) => useSearchStore.getState().setSortBy(val)}
+            >
+              <SelectTrigger className="w-full" aria-label={t('filters.sort')}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SORT_OPTIONS.map((option) => (
+                  <SelectItem key={option} value={option}>
+                    {getSearchSortLabel(t, option)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {hasToolbarChanges && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                clearFilters();
+                setBboxOpen(false);
+              }}
+            >
+              {t('filters.clearFilters')}
+            </Button>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
+    </>
+  );
+}

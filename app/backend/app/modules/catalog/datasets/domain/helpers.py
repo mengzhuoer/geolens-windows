@@ -1,0 +1,390 @@
+"""Shared helpers for dataset routers."""
+
+import contextlib
+import uuid
+from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.identity import Identity
+from app.core.pointcloud import pointcloud_path
+from app.core.record_types import RASTER_FAMILY_RECORD_TYPES
+from app.core.tile_scope import tile_template_query
+from app.core.tiles3d import tileset_path
+from app.modules.auth.models import User
+from app.modules.catalog.datasets.domain.source_freshness import (
+    compute_source_freshness,
+)
+from app.modules.catalog.datasets.domain.schemas import (
+    DatasetResponse,
+    DatasetRetention,
+    PointCloudMetadata,
+    RasterBandInfo,
+    RasterConnect,
+    RasterMetadata,
+    TilesetMetadata,
+)
+from app.modules.catalog.sources.provenance import (
+    UNKNOWN_ACTOR_LABEL,
+    derive_last_edited,
+    resolve_actor,
+)
+from app.core.geo import (
+    extent_to_bbox,
+    raster_crs_facts,
+    shown_extent,
+    shows_mosaic_size,
+)
+from app.platform.dataset_origin import classify_origin, project_unknown
+from app.platform.storage.titiler_url import resolve_current_storage_key
+
+
+async def _load_actor_identities(
+    db: AsyncSession,
+    actor_ids: Iterable[uuid.UUID | None],
+) -> dict[uuid.UUID, Identity]:
+    ids = {actor_id for actor_id in actor_ids if actor_id is not None}
+    if not ids:
+        return {}
+    result = await db.execute(select(User).where(User.id.in_(ids)))
+    users = result.scalars().all()
+    return {u.id: u for u in users}
+
+
+def _build_raster_metadata(
+    dataset,
+    raster_asset,
+    is_admin: bool = False,
+    source_count: int | None = None,
+    base_url: str | None = None,
+    show_size: bool = True,
+) -> RasterMetadata | None:
+    """``show_size=False`` leaves out width, height and file size, which span
+    every member of a VRT."""
+    if raster_asset is None:
+        return None
+
+    bands = []
+    if raster_asset.band_info:
+        # Default a missing "index" to the 1-based position, not 0, so
+        # legacy rows without the key don't all collapse onto band 0.
+        for position, b in enumerate(raster_asset.band_info, start=1):
+            bands.append(
+                RasterBandInfo(
+                    index=b.get("index", position),
+                    dtype=b.get("dtype", ""),
+                    nodata=b.get("nodata"),
+                    color_interp=b.get("color_interp"),
+                )
+            )
+
+    # Admins see where a managed COG sits on an S3 install; the row's tag
+    # separates managed from remote bytes and doesn't name the store.
+    s3_uri = None
+    if (
+        is_admin
+        and settings.storage_provider == "s3"
+        and raster_asset.storage_backend != "remote"
+    ):
+        # A hand-edited key the resolver refuses has no location to show.
+        with contextlib.suppress(ValueError):
+            key = resolve_current_storage_key(raster_asset.asset_uri)
+            s3_uri = f"s3://{settings.s3_bucket}/{key}"
+
+    # ?api_key= is deprecated, but desktop GIS XYZ tile clients
+    # can't send headers -- this placeholder is the sanctioned remaining use.
+    tile_url_path = f"/raster-tiles/{dataset.id}/tiles/{{z}}/{{x}}/{{y}}.png"
+    # nginx keys raster_cache on `v` and `pv`, so a replace
+    # or a publication transition rolls the cache. connect URL stays
+    # unversioned: copied once into GIS tools, a frozen pair pins staleness.
+    tile_url_meta = tile_url_path + tile_template_query(
+        getattr(dataset, "tile_cache_version", None),
+        getattr(dataset, "publication_version", None),
+    )
+
+    if base_url:
+        tile_url_connect = f"{base_url}{tile_url_path}?api_key={{your_key}}"
+    else:
+        tile_url_connect = tile_url_path
+
+    # VRT datasets don't have a single COG download
+    record_type = getattr(dataset, "record_type", None) or getattr(
+        dataset.record, "record_type", None
+    )
+    is_vrt = record_type == "vrt_dataset"
+    if is_vrt:
+        download_url = None
+    else:
+        download_url = f"/api/datasets/{dataset.id}/download/cog"
+
+    connect = RasterConnect(
+        download_url=download_url,
+        tile_url=tile_url_connect,
+        s3_uri=s3_uri,
+    )
+
+    return RasterMetadata(
+        epsg=raster_asset.epsg,
+        crs_is_geographic=raster_crs_facts(raster_asset)["crs_is_geographic"],
+        res_x=raster_asset.res_x,
+        res_y=raster_asset.res_y,
+        band_count=raster_asset.band_count,
+        is_dem=raster_asset.is_dem,
+        nodata=raster_asset.nodata,
+        compression=raster_asset.compression,
+        width=raster_asset.width if show_size else None,
+        height=raster_asset.height if show_size else None,
+        size_bytes=raster_asset.size_bytes if show_size else None,
+        tile_url=tile_url_meta,
+        bands=bands,
+        connect=connect,
+        status=raster_asset.status,
+        vrt_type=raster_asset.vrt_type,
+        source_count=source_count,
+        resolution_strategy=raster_asset.resolution_strategy,
+    )
+
+
+def dataset_to_response(
+    dataset,
+    *,
+    collections=None,
+    actors_by_id: Mapping[uuid.UUID, Identity] | None = None,
+    raster_asset=None,
+    tileset_asset=None,
+    pointcloud_asset=None,
+    is_admin: bool = False,
+    source_count: int | None = None,
+    vrt_extents: Mapping[uuid.UUID, object | None] | None = None,
+    base_url: str | None = None,
+    stac_assets=None,
+    derived_from: dict | None = None,
+    lineage_summary: str | None = None,
+    can_view_provenance: bool = False,
+) -> DatasetResponse:
+    """Convert a Dataset ORM object to a DatasetResponse schema.
+
+    ``can_view_provenance`` gates ``origin_uri``/``origin_ref`` --
+    owner/admin see the raw pointer, everyone else gets it nulled. Callers
+    resolve it via ``can_view_dataset_provenance`` in ``authorization.py``;
+    it defaults to False so a forgetful call site redacts rather than leaks.
+
+    ``vrt_extents`` is the requester's ``visible_vrt_extents``; a VRT it
+    leaves out shows no extent (``shown_extent``).
+    """
+    record = dataset.record
+    actor_map = actors_by_id or {}
+
+    created_user = actor_map.get(record.created_by) if record.created_by else None
+    updated_user = actor_map.get(record.updated_by) if record.updated_by else None
+
+    created_by_display = resolve_actor(
+        record.created_by,
+        created_user,
+        missing_label=UNKNOWN_ACTOR_LABEL,
+    )
+    last_edited = derive_last_edited(
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        updated_by=record.updated_by,
+        updated_user=updated_user,
+    )
+
+    raster_metadata = None
+    record_type = getattr(record, "record_type", "vector_dataset") or "vector_dataset"
+    if record_type in RASTER_FAMILY_RECORD_TYPES and raster_asset is not None:
+        raster_metadata = _build_raster_metadata(
+            dataset,
+            raster_asset,
+            is_admin=is_admin,
+            source_count=source_count,
+            base_url=base_url,
+            show_size=shows_mosaic_size(record, dataset.id, vrt_extents),
+        )
+
+    tileset = (
+        TilesetMetadata(
+            url=f"/api{tileset_path(dataset.id)}",
+            size_bytes=tileset_asset.size_bytes,
+            version=dataset.tileset_version,
+            geometric_error=dataset.tileset_geometric_error,
+            bounding_volume=dataset.tileset_bounding_volume,
+            content_types=dataset.tileset_content_types,
+            extensions_required=dataset.tileset_extensions_required,
+        )
+        if record_type == "tiles3d_dataset" and tileset_asset is not None
+        else None
+    )
+    pointcloud = (
+        PointCloudMetadata(
+            url=(
+                f"/api{pointcloud_path(dataset.id, dataset.pointcloud_attempt_id)}"
+                if dataset.pointcloud_attempt_id is not None
+                else None
+            ),
+            size_bytes=pointcloud_asset.size_bytes,
+            point_count=dataset.pointcloud_point_count,
+            point_format=dataset.pointcloud_point_format,
+            vertical_crs=dataset.pointcloud_vertical_crs,
+        )
+        if record_type == "pointcloud_dataset" and pointcloud_asset is not None
+        else None
+    )
+
+    # Resolved once -- serves as `origin` below and gates
+    # source freshness, so the badge and freshness chip can't disagree.
+    origin = classify_origin(dataset.source_format, record_type)
+
+    return DatasetResponse(
+        id=dataset.id,
+        record_id=dataset.record_id,
+        table_name=dataset.table_name,
+        title=record.title,
+        summary=record.summary,
+        srid=dataset.srid,
+        geometry_type=dataset.geometry_type,
+        feature_count=dataset.feature_count,
+        is_3d=dataset.is_3d,
+        n_dims=dataset.n_dims,
+        z_min=dataset.z_min,
+        z_max=dataset.z_max,
+        # RFC 7946 §5.2 spec bbox (west > east on a seam crossing),
+        # not the flattened span form. Mirrored by
+        # dataset_extent_bbox in maps/_router_helpers.py for the same reason;
+        # pinned by tests/test_antimeridian_extent.py.
+        extent_bbox=extent_to_bbox(shown_extent(record, dataset.id, vrt_extents)),
+        column_info=dataset.column_info,
+        quality_detail=dataset.quality_detail,
+        license=record.license,
+        attribution=record.attribution,
+        source_organization=record.source_organization,
+        data_vintage_start=record.temporal_start,
+        data_vintage_end=record.temporal_end,
+        source_format=dataset.source_format,
+        source_filename=dataset.source_filename,
+        tile_columns=dataset.tile_columns,
+        retention=(
+            DatasetRetention(
+                column=dataset.retention_column, days=dataset.retention_days
+            )
+            if dataset.retention_column is not None
+            and dataset.retention_days is not None
+            else None
+        ),
+        original_srid=dataset.original_srid,
+        current_version=dataset.current_version,
+        source_url=dataset.source_url,
+        # Origin is COMPUTED here, not stored -- it's fully
+        # determined by source_format and record_type, so all callers agree.
+        origin=origin,
+        # Raw pointers are owner-or-admin only; every other
+        # reader keeps `origin` (above) and the freshness/health fields below.
+        origin_uri=dataset.origin_uri if can_view_provenance else None,
+        origin_ref=dataset.origin_ref if can_view_provenance else None,
+        data_revision=dataset.data_revision if can_view_provenance else None,
+        last_refreshed_at=dataset.last_refreshed_at,
+        last_checked_at=dataset.last_checked_at,
+        # NULL is the stored spelling of "never determined"; "unknown" is the
+        # wire spelling. Only one of the two is ever storable.
+        source_health=project_unknown(dataset.source_health),
+        source_health_detail=dataset.source_health_detail,
+        schema_drift_status=project_unknown(dataset.schema_drift_status),
+        # Clock read lives here so compute_source_freshness stays
+        # a total function of its arguments, testable without freezing time.
+        source_freshness=compute_source_freshness(
+            dataset.last_refreshed_at,
+            record.update_frequency,
+            datetime.now(timezone.utc),
+            origin=origin,
+        ),
+        quality_statement=dataset.quality_statement,
+        visibility=record.visibility,
+        created_by=record.created_by,
+        created_by_display=created_by_display,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+        last_edited_by_display=last_edited.display,
+        last_edited_at=last_edited.timestamp,
+        collections=collections,
+        record_status=record.record_status,
+        # Passed in already access-checked -- an analysis output's
+        # lineage sentence names datasets it was built from, and reading
+        # record.lineage_summary here instead leaked them past the requester
+        # check. Guarded by tests/test_analysis_provenance.py.
+        lineage_summary=lineage_summary,
+        # Passed in already access-checked (via visible_derived_from);
+        # not read off the record, since list builders share this function and
+        # would need a per-row check to emit it safely.
+        derived_from=derived_from,
+        update_frequency=record.update_frequency,
+        usage_constraints=record.usage_constraints,
+        access_constraints=record.access_constraints,
+        sensitivity_classification=record.sensitivity_classification,
+        theme_category=record.theme_category,
+        owner_org=record.owner_org,
+        published_at=record.published_at,
+        updated_by=record.updated_by,
+        record_type=record_type,
+        raster=raster_metadata,
+        tileset=tileset,
+        pointcloud=pointcloud,
+        stac_assets=stac_assets,
+        language=getattr(record, "language", None),
+    )
+
+
+async def dataset_geom_is_generic(db, table_name: str) -> bool:
+    """True when the active tenant table's ``geom`` is generic GEOMETRY.
+
+    Mirrors features/service.py::_geom_column_is_generic, which is copied here
+    because features already imports from datasets.
+    """
+    from app.core.db.tenant_schema import tenant_data_schema
+    from app.core.db.tenant_session import current_tenant_var
+    from sqlalchemy import text
+
+    schema = tenant_data_schema(current_tenant_var.get())
+    result = await db.execute(
+        text(
+            "SELECT type FROM geometry_columns "
+            "WHERE f_table_schema = :schema AND f_table_name = :t "
+            "AND f_geometry_column = 'geom'"
+        ).bindparams(schema=schema, t=table_name)
+    )
+    col_type = result.scalar_one_or_none()
+    return col_type is not None and col_type.strip().upper() == "GEOMETRY"
+
+
+class DatasetNotFoundError(LookupError):
+    """The dataset to update no longer exists."""
+
+
+class WorkflowTransitionDenied(ValueError):
+    """A refused publication stage change, with the stages as fields.
+
+    ``detail`` is the 422 body: ``message`` stays human-readable for clients
+    that only show text, and the stage names travel as fields so no reader
+    has to split them back out of the sentence.
+    """
+
+    def __init__(self, current: str, requested: str, allowed: Iterable[str]) -> None:
+        self.current = current
+        self.requested = requested
+        self.allowed = sorted(allowed)
+        super().__init__(
+            f"Cannot transition from '{current}' to '{requested}'. "
+            f"Allowed: {self.allowed}"
+        )
+
+    @property
+    def detail(self) -> dict[str, object]:
+        return {
+            "code": "workflow_transition_denied",
+            "message": str(self),
+            "current_stage": self.current,
+            "requested_stage": self.requested,
+            "allowed_stages": self.allowed,
+        }

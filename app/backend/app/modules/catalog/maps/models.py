@@ -1,0 +1,321 @@
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.db import Base
+
+
+class Map(Base):
+    __tablename__ = "maps"
+    __table_args__ = (
+        CheckConstraint(
+            "visibility IN ('private', 'public', 'internal', 'restricted')",
+            name="chk_maps_visibility",
+        ),
+        # Trigram GIN indexes (migration 0010), declared here so
+        # alembic-check sees them. `postgresql_ops` sits outside the
+        # expression so alembic's index compare can match it.
+        Index(
+            "ix_maps_name_trgm",
+            text("lower(name)"),
+            postgresql_using="gin",
+            postgresql_ops={"lower(name)": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_maps_description_trgm",
+            text("lower(coalesce(description, ''))"),
+            postgresql_using="gin",
+            postgresql_ops={"lower(coalesce(description, ''))": "gin_trgm_ops"},
+        ),
+        Index(
+            "ix_maps_forked_from",
+            "forked_from",
+            postgresql_where=text("forked_from IS NOT NULL"),
+        ),
+        # No composite Map.visibility + created_by index: EXPLAIN showed no seq
+        # scan below ~10k rows, so its write and disk cost isn't worth it yet.
+        {"schema": "catalog"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Viewport state
+    center_lng: Mapped[float | None] = mapped_column(Float, nullable=True)
+    center_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    zoom: Mapped[float | None] = mapped_column(Float, nullable=True)
+    bearing: Mapped[float] = mapped_column(Float, default=0, server_default="0")
+    pitch: Mapped[float] = mapped_column(Float, default=0, server_default="0")
+
+    # Basemap
+    basemap_style: Mapped[str] = mapped_column(
+        String(2000),
+        default="openfreemap-positron",
+        server_default="openfreemap-positron",
+    )
+    show_basemap_labels: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true"
+    )
+    basemap_config: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, default=None
+    )
+
+    # Active plugin IDs (null = use client defaults, [] = no plugins)
+    plugins: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
+
+    # Custom map-level legend title (null = no override). Can't reuse
+    # `plugins` (holds enabled plugin IDs) or the basemap/terrain JSONB blobs
+    # (extra="forbid"-validated), so this needs its own nullable column.
+    legend_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Map-level terrain configuration (null = terrain disabled/unconfigured)
+    terrain_config: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, default=None
+    )
+
+    # Widgets on the map's layers, validated by maps/dashboard.py (null = none)
+    dashboard_config: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, default=None
+    )
+
+    # Whether viewers offer the layers' attribute tables; embed tokens may page
+    # rows only while it is on.
+    show_attribute_table: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+
+    # Visibility
+    visibility: Mapped[str] = mapped_column(
+        String(20), default="private", server_default="private"
+    )
+
+    # Preview thumbnail — storage key (e.g. "maps/thumbnails/{id}.jpg")
+    thumbnail_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # The thumbnail's own cache version, apart from `updated_at`: a lazy
+    # backfill (a read, not an edit) shouldn't bump the edit timestamp.
+    # Nullable; the frontend falls back to `updated_at` for old rows.
+    thumbnail_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # OG/social-card image key. Separate from thumbnail_uri: the OG image is
+    # 1200x630 and exceeds the 100KB thumbnail cap.
+    og_image_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Lineage (fork tracking)
+    forked_from: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.maps.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Ownership
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Dormant tenant_id: nullable, no FK enforcement.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MapLayer(Base):
+    __tablename__ = "map_layers"
+    __table_args__ = (
+        CheckConstraint(
+            "layer_type IN ('vector_geolens', 'raster_geolens', 'geojson')",
+            name="chk_map_layers_layer_type",
+        ),
+        {"schema": "catalog"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, server_default=func.gen_random_uuid()
+    )
+    map_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.maps.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.datasets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    visible: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    opacity: Mapped[float] = mapped_column(Float, default=1.0, server_default="1.0")
+    paint: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+    layout: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+    layer_type: Mapped[str] = mapped_column(
+        String(50), nullable=False, server_default="vector_geolens"
+    )
+    display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    filter: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    label_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    popup_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    style_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    show_in_legend: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MapEditHistoryEvent(Base):
+    __tablename__ = "map_edit_history_events"
+    __table_args__ = (
+        CheckConstraint(
+            "target_type IN ('map', 'layer')",
+            name="chk_map_edit_history_events_target_type",
+        ),
+        Index(
+            "ix_catalog_map_edit_history_events_map_created_at",
+            "map_id",
+            "created_at",
+        ),
+        {"schema": "catalog"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, server_default=func.gen_random_uuid()
+    )
+    map_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.maps.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    actor_username: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    target_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    target_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    details: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MapGroupGrant(Base):
+    """A sharing group that may read a ``restricted`` map."""
+
+    __tablename__ = "map_group_grants"
+    __table_args__ = (
+        Index("ix_map_group_grants_group_id", "group_id"),
+        Index(
+            "ix_map_group_grants_granted_by",
+            "granted_by",
+            postgresql_where=text("granted_by IS NOT NULL"),
+        ),
+        {"schema": "catalog"},
+    )
+
+    map_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.maps.id", ondelete="CASCADE"), primary_key=True
+    )
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.groups.id", ondelete="CASCADE"), primary_key=True
+    )
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Derived from the map by trigger, which also refuses another tenant's group.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class MapShareToken(Base):
+    __tablename__ = "map_share_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_map_share_tokens_token_hash"),
+        Index(
+            "ix_map_share_tokens_created_by",
+            "created_by",
+            postgresql_where=text("created_by IS NOT NULL"),
+        ),
+        {"schema": "catalog"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, server_default=func.gen_random_uuid()
+    )
+    map_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("catalog.maps.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    token_hint: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class MapIconAsset(Base):
+    __tablename__ = "map_icon_assets"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_map_icon_assets_slug"),
+        CheckConstraint(
+            "media_type IN ('image/svg+xml', 'image/png')",
+            name="chk_map_icon_assets_media_type",
+        ),
+        {"schema": "catalog"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        primary_key=True, server_default=func.gen_random_uuid()
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # No index=True: uq_map_icon_assets_slug's index already covers slug lookups.
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    storage_key: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("catalog.users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

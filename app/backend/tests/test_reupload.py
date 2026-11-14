@@ -1,0 +1,2814 @@
+"""Integration tests for re-upload API endpoints and schema diff service.
+
+Tests cover: upload creates job, preview returns schema diff, commit queues task,
+dataset identity preserved, versions endpoint, RBAC, 404/400 error cases,
+current_version in response, and schema diff computation.
+
+Requirements:
+  - Docker database must be running (docker compose up db)
+  - Alembic migrations must be applied
+"""
+
+import asyncio
+import contextlib
+import uuid
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.core.config import settings
+from app.core.service_tokens import CredentialMethod, ServiceCredential
+from fastapi import HTTPException, UploadFile
+from httpx import AsyncClient
+from sqlalchemy import select, text
+
+from app.modules.auth.models import User
+from app.modules.catalog.datasets.domain.models import Dataset
+from app.modules.catalog.datasets.domain.service import compute_schema_diff
+from app.modules.catalog.datasets.api import router_reupload
+from app.platform.jobs.models import ARCHIVE_PENDING_METADATA_KEY, IngestJob
+from app.platform.security import SSRFError
+
+from tests.factories import create_dataset, get_user_id
+
+
+@pytest.mark.anyio
+async def test_reupload_commit_failure_cleans_owned_staged_file(tmp_path):
+    dataset = MagicMock(id=uuid.uuid4())
+    dataset.record.record_type = "vector_dataset"
+    job = MagicMock(id=uuid.uuid4(), user_metadata={})
+    staged = tmp_path / "replacement.geojson"
+    staged.write_bytes(b"{}")
+    port = MagicMock()
+    port.create_ingest_job = AsyncMock(return_value=job)
+    port.save_upload_file = AsyncMock(return_value=staged)
+    port.validate_file_extension = MagicMock()
+    port.validate_file_content = MagicMock()
+    db = AsyncMock()
+    # The first commit is the one that frees the pooled connection
+    # before the upload. The failure under test is still the one after it.
+    db.commit.side_effect = [None, RuntimeError("commit failed")]
+    cleanup = AsyncMock()
+    upload = UploadFile(
+        filename="replacement.geojson",
+        file=BytesIO(b"{}"),
+        size=2,
+    )
+
+    with (
+        patch.object(router_reupload, "get_dataset", AsyncMock(return_value=dataset)),
+        patch.object(router_reupload, "check_dataset_write_access", AsyncMock()),
+        patch.object(
+            router_reupload,
+            "get_allowed_extensions_list",
+            AsyncMock(return_value=[".geojson"]),
+        ),
+        patch.object(router_reupload, "check_replacement_quota", AsyncMock()),
+        patch.object(
+            router_reupload.UPLOAD_MAX_SIZE_MB, "get", AsyncMock(return_value=10)
+        ),
+        patch.object(router_reupload, "get_catalog_port", return_value=port),
+        patch.object(router_reupload, "_cleanup_uncommitted_reupload_source", cleanup),
+    ):
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await router_reupload.reupload_dataset(
+                dataset.id,
+                MagicMock(),
+                upload,
+                MagicMock(id=uuid.uuid4()),
+                db,
+            )
+
+    cleanup.assert_awaited_once_with(staged, job_id=job.id)
+
+
+@pytest.mark.anyio
+async def test_cleanup_uncommitted_reupload_source_reraises_cancellation():
+    """A client disconnect during the storage delete must unwind the
+    caller, not be absorbed into a best-effort warning log.
+
+    `_cleanup_uncommitted_reupload_source` is called both from the upload
+    rollback path (a disconnect during validation) and, unguarded, right
+    before the presigned-completion door returns success — swallowing
+    CancelledError there let a cancelled request return 200 anyway.
+    """
+    job_id = uuid.uuid4()
+    storage_key = f"reupload-staging/{job_id}/replacement.geojson"
+
+    mock_storage = MagicMock()
+    mock_storage.delete = AsyncMock(side_effect=asyncio.CancelledError())
+
+    with patch.object(router_reupload, "get_storage", return_value=mock_storage):
+        with pytest.raises(asyncio.CancelledError):
+            await router_reupload._cleanup_uncommitted_reupload_source(
+                storage_key, job_id=job_id
+            )
+
+
+@pytest.mark.anyio
+async def test_cleanup_uncommitted_reupload_source_still_swallows_storage_errors():
+    """Regression guard: the best-effort swallow for genuine storage errors
+    (fix #1207) must survive alongside the CancelledError re-raise above."""
+    job_id = uuid.uuid4()
+    storage_key = f"reupload-staging/{job_id}/replacement.geojson"
+
+    mock_storage = MagicMock()
+    mock_storage.delete = AsyncMock(side_effect=RuntimeError("storage unavailable"))
+
+    with patch.object(router_reupload, "get_storage", return_value=mock_storage):
+        # Must not raise — the pre-existing best-effort contract.
+        await router_reupload._cleanup_uncommitted_reupload_source(
+            storage_key, job_id=job_id
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _create_dataset(
+    session,
+    *,
+    created_by: uuid.UUID,
+    name: str = "Reupload Test Dataset",
+    visibility: str = "public",
+    record_type: str = "vector_dataset",
+    column_info: list[dict] | None = None,
+) -> Dataset:
+    """Insert a Record + Dataset pair directly into the DB."""
+    return await create_dataset(
+        session,
+        created_by=created_by,
+        name=name,
+        description=f"Test dataset: {name}",
+        theme_category=[],
+        visibility=visibility,
+        record_type=record_type,
+        feature_count=100,
+        source_filename="original.geojson",
+        column_info=column_info
+        if column_info is not None
+        else [
+            {"name": "name", "type": "String"},
+            {"name": "value", "type": "Integer"},
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Module-scoped mocks for file I/O and task deferral
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def mock_reupload_catalog_port():
+    """Pin a single catalog port instance so method patches affect router calls."""
+    port = router_reupload.get_catalog_port()
+    with patch.object(router_reupload, "get_catalog_port", return_value=port):
+        yield port
+
+
+@pytest.fixture(autouse=True)
+def mock_reupload_task(mock_reupload_catalog_port):
+    """Prevent procrastinate task deferral in reupload tests."""
+    mock_task = MagicMock()
+    # Default queue path
+    mock_task.defer_async = AsyncMock(return_value=None)
+    # Priority queue path (reupload_file.configure(...).defer_async(...))
+    mock_task.configure.return_value.defer_async = AsyncMock(return_value=None)
+    with patch.object(
+        mock_reupload_catalog_port,
+        "reupload_file_task",
+        return_value=mock_task,
+    ):
+        yield mock_task
+
+
+@pytest.fixture(autouse=True)
+def mock_reupload_file_save(mock_reupload_catalog_port):
+    """Mock file-save helper while still writing a real temp file for validation."""
+
+    async def _fake_save(
+        file, job_id: str, *, max_size_bytes: int | None = None
+    ) -> Path:
+        assert max_size_bytes is not None
+        staging_dir = Path("/tmp/fake_staging")
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(file.filename or "").suffix or ".bin"
+        out_path = staging_dir / f"{job_id}{suffix}"
+
+        content = await file.read()
+        if not content:
+            if suffix in {".geojson", ".json"}:
+                content = b'{"type":"FeatureCollection","features":[]}'
+            elif suffix == ".csv":
+                content = b"id,name\n1,test\n"
+            else:
+                content = b"test"
+        out_path.write_bytes(content)
+        await file.seek(0)
+        return out_path
+
+    with patch.object(
+        mock_reupload_catalog_port,
+        "save_upload_file",
+        new_callable=AsyncMock,
+    ) as mock_save:
+        mock_save.side_effect = _fake_save
+        yield mock_save
+
+
+@pytest.fixture(autouse=True)
+def mock_ogrinfo_preview(mock_reupload_catalog_port):
+    """Mock ogrinfo preview to return predictable data."""
+    with patch.object(
+        mock_reupload_catalog_port,
+        "run_ogrinfo_preview",
+        new_callable=AsyncMock,
+    ) as mock_preview:
+        mock_preview.return_value = {
+            "srid": 4326,
+            "geometry_type": "Point",
+            "layer_name": "test",
+            "feature_count": 200,
+            "columns": [
+                {"name": "name", "type": "String"},
+                {"name": "value", "type": "Real"},
+                {"name": "new_col", "type": "String"},
+            ],
+            "sample_rows": [
+                {"name": "Test", "value": 3.14, "new_col": "hello"},
+            ],
+            # single-layer default — all_layers is None
+            "all_layers": None,
+        }
+        yield mock_preview
+
+
+# ---------------------------------------------------------------------------
+# SC1: Upload creates job
+# ---------------------------------------------------------------------------
+
+
+class TestReuploadUpload:
+    async def test_reupload_upload_creates_job(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_reupload_file_save,
+    ):
+        """POST /datasets/{id}/reupload returns 201 with job_id."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "update.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert "job_id" in data
+        assert data["status"] == "pending"
+        assert data["message"] == "File uploaded for re-upload preview"
+
+        save_kwargs = mock_reupload_file_save.await_args.kwargs
+        assert save_kwargs["max_size_bytes"] > 0
+
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.id == uuid.UUID(data["job_id"]))
+        )
+        job = result.scalar_one()
+        assert job.dataset_id == dataset.id
+        assert job.created_by == admin_id
+        # The bind adds `staged_at`, which restarts the pending
+        # window. The two markers the job-binding gate reads are unchanged.
+        assert job.user_metadata["reupload"] is True
+        assert job.user_metadata["dataset_id"] == str(dataset.id)
+        assert job.user_metadata["staged_at"]
+        assert job.user_metadata["start_data_revision"] == dataset.data_revision
+        assert job.user_metadata["admitted_capability"] == "edit_metadata"
+        assert set(job.user_metadata) == {
+            "reupload",
+            "dataset_id",
+            "staged_at",
+            "start_data_revision",
+            "admitted_capability",
+        }
+
+    async def test_reupload_stream_limit_error_leaves_a_reapable_job(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_reupload_file_save,
+    ):
+        """A streaming size rejection binds no upload to the job.
+
+        The job row is committed before the stream so the pooled
+        connection is not held across it, so a rejection now leaves the row
+        rather than rolling it back. It stays `pending` with nothing bound,
+        which is what `stale_pending_clauses` reaps on its one-hour policy.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        filename = f"too-large-{uuid.uuid4()}.geojson"
+        mock_reupload_file_save.side_effect = HTTPException(
+            status_code=413,
+            detail="File size exceeds maximum allowed (1.0 MB).",
+        )
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={"file": (filename, b"{}", "application/json")},
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == 413
+        assert mock_reupload_file_save.await_args.kwargs["max_size_bytes"] > 0
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.source_filename == filename)
+        )
+        job = result.scalar_one_or_none()
+        assert job is not None
+        assert job.status == "pending"
+        assert not job.file_path
+
+    async def test_s3_validation_download_failure_deletes_the_staged_source(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_reupload_file_save,
+        mock_reupload_catalog_port,
+    ):
+        """A provider failure cannot orphan the staged source.
+
+        The job row is committed before the upload now, so the
+        assertion that survives is about the SOURCE. The row itself stays
+        `pending` with nothing bound, for the sweep to reap.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        source_filename = f"resolve-failure-{uuid.uuid4()}.geojson"
+        storage_key = f"staging/{uuid.uuid4()}/{source_filename}"
+        mock_reupload_file_save.side_effect = None
+        mock_reupload_file_save.return_value = storage_key
+        storage = AsyncMock()
+
+        with (
+            patch.object(
+                mock_reupload_catalog_port,
+                "resolve_file_path",
+                new=AsyncMock(side_effect=RuntimeError("storage unavailable")),
+            ),
+            patch.object(router_reupload, "get_storage", return_value=storage),
+        ):
+            with pytest.raises(RuntimeError, match="storage unavailable"):
+                await client.post(
+                    f"/datasets/{dataset.id}/reupload",
+                    files={
+                        "file": (
+                            source_filename,
+                            b'{"type":"FeatureCollection","features":[]}',
+                            "application/geo+json",
+                        )
+                    },
+                    headers=admin_auth_header,
+                )
+
+        storage.delete.assert_awaited_once_with(storage_key)
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.source_filename == source_filename)
+        )
+        job = result.scalar_one_or_none()
+        assert job is not None
+        assert job.status == "pending"
+        assert not job.file_path
+
+    async def test_reupload_invalid_dataset_returns_404(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+    ):
+        """POST /datasets/{random_uuid}/reupload returns 404."""
+        resp = await client.post(
+            f"/datasets/{uuid.uuid4()}/reupload",
+            files={
+                "file": (
+                    "update.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 404
+
+    async def test_reupload_invalid_file_extension_returns_400(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """POST /datasets/{id}/reupload with a .txt file returns 400."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={"file": ("data.txt", b"some text content", "text/plain")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert detail["code"] == "disallowed_extension", detail
+        assert "not allowed" in detail["message"].lower()
+
+    async def test_reupload_requires_admin_or_editor(
+        self,
+        client: AsyncClient,
+        viewer_auth_header: dict,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Viewer role gets 403 on POST /datasets/{id}/reupload."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "update.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=viewer_auth_header,
+        )
+        assert resp.status_code == 403
+
+    async def test_reupload_rejects_raster_file_for_vector_dataset(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """POST /datasets/{id}/reupload with a .tif file for a vector dataset returns 400."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(
+            test_db_session, created_by=admin_id, record_type="vector_dataset"
+        )
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={"file": ("layer.tif", b"FAKE_TIFF_DATA", "image/tiff")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"].lower()
+        assert "vector dataset" in detail
+        assert ".tif" in detail
+
+    async def test_reupload_rejects_vector_file_for_raster_dataset(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """POST /datasets/{id}/reupload with a .geojson file for a raster dataset returns 400."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(
+            test_db_session, created_by=admin_id, record_type="raster_dataset"
+        )
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "data.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"].lower()
+        assert "raster dataset" in detail
+
+    async def test_reupload_accepts_tif_for_raster_dataset(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """The record-type gate no longer refuses raster outright.
+
+        These bytes are not a TIFF, so the request still fails — but at the
+        CONTENT check (422), not the record-type gate (400). That distinction
+        is the assertion: a 400 here would mean the door is still shut.
+        """
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(
+            test_db_session, created_by=admin_id, record_type="raster_dataset"
+        )
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={"file": ("layer.tif", b"FAKE_TIFF_DATA", "image/tiff")},
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == 422, resp.text
+
+    async def test_reupload_rejects_any_file_for_vrt_dataset(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """POST /datasets/{id}/reupload with any file for a vrt dataset returns 400."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(
+            test_db_session, created_by=admin_id, record_type="vrt_dataset"
+        )
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={"file": ("layer.tif", b"FAKE_TIFF_DATA", "image/tiff")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400
+        detail = resp.json()["detail"].lower()
+        assert "vrt" in detail
+        assert "membership" in detail
+
+    async def test_presigned_reupload_job_is_bound_to_owner_purpose_and_dataset(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        storage = MagicMock()
+        storage.generate_presigned_put_url.return_value = "https://uploads.test/put"
+
+        with (
+            patch.object(router_reupload.settings, "storage_provider", "s3"),
+            patch.object(router_reupload, "get_storage", return_value=storage),
+        ):
+            resp = await client.post(
+                f"/datasets/{dataset.id}/reupload/presigned",
+                json={
+                    "filename": "replacement.geojson",
+                    "file_size": 128,
+                    "content_type": "application/geo+json",
+                },
+                headers=admin_auth_header,
+            )
+
+        assert resp.status_code == 201, resp.text
+        job_id = uuid.UUID(resp.json()["job_id"])
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.id == job_id)
+        )
+        job = result.scalar_one()
+        assert job.created_by == admin_id
+        assert job.dataset_id == dataset.id
+        assert job.user_metadata["reupload"] is True
+        assert job.user_metadata["dataset_id"] == str(dataset.id)
+        assert job.user_metadata["presigned"] is True
+
+    async def test_presigned_reupload_answers_400_for_a_disallowed_extension(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """A disallowed extension answers 400, matching the direct reupload
+        door, instead of an unhandled ValueError from validate_file_extension."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        storage = MagicMock()
+
+        with (
+            patch.object(router_reupload.settings, "storage_provider", "s3"),
+            patch.object(router_reupload, "get_storage", return_value=storage),
+        ):
+            resp = await client.post(
+                f"/datasets/{dataset.id}/reupload/presigned",
+                json={
+                    "filename": "malware.exe",
+                    "file_size": 128,
+                    "content_type": "application/octet-stream",
+                },
+                headers=admin_auth_header,
+            )
+
+        assert resp.status_code == 400, resp.text
+        detail = resp.json()["detail"]
+        assert detail["code"] == "disallowed_extension", detail
+        assert "'.exe'" in detail["message"]
+        assert "not allowed" in detail["message"]
+
+
+# ---------------------------------------------------------------------------
+# SC3: Preview returns schema diff
+# ---------------------------------------------------------------------------
+
+
+class TestReuploadPreview:
+    async def test_reupload_preview_returns_schema_diff(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Upload file then POST preview returns schema_diff with diff fields."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        # Upload
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "update.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        # Preview
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/preview",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "columns" in data
+        assert "crs" in data
+        assert "feature_count" in data
+        assert "schema_diff" in data
+
+        diff = data["schema_diff"]
+        assert "columns_added" in diff
+        assert "columns_removed" in diff
+        assert "type_changes" in diff
+        assert "row_count_delta" in diff
+
+        # Our mock returns: new has "new_col" (added), old has "value" as Integer but new is Real (type change)
+        added_names = [c["name"] for c in diff["columns_added"]]
+        assert "new_col" in added_names
+
+        type_change_names = [c["name"] for c in diff["type_changes"]]
+        assert "value" in type_change_names
+
+    async def test_preview_surfaces_the_ingest_ceiling_message(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_ogrinfo_preview,
+    ):
+        """The ceiling message survives this door, not the generic 422."""
+        from app.processing.ingest.ogr import IngestBudgetExceededError
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "update.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        mock_ogrinfo_preview.side_effect = IngestBudgetExceededError(
+            "Parquet file has 6 rows, above the 5-row ingest limit. "
+            "Split the file or load a subset.",
+            code="ingest_row_limit_exceeded",
+            values={"rows": 6, "limit": 5},
+        )
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/preview",
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["code"] == "ingest_row_limit_exceeded", detail
+        assert "above the 5-row ingest limit" in detail["message"], detail
+        assert "may be malformed or unsupported" not in detail["message"], detail
+
+    @pytest.mark.parametrize(
+        "record_type,expected_status",
+        [("vector_dataset", 422), ("table", 200)],
+    )
+    async def test_preview_refuses_a_replacement_that_strips_geometry(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_ogrinfo_preview,
+        record_type: str,
+        expected_status: int,
+    ):
+        """A table has no geometry to lose; a vector dataset does."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(
+            test_db_session, created_by=admin_id, record_type=record_type
+        )
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={"file": ("attributes.csv", b"id,name\n1,test\n", "text/csv")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        mock_ogrinfo_preview.return_value = {
+            **mock_ogrinfo_preview.return_value,
+            "geometry_type": None,
+        }
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/preview",
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == expected_status, resp.text
+        if expected_status == 422:
+            detail = resp.json()["detail"]
+            assert detail["code"] == "geometry_loss", detail
+            assert "no geometry" in detail["message"], detail
+
+    async def test_s3_preview_download_is_removed_after_use(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_reupload_catalog_port,
+        tmp_path,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="replacement.geojson",
+            file_path=f"staging/{uuid.uuid4()}/replacement.geojson",
+            created_by=admin_id,
+            status="pending",
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+
+        downloaded = tmp_path / "downloaded-preview.geojson"
+        downloaded.write_text('{"type":"FeatureCollection","features":[]}')
+        with patch.object(
+            mock_reupload_catalog_port,
+            "resolve_file_path",
+            new=AsyncMock(return_value=str(downloaded)),
+        ):
+            resp = await client.post(
+                f"/datasets/{dataset.id}/reupload/{job.id}/preview",
+                headers=admin_auth_header,
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert not downloaded.exists()
+
+    async def test_unreadable_file_answers_422_and_removes_the_download(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_reupload_catalog_port,
+        mock_ogrinfo_preview,
+        tmp_path,
+    ):
+        """A file ogrinfo cannot read answers the import preview's 422 (#2036)."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="replacement.geojson",
+            file_path=f"staging/{uuid.uuid4()}/replacement.geojson",
+            created_by=admin_id,
+            status="pending",
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+
+        downloaded = tmp_path / "downloaded-preview.geojson"
+        downloaded.write_text('{"type":"FeatureCollection","features":[')
+        mock_ogrinfo_preview.side_effect = router_reupload.IngestionError(
+            "Could not open 'replacement.geojson' as a spatial dataset — the "
+            "file may be corrupt, incomplete, or not a valid GeoJSON "
+            "(.geojson) file."
+        )
+        with patch.object(
+            mock_reupload_catalog_port,
+            "resolve_file_path",
+            new=AsyncMock(return_value=str(downloaded)),
+        ):
+            resp = await client.post(
+                f"/datasets/{dataset.id}/reupload/{job.id}/preview",
+                headers=admin_auth_header,
+            )
+
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail["code"] == "preview_failed"
+        assert detail["message"] == (
+            "Unable to preview file. The file may be malformed or unsupported."
+        )
+        assert not downloaded.exists()
+
+
+class TestCsvReuploadDiffUsesTheAutodetectedType:
+    """The CSV import autodetects column types as the preview does, so the
+    diff compares the preview's types with the stored columns directly.
+    """
+
+    async def _preview_diff(
+        self, client, admin_auth_header, test_db_session, mock_ogrinfo_preview, old
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            record_type="table",
+            column_info=[
+                {"name": "name", "type": "character varying"},
+                {"name": "value", "type": old},
+            ],
+        )
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={"file": ("update.csv", b"name,value\nalpha,100\n", "text/csv")},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        mock_ogrinfo_preview.return_value = {
+            "srid": None,
+            "geometry_type": None,
+            "layer_name": "update",
+            "feature_count": 1,
+            "columns": [
+                {"name": "name", "type": "String"},
+                {"name": "value", "type": "Integer"},
+            ],
+            "sample_rows": [{"name": "alpha", "value": 100}],
+            "all_layers": None,
+        }
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/preview",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()["schema_diff"]["type_changes"]
+
+    async def test_numeric_column_over_a_numeric_column_reports_no_change(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_ogrinfo_preview,
+    ):
+        changes = await self._preview_diff(
+            client, admin_auth_header, test_db_session, mock_ogrinfo_preview, "integer"
+        )
+        assert changes == []
+
+    async def test_numeric_column_over_a_varchar_column_reports_the_change(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_ogrinfo_preview,
+    ):
+        changes = await self._preview_diff(
+            client,
+            admin_auth_header,
+            test_db_session,
+            mock_ogrinfo_preview,
+            "character varying",
+        )
+        assert changes == [
+            {"name": "value", "old_type": "character varying", "new_type": "integer"}
+        ]
+
+
+class TestTypeChangeReportsTheStoredType:
+    """A reported type change names the type the import will actually
+    store, not the raw OGR label, which can read as unrelated to the
+    stored type it matches or as no change at all for a mapped subtype.
+    """
+
+    async def test_geojson_boolean_over_integer_column_reports_the_real_stored_type(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_ogrinfo_preview,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            record_type="table",
+            column_info=[{"name": "is_capital", "type": "integer"}],
+        )
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "update.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        mock_ogrinfo_preview.return_value = {
+            "srid": 4326,
+            "geometry_type": None,
+            "layer_name": "update",
+            "feature_count": 1,
+            "columns": [
+                {"name": "is_capital", "type": "Integer", "subtype": "Boolean"}
+            ],
+            "sample_rows": [{"is_capital": True}],
+            "all_layers": None,
+        }
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/preview",
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["schema_diff"]["type_changes"] == [
+            {"name": "is_capital", "old_type": "integer", "new_type": "boolean"}
+        ]
+
+
+class TestReuploadJobBinding:
+    async def test_ordinary_unbound_job_is_hidden_from_all_reupload_consumers(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        ordinary_job = IngestJob(
+            source_filename="ordinary.geojson",
+            file_path="/tmp/ordinary.geojson",
+            created_by=admin_id,
+            status="pending",
+        )
+        test_db_session.add(ordinary_job)
+        await test_db_session.commit()
+
+        preview = await client.post(
+            f"/datasets/{dataset.id}/reupload/{ordinary_job.id}/preview",
+            headers=admin_auth_header,
+        )
+        commit = await client.post(
+            f"/datasets/{dataset.id}/reupload/{ordinary_job.id}/commit",
+            json={},
+            headers=admin_auth_header,
+        )
+        complete = await client.post(
+            f"/datasets/{dataset.id}/reupload/presigned/{ordinary_job.id}/complete",
+            json={"parts": []},
+            headers=admin_auth_header,
+        )
+
+        assert preview.status_code == 404
+        assert commit.status_code == 404
+        assert complete.status_code == 404
+
+    async def test_foreign_owner_job_is_hidden_even_when_dataset_binding_matches(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        viewer_auth_header: dict,
+        test_db_session,
+    ):
+        del viewer_auth_header  # fixture creates the foreign user used below
+        admin_id = await get_user_id(test_db_session, "admin")
+        result = await test_db_session.execute(
+            select(User.id).where(User.id != admin_id).limit(1)
+        )
+        foreign_id = result.scalar_one()
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        foreign_job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="foreign.geojson",
+            file_path="/tmp/foreign.geojson",
+            created_by=foreign_id,
+            status="pending",
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+            },
+        )
+        test_db_session.add(foreign_job)
+        await test_db_session.commit()
+
+        preview = await client.post(
+            f"/datasets/{dataset.id}/reupload/{foreign_job.id}/preview",
+            headers=admin_auth_header,
+        )
+        commit = await client.post(
+            f"/datasets/{dataset.id}/reupload/{foreign_job.id}/commit",
+            json={},
+            headers=admin_auth_header,
+        )
+
+        assert preview.status_code == 404
+        assert commit.status_code == 404
+
+    async def test_non_reupload_purpose_is_hidden_when_owner_and_dataset_match(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        wrong_purpose_job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="ordinary.geojson",
+            file_path="/tmp/ordinary.geojson",
+            created_by=admin_id,
+            status="pending",
+            user_metadata={"dataset_id": str(dataset.id)},
+        )
+        test_db_session.add(wrong_purpose_job)
+        await test_db_session.commit()
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{wrong_purpose_job.id}/preview",
+            headers=admin_auth_header,
+        )
+
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Service re-upload preview parity + safety
+# ---------------------------------------------------------------------------
+
+
+class TestServiceReuploadPreview:
+    async def test_service_reupload_preview_returns_parity_response_and_dataset_bound_job(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        with (
+            patch(
+                "app.modules.catalog.datasets.api.router_reupload.build_gdal_source"
+            ) as mock_build_source,
+            patch(
+                "app.modules.catalog.datasets.api.router_reupload.run_service_preview",
+                new_callable=AsyncMock,
+            ) as mock_run_preview,
+        ):
+            mock_build_source.return_value = ("WFS:https://example.com/wfs", "roads")
+            mock_run_preview.return_value = {
+                "srid": 4326,
+                "geometry_type": "Point",
+                "layer_name": "roads",
+                "feature_count": 120,
+                "columns": [
+                    {"name": "name", "type": "String"},
+                    {"name": "value", "type": "Real"},
+                    {"name": "new_col", "type": "String"},
+                ],
+                "sample_rows": [{"name": "Main St", "value": 1.5, "new_col": "A"}],
+            }
+
+            resp = await client.post(
+                f"/datasets/{dataset.id}/reupload/service/preview",
+                json={
+                    "url": "https://example.com/wfs",
+                    "service_type": "WFS 2.0.0",
+                    "layer_name": "roads",
+                    "layer_title": "Roads Layer",
+                    "layer_id": None,
+                    "token": "secret-token",
+                },
+                headers=admin_auth_header,
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "job_id" in data
+        assert "schema_diff" in data
+        assert "columns" in data
+        assert "feature_count" in data
+        assert "sample_rows" in data
+        assert "layer_name" in data
+        assert data["source_filename"] == "Roads Layer"
+        assert data["layer_name"] == "roads"
+        assert data["feature_count"] == 120
+
+        diff = data["schema_diff"]
+        assert "columns_added" in diff
+        assert "columns_removed" in diff
+        assert "type_changes" in diff
+        assert "row_count_old" in diff
+        assert "row_count_new" in diff
+        assert "row_count_delta" in diff
+        assert any(col["name"] == "new_col" for col in diff["columns_added"])
+        assert any(change["name"] == "value" for change in diff["type_changes"])
+
+        # The GDAL source builder takes a bare token, which
+        # only its ArcGIS branch reads; the preview takes the whole credential
+        # and composes the header itself. For a WFS layer the token is None
+        # here because the credential travels as a header instead.
+        mock_build_source.assert_called_once_with(
+            "WFS 2.0.0",
+            "https://example.com/wfs",
+            "roads",
+            None,
+            token="secret-token",
+            order_field=None,
+            result_limit=5,
+            return_z=False,
+        )
+        mock_run_preview.assert_awaited_once_with(
+            "WFS:https://example.com/wfs",
+            "roads",
+            credential=ServiceCredential(
+                method=CredentialMethod.BEARER,
+                service_format="wfs",
+                token="secret-token",
+            ),
+        )
+
+        job_id = uuid.UUID(data["job_id"])
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.id == job_id)
+        )
+        job = result.scalar_one()
+
+        assert job.dataset_id == dataset.id
+        assert job.source_url == "https://example.com/wfs"
+        assert job.source_layer == "roads"
+        assert job.source_filename == "Roads Layer"
+        assert job.user_metadata["reupload"] is True
+        assert job.user_metadata["dataset_id"] == str(dataset.id)
+        assert job.user_metadata["service_type"] == "WFS 2.0.0"
+        assert job.user_metadata["source_type"] == "service_url"
+        assert "token" not in job.user_metadata
+        assert "secret-token" not in str(job.user_metadata)
+
+    async def test_service_reupload_preview_failure_returns_a_coded_502(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """A remote service preview failure carries a stable code, not raw prose."""
+        from app.processing.ingest.ogr import IngestionError
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        with (
+            patch(
+                "app.modules.catalog.datasets.api.router_reupload.build_gdal_source"
+            ) as mock_build_source,
+            patch(
+                "app.modules.catalog.datasets.api.router_reupload.run_service_preview",
+                new_callable=AsyncMock,
+            ) as mock_run_preview,
+        ):
+            mock_build_source.return_value = ("WFS:https://example.com/wfs", "roads")
+            mock_run_preview.side_effect = IngestionError("service unreachable")
+
+            resp = await client.post(
+                f"/datasets/{dataset.id}/reupload/service/preview",
+                json={
+                    "url": "https://example.com/wfs",
+                    "service_type": "WFS 2.0.0",
+                    "layer_name": "roads",
+                    "layer_title": "Roads Layer",
+                    "layer_id": None,
+                    "token": "secret-token",
+                },
+                headers=admin_auth_header,
+            )
+
+        assert resp.status_code == 502, resp.text
+        detail = resp.json()["detail"]
+        assert detail["code"] == "service_preview_failed"
+        assert detail["message"] == (
+            "Failed to preview remote layer. The service may be unavailable "
+            "or the layer format is unsupported."
+        )
+
+    async def test_service_reupload_preview_ssrf_blocked_returns_400_without_remote_calls(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        blocked_url = "https://127.0.0.1/internal"
+
+        with (
+            patch(
+                "app.modules.catalog.datasets.api.router_reupload.validate_url_for_ssrf",
+                side_effect=SSRFError(
+                    "URLs targeting private/internal networks are not allowed"
+                ),
+            ) as mock_ssrf,
+            patch(
+                "app.modules.catalog.datasets.api.router_reupload.build_gdal_source"
+            ) as mock_build_source,
+            patch(
+                "app.modules.catalog.datasets.api.router_reupload.run_service_preview",
+                new_callable=AsyncMock,
+            ) as mock_run_preview,
+        ):
+            resp = await client.post(
+                f"/datasets/{dataset.id}/reupload/service/preview",
+                json={
+                    "url": blocked_url,
+                    "service_type": "WFS 2.0.0",
+                    "layer_name": "roads",
+                    "layer_title": "Roads Layer",
+                    "token": "secret-token",
+                },
+                headers=admin_auth_header,
+            )
+
+        assert resp.status_code == 400
+        assert "not allowed" in resp.json()["detail"].lower()
+        mock_ssrf.assert_called_once_with(blocked_url)
+        mock_build_source.assert_not_called()
+        mock_run_preview.assert_not_awaited()
+
+        result = await test_db_session.execute(
+            select(IngestJob).where(
+                IngestJob.dataset_id == dataset.id,
+                IngestJob.source_url == blocked_url,
+            )
+        )
+        assert result.scalar_one_or_none() is None
+
+
+# ---------------------------------------------------------------------------
+# SC2: Commit queues task
+# ---------------------------------------------------------------------------
+
+
+class TestReuploadCommit:
+    async def test_reupload_commit_queues_task(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_reupload_task,
+    ):
+        """Upload file then POST commit returns 'Re-upload queued'."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        # Upload
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "update.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        # Commit
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/commit",
+            json={},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert data["status"] == "pending"
+        assert data["message"] == "Re-upload queued"
+
+        # Verify task was deferred via priority queue for small files
+        mock_reupload_task.configure.assert_called_once_with(queue="priority")
+        mock_reupload_task.configure.return_value.defer_async.assert_called_once()
+        call_kwargs = mock_reupload_task.configure.return_value.defer_async.call_args
+        assert call_kwargs.kwargs["dataset_id"] == str(dataset.id)
+        assert call_kwargs.kwargs["job_id"] == job_id
+
+
+# ---------------------------------------------------------------------------
+# SC1: Dataset identity preserved (endpoint-level test)
+# ---------------------------------------------------------------------------
+
+
+class TestReuploadPreservesIdentity:
+    async def test_reupload_preserves_dataset_identity(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Full flow: upload, commit. Verify dataset ID/table_name/name are unchanged."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(
+            test_db_session,
+            created_by=admin_id,
+            name="Identity Preservation Test",
+        )
+        original_id = str(dataset.id)
+        original_table_name = dataset.table_name
+        original_name = dataset.record.title
+        original_description = dataset.record.summary
+
+        # Upload
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "new_data.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        # Commit (task is mocked, so no actual swap happens)
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/commit",
+            json={},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 202
+
+        # Verify dataset identity unchanged via GET endpoint
+        resp = await client.get(
+            f"/datasets/{original_id}",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["id"] == original_id
+        assert data["table_name"] == original_table_name
+        assert data["title"] == original_name
+        assert data["summary"] == original_description
+
+
+# ---------------------------------------------------------------------------
+# SC4: Versions endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestVersionsEndpoint:
+    async def test_versions_endpoint_returns_history(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """After inserting a version record, GET /datasets/{id}/versions returns it."""
+        from app.modules.catalog.collections.models import DatasetVersion
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        # Manually insert a version record
+        version = DatasetVersion(
+            dataset_id=dataset.id,
+            version_number=1,
+            source_filename="original.geojson",
+            source_format="geojson",
+            feature_count=100,
+            srid=4326,
+            geometry_type="MultiPolygon",
+            file_hash="abc123",
+            uploaded_by=admin_id,
+        )
+        test_db_session.add(version)
+        await test_db_session.commit()
+
+        resp = await client.get(
+            f"/datasets/{dataset.id}/versions/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "versions" in data
+        assert "total" in data
+        assert data["total"] >= 1
+
+        # Find version 1 explicitly rather than relying on response ordering
+        matching = [v for v in data["versions"] if v["version_number"] == 1]
+        assert len(matching) == 1, "Expected exactly one version with version_number=1"
+        v = matching[0]
+        assert v["source_filename"] == "original.geojson"
+        assert v["feature_count"] == 100
+        assert v["uploaded_by"] == str(admin_id)
+
+    async def test_versions_endpoint_empty_dataset(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """GET /datasets/{id}/versions for dataset with no versions returns empty list."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        resp = await client.get(
+            f"/datasets/{dataset.id}/versions/",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["total"] == 0
+        assert resp.json()["versions"] == []
+
+
+# ---------------------------------------------------------------------------
+# DatasetResponse includes current_version
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentVersionInResponse:
+    async def test_dataset_response_includes_current_version(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """GET /datasets/{id} response includes current_version field."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        resp = await client.get(
+            f"/datasets/{dataset.id}",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "current_version" in data
+        assert data["current_version"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Schema diff pure function test
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaDiffComputation:
+    def test_schema_diff_computation(self):
+        """Unit test: compute_schema_diff with known inputs returns correct diff."""
+        old_cols = [
+            {"name": "id", "type": "Integer"},
+            {"name": "name", "type": "String"},
+            {"name": "old_only", "type": "Real"},
+        ]
+        new_cols = [
+            {"name": "id", "type": "Integer"},
+            {"name": "name", "type": "Real"},  # type change
+            {"name": "new_only", "type": "String"},  # added
+        ]
+
+        result = compute_schema_diff(old_cols, new_cols, 100, 150)
+
+        assert result["columns_added"] == [{"name": "new_only", "type": "String"}]
+        assert result["columns_removed"] == [{"name": "old_only", "type": "Real"}]
+        # new_type names the stored PostgreSQL type ogr2ogr will create
+        # (double precision for a bare Real), not the raw OGR label.
+        assert result["type_changes"] == [
+            {"name": "name", "old_type": "String", "new_type": "double precision"}
+        ]
+        assert result["row_count_old"] == 100
+        assert result["row_count_new"] == 150
+        assert result["row_count_delta"] == 50
+
+    def test_integer64_previews_as_the_stored_bigint(self):
+        result = compute_schema_diff(
+            [{"name": "n", "type": "character varying"}],
+            [{"name": "n", "type": "Integer64"}],
+            1,
+            1,
+        )
+        assert result["type_changes"] == [
+            {"name": "n", "old_type": "character varying", "new_type": "bigint"}
+        ]
+
+    def test_schema_diff_no_changes(self):
+        """Identical schemas produce empty diff."""
+        cols = [{"name": "a", "type": "Integer"}]
+        result = compute_schema_diff(cols, cols, 10, 10)
+        assert result["columns_added"] == []
+        assert result["columns_removed"] == []
+        assert result["type_changes"] == []
+        assert result["row_count_delta"] == 0
+
+    def test_schema_diff_null_counts(self):
+        """Null feature counts are UNKNOWN, and the delta says so.
+
+        The test once asserted a delta of 0, which is what
+        `(new or 0) - (old or 0)` produced: an
+        unknown count coerced to zero invents a delta the size of whichever
+        side is known, and two unknowns read as "no change" rather than as
+        "not known". The field is nullable now, and still required.
+        """
+        result = compute_schema_diff([], [], None, None)
+        assert result["row_count_old"] is None
+        assert result["row_count_new"] is None
+        assert result["row_count_delta"] is None
+
+    def test_schema_diff_case_insensitive(self):
+        """Column matching is case-insensitive (ogr2ogr lowercases on import)."""
+        old_cols = [{"name": "label12", "type": "character varying"}]
+        new_cols = [{"name": "LABEL12", "type": "String"}]
+        result = compute_schema_diff(old_cols, new_cols, 10, 10)
+        assert result["columns_added"] == []
+        assert result["columns_removed"] == []
+        assert result["type_changes"] == []
+
+    def test_schema_diff_subtype_matches_stored_type(self):
+        """A GDAL field subtype maps to a narrower PostgreSQL column type
+        than its bare OGR type (Integer/Boolean -> boolean, Integer/Int16 ->
+        smallint, Real/Float32 -> real, String/JSON -> json). An unchanged
+        column reporting one of these subtypes must not read as a type
+        change against the stored column.
+        """
+        old_cols = [
+            {"name": "is_capital", "type": "boolean"},
+            {"name": "rank", "type": "smallint"},
+            {"name": "area_km2", "type": "real"},
+            {"name": "tags", "type": "json"},
+        ]
+        new_cols = [
+            {"name": "is_capital", "type": "Integer", "subtype": "Boolean"},
+            {"name": "rank", "type": "Integer", "subtype": "Int16"},
+            {"name": "area_km2", "type": "Real", "subtype": "Float32"},
+            {"name": "tags", "type": "String", "subtype": "JSON"},
+        ]
+        result = compute_schema_diff(old_cols, new_cols, 10, 10)
+        assert result["type_changes"] == []
+
+    def test_schema_diff_subtype_does_not_mask_a_real_type_change(self):
+        """A boolean column that became a plain string is still reported,
+        naming the stored type it will become rather than the raw label.
+        """
+        old_cols = [{"name": "is_capital", "type": "boolean"}]
+        new_cols = [{"name": "is_capital", "type": "String"}]
+        result = compute_schema_diff(old_cols, new_cols, 10, 10)
+        assert result["type_changes"] == [
+            {
+                "name": "is_capital",
+                "old_type": "boolean",
+                "new_type": "character varying",
+            }
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Multi-layer support tests
+# ---------------------------------------------------------------------------
+
+
+async def _create_complete_ingest_job(
+    session,
+    *,
+    dataset_id: uuid.UUID,
+    created_by: uuid.UUID,
+    source_layer: str | None,
+) -> "IngestJob":
+    """Insert a completed IngestJob to seed previous_source_layer lookups."""
+    from datetime import datetime, timezone
+
+    job = IngestJob(
+        dataset_id=dataset_id,
+        source_filename="original.gpkg",
+        source_layer=source_layer,
+        created_by=created_by,
+        status="complete",
+        user_metadata={"reupload": True, "dataset_id": str(dataset_id)},
+    )
+    job.started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    job.completed_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    session.add(job)
+    await session.commit()
+    return job
+
+
+class TestReuploadMultiLayer:
+    """Multi-layer GPKG reupload tests."""
+
+    async def test_preview_returns_all_layers_for_multi_layer_source(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_ogrinfo_preview,
+    ):
+        """Preview response includes all_layers when file has >1 layers."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        # Seed a prior completed job with source_layer so previous_source_layer is populated.
+        await _create_complete_ingest_job(
+            test_db_session,
+            dataset_id=dataset.id,
+            created_by=admin_id,
+            source_layer="buildings",
+        )
+
+        # Upload using GeoJSON (valid content for content validation bypass via mock)
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "multi.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        # Override mock to return multi-layer response
+        mock_ogrinfo_preview.return_value = {
+            "srid": 4326,
+            "geometry_type": "Point",
+            "layer_name": "buildings",
+            "feature_count": 10,
+            "columns": [{"name": "name", "type": "String"}],
+            "sample_rows": [],
+            "all_layers": [
+                {"name": "buildings", "feature_count": 10, "field_count": 1},
+                {"name": "addresses", "feature_count": 5, "field_count": 2},
+            ],
+        }
+
+        # Preview (no body → single-layer call)
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/preview",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["all_layers"] is not None
+        assert len(data["all_layers"]) == 2
+        layer_names = [lyr["name"] for lyr in data["all_layers"]]
+        assert "buildings" in layer_names
+        assert "addresses" in layer_names
+        # previous_source_layer from the seeded prior job
+        assert data["previous_source_layer"] == "buildings"
+
+    async def test_preview_honors_layer_name_in_request_body(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+        mock_ogrinfo_preview,
+    ):
+        """Preview endpoint passes layer_name from request body to run_ogrinfo_preview."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "multi.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        # Override mock to return response with all_layers so validation passes
+        mock_ogrinfo_preview.return_value = {
+            "srid": 4326,
+            "geometry_type": "Point",
+            "layer_name": "addresses",
+            "feature_count": 5,
+            "columns": [{"name": "street", "type": "String"}],
+            "sample_rows": [],
+            "all_layers": [
+                {"name": "buildings", "feature_count": 10, "field_count": 1},
+                {"name": "addresses", "feature_count": 5, "field_count": 2},
+            ],
+        }
+
+        # Preview WITH layer_name in request body
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/preview",
+            json={"layer_name": "addresses"},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+
+        # Assert mock was called with layer_name="addresses"
+        call_args = mock_ogrinfo_preview.call_args
+        assert call_args.kwargs.get("layer_name") == "addresses" or (
+            len(call_args.args) > 1 and call_args.args[1] == "addresses"
+        )
+
+    async def test_commit_persists_layer_name_to_source_layer(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Commit with layer_name body field persists to IngestJob.source_layer."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        # Upload
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "multi.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        # Commit with layer_name
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/commit",
+            json={"layer_name": "addresses"},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 202
+
+        # Verify IngestJob.source_layer was persisted
+        result = await test_db_session.execute(
+            select(IngestJob).where(IngestJob.id == uuid.UUID(job_id))
+        )
+        job = result.scalar_one()
+        await test_db_session.refresh(job)
+        assert job.source_layer == "addresses"
+
+    async def test_preview_previous_source_layer_is_null_when_no_prior_complete_job(
+        self,
+        client: AsyncClient,
+        admin_auth_header: dict,
+        test_db_session,
+    ):
+        """Preview response previous_source_layer is None when no prior completed job exists."""
+        admin_id = await get_user_id(test_db_session, "admin")
+        # Fresh dataset — no prior IngestJobs
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload",
+            files={
+                "file": (
+                    "update.geojson",
+                    b'{"type":"FeatureCollection","features":[]}',
+                    "application/json",
+                )
+            },
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 201
+        job_id = resp.json()["job_id"]
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job_id}/preview",
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["previous_source_layer"] is None
+
+
+class TestStagingTableName:
+    """Attempt-owned staging names fit PostgreSQL's identifier limit."""
+
+    def test_short_name_includes_attempt_token(self):
+        from app.platform.jobs.heartbeat import attempt_scoped_staging_table
+
+        name = "roads"
+        attempt_id = uuid.uuid4()
+        staging = attempt_scoped_staging_table(name, attempt_id)
+        assert staging == f"roads_staging_{attempt_id.hex}"
+        assert len(staging) <= 63
+
+    def test_long_name_truncated_before_suffix(self):
+        from app.platform.jobs.heartbeat import attempt_scoped_staging_table
+
+        name = "computed_change_in_land_use_and_land_cover_from_2012_to_2015"
+        assert len(name) == 60
+        attempt_id = uuid.uuid4()
+        staging = attempt_scoped_staging_table(name, attempt_id)
+        assert len(staging) == 63
+        assert staging.endswith(f"_staging_{attempt_id.hex}")
+
+    def test_max_length_name(self):
+        from app.platform.jobs.heartbeat import attempt_scoped_staging_table
+
+        name = "a" * 63
+        attempt_id = uuid.uuid4()
+        staging = attempt_scoped_staging_table(name, attempt_id)
+        assert len(staging) == 63
+        assert staging == "a" * 22 + f"_staging_{attempt_id.hex}"
+
+
+async def _spawn_then_explode(*args, on_spawn=None, **kwargs):
+    """Stand-in for run_ogr2ogr_service where the subprocess spawns and the
+    fetch then fails — on_spawn fires exactly as the real runner fires it."""
+    if on_spawn is not None:
+        on_spawn()
+    raise RuntimeError("upstream fetch exploded")
+
+
+class TestFailedServiceReuploadDatesTheContact:
+    async def test_failed_fetch_still_stamps_last_checked_at(self, test_db_session):
+        """last_checked_at means "last time GeoLens
+        contacted the origin at all", and a failed refresh contact counts —
+        the probe already dates its failures for the same reason. The old
+        data stays (the swap never ran), so only the timestamp moves. The
+        stamp requires the fetch target to BE the stored service origin —
+        pinned by the sibling replacement-URL test."""
+        from app.platform.dataset_origin import set_dataset_origin
+        from app.processing.ingest.tasks_reupload import reupload_service
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        dataset.source_format = "wfs"
+        set_dataset_origin(
+            dataset,
+            "service",
+            uri="https://svc.test/wfs/roads",
+            service_type="wfs",
+            url="https://svc.test/wfs",
+            layer_id="roads",
+        )
+        await test_db_session.commit()
+        assert dataset.last_checked_at is None
+        attempt = uuid.uuid4()
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="roads",
+            source_url="https://svc.test/wfs",
+            source_layer="roads",
+            created_by=admin_id,
+            status="pending",
+            attempt_id=attempt,
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+                "service_type": "WFS 2.0",
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogr2ogr_service",
+                new=_spawn_then_explode,
+            ),
+            pytest.raises(RuntimeError, match="upstream fetch exploded"),
+        ):
+            await reupload_service.__wrapped__(  # type: ignore[attr-defined]
+                job_id=str(job.id),
+                dataset_id=str(dataset.id),
+                source_url="https://svc.test/wfs",
+                source_layer="roads",
+                user_id=str(admin_id),
+                attempt_id=str(attempt),
+            )
+
+        await test_db_session.refresh(dataset)
+        assert dataset.last_checked_at is not None
+        # The verdict stays with the probe's classifier, and the job failed.
+        assert dataset.source_health is None
+        await test_db_session.refresh(job)
+        assert job.status == "failed"
+
+    async def test_failed_fetch_after_rebind_stamps_nothing(self, test_db_session):
+        """If another reupload rebinds the origin while
+        the doomed fetch is running, the failed task must not stamp the OLD
+        origin's contact onto the NEW binding — a file reupload would leave
+        an upload with a contact time it cannot have, and uploads 409 the
+        probe so nothing corrects it."""
+        from app.platform.dataset_origin import set_dataset_origin
+        from app.processing.ingest.tasks_reupload import reupload_service
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        dataset.source_format = "wfs"
+        set_dataset_origin(
+            dataset,
+            "service",
+            uri="https://svc.test/wfs/roads",
+            service_type="wfs",
+            url="https://svc.test/wfs",
+            layer_id="roads",
+        )
+        await test_db_session.commit()
+        attempt = uuid.uuid4()
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="roads",
+            source_url="https://svc.test/wfs",
+            source_layer="roads",
+            created_by=admin_id,
+            status="pending",
+            attempt_id=attempt,
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+                "service_type": "WFS 2.0",
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+
+        async def rebind_then_explode(*args, on_spawn=None, **kwargs):
+            if on_spawn is not None:
+                on_spawn()
+            set_dataset_origin(dataset, "upload", filename="roads.gpkg")
+            dataset.source_format = "gpkg"
+            await test_db_session.commit()
+            raise RuntimeError("upstream fetch exploded")
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogr2ogr_service",
+                new=rebind_then_explode,
+            ),
+            pytest.raises(RuntimeError, match="upstream fetch exploded"),
+        ):
+            await reupload_service.__wrapped__(  # type: ignore[attr-defined]
+                job_id=str(job.id),
+                dataset_id=str(dataset.id),
+                source_url="https://svc.test/wfs",
+                source_layer="roads",
+                user_id=str(admin_id),
+                attempt_id=str(attempt),
+            )
+
+        await test_db_session.refresh(dataset)
+        assert dataset.last_checked_at is None
+
+    async def test_failed_fetch_of_a_replacement_url_stamps_nothing(
+        self, test_db_session
+    ):
+        """A reupload may target a DIFFERENT URL than the
+        stored binding — a replacement source for an upload dataset. A failed
+        fetch of the candidate says nothing about the stored origin, so
+        stamping it would date a contact the stored origin never had; for an
+        upload the timestamp would be uncorrectable, since uploads 409 the
+        probe."""
+        from app.processing.ingest.tasks_reupload import reupload_service
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        # An upload dataset: no service binding at all.
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        attempt = uuid.uuid4()
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="roads",
+            source_url="https://replacement.test/wfs",
+            source_layer="roads",
+            created_by=admin_id,
+            status="pending",
+            attempt_id=attempt,
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+                "service_type": "WFS 2.0",
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogr2ogr_service",
+                new=_spawn_then_explode,
+            ),
+            pytest.raises(RuntimeError, match="upstream fetch exploded"),
+        ):
+            await reupload_service.__wrapped__(  # type: ignore[attr-defined]
+                job_id=str(job.id),
+                dataset_id=str(dataset.id),
+                source_url="https://replacement.test/wfs",
+                source_layer="roads",
+                user_id=str(admin_id),
+                attempt_id=str(attempt),
+            )
+
+        await test_db_session.refresh(dataset)
+        assert dataset.last_checked_at is None
+
+    async def test_failed_fetch_of_a_different_layer_stamps_nothing(
+        self, test_db_session
+    ):
+        """Same service base, different layer is still a
+        different origin — the stored layer was never contacted."""
+        from app.platform.dataset_origin import set_dataset_origin
+        from app.processing.ingest.tasks_reupload import reupload_service
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        dataset.source_format = "wfs"
+        set_dataset_origin(
+            dataset,
+            "service",
+            uri="https://svc.test/wfs/roads",
+            service_type="wfs",
+            url="https://svc.test/wfs",
+            layer_id="roads",
+        )
+        await test_db_session.commit()
+        attempt = uuid.uuid4()
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="buildings",
+            source_url="https://svc.test/wfs",
+            source_layer="buildings",
+            created_by=admin_id,
+            status="pending",
+            attempt_id=attempt,
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+                "service_type": "WFS 2.0",
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogr2ogr_service",
+                new=_spawn_then_explode,
+            ),
+            pytest.raises(RuntimeError, match="upstream fetch exploded"),
+        ):
+            await reupload_service.__wrapped__(  # type: ignore[attr-defined]
+                job_id=str(job.id),
+                dataset_id=str(dataset.id),
+                source_url="https://svc.test/wfs",
+                source_layer="buildings",
+                user_id=str(admin_id),
+                attempt_id=str(attempt),
+            )
+
+        await test_db_session.refresh(dataset)
+        assert dataset.last_checked_at is None
+
+    async def test_spawn_failure_withdraws_the_contact_claim(self, test_db_session):
+        """An OSError from the subprocess launch means
+        ogr2ogr never spawned — nothing left the machine, so a matching
+        binding must still not be stamped."""
+        from app.platform.dataset_origin import set_dataset_origin
+        from app.processing.ingest.tasks_reupload import reupload_service
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        dataset.source_format = "wfs"
+        set_dataset_origin(
+            dataset,
+            "service",
+            uri="https://svc.test/wfs/roads",
+            service_type="wfs",
+            url="https://svc.test/wfs",
+            layer_id="roads",
+        )
+        await test_db_session.commit()
+        attempt = uuid.uuid4()
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="roads",
+            source_url="https://svc.test/wfs",
+            source_layer="roads",
+            created_by=admin_id,
+            status="pending",
+            attempt_id=attempt,
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+                "service_type": "WFS 2.0",
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.processing.ingest.ogr.run_ogr2ogr_service",
+                new=AsyncMock(side_effect=FileNotFoundError("ogr2ogr missing")),
+            ),
+            pytest.raises(FileNotFoundError),
+        ):
+            await reupload_service.__wrapped__(  # type: ignore[attr-defined]
+                job_id=str(job.id),
+                dataset_id=str(dataset.id),
+                source_url="https://svc.test/wfs",
+                source_layer="roads",
+                user_id=str(admin_id),
+                attempt_id=str(attempt),
+            )
+
+        await test_db_session.refresh(dataset)
+        assert dataset.last_checked_at is None
+
+
+class TestWorkerSsrfRefusalFinalizesTheRun:
+    async def test_fetch_time_ssrf_failure_fails_job_and_run(self, test_db_session):
+        """The worker-time SSRF check used to raise before
+        the failure handler's try began, leaving the pending run active — and
+        the admission index then refused every further refresh for the
+        dataset until the stale sweep, an hour of lockout for a URL that was
+        never going to be fetched."""
+        from app.platform.security import SSRFError
+        from app.platform.refresh.service import create_pending_run
+        from app.processing.ingest.tasks_reupload import reupload_service
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        attempt = uuid.uuid4()
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="roads",
+            source_url="https://rebinder.test/wfs",
+            source_layer="roads",
+            created_by=admin_id,
+            status="pending",
+            attempt_id=attempt,
+            user_metadata={
+                "reupload": True,
+                "dataset_id": str(dataset.id),
+                "service_type": "WFS 2.0",
+            },
+        )
+        test_db_session.add(job)
+        await test_db_session.flush()
+        run = await create_pending_run(
+            test_db_session,
+            dataset_id=dataset.id,
+            origin_kind="service",
+            trigger="manual",
+            triggered_by=admin_id,
+            ingest_job_id=job.id,
+            feature_count_before=None,
+        )
+        await test_db_session.commit()
+
+        async def _refuse(url: str) -> None:
+            raise SSRFError("resolved to a private range at fetch time")
+
+        with (
+            patch(
+                "app.platform.security.validate_url_for_ssrf",
+                new=AsyncMock(side_effect=_refuse),
+            ),
+            pytest.raises(RuntimeError, match="safety check at worker fetch time"),
+        ):
+            await reupload_service.__wrapped__(  # type: ignore[attr-defined]
+                job_id=str(job.id),
+                dataset_id=str(dataset.id),
+                source_url="https://rebinder.test/wfs",
+                source_layer="roads",
+                user_id=str(admin_id),
+                attempt_id=str(attempt),
+            )
+
+        await test_db_session.refresh(job)
+        assert job.status == "failed"
+        # refresh, not select: the run is already in this session's identity
+        # map with its pre-task attributes, and a select would hand back that
+        # stale object rather than repopulating it.
+        await test_db_session.refresh(run)
+        assert run.status == "failed"
+        # No packet went out; the contact clock must not claim otherwise.
+        await test_db_session.refresh(dataset)
+        assert dataset.last_checked_at is None
+
+
+class TestSourcelessCommitDoesNotReserve:
+    async def test_incomplete_presigned_commit_400s_without_a_run(
+        self, client: AsyncClient, admin_auth_header, test_db_session
+    ):
+        """A presigned reupload whose upload never
+        completed has file_path='' and no source_url. Committing it must 400
+        BEFORE the run row reserves the dataset — creating the run first left
+        an active reservation the sweep could not release while the job sat
+        pending, blocking every refresh for up to the bound-job timeout."""
+        from sqlalchemy import func as sa_func
+
+        from app.platform.refresh.models import DatasetRefreshRun
+
+        admin_id = await get_user_id(test_db_session, "admin")
+        dataset = await _create_dataset(test_db_session, created_by=admin_id)
+        job = IngestJob(
+            dataset_id=dataset.id,
+            source_filename="replacement.gpkg",
+            file_path="",
+            created_by=admin_id,
+            status="pending",
+            user_metadata={"reupload": True, "dataset_id": str(dataset.id)},
+        )
+        test_db_session.add(job)
+        await test_db_session.commit()
+
+        resp = await client.post(
+            f"/datasets/{dataset.id}/reupload/{job.id}/commit",
+            json={},
+            headers=admin_auth_header,
+        )
+        assert resp.status_code == 400, resp.text
+
+        count = (
+            await test_db_session.execute(
+                select(sa_func.count())
+                .select_from(DatasetRefreshRun)
+                .where(DatasetRefreshRun.dataset_id == dataset.id)
+            )
+        ).scalar_one()
+        assert count == 0
+
+
+# The real staging pipeline grants the cluster-wide reader role.
+@pytest.mark.xdist_group("tenancy_global_state")
+class TestArchiveRunsAfterTheSwapCommit:
+    """A re-upload archives the original file after the swap commits."""
+
+    @staticmethod
+    async def _seed(session, *, table_name: str, file_path: str):
+        from app.platform.refresh.service import create_pending_run
+
+        admin_id = await get_user_id(session, "admin")
+        dataset = await create_dataset(
+            session,
+            created_by=admin_id,
+            table_name=table_name,
+            visibility="public",
+            record_type="vector_dataset",
+            geometry_type="Point",
+            feature_count=1,
+            source_format="geojson",
+            source_filename="original.geojson",
+            column_info=[{"name": "name", "type": "text"}],
+        )
+        await session.execute(
+            text(
+                f'CREATE TABLE "data"."{table_name}" '
+                "(gid serial PRIMARY KEY, geom geometry(Point, 4326), name text)"
+            )
+        )
+        await session.execute(
+            text(
+                f'INSERT INTO "data"."{table_name}" (geom, name) VALUES '
+                "(ST_SetSRID(ST_MakePoint(2.35, 48.85), 4326), 'Paris')"
+            )
+        )
+        await session.commit()
+
+        job = IngestJob(
+            dataset_id=dataset.id,
+            status="pending",
+            attempt_id=uuid.uuid4(),
+            source_filename="update.geojson",
+            file_path=file_path,
+            created_by=admin_id,
+            user_metadata={"reupload": True, "dataset_id": str(dataset.id)},
+        )
+        session.add(job)
+        await session.flush()
+        # Mirrors the commit endpoint (router_reupload.py): the run row this
+        # job's phase 1 claims and phase 2 finalizes.
+        await create_pending_run(
+            session,
+            dataset_id=dataset.id,
+            origin_kind="upload",
+            trigger="manual",
+            triggered_by=admin_id,
+            ingest_job_id=job.id,
+            feature_count_before=dataset.feature_count,
+        )
+        await session.commit()
+        await session.refresh(job)
+        return admin_id, dataset, job
+
+    @staticmethod
+    async def _fake_ogr2ogr(file_path, staging_tn, db_conn_str, **kwargs):
+        """Stands in for the GDAL subprocess: creates the staging table for real."""
+        import app.core.db as db_module
+
+        async with db_module.async_session() as session:
+            await session.execute(
+                text(
+                    f'CREATE TABLE "data"."{staging_tn}" '
+                    "(gid serial PRIMARY KEY, geom geometry(Point, 4326), name text)"
+                )
+            )
+            await session.execute(
+                text(
+                    f'INSERT INTO "data"."{staging_tn}" (geom, name) VALUES '
+                    "(ST_SetSRID(ST_MakePoint(2.29, 48.86), 4326), 'Paris 2')"
+                )
+            )
+            await session.commit()
+
+    async def _run_reupload(
+        self,
+        test_db_session,
+        tmp_path,
+        *,
+        table_name: str,
+        put_side_effect,
+        extra_patches: tuple = (),
+        staged_key: str | None = None,
+        raises: type[BaseException] | None = None,
+        fake_downloads: bool = True,
+    ):
+        """Run the task on ``update.geojson``, staged in place or, with
+        ``staged_key``, in object storage and downloaded to that file.
+
+        ``raises`` is what the task is expected to raise. Without
+        ``fake_downloads`` a staged object is read through the storage double."""
+        local_file = tmp_path / "update.geojson"
+        local_file.write_text('{"type":"FeatureCollection","features":[]}')
+        file_path = staged_key or str(local_file)
+        admin_id, dataset, job = await self._seed(
+            test_db_session, table_name=table_name, file_path=file_path
+        )
+
+        mock_storage = AsyncMock()
+        mock_storage.put = AsyncMock(side_effect=put_side_effect)
+
+        async def _resolve(path, job_id):
+            if staged_key is None:
+                return str(local_file)
+            # Each reader of a staged object gets its own download of it.
+            download = tmp_path / f"download-{uuid.uuid4().hex}.geojson"
+            download.write_bytes(local_file.read_bytes())
+            return str(download)
+
+        from app.processing.ingest.tasks import reupload_file
+
+        with contextlib.ExitStack() as stack:
+            if fake_downloads:
+                stack.enter_context(
+                    patch(
+                        "app.processing.ingest.service.resolve_file_path",
+                        new=AsyncMock(side_effect=_resolve),
+                    )
+                )
+            stack.enter_context(
+                patch(
+                    "app.processing.ingest.tasks_reupload._validate_upload_file_safety",
+                    new=AsyncMock(),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "app.processing.ingest.ogr.run_ogrinfo",
+                    new=AsyncMock(
+                        return_value={
+                            "srid": 4326,
+                            "geometry_type": "Point",
+                            "layer_name": "update",
+                            "feature_count": 1,
+                            "columns": [{"name": "name", "type": "String"}],
+                        }
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "app.processing.ingest.ogr.run_ogr2ogr",
+                    new=AsyncMock(side_effect=self._fake_ogr2ogr),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "app.processing.ingest.tasks_staging.get_storage",
+                    lambda: mock_storage,
+                )
+            )
+            # The follow-ups archive a local upload only from the staging dir.
+            stack.enter_context(
+                patch.object(settings, "upload_staging_dir", str(tmp_path))
+            )
+            for extra in extra_patches:
+                stack.enter_context(extra)
+            if raises is not None:
+                stack.enter_context(pytest.raises(raises))
+            await reupload_file(
+                job_id=str(job.id),
+                dataset_id=str(dataset.id),
+                file_path=file_path,
+                user_id=str(admin_id),
+                attempt_id=str(job.attempt_id),
+            )
+        return dataset, job
+
+    async def test_no_io_under_the_lock(
+        self, client: AsyncClient, test_db_session, tmp_path
+    ):
+        """The archive's storage.put runs after the swap's lock is released."""
+        table_name = f"reup2175_{uuid.uuid4().hex[:10]}"
+        probe: dict = {}
+
+        async def _put_probes_the_live_table_lock(key, fobj):
+            import app.core.db as db_module
+
+            async with db_module.async_session() as probe_session:
+                await probe_session.execute(text("SET lock_timeout = '1s'"))
+                try:
+                    await probe_session.execute(
+                        text(f'SELECT 1 FROM "data"."{table_name}" LIMIT 1')
+                    )
+                    probe["ok"] = True
+                except Exception as exc:  # the assertion below reports it
+                    probe["ok"] = False
+                    probe["error"] = str(exc)
+                finally:
+                    await probe_session.rollback()
+
+        _dataset, job = await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=table_name,
+            put_side_effect=_put_probes_the_live_table_lock,
+        )
+
+        assert probe.get("ok") is True, probe.get("error")
+        await test_db_session.refresh(job)
+        assert job.status == "complete"
+
+    async def test_a_failed_archive_still_completes_the_job(
+        self, client: AsyncClient, test_db_session, tmp_path
+    ):
+        from app.platform.refresh.models import DatasetRefreshRun
+
+        async def _raising_put(key, fobj):
+            raise RuntimeError("S3 unreachable")
+
+        _dataset, job = await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=f"reup2175_{uuid.uuid4().hex[:10]}",
+            put_side_effect=_raising_put,
+        )
+
+        await test_db_session.refresh(job)
+        assert job.status == "complete"
+        assert job.user_metadata["archive_failed"] is True
+
+        run = (
+            await test_db_session.execute(
+                select(DatasetRefreshRun).where(
+                    DatasetRefreshRun.ingest_job_id == job.id
+                )
+            )
+        ).scalar_one()
+        assert run.status == "succeeded"
+
+    async def test_a_successful_reupload_archives_the_original_bytes(
+        self, client: AsyncClient, test_db_session, tmp_path
+    ):
+        put_calls = []
+
+        async def _recording_put(key, fobj):
+            put_calls.append(key)
+
+        dataset, job = await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=f"reup2175_{uuid.uuid4().hex[:10]}",
+            put_side_effect=_recording_put,
+        )
+
+        assert put_calls == [f"originals/{dataset.id}/{job.id}_update.geojson"]
+        await test_db_session.refresh(job)
+        assert job.status == "complete"
+        assert "archive_failed" not in (job.user_metadata or {})
+
+    @pytest.mark.parametrize("archived", [True, False], ids=["archived", "unarchived"])
+    async def test_the_staged_upload_goes_only_once_its_original_is_archived(
+        self, client: AsyncClient, test_db_session, tmp_path, archived
+    ):
+        async def _put(key, fobj):
+            if not archived:
+                raise RuntimeError("S3 unreachable")
+
+        _dataset, job = await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=f"reup_{uuid.uuid4().hex[:10]}",
+            put_side_effect=_put,
+        )
+
+        assert (tmp_path / "update.geojson").exists() is not archived
+        await test_db_session.refresh(job)
+        assert (ARCHIVE_PENDING_METADATA_KEY in job.user_metadata) is not archived
+
+    @pytest.mark.parametrize("archived", [True, False], ids=["archived", "unarchived"])
+    async def test_a_presigned_upload_goes_only_once_its_original_is_archived(
+        self, client: AsyncClient, test_db_session, tmp_path, archived
+    ):
+        frozen_key = f"staging/{uuid.uuid4()}/frozen/update.geojson"
+        storage = AsyncMock()
+        # A bare mock's truthy exists() would read as a landed archive.
+        storage.exists = AsyncMock(return_value=archived)
+
+        async def _put(key, fobj):
+            if not archived:
+                raise RuntimeError("S3 unreachable")
+
+        _dataset, job = await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=f"reup_{uuid.uuid4().hex[:10]}",
+            put_side_effect=_put,
+            staged_key=frozen_key,
+            extra_patches=(patch("app.platform.storage.get_storage", lambda: storage),),
+        )
+
+        deleted = [call.args[0] for call in storage.delete.await_args_list]
+        assert (frozen_key in deleted) is archived
+        assert not list(tmp_path.glob("download-*"))
+        await test_db_session.refresh(job)
+        assert (ARCHIVE_PENDING_METADATA_KEY in job.user_metadata) is not archived
+
+    async def test_caches_are_invalidated_before_the_archive_runs(
+        self, client: AsyncClient, test_db_session, tmp_path
+    ):
+        """Clients must not see a completed job with pre-swap tiles/metadata.
+
+        Records order rather than asserting inside ``put``'s side effect:
+        _archive_original_file catches any exception from a failed put,
+        including an AssertionError raised there, as a failed archive.
+        """
+        calls: list[str] = []
+
+        async def _recording_catalog_invalidate():
+            calls.append("catalog")
+
+        async def _recording_tile_invalidate(table_name):
+            calls.append("tile")
+
+        async def _recording_put(key, fobj):
+            calls.append("put")
+
+        await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=f"reup2175_{uuid.uuid4().hex[:10]}",
+            put_side_effect=_recording_put,
+            extra_patches=(
+                patch(
+                    "app.processing.ingest.publish_followups.invalidate_catalog_cache",
+                    new=AsyncMock(side_effect=_recording_catalog_invalidate),
+                ),
+                patch(
+                    "app.processing.ingest.publish_followups.invalidate_tile_cache_for_table",
+                    new=AsyncMock(side_effect=_recording_tile_invalidate),
+                ),
+            ),
+        )
+
+        assert calls == ["catalog", "tile", "put"], calls
+
+    @staticmethod
+    def _upload_left(tmp_path, storage, frozen_key: str | None) -> bool:
+        """Whether the upload survived: the local file, or the frozen object."""
+        if frozen_key is None:
+            return (tmp_path / "update.geojson").exists()
+        deleted = [call.args[0] for call in storage.delete.await_args_list]
+        return frozen_key not in deleted
+
+    async def test_a_presigned_upload_is_read_from_storage_once(
+        self, client: AsyncClient, test_db_session, tmp_path
+    ):
+        """The follow-ups archive from the task's download, not a second read."""
+        frozen_key = f"staging/{uuid.uuid4()}/frozen/update.geojson"
+        reads: list[str] = []
+
+        async def _get_to_file(key, dest):
+            reads.append(key)
+            Path(dest).write_text('{"type":"FeatureCollection","features":[]}')
+
+        storage = AsyncMock()
+        storage.exists = AsyncMock(return_value=False)
+        storage.get_to_file = AsyncMock(side_effect=_get_to_file)
+        put_calls = []
+
+        async def _recording_put(key, fobj):
+            put_calls.append(key)
+
+        from app.processing.ingest.service import resolve_file_path
+
+        resolve = AsyncMock(side_effect=resolve_file_path)
+        dataset, job = await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=f"reup_{uuid.uuid4().hex[:10]}",
+            put_side_effect=_recording_put,
+            staged_key=frozen_key,
+            fake_downloads=False,
+            extra_patches=(
+                patch("app.platform.storage.get_storage", lambda: storage),
+                patch("app.processing.ingest.service.resolve_file_path", new=resolve),
+            ),
+        )
+
+        assert resolve.await_count == 1
+        assert reads == [frozen_key]
+        assert put_calls == [f"originals/{dataset.id}/{job.id}_update.geojson"]
+        deleted = [call.args[0] for call in storage.delete.await_args_list]
+        assert frozen_key in deleted
+        assert not list(tmp_path.glob(f"{job.id}_*"))
+
+    @pytest.mark.parametrize("staged", ["local", "object_storage"])
+    async def test_a_cancelled_archive_keeps_the_upload_and_its_mark(
+        self, client: AsyncClient, test_db_session, tmp_path, staged
+    ):
+        async def _cancelling_put(key, fobj):
+            raise asyncio.CancelledError()
+
+        frozen_key = (
+            f"staging/{uuid.uuid4()}/frozen/update.geojson"
+            if staged == "object_storage"
+            else None
+        )
+        storage = AsyncMock()
+        storage.exists = AsyncMock(return_value=False)
+
+        _dataset, job = await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=f"reup_{uuid.uuid4().hex[:10]}",
+            put_side_effect=_cancelling_put,
+            staged_key=frozen_key,
+            extra_patches=(patch("app.platform.storage.get_storage", lambda: storage),),
+            raises=asyncio.CancelledError,
+        )
+
+        await test_db_session.refresh(job)
+        assert job.status == "complete"
+        assert job.user_metadata[ARCHIVE_PENDING_METADATA_KEY] is True
+        assert "archive_failed" not in job.user_metadata
+        assert self._upload_left(tmp_path, storage, frozen_key)
+        assert not list(tmp_path.glob("download-*"))
+
+    @pytest.mark.parametrize("staged", ["local", "object_storage"])
+    async def test_a_failed_archive_job_load_keeps_the_upload_and_its_mark(
+        self, client: AsyncClient, test_db_session, tmp_path, staged
+    ):
+        """A job that can't be loaded for its archive stays complete, marked and flagged."""
+        import app.processing.ingest.publish_followups as publish_followups
+
+        real_lock = publish_followups._lock_owed_archive
+        calls = {"n": 0}
+
+        async def _raising_once_lock(*args, **kwargs):
+            if calls["n"] == 0:
+                calls["n"] += 1
+                raise RuntimeError("pool checkout timed out")
+            return await real_lock(*args, **kwargs)
+
+        put_calls = []
+
+        async def _recording_put(key, fobj):
+            put_calls.append(key)
+
+        frozen_key = (
+            f"staging/{uuid.uuid4()}/frozen/update.geojson"
+            if staged == "object_storage"
+            else None
+        )
+        storage = AsyncMock()
+        storage.exists = AsyncMock(return_value=False)
+
+        dataset, job = await self._run_reupload(
+            test_db_session,
+            tmp_path,
+            table_name=f"reup_{uuid.uuid4().hex[:10]}",
+            put_side_effect=_recording_put,
+            staged_key=frozen_key,
+            extra_patches=(
+                patch.object(
+                    publish_followups, "_lock_owed_archive", _raising_once_lock
+                ),
+                patch("app.platform.storage.get_storage", lambda: storage),
+            ),
+        )
+
+        # The load raised before _archive_original_file ever ran.
+        assert calls["n"] == 1
+        assert put_calls == []
+        await test_db_session.refresh(job)
+        assert job.status == "complete"
+        assert job.user_metadata[ARCHIVE_PENDING_METADATA_KEY] is True
+        assert job.user_metadata["archive_failed"] is True
+        assert self._upload_left(tmp_path, storage, frozen_key)
+        assert not list(tmp_path.glob("download-*"))
+
+        from app.platform.refresh.models import DatasetRefreshRun
+
+        run = (
+            await test_db_session.execute(
+                select(DatasetRefreshRun).where(
+                    DatasetRefreshRun.ingest_job_id == job.id
+                )
+            )
+        ).scalar_one()
+        assert run.status == "succeeded"
